@@ -20,6 +20,23 @@ var ErrReadOnlyTxn = errors.New("kv: write on a read-only transaction")
 // ErrTxnDone is returned when a transaction is used after Commit or Discard.
 var ErrTxnDone = errors.New("kv: transaction already finished")
 
+// Isolation selects a transaction's isolation level (spec 10 §3, §4). The zero value
+// is SnapshotIsolation, the high-performance default; Serializable adds read-set
+// tracking and rw-antidependency detection at commit to give full serializability.
+type Isolation uint8
+
+const (
+	// SnapshotIsolation gives every read a stable snapshot and serializes conflicting
+	// writers (first-committer-wins). Its one anomaly is write skew (spec 10 §3).
+	SnapshotIsolation Isolation = iota
+	// Serializable is snapshot isolation plus commit-time read-set validation: a
+	// transaction aborts if any key or range it read was written by a transaction that
+	// committed in its snapshot-to-commit window. This closes write skew and every
+	// other SI anomaly, at a higher abort rate under contention (spec 10 §4). Reads
+	// still never block; the check is optimistic, not lock-based.
+	Serializable
+)
+
 // opKind tags a buffered mutation so read-your-writes resolution and batch
 // construction can replay it.
 type opKind uint8
@@ -64,6 +81,18 @@ type Txn struct {
 	// harness (spec 23 §2) to reconstruct the commit-version order.
 	commitTs uint64
 
+	// isolation is the level this transaction runs at, copied from the database
+	// default at Begin. Under Serializable the transaction also tracks its reads.
+	isolation Isolation
+
+	// reads is the set of user keys this writable serializable transaction has read,
+	// and readRanges the scan predicates it has iterated. The oracle validates them at
+	// commit (spec 10 §4): a concurrent write to any of them is a rw-antidependency
+	// that aborts the commit. Both stay nil under snapshot isolation and for read-only
+	// transactions, which never validate.
+	reads      map[string]struct{}
+	readRanges []keyRange
+
 	done bool
 }
 
@@ -107,6 +136,7 @@ func (d *DB) Begin(writable bool) *Txn {
 		db:          d,
 		writable:    writable,
 		readVersion: d.orc.readTs(),
+		isolation:   d.isolation,
 	}
 }
 
@@ -118,6 +148,7 @@ func (t *Txn) Get(key []byte) ([]byte, error) {
 	if t.done {
 		return nil, ErrTxnDone
 	}
+	t.trackRead(key)
 	val, ok, err := t.resolve(key)
 	if err != nil {
 		return nil, err
@@ -133,8 +164,39 @@ func (t *Txn) Exists(key []byte) (bool, error) {
 	if t.done {
 		return false, ErrTxnDone
 	}
+	t.trackRead(key)
 	_, ok, err := t.resolve(key)
 	return ok, err
+}
+
+// trackRead records a point read for commit-time serializability validation. It runs
+// only for a writable serializable transaction, since a read-only transaction never
+// commits writes and so never validates, and snapshot isolation does not track reads.
+// A read of an absent key is recorded too: its absence is part of what the transaction
+// depends on, so a concurrent insert is a rw-antidependency. The key is copied because
+// callers may reuse the slice.
+func (t *Txn) trackRead(key []byte) {
+	if t.isolation != Serializable || !t.writable {
+		return
+	}
+	if t.reads == nil {
+		t.reads = make(map[string]struct{})
+	}
+	t.reads[string(key)] = struct{}{}
+}
+
+// trackRange records a scan predicate [lo, hi) for commit-time serializability
+// validation, so a concurrent write that lands inside the scanned interval, including
+// an insert of a key the scan would have seen (a phantom), aborts the commit. It runs
+// only for a writable serializable transaction. Bounds are copied.
+func (t *Txn) trackRange(lo, hi []byte) {
+	if t.isolation != Serializable || !t.writable {
+		return
+	}
+	t.readRanges = append(t.readRanges, keyRange{
+		lo: cloneOrNil(lo),
+		hi: cloneOrNil(hi),
+	})
 }
 
 // resolve folds the transaction's buffered ops for key over the snapshot value,
@@ -315,12 +377,37 @@ func (t *Txn) Commit() error {
 		t.finish()
 		return err
 	}
-	v, err := t.db.commitTxn(t.readVersion, ops, conflictKeys)
+	var v uint64
+	if t.isolation == Serializable {
+		v, err = t.db.commitTxnSerializable(t.readVersion, ops, conflictKeys, t.readKeys(), t.readRanges)
+	} else {
+		v, err = t.db.commitTxn(t.readVersion, ops, conflictKeys)
+	}
 	if err == nil {
 		t.commitTs = v
 	}
 	t.finish()
 	return err
+}
+
+// readKeys returns the tracked read set as a slice, for the serializable commit check.
+func (t *Txn) readKeys() []string {
+	if len(t.reads) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(t.reads))
+	for k := range t.reads {
+		out = append(out, k)
+	}
+	return out
+}
+
+// cloneOrNil copies a bound, preserving a nil (open) bound as nil.
+func cloneOrNil(b []byte) []byte {
+	if b == nil {
+		return nil
+	}
+	return append([]byte(nil), b...)
 }
 
 // Discard releases the transaction's snapshot without applying its writes. It is

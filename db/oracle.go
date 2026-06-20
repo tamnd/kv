@@ -1,6 +1,28 @@
 package db
 
-import "sync"
+import (
+	"sync"
+
+	"github.com/tamnd/kv/format"
+)
+
+// keyRange is a half-open scan predicate [lo, hi) a serializable transaction read, in
+// user-key order. A nil bound is open: nil lo is unbounded below, nil hi unbounded
+// above. The oracle tests a concurrent write key against it for rw-antidependencies.
+type keyRange struct {
+	lo, hi []byte
+}
+
+// covers reports whether key falls in [lo, hi).
+func (r keyRange) covers(key []byte) bool {
+	if r.lo != nil && format.CompareUser(key, r.lo) < 0 {
+		return false
+	}
+	if r.hi != nil && format.CompareUser(key, r.hi) >= 0 {
+		return false
+	}
+	return true
+}
 
 // oracle assigns commit versions and tracks which read snapshots are still live,
 // the Badger-style watermark oracle of spec 10 §2. It is the one place version
@@ -138,6 +160,51 @@ func (o *oracle) newCommitTs(readVersion uint64, writes []string) (uint64, bool)
 		for _, k := range writes {
 			if _, hit := c.writes[k]; hit {
 				return 0, false
+			}
+		}
+	}
+	return o.recordCommitLocked(writes), true
+}
+
+// newCommitTsSerializable is the serializable-isolation commit path (spec 10 §4). It
+// runs the same first-committer-wins write-write check as newCommitTs, and in addition
+// validates the transaction's read set: if any transaction that committed after
+// readVersion wrote a key the committing transaction read (as a point read or inside a
+// scanned range), that is a read-write antidependency that can produce a
+// non-serializable schedule, so the commit aborts. With the single committing writer
+// (spec 10 §5.1) this read validation makes the commit-version order a serializable
+// order: every committed transaction's reads are still valid as of its commit, so it
+// could have run entirely at that point. It closes write skew and every other SI
+// anomaly, conservatively (it may abort some schedules a precise pivot detector would
+// allow, the standard optimistic-validation trade).
+func (o *oracle) newCommitTsSerializable(readVersion uint64, writes, reads []string, ranges []keyRange) (uint64, bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	readSet := make(map[string]struct{}, len(reads))
+	for _, k := range reads {
+		readSet[k] = struct{}{}
+	}
+	for i := range o.commits {
+		c := &o.commits[i]
+		if c.version <= readVersion {
+			continue
+		}
+		// Write-write: a key we are writing was written since our snapshot.
+		for _, k := range writes {
+			if _, hit := c.writes[k]; hit {
+				return 0, false
+			}
+		}
+		// Read-write antidependency: a key we read was written since our snapshot.
+		for wk := range c.writes {
+			if _, hit := readSet[wk]; hit {
+				return 0, false
+			}
+			for _, rg := range ranges {
+				if rg.covers([]byte(wk)) {
+					return 0, false
+				}
 			}
 		}
 	}
