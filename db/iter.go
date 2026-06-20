@@ -101,33 +101,45 @@ func (d *DB) rangeSnapshot(version uint64, lower, upper []byte, keysOnly bool) (
 }
 
 // overlayBuffer merges the transaction's buffered writes in [lower, upper) onto the
-// base snapshot view, so the scan sees the transaction's own uncommitted puts and
-// deletes (spec 11 §6). Each buffered key is resolved to its net effect (the same
-// fold Get uses), then it replaces, inserts, or removes the base entry. A read-only
-// transaction has no buffer, so base passes through.
+// base snapshot view, so the scan sees the transaction's own uncommitted puts,
+// deletes, and range deletes (spec 11 §6). Each affected key is resolved to its net
+// effect (the same fold Get uses), then it replaces, inserts, or removes the base
+// entry. The affected set is every buffered point-op key plus every base key a
+// buffered range delete covers. A read-only transaction has no buffer, so base
+// passes through.
 func (t *Txn) overlayBuffer(base []iterItem, lower, upper []byte, keysOnly bool) ([]iterItem, error) {
 	if len(t.ops) == 0 {
 		return base, nil
 	}
-	combined := make(map[string][]byte, len(base)+len(t.latest))
-	order := make([]string, 0, len(base)+len(t.latest))
+	combined := make(map[string][]byte, len(base)+len(t.ops))
+	order := make([]string, 0, len(base)+len(t.ops))
 	for _, it := range base {
 		k := string(it.key)
 		combined[k] = it.val
 		order = append(order, k)
 	}
 
-	seen := make(map[string]struct{}, len(t.latest))
+	resolveSet := make(map[string]struct{}, len(t.ops))
 	for _, op := range t.ops {
-		ks := string(op.key)
-		if _, ok := seen[ks]; ok {
+		if op.kind == opRangeDelete {
+			// A range delete affects the base keys it covers; a buffered insert in
+			// the range is already its own point op below.
+			for _, it := range base {
+				if rangeCovers(op.key, op.value, it.key) {
+					resolveSet[string(it.key)] = struct{}{}
+				}
+			}
 			continue
 		}
-		seen[ks] = struct{}{}
-		if !inBounds(op.key, lower, upper) {
+		resolveSet[string(op.key)] = struct{}{}
+	}
+
+	for ks := range resolveSet {
+		key := []byte(ks)
+		if !inBounds(key, lower, upper) {
 			continue
 		}
-		val, exists, err := t.resolve(op.key)
+		val, exists, err := t.resolve(key)
 		if err != nil {
 			return nil, err
 		}
