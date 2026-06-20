@@ -53,6 +53,12 @@ type Options struct {
 	// Isolation is the isolation level every transaction runs at (spec 10 §3, §4).
 	// Zero is SnapshotIsolation, the default; Serializable adds read-set validation.
 	Isolation Isolation
+	// AutoCheckpoint is the WAL backlog, in frames, at which a background passive
+	// checkpoint is triggered so the log stays bounded under sustained writes
+	// (spec 09 §1.3). Zero selects a sensible default; a negative value disables
+	// auto-checkpointing entirely, leaving the WAL to grow until an explicit
+	// Checkpoint or a clean close.
+	AutoCheckpoint int
 }
 
 func (o Options) maxRetries() int {
@@ -74,6 +80,19 @@ func (o Options) engineKind() format.EngineKind {
 		return format.EngineBTree
 	}
 	return o.Engine
+}
+
+// autoCheckpoint resolves the WAL backlog threshold in frames: zero takes the 1000
+// frame default (the SQLite wal_autocheckpoint analog), a negative value disables
+// auto-checkpointing and returns zero (spec 09 §1.3).
+func (o Options) autoCheckpoint() int {
+	if o.AutoCheckpoint == 0 {
+		return 1000
+	}
+	if o.AutoCheckpoint < 0 {
+		return 0
+	}
+	return o.AutoCheckpoint
 }
 
 func (o Options) sync() wal.Sync {
@@ -107,6 +126,22 @@ type DB struct {
 	maxRetries int
 	syncMode   wal.Sync
 	isolation  Isolation
+
+	// Auto-checkpointer (spec 09 §1.3). When ckptThreshold is positive a single
+	// long-lived goroutine folds the WAL in the background: a commit that pushes the
+	// backlog past the threshold signals ckptSig (non-blocking, coalesced through the
+	// one-slot buffer), and the worker runs a passive Checkpoint off the commit path.
+	// ckptStop closes on Close to retire the worker, ckptDone closes when it has; both
+	// are nil when auto-checkpointing is disabled. The worker takes d.mu itself, so the
+	// signal must be sent while holding it but the shutdown join must not.
+	ckptThreshold int
+	ckptSig       chan struct{}
+	ckptStop      chan struct{}
+	ckptDone      chan struct{}
+	closeOnce     sync.Once
+
+	ckptErrMu sync.Mutex
+	ckptErr   error
 }
 
 // Open opens the database at path, creating it if it does not exist, and runs crash
@@ -153,6 +188,7 @@ func create(fs vfs.FS, path string, opts Options) (*DB, error) {
 		pgr.Close()
 		return nil, err
 	}
+	d.startCheckpointer(opts.autoCheckpoint())
 	return d, nil
 }
 
@@ -217,6 +253,7 @@ func openExisting(fs vfs.FS, path string, opts Options) (*DB, error) {
 		last = maxVer
 	}
 	d.orc = newOracle(last)
+	d.startCheckpointer(opts.autoCheckpoint())
 	return d, nil
 }
 
@@ -369,6 +406,7 @@ func (d *DB) applyCommitted(b *engine.WriteBatch, v uint64) error {
 		return err
 	}
 	d.pgr.Header().LastCommitVersion = v
+	d.maybeCheckpoint()
 	return nil
 }
 
@@ -521,6 +559,82 @@ func (d *DB) Stats() Stats {
 	}
 }
 
+// startCheckpointer launches the background passive-checkpoint worker when threshold
+// is positive. It is called once at the end of open, after every field the worker
+// reads is set, so a constructor that fails earlier never leaves a goroutine behind. A
+// non-positive threshold leaves all of the worker channels nil, which maybeCheckpoint
+// and Close both treat as "auto-checkpointing disabled" (spec 09 §1.3).
+func (d *DB) startCheckpointer(threshold int) {
+	if threshold <= 0 {
+		return
+	}
+	d.ckptThreshold = threshold
+	d.ckptSig = make(chan struct{}, 1)
+	d.ckptStop = make(chan struct{})
+	d.ckptDone = make(chan struct{})
+	go d.checkpointLoop()
+}
+
+// checkpointLoop is the body of the auto-checkpoint worker: it folds the WAL whenever a
+// commit signals a backlog past the threshold, and retires when Close stops it. The
+// worker takes d.mu inside Checkpoint, so it must run on its own goroutine and never be
+// joined while the caller holds the lock. A failed background checkpoint is remembered
+// and surfaced from Close rather than crashing the writer that triggered it.
+func (d *DB) checkpointLoop() {
+	defer close(d.ckptDone)
+	for {
+		select {
+		case <-d.ckptStop:
+			return
+		case <-d.ckptSig:
+			if err := d.Checkpoint(); err != nil {
+				d.recordCheckpointErr(err)
+			}
+		}
+	}
+}
+
+// maybeCheckpoint signals the background worker when the unfolded WAL backlog has grown
+// past the configured threshold. The caller holds d.mu, so the LSN and checkpoint mark
+// it reads are stable; the send is non-blocking and the one-slot buffer coalesces a
+// burst of commits into a single pending wakeup, so a hot writer never blocks on the
+// checkpointer (spec 09 §1.3). It is a no-op when auto-checkpointing is disabled.
+func (d *DB) maybeCheckpoint() {
+	if d.ckptSig == nil {
+		return
+	}
+	lsn := d.wal.LSN()
+	if lsn == 0 {
+		return
+	}
+	written := lsn - 1
+	folded := d.pgr.CheckpointLSN()
+	if written <= folded || written-folded < uint64(d.ckptThreshold) {
+		return
+	}
+	select {
+	case d.ckptSig <- struct{}{}:
+	default:
+	}
+}
+
+// recordCheckpointErr keeps the first background-checkpoint failure so Close can report
+// it; later failures are subsumed, since the first is the one that explains the backlog.
+func (d *DB) recordCheckpointErr(err error) {
+	d.ckptErrMu.Lock()
+	if d.ckptErr == nil {
+		d.ckptErr = err
+	}
+	d.ckptErrMu.Unlock()
+}
+
+// backgroundErr returns the first background-checkpoint failure, or nil.
+func (d *DB) backgroundErr() error {
+	d.ckptErrMu.Lock()
+	defer d.ckptErrMu.Unlock()
+	return d.ckptErr
+}
+
 // Checkpoint folds the WAL into the main file and resets the log, in the strict
 // order that makes an interrupted checkpoint safe: fold dirty pages and fsync the
 // main file (recording the folded LSN and the durable version in its header), then
@@ -549,7 +663,21 @@ func (d *DB) Checkpoint() error {
 // Close releases the database without an implicit checkpoint: committed data is
 // already durable in the WAL and recovers on the next open. For a clean shutdown
 // that leaves an empty WAL, call Checkpoint first.
+//
+// It first retires the background checkpointer, joining the worker outside the lock so
+// any in-flight passive checkpoint (which takes d.mu itself) finishes before the file
+// is torn down, then closes the WAL and pager. A background-checkpoint failure that was
+// otherwise silent surfaces here.
 func (d *DB) Close() error {
+	var bgErr error
+	d.closeOnce.Do(func() {
+		if d.ckptStop != nil {
+			close(d.ckptStop)
+			<-d.ckptDone
+		}
+		bgErr = d.backgroundErr()
+	})
+
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	var firstErr error
@@ -560,6 +688,9 @@ func (d *DB) Close() error {
 	}
 	if err := d.pgr.Close(); err != nil && firstErr == nil {
 		firstErr = err
+	}
+	if firstErr == nil {
+		firstErr = bgErr
 	}
 	return firstErr
 }

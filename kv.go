@@ -117,6 +117,14 @@ func WithIsolation(level Isolation) Option {
 	return func(c *config) { c.opts.Isolation = level }
 }
 
+// WithAutoCheckpoint sets the WAL backlog, in frames, at which a background passive
+// checkpoint folds the log into the main file so it stays bounded under sustained writes
+// (open-time, spec 09 §1.3). Zero keeps the default; a negative value disables
+// auto-checkpointing, leaving the WAL to grow until an explicit Checkpoint or clean close.
+func WithAutoCheckpoint(frames int) Option {
+	return func(c *config) { c.opts.AutoCheckpoint = frames }
+}
+
 // WithMergeOperator registers the associative merge operator Txn.Merge folds operands
 // through (spec 15 §5). The name identifies the operator's semantics; operator-name
 // persistence in the header is a later slice, so today the function must be re-supplied

@@ -3,6 +3,7 @@ package db
 import (
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/tamnd/kv/engine"
 	"github.com/tamnd/kv/vfs"
@@ -288,5 +289,77 @@ func TestMergeAndDeleteResolution(t *testing.T) {
 	d.Write(func(b *engine.WriteBatch) { b.Delete([]byte("k")) })
 	if v, ok := get(t, d, "k"); ok {
 		t.Fatalf("k = %q present after delete", v)
+	}
+}
+
+// TestAutoCheckpointBoundsWAL drives sustained commits against a small auto-checkpoint
+// threshold and asserts the background worker folds the log so the backlog stays
+// bounded instead of growing with every write (spec 09 §1.3). Without the worker the
+// backlog would climb to one frame per commit; with it the backlog settles below the
+// threshold once writing stops and the last signaled checkpoint catches up.
+func TestAutoCheckpointBoundsWAL(t *testing.T) {
+	fs := vfs.NewMem()
+	const threshold = 8
+	d, err := Open(fs, "test.kv", Options{PageSize: 4096, AutoCheckpoint: threshold})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer d.Close()
+
+	const writes = 300
+	for i := 0; i < writes; i++ {
+		k := []byte(fmt.Sprintf("k%04d", i))
+		if _, err := d.Write(func(b *engine.WriteBatch) { b.Set(k, []byte("v")) }); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+
+	// The checkpointer runs asynchronously, so poll until the backlog drains below the
+	// threshold. A failure to converge means the worker never kept up -- a real bug, not
+	// flakiness -- so the deadline is generous.
+	deadline := time.Now().Add(5 * time.Second)
+	var last uint64
+	for time.Now().Before(deadline) {
+		last = d.Stats().WALBacklog
+		if last < threshold {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if last >= threshold {
+		t.Fatalf("WAL backlog %d never fell below threshold %d after %d writes", last, threshold, writes)
+	}
+
+	// The folded data must still read back correctly: auto-checkpoint is durability, not
+	// data loss.
+	for _, i := range []int{0, writes / 2, writes - 1} {
+		k := fmt.Sprintf("k%04d", i)
+		if v, ok := get(t, d, k); !ok || v != "v" {
+			t.Fatalf("%s = %q,%v after auto-checkpoint, want v,true", k, v, ok)
+		}
+	}
+}
+
+// TestAutoCheckpointDisabledLetsWALGrow is the negative control: with auto-checkpointing
+// disabled the backlog grows with the writes and no background worker folds it, so the
+// feature's effect in the test above is attributable to the worker and not to some other
+// path checkpointing on its own.
+func TestAutoCheckpointDisabledLetsWALGrow(t *testing.T) {
+	fs := vfs.NewMem()
+	d, err := Open(fs, "test.kv", Options{PageSize: 4096, AutoCheckpoint: -1})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer d.Close()
+
+	const writes = 50
+	for i := 0; i < writes; i++ {
+		k := []byte(fmt.Sprintf("k%04d", i))
+		if _, err := d.Write(func(b *engine.WriteBatch) { b.Set(k, []byte("v")) }); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+	if backlog := d.Stats().WALBacklog; backlog < uint64(writes) {
+		t.Fatalf("WAL backlog %d with auto-checkpoint disabled, want >= %d", backlog, writes)
 	}
 }
