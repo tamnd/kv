@@ -61,6 +61,16 @@ func (b *WriteBatch) Merge(userKey, operand []byte) {
 	b.Add(format.EncodeInternalKey(userKey, b.version, format.KindMerge), operand)
 }
 
+// DeleteRange appends a range deletion of the half-open interval [lo, hi) at the
+// batch's version. It is stored as a single marker cell keyed at lo (kind
+// KindRangeBegin) carrying hi as its value, so a redo of the same committed batch
+// re-installs the identical cell and stays idempotent. Resolution treats every key
+// in [lo, hi) older than this version as absent; the marker itself never surfaces
+// as a user key (spec 11 §4, spec 02 §8.4).
+func (b *WriteBatch) DeleteRange(lo, hi []byte) {
+	b.Add(format.EncodeInternalKey(lo, b.version, format.KindRangeBegin), hi)
+}
+
 // Encode serializes the batch to its wire form. This is the exact payload the WAL
 // logs as a kv-batch frame (spec 07 §2.2), so "what is durable" and "what is
 // applied" are byte-identical. The layout is varint version, varint entry count,

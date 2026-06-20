@@ -43,7 +43,7 @@ func (r *reader) Get(userKey []byte) ([]byte, error) {
 			group = append(group, entry{ik: l.keys[i], val: l.vals[i]})
 		}
 	}
-	res := resolveStream(group, r.snap, r.t.merge)
+	res := resolveStream(group, r.snap, r.t.merge, r.t.rangeDels)
 	if len(res) == 0 {
 		return nil, engine.ErrNotFound
 	}
@@ -61,7 +61,7 @@ func (r *reader) NewIter(opts engine.IterOptions) (engine.Cursor, error) {
 	if err != nil {
 		return nil, err
 	}
-	view := resolveStream(entries, r.snap, r.t.merge)
+	view := resolveStream(entries, r.snap, r.t.merge, r.t.rangeDels)
 	return &cursor{view: view, pos: -1, reverse: opts.Reverse}, nil
 }
 
@@ -81,54 +81,37 @@ type resolvedKV struct {
 
 // resolveStream folds an ascending (by CompareInternal) stream of cells into the
 // MVCC-visible view at snap: for each user key the newest version <= snap, with
-// tombstones removed and merge operands folded oldest-first over the base. This is
-// the same resolution the model oracle performs (spec 10 §3) -- intentionally
-// identical so the conformance check passes by construction.
-func resolveStream(entries []entry, snap engine.Snapshot, merge func(existing, operand []byte) []byte) []resolvedKV {
+// tombstones removed, merge operands folded over the base, and covering range
+// deletes applied. It delegates the per-key fold to format.Fold, the one resolver
+// shared with the model and the oracle (spec 10 §3, spec 11 §4) -- intentionally
+// identical so the conformance check passes by construction. rangeDels is the
+// engine's live interval set, since a covering marker may live in a leaf this scan
+// never reads.
+func resolveStream(entries []entry, snap engine.Snapshot, merge func(existing, operand []byte) []byte, rangeDels []format.RangeDel) []resolvedKV {
 	var out []resolvedKV
 	i := 0
 	for i < len(entries) {
 		uk := format.UserKey(entries[i].ik)
-		var operands [][]byte // newest-first
-		var baseVal []byte
-		baseIsSet := false
-		baseFound := false
+		// Gather this user key's group (newest-first), dropping range markers, which
+		// resolve through rangeDels rather than as ops.
+		var ops []format.Op
 		j := i
 		for j < len(entries) && format.CompareUser(format.UserKey(entries[j].ik), uk) == 0 {
 			ik := entries[j].ik
 			val := entries[j].val
 			j++
-			if baseFound {
-				continue // older than the resolved base; shadowed
-			}
-			if format.Version(ik) > snap.Version {
-				continue // not visible at this snapshot
-			}
-			switch format.KindOf(ik) {
-			case format.KindMerge:
-				operands = append(operands, val)
+			k := format.KindOf(ik)
+			if k == format.KindRangeBegin || k == format.KindRangeEnd {
 				continue
-			case format.KindSet:
-				baseVal = val
-				baseIsSet = true
 			}
-			baseFound = true // a set or delete is the base; stop collecting
+			ops = append(ops, format.Op{Version: format.Version(ik), Kind: k, Value: val})
 		}
 		i = j
 
-		if !baseIsSet && len(operands) == 0 {
-			continue // delete base with no operands, or nothing visible
-		}
-		var val []byte
-		if baseIsSet {
-			val = baseVal
-		}
-		for k := len(operands) - 1; k >= 0; k-- { // fold oldest operand first
-			if merge != nil {
-				val = merge(val, operands[k])
-			} else {
-				val = operands[k]
-			}
+		rd := format.NewestCoveringRangeDel(rangeDels, uk, snap.Version)
+		val, ok := format.Fold(ops, snap.Version, rd, merge)
+		if !ok {
+			continue
 		}
 		out = append(out, resolvedKV{uk: append([]byte(nil), uk...), val: append([]byte(nil), val...)})
 	}

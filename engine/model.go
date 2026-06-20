@@ -27,6 +27,9 @@ type Model struct {
 	// merge operand behaves as a plain set (operand replaces). The real merge
 	// registry arrives with the library API (spec 15).
 	merge func(existing, operand []byte) []byte
+	// rangeDels is the live set of range-delete intervals, rebuilt from the marker
+	// cells in store. Reads consult it to fold range deletes (spec 11 §4).
+	rangeDels []format.RangeDel
 }
 
 // NewModel returns an empty model engine.
@@ -59,6 +62,14 @@ func (m *Model) Apply(batch *WriteBatch, commitVersion uint64) error {
 		ik := string(e.InternalKey)
 		// A tombstone still occupies a key slot so that it shadows older versions.
 		m.store[ik] = append([]byte(nil), e.Value...)
+		// A range-delete marker also records its interval so reads can fold it.
+		if format.KindOf(e.InternalKey) == format.KindRangeBegin {
+			m.rangeDels = append(m.rangeDels, format.RangeDel{
+				Lo:      append([]byte(nil), format.UserKey(e.InternalKey)...),
+				Hi:      append([]byte(nil), e.Value...),
+				Version: format.Version(e.InternalKey),
+			})
+		}
 	}
 	return nil
 }
@@ -111,52 +122,25 @@ func (m *Model) snapshot(snap Snapshot) []resolved {
 	var i int
 	for i < len(iks) {
 		uk := format.UserKey(iks[i])
-		// Walk this user key's version group (already newest-first). Collect merge
-		// operands above the newest visible base (a set or a delete).
-		var operands [][]byte // newest-first
-		var baseVal []byte
-		baseIsSet := false
-		baseFound := false
+		// Gather this user key's version group (already newest-first), dropping the
+		// range-delete markers, which resolve through rangeDels rather than as ops.
+		var ops []format.Op
 		j := i
-		// Consume the entire version group so older, shadowed versions are not
-		// reprocessed as a fresh key on the next outer iteration.
 		for j < len(iks) && bytes.Equal(format.UserKey(iks[j]), uk) {
 			ik := iks[j]
 			j++
-			if baseFound {
-				continue // older than the resolved base; shadowed
-			}
-			if format.Version(ik) > snap.Version {
-				continue // not visible at this snapshot
-			}
-			if format.KindOf(ik) == format.KindMerge {
-				operands = append(operands, m.store[string(ik)])
+			k := format.KindOf(ik)
+			if k == format.KindRangeBegin || k == format.KindRangeEnd {
 				continue
 			}
-			if format.KindOf(ik) == format.KindSet {
-				baseVal = m.store[string(ik)]
-				baseIsSet = true
-			}
-			baseFound = true // a set or delete is the base; stop collecting
+			ops = append(ops, format.Op{Version: format.Version(ik), Kind: k, Value: m.store[string(ik)]})
 		}
 		i = j
 
-		// The key is present if there is a set base or any merge operand. A delete
-		// base with no operands shadows the key; merges on top of a delete start
-		// fresh from the operands.
-		if !baseIsSet && len(operands) == 0 {
+		rd := format.NewestCoveringRangeDel(m.rangeDels, uk, snap.Version)
+		val, ok := format.Fold(ops, snap.Version, rd, m.merge)
+		if !ok {
 			continue
-		}
-		var val []byte
-		if baseIsSet {
-			val = baseVal
-		}
-		for k := len(operands) - 1; k >= 0; k-- { // fold oldest operand first
-			if m.merge != nil {
-				val = m.merge(val, operands[k])
-			} else {
-				val = operands[k]
-			}
 		}
 		out = append(out, resolved{uk: append([]byte(nil), uk...), val: append([]byte(nil), val...)})
 	}

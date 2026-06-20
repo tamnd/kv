@@ -21,6 +21,9 @@ type Oracle struct {
 	// versions[userKey] is the list of (version, kind, value) newest-first.
 	versions map[string][]oracleVer
 	merge    func(existing, operand []byte) []byte
+	// rangeDels is the live set of range-delete intervals, consulted during a read
+	// exactly as each engine consults its own (spec 11 §4).
+	rangeDels []format.RangeDel
 }
 
 type oracleVer struct {
@@ -45,44 +48,30 @@ func (o *Oracle) Apply(batch *WriteBatch, commitVersion uint64) {
 		sort.SliceStable(o.versions[uk], func(i, j int) bool {
 			return o.versions[uk][i].version > o.versions[uk][j].version
 		})
+		if k == format.KindRangeBegin {
+			o.rangeDels = append(o.rangeDels, format.RangeDel{
+				Lo:      append([]byte(nil), format.UserKey(e.InternalKey)...),
+				Hi:      append([]byte(nil), e.Value...),
+				Version: v,
+			})
+		}
 	}
 }
 
-// Get returns the value visible at snap, or false if absent.
+// Get returns the value visible at snap, or false if absent. It uses the same
+// shared fold as both engine cores (format.Fold), so a divergence is always a bug
+// in the engine, never in the oracle's resolution.
 func (o *Oracle) Get(userKey []byte, snap Snapshot) ([]byte, bool) {
 	vers := o.versions[string(userKey)]
-	var operands [][]byte
-	baseIsSet := false
-	var baseVal []byte
+	ops := make([]format.Op, 0, len(vers))
 	for _, ver := range vers {
-		if ver.version > snap.Version {
+		if ver.kind == format.KindRangeBegin || ver.kind == format.KindRangeEnd {
 			continue
 		}
-		if ver.kind == format.KindMerge {
-			operands = append(operands, ver.value)
-			continue
-		}
-		if ver.kind == format.KindSet {
-			baseVal = ver.value
-			baseIsSet = true
-		}
-		break
+		ops = append(ops, format.Op{Version: ver.version, Kind: ver.kind, Value: ver.value})
 	}
-	if !baseIsSet && len(operands) == 0 {
-		return nil, false
-	}
-	var val []byte
-	if baseIsSet {
-		val = baseVal
-	}
-	for k := len(operands) - 1; k >= 0; k-- {
-		if o.merge != nil {
-			val = o.merge(val, operands[k])
-		} else {
-			val = operands[k]
-		}
-	}
-	return val, true
+	rd := format.NewestCoveringRangeDel(o.rangeDels, userKey, snap.Version)
+	return format.Fold(ops, snap.Version, rd, o.merge)
 }
 
 // Scan returns the visible (key,value) pairs in [lower,upper) at snap, sorted by

@@ -186,6 +186,131 @@ func TestRangeAndPrefixScan(t *testing.T) {
 	}
 }
 
+// TestConformanceRangeDelete drives sets, a range deletion, and re-sets above it
+// through the oracle at a tiny page size, so the range-delete marker cell and the
+// keys it covers land in different leaves. CheckEngine compares the B-tree to the
+// oracle at every commit version, which exercises the snapshot before the delete
+// (keys present), at the delete (covered keys absent), and after a re-set (the
+// newer version survives the older range delete).
+func TestConformanceRangeDelete(t *testing.T) {
+	bt := newBTree(t, 512, 16)
+
+	var batches []*engine.WriteBatch
+
+	// Enough keys at a small page size to span several leaves, so the marker cell
+	// and the keys it covers do not share a single leaf.
+	b1 := engine.NewWriteBatch(10)
+	for i := 0; i < 60; i++ {
+		b1.Set([]byte(fmt.Sprintf("k%02d", i)), []byte("one"))
+	}
+	batches = append(batches, b1)
+
+	// Delete the half-open interval [k20, k40): covers k20..k39, leaves k40.
+	b2 := engine.NewWriteBatch(20)
+	b2.DeleteRange([]byte("k20"), []byte("k40"))
+	batches = append(batches, b2)
+
+	// Re-set two covered keys above the range delete; both must reappear.
+	b3 := engine.NewWriteBatch(30)
+	b3.Set([]byte("k30"), []byte("two"))
+	batches = append(batches, b3)
+
+	b4 := engine.NewWriteBatch(40)
+	b4.Set([]byte("k25"), []byte("three"))
+	batches = append(batches, b4)
+
+	if err := engine.CheckEngine(bt, batches, concatMerge); err != nil {
+		t.Fatalf("conformance: %v", err)
+	}
+}
+
+// TestConformanceRangeDeleteMerge checks merges interacting with a range delete: a
+// merge committed above the range delete folds over an empty base (the range delete
+// wiped the prior versions), while a merge below it is erased.
+func TestConformanceRangeDeleteMerge(t *testing.T) {
+	bt := newBTree(t, 4096, 16)
+
+	var batches []*engine.WriteBatch
+
+	b1 := engine.NewWriteBatch(10)
+	b1.Set([]byte("p"), []byte("base"))
+	b1.Set([]byte("out"), []byte("keep")) // outside the deleted range
+	batches = append(batches, b1)
+
+	b2 := engine.NewWriteBatch(15)
+	b2.Merge([]byte("p"), []byte("+a")) // folds to "base+a" before the delete
+	batches = append(batches, b2)
+
+	b3 := engine.NewWriteBatch(20)
+	b3.DeleteRange([]byte("p"), []byte("q")) // covers p, not out
+	batches = append(batches, b3)
+
+	b4 := engine.NewWriteBatch(25)
+	b4.Merge([]byte("p"), []byte("+b")) // folds over empty base -> "+b"
+	batches = append(batches, b4)
+
+	if err := engine.CheckEngine(bt, batches, concatMerge); err != nil {
+		t.Fatalf("conformance: %v", err)
+	}
+}
+
+// TestRangeDeleteReopen applies a range delete, checkpoints, reopens the file, and
+// checks the covered keys are still absent -- the interval set is rebuilt from the
+// marker cells at Open, not held only in memory.
+func TestRangeDeleteReopen(t *testing.T) {
+	fs := vfs.NewMem()
+	p, err := pager.Create(fs, "test.kv", pager.Options{PageSize: 512, CacheFrames: 16, Engine: format.EngineBTree})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	bt := New(p)
+	if err := bt.Open(&engine.Env{}); err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	b := engine.NewWriteBatch(5)
+	for i := 0; i < 10; i++ {
+		b.Set([]byte(fmt.Sprintf("k%02d", i)), []byte("v"))
+	}
+	if err := bt.Apply(b, 5); err != nil {
+		t.Fatalf("apply sets: %v", err)
+	}
+	// Delete at a later version than the sets, so the covered keys are unambiguously
+	// older than the range delete.
+	bd := engine.NewWriteBatch(10)
+	bd.DeleteRange([]byte("k03"), []byte("k07")) // covers k03..k06
+	if err := bt.Apply(bd, 10); err != nil {
+		t.Fatalf("apply range delete: %v", err)
+	}
+	if err := p.Checkpoint(0); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	p2, err := pager.Open(fs, "test.kv", pager.Options{})
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	bt2 := New(p2)
+	if err := bt2.Open(&engine.Env{}); err != nil {
+		t.Fatalf("reopen btree: %v", err)
+	}
+	rd, _ := bt2.NewReader(engine.Snapshot{Version: 10})
+	defer rd.Close()
+	for i := 0; i < 10; i++ {
+		k := []byte(fmt.Sprintf("k%02d", i))
+		_, err := rd.Get(k)
+		covered := i >= 3 && i <= 6
+		if covered && err != engine.ErrNotFound {
+			t.Fatalf("covered key %q after reopen: err = %v, want ErrNotFound", k, err)
+		}
+		if !covered && err != nil {
+			t.Fatalf("uncovered key %q after reopen: %v", k, err)
+		}
+	}
+}
+
 // TestReopenAfterCheckpoint checkpoints a split tree, reopens the file, and checks
 // the data is still all there -- the root and every page survived the round trip.
 func TestReopenAfterCheckpoint(t *testing.T) {

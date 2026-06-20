@@ -31,6 +31,10 @@ type BTree struct {
 	pgr      *pager.Pager
 	pageSize int
 	merge    func(existing, operand []byte) []byte
+	// rangeDels is the live set of range-delete intervals. It is rebuilt from the
+	// marker cells at Open and extended on Apply, so a read can fold a range delete
+	// whose marker cell lives in a leaf the read never visits (spec 11 §4).
+	rangeDels []format.RangeDel
 }
 
 // New returns a B-tree core bound to pgr. Call Open to finish wiring it to the
@@ -60,6 +64,27 @@ func (t *BTree) Open(env *engine.Env) error {
 		}
 		t.setRoot(pgno)
 	}
+	return t.rebuildRangeDels()
+}
+
+// rebuildRangeDels reconstructs the in-memory range-delete interval set by scanning
+// the marker cells in the tree. It runs at Open so a database reopened after a crash
+// or clean close resolves range deletes the same way it did before (spec 11 §4).
+func (t *BTree) rebuildRangeDels() error {
+	t.rangeDels = nil
+	entries, err := t.collectRange(nil, nil)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if format.KindOf(e.ik) == format.KindRangeBegin {
+			t.rangeDels = append(t.rangeDels, format.RangeDel{
+				Lo:      append([]byte(nil), format.UserKey(e.ik)...),
+				Hi:      append([]byte(nil), e.val...),
+				Version: format.Version(e.ik),
+			})
+		}
+	}
 	return nil
 }
 
@@ -80,6 +105,13 @@ func (t *BTree) Apply(batch *engine.WriteBatch, commitVersion uint64) error {
 	for _, e := range batch.Entries() {
 		if err := t.insertOne(e.InternalKey, e.Value); err != nil {
 			return err
+		}
+		if format.KindOf(e.InternalKey) == format.KindRangeBegin {
+			t.rangeDels = append(t.rangeDels, format.RangeDel{
+				Lo:      append([]byte(nil), format.UserKey(e.InternalKey)...),
+				Hi:      append([]byte(nil), e.Value...),
+				Version: format.Version(e.InternalKey),
+			})
 		}
 	}
 	return nil
