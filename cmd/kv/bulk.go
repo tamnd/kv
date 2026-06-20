@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/tamnd/kv"
 )
@@ -139,22 +140,45 @@ func cmdLoad(args []string) int {
 }
 
 // cmdCheckpoint folds the WAL into the main file and resets the log, the manual analog
-// of SQLite's wal_checkpoint (spec 09).
+// of SQLite's wal_checkpoint (spec 09 §1.2). --mode selects how aggressively the WAL is
+// reclaimed: passive (the default), full, restart, or truncate; truncate additionally
+// returns the -wal file's space to the operating system.
 func cmdCheckpoint(args []string) int {
 	fs := flag.NewFlagSet("checkpoint", flag.ContinueOnError)
+	mode := fs.String("mode", "passive", "passive | full | restart | truncate")
 	if err := parseArgs(fs, args); err != nil {
 		return exitUsage
 	}
 	if fs.NArg() != 1 {
-		return usageErr("usage: kv checkpoint <db>")
+		return usageErr("usage: kv checkpoint <db> [--mode passive|full|restart|truncate]")
+	}
+	m, ok := checkpointMode(*mode)
+	if !ok {
+		return usageErr("unknown checkpoint mode %q (want passive, full, restart, or truncate)", *mode)
 	}
 	d, code := openDB(fs.Arg(0))
 	if code != exitOK {
 		return code
 	}
 	defer d.Close()
-	if err := d.Checkpoint(); err != nil {
+	if err := d.CheckpointMode(m); err != nil {
 		return fail(err)
 	}
 	return exitOK
+}
+
+// checkpointMode maps a mode name to its library constant, case-insensitively.
+func checkpointMode(name string) (kv.CheckpointMode, bool) {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "", "passive":
+		return kv.CheckpointPassive, true
+	case "full":
+		return kv.CheckpointFull, true
+	case "restart":
+		return kv.CheckpointRestart, true
+	case "truncate":
+		return kv.CheckpointTruncate, true
+	default:
+		return 0, false
+	}
 }

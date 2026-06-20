@@ -255,6 +255,63 @@ func TestCLICheckSound(t *testing.T) {
 	}
 }
 
+// TestCLICheckpointModes runs every checkpoint mode through the CLI and confirms each folds
+// the data soundly, plus that an unknown mode is a usage error (spec 09 §1.2, spec 16).
+func TestCLICheckpointModes(t *testing.T) {
+	for _, mode := range []string{"passive", "full", "restart", "truncate"} {
+		p := dbPath(t)
+		for _, k := range []string{"a", "b", "c"} {
+			if code := run([]string{"set", p, k, "v"}); code != exitOK {
+				t.Fatalf("[%s] set %s: exit %d", mode, k, code)
+			}
+		}
+		if code := run([]string{"checkpoint", p, "--mode", mode}); code != exitOK {
+			t.Fatalf("checkpoint --mode %s: exit %d, want 0", mode, code)
+		}
+		if code := run([]string{"check", p}); code != exitOK {
+			t.Fatalf("[%s] check after checkpoint: exit %d", mode, code)
+		}
+		if code := run([]string{"get", p, "b"}); code != exitOK {
+			t.Fatalf("[%s] get after checkpoint: exit %d", mode, code)
+		}
+	}
+
+	bad := dbPath(t)
+	if code := run([]string{"checkpoint", bad, "--mode", "bogus"}); code != exitUsage {
+		t.Fatalf("unknown mode = exit %d, want %d", code, exitUsage)
+	}
+}
+
+// TestCLIPragmaWalCheckpoint drives a checkpoint through the pragma surface, both the bare
+// read form (a passive checkpoint) and the value form selecting truncate.
+func TestCLIPragmaWalCheckpoint(t *testing.T) {
+	p := dbPath(t)
+	for _, k := range []string{"a", "b"} {
+		if code := run([]string{"set", p, k, "v"}); code != exitOK {
+			t.Fatalf("set %s: exit %d", k, code)
+		}
+	}
+	out := capture(t, func() {
+		if code := run([]string{"pragma", p, "wal_checkpoint"}); code != exitOK {
+			t.Fatalf("pragma wal_checkpoint: exit %d", code)
+		}
+	})
+	if !strings.Contains(out, "checkpointed") {
+		t.Fatalf("wal_checkpoint output = %q, want a checkpointed confirmation", out)
+	}
+	out = capture(t, func() {
+		if code := run([]string{"pragma", p, "wal_checkpoint=truncate"}); code != exitOK {
+			t.Fatalf("pragma wal_checkpoint=truncate: exit %d", code)
+		}
+	})
+	if !strings.Contains(out, "truncate") {
+		t.Fatalf("wal_checkpoint=truncate output = %q, want it to name the mode", out)
+	}
+	if code := run([]string{"check", p}); code != exitOK {
+		t.Fatalf("check after pragma checkpoint: exit %d", code)
+	}
+}
+
 // TestCLICheckJSON confirms the machine-readable form reports ok=true for a sound file.
 func TestCLICheckJSON(t *testing.T) {
 	p := dbPath(t)

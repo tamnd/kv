@@ -124,6 +124,26 @@ func pragmas() []pragma {
 			get:     stat(func(s kv.Stats) string { return strconv.FormatUint(s.Syncs, 10) }),
 		},
 		{
+			name:    "wal_checkpoint",
+			summary: "checkpoint the WAL; value passive|full|restart|truncate selects the mode",
+			get: func(d *kv.DB) (string, error) {
+				if err := d.CheckpointMode(kv.CheckpointPassive); err != nil {
+					return "", err
+				}
+				return "checkpointed (passive)", nil
+			},
+			set: func(d *kv.DB, val string) (string, error) {
+				m, ok := checkpointMode(val)
+				if !ok {
+					return "", usagePragma("wal_checkpoint wants passive|full|restart|truncate, got %q", val)
+				}
+				if err := d.CheckpointMode(m); err != nil {
+					return "", err
+				}
+				return fmt.Sprintf("checkpointed (%s)", strings.ToLower(strings.TrimSpace(val))), nil
+			},
+		},
+		{
 			name:    "incremental_vacuum",
 			summary: "return up to N trailing free pages to the OS; 0 or empty means all",
 			get: func(d *kv.DB) (string, error) {
