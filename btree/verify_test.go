@@ -7,6 +7,7 @@ import (
 	"github.com/tamnd/kv/engine"
 	"github.com/tamnd/kv/format"
 	"github.com/tamnd/kv/pager"
+	"github.com/tamnd/kv/vfs"
 )
 
 // applyKeys inserts n distinct keys at a single version, enough at a tiny page size to
@@ -218,6 +219,96 @@ func TestVerifyDetectsFreelistViolation(t *testing.T) {
 	}
 	if !hasClass(rep, "freelist") {
 		t.Fatalf("want a freelist problem, got %+v", rep.Problems)
+	}
+}
+
+// TestVerifyDetectsChecksumCorruption flushes a checksummed tree to disk, flips a content
+// byte inside a leaf page on disk so its stored checksum no longer matches, and confirms
+// the verifier reports a "checksum" problem, the torn-write/bit-rot class (spec 02 §3.2,
+// spec 23 §3). The flip changes neither the page type nor key order, so the report
+// isolates the checksum class: it is the only detector for a page that is otherwise
+// structurally perfect but silently wrong in a data byte.
+func TestVerifyDetectsChecksumCorruption(t *testing.T) {
+	fs := vfs.NewMem()
+	p, err := pager.Create(fs, "test.kv", pager.Options{
+		PageSize:    512,
+		CacheFrames: 64,
+		Engine:      format.EngineBTree,
+		Checksum:    format.ChecksumCRC32C,
+	})
+	if err != nil {
+		t.Fatalf("create pager: %v", err)
+	}
+	bt := New(p)
+	if err := bt.Open(&engine.Env{}); err != nil {
+		t.Fatalf("open btree: %v", err)
+	}
+	applyKeys(t, bt, 300)
+	leaf := firstLeaf(t, bt)
+
+	// Flush every dirty page to disk with a valid checksum, then corrupt one content byte
+	// of the leaf on disk behind the pager's back.
+	if err := p.Checkpoint(0); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	f, err := fs.Open("test.kv", vfs.OpenReadWrite)
+	if err != nil {
+		t.Fatalf("open file: %v", err)
+	}
+	page := make([]byte, 512)
+	off := int64(leaf-1) * 512
+	if _, err := f.ReadAt(page, off); err != nil {
+		t.Fatalf("read leaf %d: %v", leaf, err)
+	}
+	page[256] ^= 0xFF // a content byte: not the type byte (0) and not the trailer
+	if _, err := f.WriteAt(page, off); err != nil {
+		t.Fatalf("write leaf %d: %v", leaf, err)
+	}
+	if err := f.Sync(vfs.SyncFull); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	f.Close()
+
+	rep, err := bt.Verify()
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if rep.OK() {
+		t.Fatal("verify passed a tree with a bit-flipped leaf page")
+	}
+	if !hasClass(rep, "checksum") {
+		t.Fatalf("want a checksum problem, got %+v", rep.Problems)
+	}
+}
+
+// TestVerifyChecksumCleanFile confirms the checksum sweep passes a freshly checkpointed
+// checksummed file: every live page is stamped and verifies, so the sweep adds no false
+// positives on a sound database.
+func TestVerifyChecksumCleanFile(t *testing.T) {
+	fs := vfs.NewMem()
+	p, err := pager.Create(fs, "test.kv", pager.Options{
+		PageSize:    512,
+		CacheFrames: 64,
+		Engine:      format.EngineBTree,
+		Checksum:    format.ChecksumCRC32C,
+	})
+	if err != nil {
+		t.Fatalf("create pager: %v", err)
+	}
+	bt := New(p)
+	if err := bt.Open(&engine.Env{}); err != nil {
+		t.Fatalf("open btree: %v", err)
+	}
+	applyKeys(t, bt, 300)
+	if err := p.Checkpoint(0); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	rep, err := bt.Verify()
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if !rep.OK() {
+		t.Fatalf("checksummed clean file reported problems: %+v", rep.Problems)
 	}
 }
 

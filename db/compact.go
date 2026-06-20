@@ -47,12 +47,13 @@ func Compact(fs vfs.FS, path string, opts Options) error {
 		return err
 	}
 
-	// Mirror the source's physical format so compaction preserves the page size and engine.
-	// The header on an existing file wins over opts, so read the live values back from the
-	// pager rather than trusting what the caller passed.
+	// Mirror the source's physical format so compaction preserves the page size, engine,
+	// and per-page checksum algorithm. The header on an existing file wins over opts, so
+	// read the live values back from the pager rather than trusting what the caller passed.
 	dstOpts := opts
 	dstOpts.PageSize = src.pgr.PageSize()
 	dstOpts.Engine = src.pgr.Header().Engine
+	dstOpts.Checksum = src.pgr.Header().Checksum
 
 	dst, err := Open(fs, tmp, dstOpts)
 	if err != nil {

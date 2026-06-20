@@ -34,6 +34,14 @@ func (p *Pager) Get(pgno uint32, intent Intent) (*Frame, error) {
 		for i := range fr.data {
 			fr.data[i] = 0
 		}
+	} else if err := verifyPageChecksum(fr.data, p.header.Checksum); err != nil {
+		// The page read whole but failed its checksum: a torn write or bit rot. Drop
+		// the frame so a retry re-reads rather than trusting the cached bad bytes, and
+		// surface ErrCorrupt to the caller (spec 02 §3.2).
+		delete(p.index, pgno)
+		fr.pgno = 0
+		fr.dirty = false
+		return nil, fmt.Errorf("pager: page %d: %w", pgno, err)
 	}
 	fr.pins.Add(1)
 	fr.ref = true
@@ -103,14 +111,40 @@ func (p *Pager) evict() *Frame {
 	return nil
 }
 
-// writeBack flushes one dirty frame to the main file. The caller must hold p.mu.
+// writeBack flushes one dirty frame to the main file. It stamps the page's checksum
+// into the reserved trailer first, so every page reaches disk self-describing and a
+// later read can detect a torn write or bit rot (spec 02 §3.2). The stamp lands in
+// the trailer the engine never uses, so it does not disturb the cached node body.
+// The caller must hold p.mu.
 func (p *Pager) writeBack(fr *Frame) error {
+	format.StampPageChecksum(fr.data, p.header.Checksum)
 	off := int64(fr.pgno-1) * int64(p.pageSize)
 	if _, err := p.file.WriteAt(fr.data, off); err != nil {
 		return err
 	}
 	fr.dirty = false
 	return nil
+}
+
+// verifyPageChecksum checks a freshly read page against its stored checksum,
+// skipping a page that is entirely zero: an uninitialized hole or a never-written
+// allocation carries no checksum and is not corruption (spec 02 §3.2). A real
+// written page always begins with a non-zero type byte.
+func verifyPageChecksum(page []byte, algo format.ChecksumAlgo) error {
+	if allZero(page) {
+		return nil
+	}
+	return format.VerifyPageChecksum(page, algo)
+}
+
+// allZero reports whether every byte of b is zero.
+func allZero(b []byte) bool {
+	for _, c := range b {
+		if c != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // Allocate returns a fresh page, pinned with Write intent and zeroed. It reuses a
@@ -199,6 +233,7 @@ func (p *Pager) flushHeaderLocked() error {
 		_, _ = p.file.ReadAt(page1, 0)
 	}
 	p.header.Encode(page1)
+	format.StampPageChecksum(page1, p.header.Checksum)
 	if fr, ok := p.index[1]; ok {
 		copy(fr.data, page1)
 		fr.dirty = false
@@ -312,6 +347,9 @@ func (p *Pager) loadFreelist() error {
 		if _, err := p.file.ReadAt(buf, off); err != nil {
 			return fmt.Errorf("pager: read freelist trunk %d: %w", trunk, err)
 		}
+		if err := verifyPageChecksum(buf, p.header.Checksum); err != nil {
+			return fmt.Errorf("pager: freelist trunk %d: %w", trunk, err)
+		}
 		tp := format.DecodeTrunk(buf, usable)
 		p.free = append(p.free, tp.Leafs...)
 		// The trunk page itself is also a free page once drained.
@@ -369,6 +407,7 @@ func (p *Pager) persistFreelistLocked() error {
 			buf[i] = 0
 		}
 		format.EncodeTrunk(buf, tp)
+		format.StampPageChecksum(buf, p.header.Checksum)
 		off := int64(trunkPages[ti]-1) * int64(p.pageSize)
 		if _, err := p.file.WriteAt(buf, off); err != nil {
 			return err

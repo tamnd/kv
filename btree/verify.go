@@ -1,6 +1,7 @@
 package btree
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/tamnd/kv/engine"
@@ -33,6 +34,12 @@ func (t *BTree) Verify() (*engine.VerifyReport, error) {
 	}
 	visited := make(map[uint32]bool)
 
+	// Sweep every live page's checksum first so a torn write or bit rot is reported as a
+	// "checksum" problem (spec 02 §3.2) even on a page the structural walk would refuse to
+	// descend into. The structural walk that follows tolerates a checksum failure rather
+	// than aborting, so one pass diagnoses both the corruption and any structure it breaks.
+	t.verifyChecksums(rep)
+
 	root := t.root()
 	if root != format.NoPage {
 		var prev []byte // last internal key seen in-order, for the global ordering check
@@ -44,6 +51,52 @@ func (t *BTree) Verify() (*engine.VerifyReport, error) {
 
 	t.verifyFreelist(visited, rep)
 	return rep, nil
+}
+
+// verifyChecksums reads every allocated, non-free page raw and checks its stored
+// checksum, recording a "checksum" problem per mismatch. It is the detector for the
+// torn-write/bit-rot corruption class (spec 23 §3): a page can pass every structural
+// invariant and still be silently wrong in a value byte, which only the checksum
+// catches. It is a no-op on a file created without checksums, and it skips freelist
+// pages (whose stale bytes carry no current checksum) and all-zero holes.
+func (t *BTree) verifyChecksums(rep *engine.VerifyReport) {
+	algo := t.pgr.ChecksumAlgo()
+	if algo == format.ChecksumNone {
+		return
+	}
+	free := make(map[uint32]bool)
+	for _, p := range t.pgr.FreePages() {
+		free[p] = true
+	}
+	for pgno := uint32(1); pgno <= rep.PageCount; pgno++ {
+		if free[pgno] {
+			continue
+		}
+		page, err := t.pgr.ReadRaw(pgno)
+		if err != nil {
+			// A short read at the tail means the page is not materialized on disk yet: a
+			// high-water page above the synced file length after a crash, or a hole. That is
+			// not corruption (the structural walk catches a live pointer into it); skip it.
+			continue
+		}
+		if allZeroPage(page) {
+			continue
+		}
+		if err := format.VerifyPageChecksum(page, algo); err != nil {
+			rep.Add("checksum", pgno, "page checksum mismatch (torn write or bit rot)")
+		}
+	}
+}
+
+// allZeroPage reports whether a page is entirely zero, an uninitialized hole that
+// carries no checksum and is not corruption.
+func allZeroPage(b []byte) bool {
+	for _, c := range b {
+		if c != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // verifyNode recursively checks the subtree rooted at pgno, whose keys must all fall in
@@ -64,18 +117,30 @@ func (t *BTree) verifyNode(pgno format.PageNo, lo, hi []byte, visited map[uint32
 
 	typ, err := t.typeOf(pgno)
 	if err != nil {
+		// A checksum failure on this page was already recorded by the checksum sweep;
+		// stop descending the unreadable subtree rather than aborting the whole walk, so
+		// the report still lists every other problem found.
+		if errors.Is(err, format.ErrCorrupt) {
+			return nil
+		}
 		return fmt.Errorf("btree verify: read page %d: %w", pgno, err)
 	}
 	switch typ {
 	case format.PageBTreeLeaf:
 		l, err := t.loadLeaf(pgno)
 		if err != nil {
+			if errors.Is(err, format.ErrCorrupt) {
+				return nil
+			}
 			return fmt.Errorf("btree verify: load leaf %d: %w", pgno, err)
 		}
 		t.verifyLeaf(pgno, l, lo, hi, prev, rep)
 	case format.PageBTreeInterior:
 		in, err := t.loadInterior(pgno)
 		if err != nil {
+			if errors.Is(err, format.ErrCorrupt) {
+				return nil
+			}
 			return fmt.Errorf("btree verify: load interior %d: %w", pgno, err)
 		}
 		if err := t.verifyInterior(pgno, in, lo, hi, visited, prev, rep); err != nil {

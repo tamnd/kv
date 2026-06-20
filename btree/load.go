@@ -54,12 +54,12 @@ func (t *BTree) BulkLoad(next func() (ik, value []byte, ok bool)) error {
 		if !ok {
 			break
 		}
-		if nodeHeaderSize+len(ik)+len(value)+8 > t.pageSize {
+		if nodeHeaderSize+len(ik)+len(value)+8 > t.usable {
 			return fmt.Errorf("btree: entry of %d bytes exceeds page (overflow values are deferred)", len(ik)+len(value))
 		}
 		cur.keys = append(cur.keys, append([]byte(nil), ik...))
 		cur.vals = append(cur.vals, append([]byte(nil), value...))
-		if len(marshalLeaf(cur)) <= t.pageSize {
+		if len(marshalLeaf(cur)) <= t.usable {
 			continue
 		}
 
@@ -145,7 +145,7 @@ func (t *BTree) packInteriorLevel(children []format.PageNo, seps [][]byte) ([]fo
 			}
 			// Keep at least one separator per node so progress is guaranteed even when a
 			// single child plus separator already fills the page.
-			if len(in.seps) >= 1 && len(marshalInterior(cand)) > t.pageSize {
+			if len(in.seps) >= 1 && len(marshalInterior(cand)) > t.usable {
 				break
 			}
 			in = cand

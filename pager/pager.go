@@ -104,9 +104,11 @@ func Create(fs vfs.FS, path string, opts Options) (*Pager, error) {
 	p := newPager(fs, f, path, ps, opts.CacheFrames)
 	p.header = h
 	p.dbSize = 1
-	// Write page 1 (the header page) so the file is non-empty and valid.
+	// Write page 1 (the header page) so the file is non-empty and valid, stamping its
+	// per-page checksum into the reserved trailer so a fresh file verifies on reopen.
 	page1 := make([]byte, ps)
 	h.Encode(page1)
+	format.StampPageChecksum(page1, h.Checksum)
 	if _, err := f.WriteAt(page1, 0); err != nil {
 		f.Close()
 		return nil, err
@@ -142,6 +144,19 @@ func Open(fs vfs.FS, path string, opts Options) (*Pager, error) {
 		return nil, err
 	}
 	ps := h.PageSize
+	// Verify page 1's checksum now that the page size is known: a torn or bit-rotted
+	// header page must be caught at open, not silently trusted. A short read (a file
+	// smaller than one page) leaves the page zero-padded, which the all-zero guard in
+	// verifyPageChecksum skips, so this only rejects a materialized, corrupt page 1.
+	if h.Checksum != format.ChecksumNone {
+		page1 := make([]byte, ps)
+		if _, err := f.ReadAt(page1, 0); err == nil {
+			if err := verifyPageChecksum(page1, h.Checksum); err != nil {
+				f.Close()
+				return nil, fmt.Errorf("pager: header page: %w", err)
+			}
+		}
+	}
 	p := newPager(fs, f, path, ps, opts.CacheFrames)
 	p.header = h
 	p.dbSize = uint32(size / int64(ps))
@@ -176,8 +191,36 @@ func newPager(fs vfs.FS, f vfs.File, path string, pageSize, cacheFrames int) *Pa
 	return p
 }
 
-// PageSize reports the usable-on-disk page size in bytes.
+// PageSize reports the full on-disk page size in bytes.
 func (p *Pager) PageSize() int { return p.pageSize }
+
+// UsablePageSize reports the page bytes a storage core may use, the full page
+// minus the reserved trailer the per-page checksum occupies (spec 02 §3.2). A core
+// must keep every node body within this bound so the pager can stamp the checksum
+// into the trailer without clobbering data.
+func (p *Pager) UsablePageSize() int { return p.header.UsablePageSize() }
+
+// ChecksumAlgo reports the per-page checksum algorithm the file was created with,
+// or format.ChecksumNone when the file carries no page checksums. The verifier's
+// checksum sweep reads it to decide whether a torn-write/bit-rot class even exists
+// for this file (spec 23 §3).
+func (p *Pager) ChecksumAlgo() format.ChecksumAlgo { return p.header.Checksum }
+
+// ReadRaw returns a copy of the page's on-disk bytes without verifying its
+// checksum, so the integrity checker can inspect a possibly-corrupt page and report
+// it rather than have the read abort (spec 23 §3). Normal page access goes through
+// Get, which does verify. pgno must be within the page count.
+func (p *Pager) ReadRaw(pgno uint32) ([]byte, error) {
+	if pgno == 0 || pgno > p.DBSize() {
+		return nil, fmt.Errorf("pager: page %d out of range", pgno)
+	}
+	buf := make([]byte, p.pageSize)
+	off := int64(pgno-1) * int64(p.pageSize)
+	if _, err := p.file.ReadAt(buf, off); err != nil {
+		return nil, err
+	}
+	return buf, nil
+}
 
 // Header returns the live header. Callers must not retain it across Checkpoint.
 func (p *Pager) Header() *format.Header { return p.header }
