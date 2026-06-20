@@ -1,0 +1,19 @@
+# Build output
+/kv
+/bin/
+*.test
+*.out
+
+# Database artifacts from tests and local runs
+*.kv
+*.kv-wal
+*.kv-shm
+*.kv-journal
+
+# Editor and OS noise
+.DS_Store
+*.swp
+
+# local workspace
+go.work
+go.work.sum
