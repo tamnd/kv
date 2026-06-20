@@ -19,8 +19,10 @@
 // index. The range and iteration path streams a k-way merge across the sources. The
 // segments are organized into levels (L0 overlapping, L1 down disjoint), and Maintain
 // runs a level-aware compaction that merges a level into the one below, dropping dead
-// versions at the watermark and tombstones at the bottom. What remains for later slices
-// is the lazy-leveling tiered bottom and Monkey filter tuning, and value separation.
+// versions at the watermark and tombstones at the bottom. Each segment's Bloom filter is
+// sized by the Monkey allocation for the level it is written at, spending more bits on
+// the small shallow levels and fewer on the large deep ones. What remains for later
+// slices is the lazy-leveling tiered bottom and value separation.
 package lsm
 
 import (
@@ -179,7 +181,7 @@ func (l *LSM) NoteLSN(lsn uint64) {
 func (l *LSM) flushLocked() error {
 	mem := l.mem
 	sealedLSN := l.memMaxLSN
-	seg, err := writeSegment(l.pgr, func(emit func(ik, val []byte) bool) {
+	seg, err := writeSegment(l.pgr, bloomBitsForLevel(0, l.levelRatio), func(emit func(ik, val []byte) bool) {
 		mem.scan(emit)
 	})
 	if err != nil {

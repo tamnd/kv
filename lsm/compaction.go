@@ -281,7 +281,7 @@ func (l *LSM) runCompactionLocked(src int, watermark uint64) (engine.MaintReport
 		return engine.MaintReport{}, err
 	}
 
-	outputs, err := l.writeSplitLocked(mi, watermark, dropTomb)
+	outputs, err := l.writeSplitLocked(mi, watermark, dropTomb, bloomBitsForLevel(out, l.levelRatio))
 	if err != nil {
 		return engine.MaintReport{}, err
 	}
@@ -334,10 +334,11 @@ func (l *LSM) runCompactionLocked(src int, watermark uint64) (engine.MaintReport
 }
 
 // writeSplitLocked drives the merge through a splitter, writing the kept cells into one
-// or more size-bounded output segments. The caller holds l.mu. An empty trailing segment
-// (when the final pull dropped every cell) is reclaimed rather than published, so a
-// compaction whose tail is all dead versions leaks no pages.
-func (l *LSM) writeSplitLocked(mi *mergeIter, watermark uint64, dropTomb bool) ([]*segment, error) {
+// or more size-bounded output segments, each filter sized for the output level by the
+// Monkey budget bitsPerKey. The caller holds l.mu. An empty trailing segment (when the
+// final pull dropped every cell) is reclaimed rather than published, so a compaction
+// whose tail is all dead versions leaks no pages.
+func (l *LSM) writeSplitLocked(mi *mergeIter, watermark uint64, dropTomb bool, bitsPerKey int) ([]*segment, error) {
 	target := l.segTargetBytes
 	if target < 1 {
 		target = 1
@@ -345,7 +346,7 @@ func (l *LSM) writeSplitLocked(mi *mergeIter, watermark uint64, dropTomb bool) (
 	sp := &splitter{mi: mi, watermark: watermark, dropTomb: dropTomb, target: target}
 	var outs []*segment
 	for !sp.exhausted {
-		seg, err := writeSegment(l.pgr, sp.fill)
+		seg, err := writeSegment(l.pgr, bitsPerKey, sp.fill)
 		if err != nil {
 			return nil, err
 		}
