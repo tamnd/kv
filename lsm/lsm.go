@@ -26,8 +26,10 @@
 // compaction moves the pointer instead of rewriting the value (WiscKey), which also lets
 // the engine hold a value larger than a page. When no segment compaction is due, Maintain
 // instead runs the value log's garbage collector, which walks the chain, marks the pages
-// any live pointer still references, and frees the dead ones back to the freelist. What
-// remains for a later slice is the REMIX range index.
+// any live pointer still references, and frees the dead ones back to the freelist. For
+// scan-heavy workloads the optional REMIX range index folds each leveled level through one
+// ordered cursor over its disjoint segments rather than one cursor per segment, shrinking
+// the range merge's heap to one entry per level.
 package lsm
 
 import (
@@ -95,6 +97,12 @@ type LSM struct {
 	// never rejects a write.
 	vlog              *vlog
 	valueSepThreshold int
+	// rangeIndex turns on the REMIX ordered index (spec 06 §6, spec 11 §5.3): when set,
+	// a range scan folds each leveled level through one ordered levelSource over its
+	// disjoint segments rather than one segSource per segment, so the heap-merge carries
+	// one entry per level instead of one per segment. It is read from the options at Open
+	// and is off by default. See remix.go.
+	rangeIndex bool
 	// vlogHeadRecorded is the value-log head the MANIFEST last recorded, so a flush or GC
 	// emits a manifestVLogHead edit only when the head actually moves: a flush moves it off
 	// NoPage when the first value separates, the GC moves it forward when it frees the old
@@ -147,6 +155,9 @@ func (l *LSM) Open(env *engine.Env) error {
 	}
 	if env != nil && env.Options.ValueSepThreshold > 0 {
 		l.valueSepThreshold = env.Options.ValueSepThreshold
+	}
+	if env != nil && env.Options.RangeIndex {
+		l.rangeIndex = true
 	}
 	l.durableLSN = l.pgr.CheckpointLSN()
 	return l.loadManifestLocked()
@@ -445,11 +456,14 @@ type srcCell struct {
 // It streams a k-way merge across the sources rather than gathering and sorting the
 // whole keyspace: each source is seeked to lower and yields its cells in internal-key
 // order, the merge picks the next-smallest, and the fold consumes the stream one user
-// key's group at a time. The resolution is the shared format.Fold, the same the oracle
-// and the B-tree core run, so the view is byte-for-byte what the old gather-and-sort
-// produced and any divergence is a bug in this plumbing, never in resolution. Because
-// the merge seeks to lower and stops past upper, a narrow scan touches only the pages
-// its range covers instead of reading the whole database.
+// key's group at a time. The sources come from rangeSourcesLocked, which with the REMIX
+// index on folds each leveled level through one ordered levelSource instead of one source
+// per segment, shrinking the heap without changing the merged order. The resolution is the
+// shared format.Fold, the same the oracle and the B-tree core run, so the view is
+// byte-for-byte what the old gather-and-sort produced and any divergence is a bug in this
+// plumbing, never in resolution. Because the merge seeks to lower and stops past upper, a
+// narrow scan touches only the pages its range covers instead of reading the whole
+// database.
 func (l *LSM) foldRange(snap engine.Snapshot, lower, upper []byte, keysOnly bool) ([]resolved, error) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
@@ -458,12 +472,7 @@ func (l *LSM) foldRange(snap engine.Snapshot, lower, upper []byte, keysOnly bool
 	// each segment's persisted list, the same union the point path folds against.
 	rangeDels := l.liveRangeDels()
 
-	segs := l.allSegmentsLocked()
-	sources := make([]mergeSource, 0, 1+len(segs))
-	sources = append(sources, &memSource{sl: l.mem.sl})
-	for _, seg := range segs {
-		sources = append(sources, &segSource{pgr: l.pgr, seg: seg})
-	}
+	sources := l.rangeSourcesLocked()
 	var target []byte
 	if lower != nil {
 		// The smallest internal key for lower's user key seeks past nothing in the group.

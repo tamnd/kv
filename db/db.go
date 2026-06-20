@@ -75,6 +75,12 @@ type Options struct {
 	// core ignores it. A smaller value flushes sooner, bounding memory and the WAL
 	// backlog at the cost of more, smaller segments.
 	MemtableSize int
+	// RangeIndex turns on the LSM core's REMIX ordered index (spec 06 §6, spec 11
+	// §5.3), which presents each leveled level's disjoint segments to a range scan as
+	// one ordered cursor instead of one per segment, cutting the heap-merge's
+	// comparisons and cursor switches. Off by default, since it helps only scan-heavy
+	// workloads and the B-tree core, a single ordered source, never needs it.
+	RangeIndex bool
 }
 
 func (o Options) maxRetries() int {
@@ -163,6 +169,7 @@ type DB struct {
 	syncMode     wal.Sync
 	isolation    Isolation
 	memtableSize int
+	rangeIndex   bool
 
 	// now is the wall-clock source, in Unix nanoseconds, that read resolution compares
 	// a TTL set's absolute expiry against (spec 15 §6). It is the real system clock by
@@ -243,7 +250,7 @@ func create(fs vfs.FS, path string, opts Options) (*DB, error) {
 		return nil, err
 	}
 	d := &DB{fs: fs, path: path, pgr: pgr, wal: w, eng: eng, orc: newOracle(0),
-		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, now: opts.clock()}
+		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, now: opts.clock()}
 	if err := d.openEngine(opts.Merge); err != nil {
 		w.Close()
 		pgr.Close()
@@ -266,7 +273,7 @@ func openExisting(fs vfs.FS, path string, opts Options) (*DB, error) {
 		return nil, err
 	}
 	d := &DB{fs: fs, path: path, pgr: pgr, eng: eng,
-		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, now: opts.clock()}
+		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, now: opts.clock()}
 	if err := d.openEngine(opts.Merge); err != nil {
 		pgr.Close()
 		return nil, err
@@ -325,6 +332,7 @@ func (d *DB) openEngine(merge func(existing, operand []byte) []byte) error {
 		Options: engine.EngineOptions{
 			PageSize:     d.pgr.PageSize(),
 			MemtableSize: d.memtableSize,
+			RangeIndex:   d.rangeIndex,
 		},
 	}
 	if err := d.eng.Open(env); err != nil {
