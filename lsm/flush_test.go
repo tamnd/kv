@@ -49,7 +49,7 @@ func TestLSMFlushConformanceBasic(t *testing.T) {
 	if err := engine.CheckEngine(l, batches, concatMerge); err != nil {
 		t.Fatalf("conformance: %v", err)
 	}
-	if len(l.segments) == 0 {
+	if len(l.allSegmentsLocked()) == 0 {
 		t.Fatal("expected the low cap to have produced segments")
 	}
 }
@@ -172,8 +172,8 @@ func TestLSMManySegmentsScan(t *testing.T) {
 		l.flushActive(t)
 		version++
 	}
-	if len(l.segments) != segs {
-		t.Fatalf("produced %d segments, want %d", len(l.segments), segs)
+	if len(l.allSegmentsLocked()) != segs {
+		t.Fatalf("produced %d segments, want %d", len(l.allSegmentsLocked()), segs)
 	}
 
 	rd, err := l.NewReader(engine.Snapshot{Version: version})

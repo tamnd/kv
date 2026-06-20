@@ -6,10 +6,11 @@ import (
 	"testing"
 
 	"github.com/tamnd/kv/engine"
+	"github.com/tamnd/kv/format"
 )
 
 // compact runs one Maintain compaction at the given watermark with a budget large
-// enough to permit work, the host call that drives a merge.
+// enough to permit work, the host call that drives a single compaction unit.
 func compact(t *testing.T, l *LSM, watermark uint64) engine.MaintReport {
 	t.Helper()
 	rep, err := l.Maintain(context.Background(), engine.MaintBudget{MaxPages: 1 << 30, Watermark: watermark})
@@ -19,15 +20,66 @@ func compact(t *testing.T, l *LSM, watermark uint64) engine.MaintReport {
 	return rep
 }
 
-// forceCompact merges the segment set regardless of the fan-in trigger, the hook the
-// merge-correctness tests use to exercise the version-drop rule on a small set without
-// flushing four segments first.
+// drain runs Maintain repeatedly until no level is over target, settling the whole tree
+// so the level invariant and the multi-level shape can be checked.
+func drainCompaction(t *testing.T, l *LSM, watermark uint64) {
+	t.Helper()
+	for {
+		if compact(t, l, watermark).PagesCompacted == 0 {
+			return
+		}
+	}
+}
+
+// forceCompact merges L0 into L1 regardless of the fan-in trigger, the hook the
+// version-semantics tests use to exercise the drop rule on a small segment set without
+// flushing a trigger's worth of segments first.
 func forceCompact(t *testing.T, l *LSM, watermark uint64) {
 	t.Helper()
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if _, err := l.compactLocked(watermark); err != nil {
+	if _, err := l.runCompactionLocked(0, watermark); err != nil {
 		t.Fatalf("compact: %v", err)
+	}
+}
+
+// levelShape reports the segment count per level, trailing empty levels trimmed, the
+// fingerprint the reopen test compares.
+func levelShape(l *LSM) []int {
+	var s []int
+	for _, lvl := range l.levels {
+		s = append(s, len(lvl))
+	}
+	for len(s) > 0 && s[len(s)-1] == 0 {
+		s = s[:len(s)-1]
+	}
+	return s
+}
+
+func sameShape(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// assertLeveledInvariant confirms every level below L0 is sorted by first key with
+// disjoint ranges, the non-overlapping invariant a leveled compaction must preserve.
+func assertLeveledInvariant(t *testing.T, l *LSM) {
+	t.Helper()
+	for i := 1; i < len(l.levels); i++ {
+		segs := l.levels[i]
+		for j := 1; j < len(segs); j++ {
+			if format.CompareUser(segs[j-1].maxKey, segs[j].minKey) >= 0 {
+				t.Fatalf("level %d not disjoint: seg %d [%s..%s] overlaps seg %d [%s..%s]",
+					i, j-1, segs[j-1].minKey, segs[j-1].maxKey, j, segs[j].minKey, segs[j].maxKey)
+			}
+		}
 	}
 }
 
@@ -49,16 +101,16 @@ func TestCompactionMergesToOneSegment(t *testing.T) {
 		l.flushActive(t)
 		version++
 	}
-	if len(l.segments) != segs {
-		t.Fatalf("expected %d segments before compaction, got %d", segs, len(l.segments))
+	if len(l.allSegmentsLocked()) != segs {
+		t.Fatalf("expected %d segments before compaction, got %d", segs, len(l.allSegmentsLocked()))
 	}
 
 	rep := compact(t, l, 0)
 	if rep.PagesCompacted != segs {
 		t.Fatalf("report merged %d segments, want %d", rep.PagesCompacted, segs)
 	}
-	if len(l.segments) != 1 {
-		t.Fatalf("expected one segment after compaction, got %d", len(l.segments))
+	if len(l.allSegmentsLocked()) != 1 {
+		t.Fatalf("expected one segment after compaction, got %d", len(l.allSegmentsLocked()))
 	}
 	// Every key still resolves through the single merged segment.
 	for s := 0; s < segs; s++ {
@@ -93,7 +145,7 @@ func TestCompactionDropsDeadVersions(t *testing.T) {
 	}
 
 	var cellsBefore int
-	for _, seg := range l.segments {
+	for _, seg := range l.allSegmentsLocked() {
 		cellsBefore += seg.numCells
 	}
 	if cellsBefore != n*rounds {
@@ -103,10 +155,10 @@ func TestCompactionDropsDeadVersions(t *testing.T) {
 	// Watermark above every committed version: only the newest version of each key can
 	// be observed, so the history collapses to one cell per key.
 	compact(t, l, version)
-	if len(l.segments) != 1 {
-		t.Fatalf("expected one segment, got %d", len(l.segments))
+	if len(l.allSegmentsLocked()) != 1 {
+		t.Fatalf("expected one segment, got %d", len(l.allSegmentsLocked()))
 	}
-	if got := l.segments[0].numCells; got != n {
+	if got := l.allSegmentsLocked()[0].numCells; got != n {
 		t.Fatalf("compaction kept %d cells, want %d (one newest version per key)", got, n)
 	}
 	// The surviving value is the newest round's.
@@ -134,8 +186,8 @@ func TestCompactionKeepsVersionsAboveWatermark(t *testing.T) {
 	// Watermark 15: a snapshot at 10 must still resolve, so version 10 cannot be dropped
 	// even though 20 and 30 shadow it at newer snapshots.
 	forceCompact(t, l, 15)
-	if len(l.segments) != 1 {
-		t.Fatalf("expected one segment, got %d", len(l.segments))
+	if len(l.allSegmentsLocked()) != 1 {
+		t.Fatalf("expected one segment, got %d", len(l.allSegmentsLocked()))
 	}
 	cases := []struct {
 		snap uint64
@@ -185,8 +237,8 @@ func TestCompactionPreservesRangeDeletes(t *testing.T) {
 	l.flushActive(t)
 
 	forceCompact(t, l, 100)
-	if len(l.segments[0].rangeDels) != 1 {
-		t.Fatalf("compaction lost the range delete: %d intervals", len(l.segments[0].rangeDels))
+	if len(l.allSegmentsLocked()[0].rangeDels) != 1 {
+		t.Fatalf("compaction lost the range delete: %d intervals", len(l.allSegmentsLocked()[0].rangeDels))
 	}
 	for i := 0; i < 10; i++ {
 		key := fmt.Sprintf("k%02d", i)
@@ -252,8 +304,8 @@ func TestCompactionSurvivesReopen(t *testing.T) {
 	}
 
 	compact(t, l, 0)
-	if len(l.segments) != 1 {
-		t.Fatalf("expected one segment after compaction, got %d", len(l.segments))
+	if len(l.allSegmentsLocked()) != 1 {
+		t.Fatalf("expected one segment after compaction, got %d", len(l.allSegmentsLocked()))
 	}
 	if err := pgr.Checkpoint(l.DurableLSN()); err != nil {
 		t.Fatalf("checkpoint: %v", err)
@@ -261,8 +313,8 @@ func TestCompactionSurvivesReopen(t *testing.T) {
 
 	pgr2 := reopenPager(t, fs, pgr)
 	l2 := openLSM(t, pgr2)
-	if len(l2.segments) != 1 {
-		t.Fatalf("reopened engine has %d segments, want 1 (the merge output)", len(l2.segments))
+	if len(l2.allSegmentsLocked()) != 1 {
+		t.Fatalf("reopened engine has %d segments, want 1 (the merge output)", len(l2.allSegmentsLocked()))
 	}
 	rd, err := l2.NewReader(engine.Snapshot{Version: version})
 	if err != nil {
@@ -277,12 +329,205 @@ func TestCompactionSurvivesReopen(t *testing.T) {
 	}
 }
 
-// TestCompactionConformance runs the shared oracle suite, then compacts at the oracle's
-// read-mark and confirms every key still resolves to the oracle's answer, so the
-// version-drop rule agrees with MVCC resolution.
+// TestLeveledFormsDeeperLevels ingests enough data under small level targets to build a
+// multi-level tree, then confirms the level invariant holds, a recent snapshot resolves
+// the newest writes, and an old snapshot still resolves the originals the merges sit on.
+func TestLeveledFormsDeeperLevels(t *testing.T) {
+	l := newLSM(t)
+	l.memtableCap = 1
+	l.l0Trigger = 2
+	l.levelRatio = 2
+	l.l1TargetBytes = 128
+	l.segTargetBytes = 64
+
+	const n = 80
+	for i := 0; i < n; i++ {
+		applyBatch(t, l, uint64(i+1), func(b *engine.WriteBatch) {
+			b.Set([]byte(fmt.Sprintf("k%05d", i)), []byte(fmt.Sprintf("v%05d", i)))
+		})
+		l.flushActive(t)
+	}
+	// Overwrite the even keys and delete every fifth, at versions above the originals.
+	for i := 0; i < n; i++ {
+		if i%2 == 0 {
+			applyBatch(t, l, uint64(1000+i), func(b *engine.WriteBatch) {
+				b.Set([]byte(fmt.Sprintf("k%05d", i)), []byte(fmt.Sprintf("w%05d", i)))
+			})
+			l.flushActive(t)
+		}
+	}
+	for i := 0; i < n; i++ {
+		if i%5 == 0 {
+			applyBatch(t, l, uint64(2000+i), func(b *engine.WriteBatch) {
+				b.Delete([]byte(fmt.Sprintf("k%05d", i)))
+			})
+			l.flushActive(t)
+		}
+	}
+
+	drainCompaction(t, l, 0)
+	assertLeveledInvariant(t, l)
+	if len(l.levels) < 3 {
+		t.Fatalf("expected a multi-level tree, got shape %v", levelShape(l))
+	}
+
+	// Newest snapshot: deletes win, then overwrites, then originals.
+	for i := 0; i < n; i++ {
+		key := fmt.Sprintf("k%05d", i)
+		v, ok := getAt(t, l, key, 9000)
+		switch {
+		case i%5 == 0:
+			if ok {
+				t.Fatalf("Get(%s)@9000 = %q, want deleted", key, v)
+			}
+		case i%2 == 0:
+			if !ok || string(v) != fmt.Sprintf("w%05d", i) {
+				t.Fatalf("Get(%s)@9000 = (%q,%v), want w%05d", key, v, ok, i)
+			}
+		default:
+			if !ok || string(v) != fmt.Sprintf("v%05d", i) {
+				t.Fatalf("Get(%s)@9000 = (%q,%v), want v%05d", key, v, ok, i)
+			}
+		}
+	}
+	// Old snapshot, before any overwrite or delete: every key reads its original, proving
+	// the merges did not strand the versions beneath them.
+	for i := 0; i < n; i++ {
+		key := fmt.Sprintf("k%05d", i)
+		if v, ok := getAt(t, l, key, uint64(i+1)); !ok || string(v) != fmt.Sprintf("v%05d", i) {
+			t.Fatalf("Get(%s)@%d = (%q,%v), want v%05d", key, i+1, v, ok, i)
+		}
+	}
+}
+
+// TestLeveledPartialPick confirms a deeper-level compaction touches only the segments
+// its input overlaps, leaving the disjoint neighbours untouched, the property that makes
+// leveled compaction incremental.
+func TestLeveledPartialPick(t *testing.T) {
+	l := newLSM(t)
+	l.l0Trigger = 1
+	l.segTargetBytes = 1 // one version group per output segment
+
+	// One L0 segment of three far-apart keys; compacting it splits L1 into three disjoint
+	// single-key segments.
+	applyBatch(t, l, 1, func(b *engine.WriteBatch) {
+		b.Set([]byte("aaa"), []byte("1"))
+		b.Set([]byte("mmm"), []byte("1"))
+		b.Set([]byte("zzz"), []byte("1"))
+	})
+	l.flushActive(t)
+	compact(t, l, 0)
+	if len(l.levels) < 2 || len(l.levels[1]) != 3 {
+		t.Fatalf("expected three disjoint L1 segments, got shape %v", levelShape(l))
+	}
+	low, mid, high := l.levels[1][0], l.levels[1][1], l.levels[1][2]
+
+	// A new write to the middle key only; compacting it must rewrite only the middle L1
+	// segment and leave the low and high segments as the exact same handles.
+	applyBatch(t, l, 2, func(b *engine.WriteBatch) { b.Set([]byte("mmm"), []byte("2")) })
+	l.flushActive(t)
+	compact(t, l, 0)
+
+	if len(l.levels[1]) != 3 || l.levels[1][0] != low || l.levels[1][2] != high {
+		t.Fatalf("partial compaction disturbed the disjoint neighbours, shape %v", levelShape(l))
+	}
+	if l.levels[1][1] == mid {
+		t.Fatalf("the overlapped middle segment was not replaced")
+	}
+	if v, ok := getAt(t, l, "mmm", 5); !ok || string(v) != "2" {
+		t.Fatalf("Get(mmm) = (%q,%v), want 2", v, ok)
+	}
+	for _, key := range []string{"aaa", "zzz"} {
+		if v, ok := getAt(t, l, key, 5); !ok || string(v) != "1" {
+			t.Fatalf("Get(%s) = (%q,%v), want 1", key, v, ok)
+		}
+	}
+}
+
+// TestLeveledBottomTombstoneDrop confirms a point delete compacted into the deepest
+// level is dropped outright, since nothing lives below it for the tombstone to shadow,
+// so the key and its value both vanish.
+func TestLeveledBottomTombstoneDrop(t *testing.T) {
+	l := newLSM(t)
+	l.l0Trigger = 2
+
+	applyBatch(t, l, 1, func(b *engine.WriteBatch) { b.Set([]byte("k"), []byte("v")) })
+	l.flushActive(t)
+	applyBatch(t, l, 2, func(b *engine.WriteBatch) { b.Delete([]byte("k")) })
+	l.flushActive(t)
+
+	compact(t, l, 10)
+	total := 0
+	for _, s := range l.allSegmentsLocked() {
+		total += s.numCells
+	}
+	if total != 0 {
+		t.Fatalf("bottom compaction left %d cells, want the tombstone and value both dropped", total)
+	}
+	if _, ok := getAt(t, l, "k", 100); ok {
+		t.Fatalf("Get(k) found a value, want not found after the tombstone drop")
+	}
+}
+
+// TestLeveledReopenRestoresLevels builds a multi-level tree, folds it and its MANIFEST
+// level edits to the file, and reopens with no WAL: the reopened engine must rebuild the
+// same per-level shape and resolve every key.
+func TestLeveledReopenRestoresLevels(t *testing.T) {
+	fs, pgr := newDurablePager(t)
+	l := openLSM(t, pgr)
+	l.memtableCap = 1
+	l.l0Trigger = 2
+	l.levelRatio = 2
+	l.l1TargetBytes = 128
+	l.segTargetBytes = 64
+
+	const n = 80
+	want := map[string]string{}
+	for i := 0; i < n; i++ {
+		v := uint64(i + 1)
+		applyLSN(t, l, v, v, func(b *engine.WriteBatch) {
+			key := fmt.Sprintf("k%05d", i)
+			val := fmt.Sprintf("v%05d", i)
+			b.Set([]byte(key), []byte(val))
+			want[key] = val
+		})
+		l.flushActive(t)
+	}
+	drainCompaction(t, l, 0)
+	assertLeveledInvariant(t, l)
+	if len(l.levels) < 3 {
+		t.Fatalf("expected a multi-level tree, got shape %v", levelShape(l))
+	}
+	shapeBefore := levelShape(l)
+
+	if err := pgr.Checkpoint(l.DurableLSN()); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	pgr2 := reopenPager(t, fs, pgr)
+	l2 := openLSM(t, pgr2)
+	if got := levelShape(l2); !sameShape(got, shapeBefore) {
+		t.Fatalf("reopened level shape %v, want %v", got, shapeBefore)
+	}
+	assertLeveledInvariant(t, l2)
+	rd, err := l2.NewReader(engine.Snapshot{Version: 10000})
+	if err != nil {
+		t.Fatalf("reader: %v", err)
+	}
+	defer rd.Close()
+	for key, val := range want {
+		if v, err := rd.Get([]byte(key)); err != nil || string(v) != val {
+			t.Fatalf("after reopen Get(%s) = (%q,%v), want %q", key, v, err, val)
+		}
+	}
+}
+
+// TestCompactionConformance runs the shared oracle suite, then drains compaction at the
+// oracle's read-mark and confirms every key still resolves to the oracle's answer, so
+// the version-drop and bottom-tombstone rules agree with MVCC resolution.
 func TestCompactionConformance(t *testing.T) {
 	l := newLSM(t)
 	l.memtableCap = 1
+	l.l0Trigger = 1
 
 	const n = 150
 	var batches []*engine.WriteBatch
@@ -306,8 +551,10 @@ func TestCompactionConformance(t *testing.T) {
 	if err := engine.CheckEngine(l, batches, concatMerge); err != nil {
 		t.Fatalf("conformance before compaction: %v", err)
 	}
-	// Compact at a watermark above every version, then re-read at the newest snapshot.
-	compact(t, l, 300)
+	// Seal the tail into L0, then drain at a watermark above every version and re-read at
+	// the newest snapshot.
+	l.flushActive(t)
+	drainCompaction(t, l, 300)
 	for i := 0; i < n; i++ {
 		key := fmt.Sprintf("k%05d", i)
 		v, ok := getAt(t, l, key, 300)

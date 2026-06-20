@@ -159,8 +159,8 @@ func TestMergeScanSpansSpilledGroup(t *testing.T) {
 	}
 	applyBatch(t, l, 8, func(b *engine.WriteBatch) { b.Set([]byte("zzz"), []byte("z")) })
 	l.flushActive(t)
-	if len(l.segments[0].index) < 3 {
-		t.Fatalf("expected the big group to span pages, got %d index entries", len(l.segments[0].index))
+	if len(l.allSegmentsLocked()[0].index) < 3 {
+		t.Fatalf("expected the big group to span pages, got %d index entries", len(l.allSegmentsLocked()[0].index))
 	}
 
 	got := scanRange(t, l, engine.IterOptions{}, 100)
