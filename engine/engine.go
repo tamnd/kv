@@ -92,6 +92,24 @@ type Reader interface {
 	Close() error
 }
 
+// BulkLoader is an optional engine capability: population of an empty engine from a
+// stream of cells already in ascending internal-key order, building the on-disk
+// structure bottom-up instead of inserting one cell at a time (spec 15 §6). The host
+// (db.Load) uses it when the engine implements it and the database has no commits yet,
+// and falls back to ordinary batched commits otherwise.
+//
+// The cells are not logged per entry: BulkLoad writes pages straight through the pager,
+// so the host makes the build durable with a single checkpoint after it returns. A
+// crash before that checkpoint leaves the database empty, which makes the load atomic
+// at the checkpoint boundary. Because it rebuilds the root from scratch it is only
+// valid on a freshly opened, empty engine.
+type BulkLoader interface {
+	// BulkLoad consumes cells from next, which returns each (internalKey, value) in
+	// ascending CompareInternal order and false at end of stream, and installs a tree
+	// built bottom-up over them as the engine's contents.
+	BulkLoad(next func() (internalKey, value []byte, ok bool)) error
+}
+
 // Cursor is the low-level iterator primitive both cores expose (spec 04 §2.3).
 // The rich caller-facing iterator (spec 11) is built on top of it above the
 // seam.

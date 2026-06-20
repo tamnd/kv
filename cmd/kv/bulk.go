@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"io"
 	"os"
 
@@ -55,22 +56,24 @@ func cmdDump(args []string) int {
 	return exitOK
 }
 
-// cmdLoad bulk-loads JSONL key/value records from a file or stdin through the explicit
-// WriteBatch builder, which buffers each record and commits in bounded chunks so a huge
-// import never holds the whole stream in memory (spec 16 §4, spec 15 §6).
+// cmdLoad bulk-loads JSONL key/value records from a file or stdin through db.Load, the
+// sorted fast path: on a fresh database it builds the tree bottom-up and makes it durable
+// with one checkpoint, far faster than inserting key by key, and on a database that
+// already holds data it falls back to chunked commits. Records stream one line at a time
+// so a huge import never holds the whole input in memory (spec 16 §4, spec 15 §6).
+//
+// The fast path requires keys in strictly ascending order, which is exactly the order kv
+// dump emits, so dump | load round-trips. Unsorted input loaded into a fresh database is
+// reported as an error rather than silently mis-built.
 func cmdLoad(args []string) int {
 	fs := flag.NewFlagSet("load", flag.ContinueOnError)
 	e := encFlags(fs)
 	input := fs.String("input", "-", "read records from this file (- for stdin)")
-	batch := fs.Int("batch", 1000, "records per commit")
 	if err := parseArgs(fs, args); err != nil {
 		return exitUsage
 	}
 	if fs.NArg() != 1 {
-		return usageErr("usage: kv load <db> [--input F] [--batch N] [--hex | --base64]")
-	}
-	if *batch < 1 {
-		return usageErr("--batch must be at least 1")
+		return usageErr("usage: kv load <db> [--input F] [--hex | --base64]")
 	}
 	d, code := openDB(fs.Arg(0))
 	if code != exitOK {
@@ -88,37 +91,49 @@ func cmdLoad(args []string) int {
 		in = f
 	}
 
-	wb := d.NewWriteBatch(*batch)
 	sc := bufio.NewScanner(in)
 	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
 	line := 0
-	for sc.Scan() {
-		line++
-		raw := sc.Bytes()
-		if len(raw) == 0 {
-			continue
+	// decodeErr carries a per-line decode failure out of the pull function, where db.Load
+	// cannot return it directly. The first one stops the stream and is reported as a usage
+	// error (bad input), distinct from a load fault.
+	var decodeErr error
+	next := func() (key, value []byte, ok bool) {
+		for sc.Scan() {
+			line++
+			raw := sc.Bytes()
+			if len(raw) == 0 {
+				continue
+			}
+			var r record
+			if err := json.Unmarshal(raw, &r); err != nil {
+				decodeErr = fmt.Errorf("line %d: bad JSON: %v", line, err)
+				return nil, nil, false
+			}
+			k, err := e.decode(r.Key)
+			if err != nil {
+				decodeErr = fmt.Errorf("line %d: bad key: %v", line, err)
+				return nil, nil, false
+			}
+			val, err := e.decode(r.Value)
+			if err != nil {
+				decodeErr = fmt.Errorf("line %d: bad value: %v", line, err)
+				return nil, nil, false
+			}
+			return k, val, true
 		}
-		var r record
-		if err := json.Unmarshal(raw, &r); err != nil {
-			return usageErr("line %d: bad JSON: %v", line, err)
-		}
-		key, err := e.decode(r.Key)
-		if err != nil {
-			return usageErr("line %d: bad key: %v", line, err)
-		}
-		val, err := e.decode(r.Value)
-		if err != nil {
-			return usageErr("line %d: bad value: %v", line, err)
-		}
-		if err := wb.Set(key, val); err != nil {
-			return fail(err)
-		}
+		return nil, nil, false
+	}
+
+	_, loadErr := d.Load(next)
+	if decodeErr != nil {
+		return usageErr("%v", decodeErr)
 	}
 	if err := sc.Err(); err != nil {
 		return fail(err)
 	}
-	if err := wb.Close(); err != nil {
-		return fail(err)
+	if loadErr != nil {
+		return fail(loadErr)
 	}
 	return exitOK
 }
