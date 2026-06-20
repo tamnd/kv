@@ -82,6 +82,14 @@ func run(args []string) int {
 			return c.run(args[1:])
 		}
 	}
+	// `kv <file>` with no subcommand opens the interactive shell on that file, the
+	// sqlite3-shell convention (spec 16 §1, §5). The single argument must be an existing
+	// file, so a genuine mistyped command still gets the unknown-command error.
+	if len(args) == 1 {
+		if _, err := os.Stat(args[0]); err == nil {
+			return runShell(args[0])
+		}
+	}
 	fmt.Fprintf(os.Stderr, "kv: unknown command %q\n\n", args[0])
 	usage(os.Stderr)
 	return exitUsage
