@@ -3,16 +3,17 @@
 // engine.Engine seam as the B-tree core (spec 04), so every layer above the seam
 // (transactions, iterators, cache, API, CLI, server) drives it unchanged.
 //
-// The engine is built in vertical slices. This first slice is the write path and
-// the in-memory read path: an arena-backed skip-list memtable that Apply inserts
-// into and that NewReader folds for point and range reads, matching the shared
-// MVCC resolution the oracle and the B-tree core use. Durability already holds,
-// because the host logs every batch to the WAL before calling Apply and replays
-// the WAL into Apply on open, so a memtable-only engine is crash-safe even before
-// on-disk segments exist. What this slice does not yet do is bound memory: there is
-// no sealing or flush, so the memtable grows until close. Sealing, L0 flush, the
-// MANIFEST, compaction, and filters arrive in the segment slices that follow, each
-// extending this seam-conformant core without disturbing it.
+// The engine is built in vertical slices. The write path is an arena-backed
+// skip-list memtable that Apply inserts into; when it fills, the engine flushes it
+// to an immutable on-disk segment and starts a fresh one, so memory stays bounded.
+// The read path folds the memtable and every segment into one snapshot view through
+// the shared MVCC resolution the oracle and the B-tree core use. Durability rests on
+// the WAL: the host logs every batch before calling Apply and replays it on open, so
+// every applied write is recoverable even while the segments a flush produced are not
+// yet cataloged. What this slice does not yet do is persist the live segment set: the
+// MANIFEST that records segments across a restart, the matching WAL reclamation, and
+// recovery's MANIFEST replay arrive in the next slice, along with the block index,
+// filters, leveled compaction, and value separation that follow.
 package lsm
 
 import (
@@ -31,22 +32,28 @@ import (
 // repeatedly doubling for a large one.
 const defaultArenaCap = 1 << 20 // 1 MiB
 
+// defaultMemtableCap is the byte size at which the active memtable is flushed to an
+// on-disk segment (spec 06 §2, WithMemtableSize). It bounds how much applied data
+// lives in memory at once.
+const defaultMemtableCap = 64 << 20 // 64 MiB
+
 // LSM is the log-structured merge engine handle (spec 06 §9).
 type LSM struct {
 	pgr *pager.Pager
 
-	mu  sync.RWMutex
-	mem *memtable
+	mu          sync.RWMutex
+	mem         *memtable
+	segments    []*segment
+	memtableCap int
 
 	merge func(existing, operand []byte) []byte
 	env   *engine.Env
 }
 
-// New returns an LSM core bound to a pager. The pager is the durable substrate the
-// later segment slices write to; this slice keeps all data in the memtable and uses
-// the pager only for its page geometry.
+// New returns an LSM core bound to a pager. The pager is the durable substrate
+// flushes write segments to and that this core reads them back from.
 func New(pgr *pager.Pager) *LSM {
-	return &LSM{pgr: pgr, mem: newMemtable(defaultArenaCap)}
+	return &LSM{pgr: pgr, mem: newMemtable(defaultArenaCap), memtableCap: defaultMemtableCap}
 }
 
 // Kind implements engine.Engine.
@@ -60,7 +67,9 @@ func (l *LSM) Open(env *engine.Env) error {
 
 // Close implements engine.Engine. It drops the in-memory state; the host
 // checkpoints before close, and on the next open the WAL replay rebuilds the
-// memtable (this slice has no on-disk segments to flush).
+// memtable. The segment pages a flush wrote are folded by the checkpoint, but until
+// the MANIFEST records them (next slice) they are unreferenced after a restart and
+// the WAL replay is what restores their data.
 func (l *LSM) Close() error { return nil }
 
 // SetMergeFunc installs the merge resolver used during read-time version
@@ -72,13 +81,43 @@ func (l *LSM) SetMergeFunc(f func(existing, operand []byte) []byte) {
 }
 
 // Apply implements engine.Engine: it inserts every entry into the active memtable.
-// The batch is already durable in the WAL, so this is pure in-memory work.
+// The batch is already durable in the WAL, so the insert is pure in-memory work.
+// When the memtable grows past its cap the engine flushes it to an on-disk segment
+// and starts a fresh one, so the resident set stays bounded (spec 06 §2). The flush
+// runs synchronously under the write lock; the sealed-queue and background flush
+// that hide its latency are a later optimization.
 func (l *LSM) Apply(batch *engine.WriteBatch, commitVersion uint64) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.mem.count() > 0 && l.mem.size() >= l.memtableCap {
+		if err := l.flushLocked(); err != nil {
+			return err
+		}
+	}
 	for _, e := range batch.Entries() {
 		l.mem.set(e.InternalKey, e.Value)
 	}
+	return nil
+}
+
+// flushLocked writes the active memtable to a new on-disk segment, appends the
+// segment to the live set, and swaps in an empty memtable. The caller holds l.mu.
+// The segment's pages are dirtied through the pager and folded by the next
+// checkpoint, the same path every engine write takes; until the MANIFEST records
+// the segment (a later slice) the live set is in-memory only and the WAL remains
+// the sole cross-restart record, so durability is unchanged.
+func (l *LSM) flushLocked() error {
+	mem := l.mem
+	seg, err := writeSegment(l.pgr, func(emit func(ik, val []byte) bool) {
+		mem.scan(emit)
+	})
+	if err != nil {
+		return err
+	}
+	if seg.numCells > 0 {
+		l.segments = append(l.segments, seg)
+	}
+	l.mem = newMemtable(defaultArenaCap)
 	return nil
 }
 
@@ -88,13 +127,19 @@ func (l *LSM) Maintain(ctx context.Context, budget engine.MaintBudget) (engine.M
 	return engine.MaintReport{}, nil
 }
 
-// Stats implements engine.Engine, reporting the memtable's footprint as the
-// physical size. On-disk segment accounting joins this once flush exists.
+// Stats implements engine.Engine, reporting the memtable footprint plus the on-disk
+// segment pages as the physical size. Live-key and amplification accounting sharpen
+// once compaction and the watermark drop shadowed versions.
 func (l *LSM) Stats() engine.EngineStats {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
+	physical := int64(l.mem.size())
+	pageSize := int64(l.pgr.PageSize())
+	for _, seg := range l.segments {
+		physical += int64(seg.pages) * pageSize
+	}
 	return engine.EngineStats{
-		PhysicalBytes: int64(l.mem.size()),
+		PhysicalBytes: physical,
 		Amplification: 1,
 	}
 }
@@ -131,27 +176,52 @@ type resolved struct {
 	val []byte
 }
 
-// snapshot folds the memtable into the sorted, visible (userKey, value) view at
-// snap: for each user key the newest version <= snap.Version, tombstones removed,
-// merges folded, range deletes applied. It uses the shared format.Fold so any
-// divergence from the oracle or the B-tree core is a bug here, never in resolution.
-func (l *LSM) snapshot(snap engine.Snapshot) []resolved {
+// srcCell is one internal-key/value pair gathered from a source during a snapshot.
+type srcCell struct {
+	ik  []byte
+	val []byte
+}
+
+// snapshot folds every source (the active memtable and each on-disk segment) into
+// the sorted, visible (userKey, value) view at snap: for each user key the newest
+// version <= snap.Version, tombstones removed, merges folded, range deletes applied.
+// It gathers all cells, sorts them into internal-key order, and resolves each user
+// key's version group with the shared format.Fold, so any divergence from the oracle
+// or the B-tree core is a bug in this plumbing, never in resolution. Gathering and
+// sorting the whole keyspace per read is the bring-up shape; the streaming heap-merge
+// across sources (spec 06 §9) replaces it once the level structure exists.
+func (l *LSM) snapshot(snap engine.Snapshot) ([]resolved, error) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 
-	// Gather every cell in internal-key order: user ascending, version descending,
-	// kind ascending. Equal-user-key cells are therefore already grouped newest-first.
-	type cell struct {
-		ik  []byte
-		val []byte
-	}
-	var cells []cell
-	l.mem.scan(func(ik, val []byte) bool {
-		cells = append(cells, cell{
-			ik:  append([]byte(nil), ik...),
-			val: append([]byte(nil), val...),
-		})
+	var cells []srcCell
+	var rangeDels []format.RangeDel
+	collect := func(ik, val []byte) bool {
+		ikc := append([]byte(nil), ik...)
+		valc := append([]byte(nil), val...)
+		cells = append(cells, srcCell{ik: ikc, val: valc})
+		// A range-delete marker is stored as a cell in every source; reconstruct its
+		// interval here so range deletes from segments fold exactly as memtable ones do.
+		if format.KindOf(ikc) == format.KindRangeBegin {
+			rangeDels = append(rangeDels, format.RangeDel{
+				Lo:      append([]byte(nil), format.UserKey(ikc)...),
+				Hi:      valc,
+				Version: format.Version(ikc),
+			})
+		}
 		return true
+	}
+	l.mem.scan(collect)
+	for _, seg := range l.segments {
+		if err := seg.scan(l.pgr, collect); err != nil {
+			return nil, err
+		}
+	}
+
+	// Order the merged cells: user ascending, version descending, kind ascending, so
+	// each user key's versions arrive contiguous and newest-first.
+	sort.SliceStable(cells, func(i, j int) bool {
+		return format.CompareInternal(cells[i].ik, cells[j].ik) < 0
 	})
 
 	var out []resolved
@@ -170,7 +240,7 @@ func (l *LSM) snapshot(snap engine.Snapshot) []resolved {
 		}
 		i = j
 
-		rd := format.NewestCoveringRangeDel(l.mem.rangeDels, uk, snap.Version)
+		rd := format.NewestCoveringRangeDel(rangeDels, uk, snap.Version)
 		val, ok := format.Fold(ops, snap.Version, rd, l.merge)
 		if !ok {
 			continue
@@ -180,7 +250,7 @@ func (l *LSM) snapshot(snap engine.Snapshot) []resolved {
 			val: append([]byte(nil), val...),
 		})
 	}
-	return out
+	return out, nil
 }
 
 // reader is a point/range read view at a fixed snapshot. It resolves the memtable
@@ -193,7 +263,10 @@ type reader struct {
 }
 
 func (r *reader) Get(userKey []byte) ([]byte, error) {
-	view := r.l.snapshot(r.snap)
+	view, err := r.l.snapshot(r.snap)
+	if err != nil {
+		return nil, err
+	}
 	idx := sort.Search(len(view), func(i int) bool {
 		return bytes.Compare(view[i].uk, userKey) >= 0
 	})
@@ -204,7 +277,10 @@ func (r *reader) Get(userKey []byte) ([]byte, error) {
 }
 
 func (r *reader) NewIter(opts engine.IterOptions) (engine.Cursor, error) {
-	view := r.l.snapshot(r.snap)
+	view, err := r.l.snapshot(r.snap)
+	if err != nil {
+		return nil, err
+	}
 	lower, upper := opts.Lower, opts.Upper
 	if len(opts.Prefix) > 0 {
 		lower = opts.Prefix
