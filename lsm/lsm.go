@@ -240,73 +240,81 @@ type srcCell struct {
 	val []byte
 }
 
-// snapshot folds every source (the active memtable and each on-disk segment) into
-// the sorted, visible (userKey, value) view at snap: for each user key the newest
-// version <= snap.Version, tombstones removed, merges folded, range deletes applied.
-// It gathers all cells, sorts them into internal-key order, and resolves each user
-// key's version group with the shared format.Fold, so any divergence from the oracle
-// or the B-tree core is a bug in this plumbing, never in resolution. Gathering and
-// sorting the whole keyspace per read is the bring-up shape; the streaming heap-merge
-// across sources (spec 06 §9) replaces it once the level structure exists.
-func (l *LSM) snapshot(snap engine.Snapshot) ([]resolved, error) {
+// foldRange folds every source (the active memtable and each on-disk segment) into
+// the sorted, visible (userKey, value) view at snap over the half-open user-key range
+// [lower, upper): for each user key the newest version <= snap.Version, tombstones
+// removed, merges folded, range deletes applied. A nil lower starts at the first key,
+// a nil upper runs to the last.
+//
+// It streams a k-way merge across the sources rather than gathering and sorting the
+// whole keyspace: each source is seeked to lower and yields its cells in internal-key
+// order, the merge picks the next-smallest, and the fold consumes the stream one user
+// key's group at a time. The resolution is the shared format.Fold, the same the oracle
+// and the B-tree core run, so the view is byte-for-byte what the old gather-and-sort
+// produced and any divergence is a bug in this plumbing, never in resolution. Because
+// the merge seeks to lower and stops past upper, a narrow scan touches only the pages
+// its range covers instead of reading the whole database.
+func (l *LSM) foldRange(snap engine.Snapshot, lower, upper []byte) ([]resolved, error) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 
-	var cells []srcCell
-	var rangeDels []format.RangeDel
-	collect := func(ik, val []byte) bool {
-		ikc := append([]byte(nil), ik...)
-		valc := append([]byte(nil), val...)
-		cells = append(cells, srcCell{ik: ikc, val: valc})
-		// A range-delete marker is stored as a cell in every source; reconstruct its
-		// interval here so range deletes from segments fold exactly as memtable ones do.
-		if format.KindOf(ikc) == format.KindRangeBegin {
-			rangeDels = append(rangeDels, format.RangeDel{
-				Lo:      append([]byte(nil), format.UserKey(ikc)...),
-				Hi:      valc,
-				Version: format.Version(ikc),
-			})
-		}
-		return true
-	}
-	l.mem.scan(collect)
+	// The deletes that may cover a key in the range live in the memtable's live set and
+	// each segment's persisted list, the same union the point path folds against.
+	rangeDels := l.liveRangeDels()
+
+	sources := make([]mergeSource, 0, 1+len(l.segments))
+	sources = append(sources, &memSource{sl: l.mem.sl})
 	for _, seg := range l.segments {
-		if err := seg.scan(l.pgr, collect); err != nil {
+		sources = append(sources, &segSource{pgr: l.pgr, seg: seg})
+	}
+	var target []byte
+	if lower != nil {
+		// The smallest internal key for lower's user key seeks past nothing in the group.
+		target = format.EncodeInternalKey(lower, format.MaxVersion, format.KindDelete)
+	}
+	mi, err := newMergeIter(sources, target)
+	if err != nil {
+		return nil, err
+	}
+
+	var out []resolved
+	var ops []format.Op
+	var groupKey []byte
+	flush := func() {
+		if groupKey == nil {
+			return
+		}
+		rd := format.NewestCoveringRangeDel(rangeDels, groupKey, snap.Version)
+		if val, ok := format.Fold(ops, snap.Version, rd, l.merge); ok {
+			out = append(out, resolved{uk: groupKey, val: append([]byte(nil), val...)})
+		}
+		ops = ops[:0]
+		groupKey = nil
+	}
+	for mi.valid() {
+		ik := mi.key()
+		uk := format.UserKey(ik)
+		if upper != nil && bytes.Compare(uk, upper) >= 0 {
+			break
+		}
+		if groupKey != nil && !bytes.Equal(uk, groupKey) {
+			flush()
+		}
+		if groupKey == nil {
+			groupKey = append([]byte(nil), uk...)
+		}
+		// A range marker resolves through rangeDels, not as an op; OpFromCell rejects it.
+		if op, ok := format.OpFromCell(ik, mi.value(), snap.Now); ok {
+			op.Value = append([]byte(nil), op.Value...) // the source slice dies on the next advance
+			ops = append(ops, op)
+		}
+		if err := mi.next(); err != nil {
 			return nil, err
 		}
 	}
-
-	// Order the merged cells: user ascending, version descending, kind ascending, so
-	// each user key's versions arrive contiguous and newest-first.
-	sort.SliceStable(cells, func(i, j int) bool {
-		return format.CompareInternal(cells[i].ik, cells[j].ik) < 0
-	})
-
-	var out []resolved
-	var i int
-	for i < len(cells) {
-		uk := format.UserKey(cells[i].ik)
-		var ops []format.Op
-		j := i
-		for j < len(cells) && bytes.Equal(format.UserKey(cells[j].ik), uk) {
-			op, ok := format.OpFromCell(cells[j].ik, cells[j].val, snap.Now)
-			j++
-			if !ok {
-				continue // range markers resolve through rangeDels, not as ops
-			}
-			ops = append(ops, op)
-		}
-		i = j
-
-		rd := format.NewestCoveringRangeDel(rangeDels, uk, snap.Version)
-		val, ok := format.Fold(ops, snap.Version, rd, l.merge)
-		if !ok {
-			continue
-		}
-		out = append(out, resolved{
-			uk:  append([]byte(nil), uk...),
-			val: append([]byte(nil), val...),
-		})
+	flush()
+	if mi.err != nil {
+		return nil, mi.err
 	}
 	return out, nil
 }
@@ -389,26 +397,19 @@ func (l *LSM) liveRangeDels() []format.RangeDel {
 }
 
 func (r *reader) NewIter(opts engine.IterOptions) (engine.Cursor, error) {
-	view, err := r.l.snapshot(r.snap)
-	if err != nil {
-		return nil, err
-	}
 	lower, upper := opts.Lower, opts.Upper
 	if len(opts.Prefix) > 0 {
 		lower = opts.Prefix
 		upper = format.PrefixSuccessor(opts.Prefix)
 	}
-	var filtered []resolved
-	for _, e := range view {
-		if lower != nil && bytes.Compare(e.uk, lower) < 0 {
-			continue
-		}
-		if upper != nil && bytes.Compare(e.uk, upper) >= 0 {
-			continue
-		}
-		filtered = append(filtered, e)
+	// foldRange resolves only the requested range, so the cursor over the result holds
+	// just those keys; the bidirectional cursor protocol is served from that materialized
+	// slice, which is now the size of the range rather than the whole keyspace.
+	view, err := r.l.foldRange(r.snap, lower, upper)
+	if err != nil {
+		return nil, err
 	}
-	return &cursor{view: filtered, pos: -1, reverse: opts.Reverse}, nil
+	return &cursor{view: view, pos: -1, reverse: opts.Reverse}, nil
 }
 
 func (r *reader) Close() error { return nil }
