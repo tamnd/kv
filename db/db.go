@@ -14,7 +14,6 @@ package db
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -22,6 +21,7 @@ import (
 	"github.com/tamnd/kv/btree"
 	"github.com/tamnd/kv/engine"
 	"github.com/tamnd/kv/format"
+	"github.com/tamnd/kv/lsm"
 	"github.com/tamnd/kv/pager"
 	"github.com/tamnd/kv/vfs"
 	"github.com/tamnd/kv/wal"
@@ -357,7 +357,7 @@ func newEngine(kind format.EngineKind, pgr *pager.Pager) (engine.Engine, error) 
 	case format.EngineBTree:
 		return btree.New(pgr), nil
 	case format.EngineLSM:
-		return nil, errors.New("kv: LSM core is not implemented yet (roadmap M4)")
+		return lsm.New(pgr), nil
 	default:
 		return nil, fmt.Errorf("kv: unknown engine kind %d", kind)
 	}
@@ -799,6 +799,12 @@ func (d *DB) maybeCheckpoint() {
 	if written <= folded || written-folded < uint64(d.ckptThreshold) {
 		return
 	}
+	// An engine that has not yet persisted past the folded point (an LSM core whose
+	// memtable has not flushed) cannot reclaim any WAL, so a wakeup would fold nothing
+	// and reset nothing. Skip it until a flush advances the durable LSN.
+	if dl, tracked := d.engineDurableLSN(); tracked && dl <= folded {
+		return
+	}
 	select {
 	case d.ckptSig <- struct{}{}:
 	default:
@@ -867,6 +873,13 @@ func (d *DB) CheckpointMode(m CheckpointMode) error {
 		return err
 	}
 	if m == CheckpointTruncate {
+		// Truncating returns the -wal frame space to the operating system, which is
+		// safe only when checkpointLocked reset the log. When the engine lags (an
+		// unflushed LSM memtable), checkpointLocked kept the tail and did not reset, so
+		// the frames past the durable point are still live and must not be discarded.
+		if dl, tracked := d.engineDurableLSN(); tracked && dl < d.wal.LSN()-1 {
+			return nil
+		}
 		return d.wal.TruncateFile()
 	}
 	return nil
@@ -885,10 +898,38 @@ func (d *DB) checkpointLocked() error {
 	d.pgr.Header().LastCommitVersion = d.orc.lastCommitted()
 
 	foldedLSN := d.wal.LSN() - 1
+	resetWAL := true
+	if dl, tracked := d.engineDurableLSN(); tracked && dl < foldedLSN {
+		// The engine has applied writes it has not yet persisted to the main file (an
+		// unflushed LSM memtable, spec 06 §4). Fold only to its durable point and keep
+		// the WAL frames past it: the WAL's Checkpointed resets the whole tail, which is
+		// correct only when the engine has folded everything, so resetting here would
+		// drop applied-but-unflushed data. The next open replays the kept frames into the
+		// memtable. The header is still written and fsynced below, so the commit version
+		// and any persistent setting remain durable.
+		foldedLSN = dl
+		resetWAL = false
+	}
 	if err := d.pgr.Checkpoint(foldedLSN); err != nil {
 		return err
 	}
-	return d.wal.Checkpointed(foldedLSN)
+	if resetWAL {
+		return d.wal.Checkpointed(foldedLSN)
+	}
+	return nil
+}
+
+// engineDurableLSN reports the highest WAL LSN whose effects the engine has
+// persisted to the main file, and whether the engine tracks a durable point at all.
+// An engine that lands every applied batch in pages the checkpoint folds (the
+// B-tree core) does not implement DurableLSN, so it returns tracked=false and the
+// checkpoint folds the whole log. The LSM core reports how far its flushes have
+// reached so the checkpoint never reclaims WAL past durable data (spec 06 §4).
+func (d *DB) engineDurableLSN() (lsn uint64, tracked bool) {
+	if e, ok := d.eng.(interface{ DurableLSN() uint64 }); ok {
+		return e.DurableLSN(), true
+	}
+	return 0, false
 }
 
 // Vacuum runs one round of incremental vacuum (spec 09 §3.1): it folds the WAL with a
