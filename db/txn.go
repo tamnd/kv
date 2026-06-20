@@ -20,6 +20,11 @@ var ErrReadOnlyTxn = errors.New("kv: write on a read-only transaction")
 // ErrTxnDone is returned when a transaction is used after Commit or Discard.
 var ErrTxnDone = errors.New("kv: transaction already finished")
 
+// ErrUnsupported is returned when an operation is asked of an engine that does not
+// implement the optional capability it needs, such as Verify on a core with no
+// structural verifier (spec 23 §3).
+var ErrUnsupported = errors.New("kv: operation not supported by this engine")
+
 // Isolation selects a transaction's isolation level (spec 10 §3, §4). The zero value
 // is SnapshotIsolation, the high-performance default; Serializable adds read-set
 // tracking and rw-antidependency detection at commit to give full serializability.

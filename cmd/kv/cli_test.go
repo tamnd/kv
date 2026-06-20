@@ -232,6 +232,54 @@ func TestCLIStatsJSON(t *testing.T) {
 	}
 }
 
+// TestCLICheckSound writes a few keys, checkpoints so the data is folded into the main
+// file, then runs check and expects exit 0 with an "ok" result.
+func TestCLICheckSound(t *testing.T) {
+	p := dbPath(t)
+	for _, k := range []string{"a", "b", "c"} {
+		if code := run([]string{"set", p, k, "v"}); code != exitOK {
+			t.Fatalf("set %s: exit %d", k, code)
+		}
+	}
+	if code := run([]string{"checkpoint", p}); code != exitOK {
+		t.Fatalf("checkpoint: exit %d", code)
+	}
+	out := capture(t, func() {
+		if code := run([]string{"check", p}); code != exitOK {
+			t.Fatalf("check: exit %d, want 0", code)
+		}
+	})
+	if !strings.Contains(out, "ok") {
+		t.Fatalf("check output = %q, want it to contain ok", out)
+	}
+}
+
+// TestCLICheckJSON confirms the machine-readable form reports ok=true for a sound file.
+func TestCLICheckJSON(t *testing.T) {
+	p := dbPath(t)
+	if code := run([]string{"set", p, "k", "v"}); code != exitOK {
+		t.Fatalf("set: exit %d", code)
+	}
+	out := capture(t, func() {
+		if code := run([]string{"check", p, "-f", "json"}); code != exitOK {
+			t.Fatalf("check -f json: exit %d", code)
+		}
+	})
+	var got struct {
+		OK        bool `json:"ok"`
+		PageCount int  `json:"page_count"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("decode %q: %v", out, err)
+	}
+	if !got.OK {
+		t.Fatalf("check json ok = false, want true: %q", out)
+	}
+	if got.PageCount == 0 {
+		t.Fatalf("check json page_count = 0, want positive")
+	}
+}
+
 // withStdin runs fn with os.Stdin replaced by a pipe carrying the given input.
 func withStdin(t *testing.T, input string, fn func()) {
 	t.Helper()

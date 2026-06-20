@@ -249,6 +249,56 @@ func (kdb *DB) Checkpoint() error {
 	return wrap(kdb.d.Checkpoint())
 }
 
+// CheckProblem is one structural violation found by Check: a corruption class, the page
+// it was found on (zero for a file-wide problem), and a human-readable description
+// (spec 16 §4, spec 23 §3).
+type CheckProblem struct {
+	Class  string
+	Page   uint32
+	Detail string
+}
+
+// CheckReport is the outcome of a structural integrity check: what was inspected and
+// every problem found. OK reports whether the file is sound.
+type CheckReport struct {
+	// PagesVisited is how many pages the walk reached from the engine root.
+	PagesVisited int
+	// Keys is how many live key cells the walk saw.
+	Keys int64
+	// FreePages is the freelist depth at the time of the check.
+	FreePages int
+	// PageCount is the file's high-water page count.
+	PageCount uint32
+	// Problems is every violation found; empty means the file is structurally sound.
+	Problems []CheckProblem
+}
+
+// OK reports whether the check found no problems.
+func (r *CheckReport) OK() bool { return len(r.Problems) == 0 }
+
+// Check runs a structural integrity check over the open database and returns a report of
+// everything it inspected and every problem it found (spec 16 §4, spec 23 §3). It walks
+// the engine's on-disk structure under the writer lock, verifying page types, key
+// ordering, subtree bounds, and that the reachable pages, the freelist, and the file size
+// all reconcile. It is what `kv check` and a CI/cron soundness gate call; the report's OK
+// method is false on any violation.
+func (kdb *DB) Check() (*CheckReport, error) {
+	r, err := kdb.d.Verify()
+	if err != nil {
+		return nil, wrap(err)
+	}
+	out := &CheckReport{
+		PagesVisited: r.PagesVisited,
+		Keys:         r.Keys,
+		FreePages:    r.FreePages,
+		PageCount:    r.PageCount,
+	}
+	for _, p := range r.Problems {
+		out.Problems = append(out.Problems, CheckProblem{Class: p.Class, Page: p.Page, Detail: p.Detail})
+	}
+	return out, nil
+}
+
 // Close flushes, runs a final checkpoint, and releases the file (spec 15 §1).
 func (kdb *DB) Close() error {
 	return wrap(kdb.d.Close())

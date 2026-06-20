@@ -259,6 +259,35 @@ func TestAutoCheckpointBoundsWAL(t *testing.T) {
 	}
 }
 
+// TestCheckReportsSound writes a spread of keys and confirms the public Check returns a
+// sound report: no problems, a positive key count, and balanced page accounting.
+func TestCheckReportsSound(t *testing.T) {
+	d := open(t)
+	for i := 0; i < 200; i++ {
+		if err := d.Update(func(txn *kv.Txn) error {
+			return txn.Set([]byte(fmt.Sprintf("k%05d", i)), []byte("v"))
+		}); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+	if err := d.Checkpoint(); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	rep, err := d.Check()
+	if err != nil {
+		t.Fatalf("check: %v", err)
+	}
+	if !rep.OK() {
+		t.Fatalf("sound database reported %d problems: %+v", len(rep.Problems), rep.Problems)
+	}
+	if rep.Keys != 200 {
+		t.Fatalf("check keys = %d, want 200", rep.Keys)
+	}
+	if got := 1 + rep.PagesVisited + rep.FreePages; uint32(got) != rep.PageCount {
+		t.Fatalf("accounting 1+%d+%d = %d != page count %d", rep.PagesVisited, rep.FreePages, got, rep.PageCount)
+	}
+}
+
 // TestReopenPersists checks data survives Close and reopen of the same path.
 func TestReopenPersists(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "data.kv")
