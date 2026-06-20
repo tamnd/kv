@@ -287,6 +287,18 @@ func (w *WriteBatch) Pending() int { return w.b.Pending() }
 // operations return ErrBatchClosed.
 func (w *WriteBatch) Close() error { return wrap(w.b.Close()) }
 
+// Load bulk-populates the database from key/value pairs delivered in ascending key
+// order, the fast path for initial population (spec 15 §6). next returns each pair and
+// true, or false at end of stream. On a fresh database it builds the tree bottom-up and
+// makes it durable with one checkpoint, far faster than inserting key by key; the keys
+// must be strictly ascending. On a database that already holds data it falls back to
+// chunked commits, which accept any order. It returns the commit version the loaded data
+// is visible at.
+func (kdb *DB) Load(next func() (key, value []byte, ok bool)) (uint64, error) {
+	v, err := kdb.d.Load(next)
+	return v, wrap(err)
+}
+
 // Stats is a point-in-time space-and-durability snapshot of an open database: page
 // counts, freelist depth, the engine's physical footprint and amplification, the latest
 // commit version, and the WAL frame backlog (spec 09 §4, spec 19). It is what the

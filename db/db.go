@@ -375,6 +375,102 @@ func (d *DB) Write(fn func(b *engine.WriteBatch)) (uint64, error) {
 	return got, nil
 }
 
+// Load bulk-populates the database from key/value pairs delivered in ascending key
+// order. next returns each pair and true, or false at end of stream. It returns the
+// commit version the loaded data is visible at.
+//
+// Load is the fast path for initial population (spec 15 §6): when the engine provides
+// the bulk-load capability and the database has no commits yet, it builds the on-disk
+// structure bottom-up, far faster than inserting key by key, and makes the result
+// durable with a single checkpoint. A crash before that checkpoint leaves the database
+// empty, so the fast path is atomic. The fast path requires keys to be strictly
+// ascending and errors otherwise. On a database that already holds data, or an engine
+// without the capability, Load falls back to a chunked sequence of ordinary commits,
+// which is slower, accepts any order, and is durable per chunk like a WriteBatch.
+func (d *DB) Load(next func() (key, value []byte, ok bool)) (uint64, error) {
+	d.mu.Lock()
+	if d.fatal != nil {
+		d.mu.Unlock()
+		return 0, d.fatal
+	}
+	bl, ok := d.eng.(engine.BulkLoader)
+	if ok && d.orc.lastCommitted() == 0 {
+		v, err := d.loadFast(bl, next)
+		d.mu.Unlock()
+		return v, err
+	}
+	d.mu.Unlock()
+	return d.loadBatched(next)
+}
+
+// loadFast drives the engine bulk loader over an empty database and makes the build
+// durable. The caller holds d.mu and has checked the database is empty, so the commit
+// version is deterministically the next one (1 on a fresh file). The keys are stamped at
+// that version as Set cells and fed in ascending internal-key order. The oracle is
+// advanced only after the build succeeds, so a failed load leaves the database empty and
+// the version counter untouched; the checkpoint then persists the version into the
+// header and folds the freshly built pages into the main file.
+func (d *DB) loadFast(bl engine.BulkLoader, next func() (key, value []byte, ok bool)) (uint64, error) {
+	v := d.orc.peekNext()
+
+	var prevKey []byte
+	var streamErr error
+	feed := func() (ik, value []byte, ok bool) {
+		k, val, ok := next()
+		if !ok {
+			return nil, nil, false
+		}
+		if prevKey != nil && format.CompareUser(k, prevKey) <= 0 {
+			streamErr = fmt.Errorf("kv: bulk load keys not strictly ascending at %q", k)
+			return nil, nil, false
+		}
+		prevKey = append(prevKey[:0], k...)
+		return format.EncodeInternalKey(k, v, format.KindSet), val, true
+	}
+
+	if err := bl.BulkLoad(feed); err != nil {
+		return 0, err
+	}
+	if streamErr != nil {
+		return 0, streamErr
+	}
+
+	// Advance the oracle before the checkpoint: checkpointLocked stamps the header with
+	// the oracle's last committed version, so the version must be live first or the
+	// freshly built pages would be folded under version 0 and read back invisible.
+	d.orc.commit(nil)
+	d.orc.applied(v)
+	if err := d.checkpointLocked(); err != nil {
+		return 0, err
+	}
+	// The fast path does not surface its keys on the change feed: it is initial
+	// population of an empty database, before any serving or subscription, and
+	// materializing the whole stream as one published batch would defeat the streaming
+	// the bulk loader exists to provide. A subscriber reads the loaded state from its
+	// opening snapshot like any other (spec 15 §7).
+	return v, nil
+}
+
+// loadBatched is the order-agnostic fallback: it streams the pairs through the explicit
+// WriteBatch builder, which commits in bounded chunks so a huge import never holds the
+// whole stream in memory. It does not hold d.mu (the batch commits take it per chunk).
+func (d *DB) loadBatched(next func() (key, value []byte, ok bool)) (uint64, error) {
+	b := d.NewWriteBatch(0)
+	for {
+		k, val, ok := next()
+		if !ok {
+			break
+		}
+		if err := b.Set(k, val); err != nil {
+			return 0, err
+		}
+	}
+	if err := b.Close(); err != nil {
+		return 0, err
+	}
+	return d.orc.lastCommitted(), nil
+}
+
 // commitTxn is the single-writer commit path for a transaction: it runs write-write
 // conflict detection at the transaction's read snapshot, and on success logs,
 // commits, and applies the buffered writes at the assigned version, then makes that
