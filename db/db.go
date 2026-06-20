@@ -13,6 +13,7 @@
 package db
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync"
@@ -406,6 +407,21 @@ func (d *DB) Get(userKey []byte) ([]byte, error) {
 		return nil, engine.ErrNotFound
 	}
 	return v, nil
+}
+
+// Maintain runs one round of engine-scheduled maintenance, currently version GC, up
+// to a page budget, and reports what it reclaimed. The GC horizon is the oracle's
+// read-mark: the oldest snapshot any in-flight reader still holds, or the latest
+// committed version when none is live, so GC never reclaims a version a live snapshot
+// can still read (spec 09, spec 10 §6). It takes the writer lock, so it is serialized
+// against commits and checkpoints. A maxPages of zero means no page cap. Report.More
+// is true when the budget ran out before the work was done and Maintain should be
+// called again.
+func (d *DB) Maintain(maxPages int) (engine.MaintReport, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	budget := engine.MaintBudget{MaxPages: maxPages, Watermark: d.orc.readMark()}
+	return d.eng.Maintain(context.Background(), budget)
 }
 
 // Checkpoint folds the WAL into the main file and resets the log, in the strict

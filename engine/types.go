@@ -63,6 +63,13 @@ type MaintBudget struct {
 	MaxPages int
 	// MaxBytes caps the bytes of I/O maintenance may perform.
 	MaxBytes int64
+	// Watermark is the version-GC horizon: the oldest version any live or future
+	// reader can still observe (the oracle's read-mark, spec 10 §6). Every version
+	// at or below it is reclaimable, since no snapshot below the watermark will ever
+	// be taken again, so the whole history at or below it collapses to the single
+	// value a snapshot at the watermark resolves. Zero disables version GC for the
+	// call.
+	Watermark uint64
 }
 
 // MaintReport summarizes what a Maintain call did.
