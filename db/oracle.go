@@ -155,6 +155,16 @@ func (o *oracle) applied(v uint64) {
 	}
 }
 
+// readMark is the version-GC horizon: the oldest version any live reader can still
+// observe, or the newest applied version when none is live. The maintenance driver
+// passes it to the engine so GC never reclaims a version a live snapshot needs
+// (spec 10 §6).
+func (o *oracle) readMark() uint64 {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.readMarkLocked()
+}
+
 // readMarkLocked is the oldest version any live reader can still observe, or the
 // newest applied version when no reader is live. Older versions and commit records
 // can never again matter to anyone.

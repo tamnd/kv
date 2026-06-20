@@ -18,7 +18,6 @@
 package btree
 
 import (
-	"context"
 	"fmt"
 
 	"github.com/tamnd/kv/engine"
@@ -35,6 +34,15 @@ type BTree struct {
 	// marker cells at Open and extended on Apply, so a read can fold a range delete
 	// whose marker cell lives in a leaf the read never visits (spec 11 §4).
 	rangeDels []format.RangeDel
+
+	// gc* carry a budget-bounded version-GC pass across calls (see gc.go). gcActive
+	// is set while a pass is mid-chain, gcResume is the next leaf to collapse, and
+	// gcResumeW is the watermark that pass adopted; a call at a different watermark
+	// restarts the pass from the leftmost leaf, since mixing watermarks across a
+	// resumed pass would be unsafe when marker cells are finally dropped.
+	gcActive  bool
+	gcResume  format.PageNo
+	gcResumeW uint64
 }
 
 // New returns a B-tree core bound to pgr. Call Open to finish wiring it to the
@@ -294,12 +302,6 @@ func (t *BTree) storeInteriorNew(in *interior) (format.PageNo, error) {
 }
 
 // --- remaining Engine SPI ---
-
-// Maintain implements engine.Engine. Lazy node merge and version GC (spec 05 §6)
-// are a later milestone; for now there is no background work.
-func (t *BTree) Maintain(ctx context.Context, budget engine.MaintBudget) (engine.MaintReport, error) {
-	return engine.MaintReport{}, nil
-}
 
 // Stats implements engine.Engine with a best-effort page-count footprint.
 func (t *BTree) Stats() engine.EngineStats {
