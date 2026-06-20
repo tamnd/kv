@@ -4,6 +4,7 @@ import (
 	"errors"
 
 	"github.com/tamnd/kv/engine"
+	"github.com/tamnd/kv/format"
 )
 
 // ErrConflict is returned by a write transaction whose commit lost a write-write
@@ -27,14 +28,21 @@ const (
 	opSet opKind = iota
 	opDelete
 	opMerge
+	opRangeDelete
 )
 
 // pendingOp is one buffered mutation in a write transaction, held privately until
-// commit so reads in other transactions never see it (spec 10 §3).
+// commit so reads in other transactions never see it (spec 10 §3). For a range
+// delete, key is the inclusive low bound and value is the exclusive high bound.
 type pendingOp struct {
 	kind  opKind
 	key   []byte
-	value []byte // the set value or the merge operand; nil for a delete
+	value []byte // the set value or merge operand; nil for a delete; high bound for a range delete
+}
+
+// rangeCovers reports whether the half-open interval [lo, hi) contains key.
+func rangeCovers(lo, hi, key []byte) bool {
+	return format.CompareUser(key, lo) >= 0 && format.CompareUser(key, hi) < 0
 }
 
 // Txn is a transaction: a fixed read snapshot plus, for a writable transaction, a
@@ -49,9 +57,6 @@ type Txn struct {
 	// ops are the buffered mutations in chronological order, replayed over the
 	// snapshot for read-your-writes and turned into one WriteBatch at commit.
 	ops []pendingOp
-	// latest maps a user key to the index of its newest buffered op, so a point
-	// read resolves without scanning the whole buffer in the common case.
-	latest map[string]int
 
 	done bool
 }
@@ -96,7 +101,6 @@ func (d *DB) Begin(writable bool) *Txn {
 		db:          d,
 		writable:    writable,
 		readVersion: d.orc.readTs(),
-		latest:      make(map[string]int),
 	}
 }
 
@@ -128,36 +132,41 @@ func (t *Txn) Exists(key []byte) (bool, error) {
 }
 
 // resolve folds the transaction's buffered ops for key over the snapshot value,
-// chronologically, matching the engine's version fold (btree resolveStream): a set
+// chronologically, matching the engine's version fold (format.Fold): a set
 // replaces, a delete clears, a merge folds through the registered operator (or
-// replaces when no operator is registered). It returns the value and whether the
-// key is present.
+// replaces when no operator is registered), and a range delete covering key clears
+// it. It walks the whole op stream so an interleaved range delete is applied in the
+// right order relative to the point ops on key. It returns the value and whether
+// the key is present.
 func (t *Txn) resolve(key []byte) ([]byte, bool, error) {
 	// Snapshot base: the engine value visible at the read version.
 	val, exists, err := t.db.snapshotGet(t.readVersion, key)
 	if err != nil {
 		return nil, false, err
 	}
-	if idx, ok := t.latest[string(key)]; ok {
-		// Replay every buffered op on this key in order from the first up to and
-		// including the newest, over the snapshot base.
-		for i := 0; i <= idx; i++ {
-			op := t.ops[i]
-			if string(op.key) != string(key) {
-				continue
-			}
-			switch op.kind {
-			case opSet:
+	ks := string(key)
+	for _, op := range t.ops {
+		switch op.kind {
+		case opSet:
+			if string(op.key) == ks {
 				val, exists = op.value, true
-			case opDelete:
+			}
+		case opDelete:
+			if string(op.key) == ks {
 				val, exists = nil, false
-			case opMerge:
+			}
+		case opMerge:
+			if string(op.key) == ks {
 				if t.db.merge != nil {
 					val = t.db.merge(val, op.value)
 				} else {
 					val = op.value
 				}
 				exists = true
+			}
+		case opRangeDelete:
+			if rangeCovers(op.key, op.value, key) {
+				val, exists = nil, false
 			}
 		}
 	}
@@ -174,6 +183,37 @@ func (t *Txn) Delete(key []byte) error { return t.record(opDelete, key, nil) }
 // read and commit time (spec 15 §5).
 func (t *Txn) Merge(key, operand []byte) error { return t.record(opMerge, key, operand) }
 
+// DeleteRange buffers a deletion of the half-open interval [lo, hi), applied at
+// commit as a single range-delete marker (spec 11 §4). Every key in [lo, hi) older
+// than the commit version reads as absent, including in this transaction's own
+// reads and scans before commit. A range delete is blind for conflict detection:
+// its write set is an interval, not a key set, so it does not abort on a concurrent
+// write to a covered key (commit-version order resolves the overlap).
+func (t *Txn) DeleteRange(lo, hi []byte) error {
+	if t.done {
+		return ErrTxnDone
+	}
+	if !t.writable {
+		return ErrReadOnlyTxn
+	}
+	t.ops = append(t.ops, pendingOp{
+		kind:  opRangeDelete,
+		key:   append([]byte(nil), lo...),
+		value: append([]byte(nil), hi...),
+	})
+	return nil
+}
+
+// bufferedRangeCovers reports whether any buffered range delete covers key.
+func (t *Txn) bufferedRangeCovers(key []byte) bool {
+	for _, op := range t.ops {
+		if op.kind == opRangeDelete && rangeCovers(op.key, op.value, key) {
+			return true
+		}
+	}
+	return false
+}
+
 func (t *Txn) record(kind opKind, key, value []byte) error {
 	if t.done {
 		return ErrTxnDone
@@ -187,7 +227,6 @@ func (t *Txn) record(kind opKind, key, value []byte) error {
 		v = append([]byte(nil), value...)
 	}
 	t.ops = append(t.ops, pendingOp{kind: kind, key: k, value: v})
-	t.latest[string(k)] = len(t.ops) - 1
 	return nil
 }
 
@@ -206,9 +245,17 @@ func (t *Txn) record(kind opKind, key, value []byte) error {
 // It reads the snapshot, so it runs before the writer lock is taken (no reentrancy
 // on db.mu); a base that shifts between here and commit is caught by the conflict
 // check on the resolved keys.
+// A buffered range delete is emitted as its own marker, in order, and is blind: it
+// is not collapsed and not conflict-detected. A point-written key that a buffered
+// range delete also covers is still resolved to its net value (resolve folds the
+// range delete in), so the marker and the per-key op agree.
 func (t *Txn) finalize() (ops []pendingOp, conflictKeys []string, err error) {
-	seen := make(map[string]struct{}, len(t.latest))
+	seen := make(map[string]struct{}, len(t.ops))
 	for _, op := range t.ops {
+		if op.kind == opRangeDelete {
+			ops = append(ops, op) // blind range marker
+			continue
+		}
 		ks := string(op.key)
 		if _, ok := seen[ks]; ok {
 			continue
@@ -217,15 +264,18 @@ func (t *Txn) finalize() (ops []pendingOp, conflictKeys []string, err error) {
 
 		count, onlyMerge := 0, true
 		for _, o := range t.ops {
-			if string(o.key) == ks {
+			if o.kind != opRangeDelete && string(o.key) == ks {
 				count++
 				if o.kind != opMerge {
 					onlyMerge = false
 				}
 			}
 		}
-		if count == 1 && onlyMerge {
-			ops = append(ops, op) // blind merge operand
+		// A lone merge stays a blind operand only when no buffered range delete
+		// covers it; a covering range delete changes the key's net value, so it must
+		// be resolved instead.
+		if count == 1 && onlyMerge && !t.bufferedRangeCovers(op.key) {
+			ops = append(ops, op)
 			continue
 		}
 		val, exists, rerr := t.resolve(op.key)

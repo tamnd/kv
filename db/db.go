@@ -314,6 +314,8 @@ func (d *DB) commitTxn(readVersion uint64, ops []pendingOp, conflictKeys []strin
 			b.Delete(op.key)
 		case opMerge:
 			b.Merge(op.key, op.value)
+		case opRangeDelete:
+			b.DeleteRange(op.key, op.value)
 		}
 	}
 	if err := d.applyCommitted(b, v); err != nil {
