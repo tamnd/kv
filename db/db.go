@@ -46,6 +46,16 @@ type Options struct {
 	// Merge folds an existing value and a merge operand into a new value during read
 	// resolution (spec 15). If nil, a merge operand behaves as a plain set.
 	Merge func(existing, operand []byte) []byte
+	// MaxRetries bounds how many times Update re-runs its closure on a write-write
+	// conflict (spec 15 §2.1). Zero selects a small default.
+	MaxRetries int
+}
+
+func (o Options) maxRetries() int {
+	if o.MaxRetries == 0 {
+		return 10
+	}
+	return o.MaxRetries
 }
 
 func (o Options) pageSize() int {
@@ -79,12 +89,19 @@ type DB struct {
 	fs   vfs.FS
 	path string
 
-	mu          sync.Mutex
-	pgr         *pager.Pager
-	wal         *wal.WAL
-	eng         engine.Engine
-	nextVersion uint64
-	syncMode    wal.Sync
+	// mu serializes the single committing writer against itself and against the
+	// engine reads (spec 10 §5.1): a commit takes it exclusively for log+apply, a
+	// read takes it shared. The version state lives in the lock-light oracle, not
+	// here, so it is consulted off this lock.
+	mu  sync.RWMutex
+	pgr *pager.Pager
+	wal *wal.WAL
+	eng engine.Engine
+	orc *oracle
+
+	merge      func(existing, operand []byte) []byte
+	maxRetries int
+	syncMode   wal.Sync
 }
 
 // Open opens the database at path, creating it if it does not exist, and runs crash
@@ -124,7 +141,8 @@ func create(fs vfs.FS, path string, opts Options) (*DB, error) {
 		pgr.Close()
 		return nil, err
 	}
-	d := &DB{fs: fs, path: path, pgr: pgr, wal: w, eng: eng, nextVersion: 1, syncMode: opts.sync()}
+	d := &DB{fs: fs, path: path, pgr: pgr, wal: w, eng: eng, orc: newOracle(0),
+		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync()}
 	if err := d.openEngine(opts.Merge); err != nil {
 		w.Close()
 		pgr.Close()
@@ -145,7 +163,8 @@ func openExisting(fs vfs.FS, path string, opts Options) (*DB, error) {
 		pgr.Close()
 		return nil, err
 	}
-	d := &DB{fs: fs, path: path, pgr: pgr, eng: eng, syncMode: opts.sync()}
+	d := &DB{fs: fs, path: path, pgr: pgr, eng: eng,
+		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync()}
 	if err := d.openEngine(opts.Merge); err != nil {
 		pgr.Close()
 		return nil, err
@@ -192,7 +211,7 @@ func openExisting(fs vfs.FS, path string, opts Options) (*DB, error) {
 	if maxVer > last {
 		last = maxVer
 	}
-	d.nextVersion = last + 1
+	d.orc = newOracle(last)
 	return d, nil
 }
 
@@ -255,7 +274,9 @@ func (d *DB) Write(fn func(b *engine.WriteBatch)) (uint64, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	v := d.nextVersion
+	// Under the single-writer lock the next version is stable between this peek and
+	// the formal commit, so the batch can be built at it before it is reserved.
+	v := d.orc.peekNext()
 	b := engine.NewWriteBatch(v)
 	fn(b)
 	if b.Len() == 0 {
@@ -263,45 +284,126 @@ func (d *DB) Write(fn func(b *engine.WriteBatch)) (uint64, error) {
 		return v - 1, nil
 	}
 
+	got := d.orc.commit(batchKeys(b))
+	if err := d.applyCommitted(b, got); err != nil {
+		return 0, err
+	}
+	d.orc.applied(got)
+	return got, nil
+}
+
+// commitTxn is the single-writer commit path for a transaction: it runs write-write
+// conflict detection at the transaction's read snapshot, and on success logs,
+// commits, and applies the buffered writes at the assigned version, then makes that
+// version visible (spec 10 §3, §5.1). It returns ErrConflict if the transaction
+// lost a write-write race.
+func (d *DB) commitTxn(readVersion uint64, ops []pendingOp, conflictKeys []string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	v, ok := d.orc.newCommitTs(readVersion, conflictKeys)
+	if !ok {
+		return ErrConflict
+	}
+	b := engine.NewWriteBatch(v)
+	for _, op := range ops {
+		switch op.kind {
+		case opSet:
+			b.Set(op.key, op.value)
+		case opDelete:
+			b.Delete(op.key)
+		case opMerge:
+			b.Merge(op.key, op.value)
+		}
+	}
+	if err := d.applyCommitted(b, v); err != nil {
+		return err
+	}
+	d.orc.applied(v)
+	return nil
+}
+
+// applyCommitted enforces the write-ahead rule for an already-versioned batch: log
+// and commit it durably, then apply it to the engine, then record the durable
+// version in the header (persisted at the next checkpoint). The caller holds d.mu
+// and calls oracle.applied after, in version order (spec 07 §1, spec 10 §2).
+func (d *DB) applyCommitted(b *engine.WriteBatch, v uint64) error {
 	encoded := b.Encode()
 	if err := d.wal.LogBatch(v, encoded); err != nil {
-		return 0, err
+		return err
 	}
 	if _, err := d.wal.Commit(v); err != nil {
-		return 0, err
+		return err
 	}
 	if err := d.eng.Apply(b, v); err != nil {
-		return 0, err
+		return err
 	}
-	// Record the durable version in the header so a checkpoint persists it; the
-	// counter only advances after the commit is durable.
 	d.pgr.Header().LastCommitVersion = v
-	d.nextVersion = v + 1
-	return v, nil
+	return nil
+}
+
+// batchKeys returns the unique user keys a blind batch wrote, so a Write
+// participates in conflict detection against concurrent transactions.
+func batchKeys(b *engine.WriteBatch) []string {
+	seen := make(map[string]struct{})
+	var keys []string
+	for _, e := range b.Entries() {
+		k := string(format.UserKey(e.InternalKey))
+		if _, ok := seen[k]; ok {
+			continue
+		}
+		seen[k] = struct{}{}
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+// snapshotGet reads key at a fixed version through a short-lived engine reader,
+// taking the shared read lock so it never observes a page mid-commit. It returns
+// the value and whether the key is present at that snapshot (spec 10 §3).
+func (d *DB) snapshotGet(version uint64, key []byte) ([]byte, bool, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	rd, err := d.eng.NewReader(engine.Snapshot{Version: version})
+	if err != nil {
+		return nil, false, err
+	}
+	defer rd.Close()
+	v, err := rd.Get(key)
+	if err == engine.ErrNotFound {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return v, true, nil
 }
 
 // Version reports the latest committed version, the snapshot a reader sees the
 // newest data at. It is zero on a fresh database with no commits.
 func (d *DB) Version() uint64 {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return d.nextVersion - 1
+	return d.orc.lastCommitted()
 }
 
 // NewReader returns a consistent read view at version. Pass d.Version() for the
-// latest committed snapshot.
+// latest committed snapshot. The returned reader holds engine resources for its
+// lifetime; for snapshot-isolated reads prefer View/Begin, which manage the
+// snapshot and its watermark registration.
 func (d *DB) NewReader(version uint64) (engine.Reader, error) {
 	return d.eng.NewReader(engine.Snapshot{Version: version})
 }
 
-// Get reads userKey at the latest committed snapshot, a convenience over NewReader.
+// Get reads userKey at the latest committed snapshot, a convenience over a View
+// transaction's Get.
 func (d *DB) Get(userKey []byte) ([]byte, error) {
-	rd, err := d.NewReader(d.Version())
+	v, ok, err := d.snapshotGet(d.Version(), userKey)
 	if err != nil {
 		return nil, err
 	}
-	defer rd.Close()
-	return rd.Get(userKey)
+	if !ok {
+		return nil, engine.ErrNotFound
+	}
+	return v, nil
 }
 
 // Checkpoint folds the WAL into the main file and resets the log, in the strict
