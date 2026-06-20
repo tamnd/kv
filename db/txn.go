@@ -58,6 +58,12 @@ type Txn struct {
 	// snapshot for read-your-writes and turned into one WriteBatch at commit.
 	ops []pendingOp
 
+	// commitTs is the version this transaction was assigned at commit, set once a
+	// writable transaction commits successfully and zero otherwise. It is the
+	// serial-order position the oracle gave the commit, used by the linearizability
+	// harness (spec 23 §2) to reconstruct the commit-version order.
+	commitTs uint64
+
 	done bool
 }
 
@@ -309,7 +315,10 @@ func (t *Txn) Commit() error {
 		t.finish()
 		return err
 	}
-	err = t.db.commitTxn(t.readVersion, ops, conflictKeys)
+	v, err := t.db.commitTxn(t.readVersion, ops, conflictKeys)
+	if err == nil {
+		t.commitTs = v
+	}
 	t.finish()
 	return err
 }

@@ -296,15 +296,15 @@ func (d *DB) Write(fn func(b *engine.WriteBatch)) (uint64, error) {
 // commitTxn is the single-writer commit path for a transaction: it runs write-write
 // conflict detection at the transaction's read snapshot, and on success logs,
 // commits, and applies the buffered writes at the assigned version, then makes that
-// version visible (spec 10 §3, §5.1). It returns ErrConflict if the transaction
-// lost a write-write race.
-func (d *DB) commitTxn(readVersion uint64, ops []pendingOp, conflictKeys []string) error {
+// version visible (spec 10 §3, §5.1). It returns the assigned commit version, or
+// ErrConflict if the transaction lost a write-write race.
+func (d *DB) commitTxn(readVersion uint64, ops []pendingOp, conflictKeys []string) (uint64, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
 	v, ok := d.orc.newCommitTs(readVersion, conflictKeys)
 	if !ok {
-		return ErrConflict
+		return 0, ErrConflict
 	}
 	b := engine.NewWriteBatch(v)
 	for _, op := range ops {
@@ -320,10 +320,10 @@ func (d *DB) commitTxn(readVersion uint64, ops []pendingOp, conflictKeys []strin
 		}
 	}
 	if err := d.applyCommitted(b, v); err != nil {
-		return err
+		return 0, err
 	}
 	d.orc.applied(v)
-	return nil
+	return v, nil
 }
 
 // applyCommitted enforces the write-ahead rule for an already-versioned batch: log
