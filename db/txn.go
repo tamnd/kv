@@ -29,6 +29,10 @@ var ErrUnsupported = errors.New("kv: operation not supported by this engine")
 // ErrSnapshotClosed is returned when a long-lived Snapshot is used after Close (spec 15 §7).
 var ErrSnapshotClosed = errors.New("kv: snapshot already closed")
 
+// ErrClosed is returned when an operation needs an open database but the database is
+// closing or closed, such as a Subscribe whose database was Closed underneath it.
+var ErrClosed = errors.New("kv: database closed")
+
 // ErrFatalSync fences a database whose WAL durability failed mid-commit: a failed
 // fsync or log append is treated as fatal and non-retryable (fsyncgate, spec 07 §6).
 // The in-flight commit is not acknowledged, and every later write returns this until

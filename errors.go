@@ -36,6 +36,9 @@ var (
 	ErrSnapshotClosed = db.ErrSnapshotClosed
 	// ErrBatchClosed means a WriteBatch was used after Close (spec 15 §6).
 	ErrBatchClosed = db.ErrBatchClosed
+	// ErrSubscriberLagged means a Subscribe callback fell too far behind the commit
+	// stream and was dropped to avoid stalling writers (spec 15 §7).
+	ErrSubscriberLagged = db.ErrSubscriberLagged
 )
 
 // wrap maps the internal db/engine sentinels onto the public ones so callers match the
@@ -51,6 +54,8 @@ func wrap(err error) error {
 		return ErrClosed
 	case errors.Is(err, db.ErrFatalSync):
 		return ErrNeedsRecovery
+	case errors.Is(err, db.ErrClosed):
+		return ErrClosed
 	default:
 		return err
 	}
