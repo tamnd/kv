@@ -7,13 +7,14 @@
 // skip-list memtable that Apply inserts into; when it fills, the engine flushes it
 // to an immutable on-disk segment and starts a fresh one, so memory stays bounded.
 // The read path folds the memtable and every segment into one snapshot view through
-// the shared MVCC resolution the oracle and the B-tree core use. Durability rests on
-// the WAL: the host logs every batch before calling Apply and replays it on open, so
-// every applied write is recoverable even while the segments a flush produced are not
-// yet cataloged. What this slice does not yet do is persist the live segment set: the
-// MANIFEST that records segments across a restart, the matching WAL reclamation, and
-// recovery's MANIFEST replay arrive in the next slice, along with the block index,
-// filters, leveled compaction, and value separation that follow.
+// the shared MVCC resolution the oracle and the B-tree core use. Durability splits
+// between the WAL and the MANIFEST: a flush writes a segment and records it in the
+// MANIFEST, the embedded catalog anchored at the header's engine root, and reports
+// the flushed batch's LSN through DurableLSN so the host reclaims the WAL behind it.
+// On open the engine loads the MANIFEST to rebuild the segment set, then the WAL tail
+// replays the batches committed after the last checkpoint into a fresh memtable over
+// it. What remains for later slices is the block index for in-segment seeks, the
+// per-segment filters, leveled compaction, and value separation.
 package lsm
 
 import (
@@ -46,6 +47,14 @@ type LSM struct {
 	segments    []*segment
 	memtableCap int
 
+	// LSN tracking for the durable-mark seam. pendingLSN is the commit LSN the host
+	// noted for the batch about to be applied; memMaxLSN is the largest LSN of any
+	// batch in the active memtable; durableLSN is the largest LSN whose data a flush
+	// has captured into an on-disk segment the MANIFEST records.
+	pendingLSN uint64
+	memMaxLSN  uint64
+	durableLSN uint64
+
 	merge func(existing, operand []byte) []byte
 	env   *engine.Env
 }
@@ -59,17 +68,26 @@ func New(pgr *pager.Pager) *LSM {
 // Kind implements engine.Engine.
 func (l *LSM) Kind() engine.Kind { return engine.LSM }
 
-// Open implements engine.Engine.
+// Open implements engine.Engine. It loads the MANIFEST, rebuilding the segment set the
+// last checkpoint recorded, and seeds the durable mark from the pager's checkpoint
+// boundary, since those segments hold every batch durable through it. Open runs before
+// redo, so the WAL tail then replays the batches committed after that boundary into a
+// fresh memtable layered over the loaded segments, with no overlap between the two.
 func (l *LSM) Open(env *engine.Env) error {
 	l.env = env
-	return nil
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if env != nil && env.Options.MemtableSize > 0 {
+		l.memtableCap = env.Options.MemtableSize
+	}
+	l.durableLSN = l.pgr.CheckpointLSN()
+	return l.loadManifestLocked()
 }
 
-// Close implements engine.Engine. It drops the in-memory state; the host
-// checkpoints before close, and on the next open the WAL replay rebuilds the
-// memtable. The segment pages a flush wrote are folded by the checkpoint, but until
-// the MANIFEST records them (next slice) they are unreferenced after a restart and
-// the WAL replay is what restores their data.
+// Close implements engine.Engine. It drops the in-memory state; the host checkpoints
+// before close, folding the segment and MANIFEST pages a flush wrote, so the next open
+// rebuilds the segment set from the MANIFEST and replays only the WAL tail past the
+// checkpoint into a fresh memtable.
 func (l *LSM) Close() error { return nil }
 
 // SetMergeFunc installs the merge resolver used during read-time version
@@ -97,7 +115,24 @@ func (l *LSM) Apply(batch *engine.WriteBatch, commitVersion uint64) error {
 	for _, e := range batch.Entries() {
 		l.mem.set(e.InternalKey, e.Value)
 	}
+	// Track the largest WAL LSN now resident in the active memtable, so a later flush
+	// knows how far the segment it writes lets the host reclaim the log.
+	if l.pendingLSN > l.memMaxLSN {
+		l.memMaxLSN = l.pendingLSN
+	}
 	return nil
+}
+
+// NoteLSN records the WAL commit LSN of the batch the host is about to Apply, the
+// optional seam the host calls only for an engine that tracks a durable mark (spec 06
+// §4). The host calls it under its single writer lock immediately before Apply, both
+// for a live commit and for each batch redo replays, so the LSN the next Apply folds
+// into the memtable is always this one. The B-tree core, which needs no durable mark,
+// does not implement it.
+func (l *LSM) NoteLSN(lsn uint64) {
+	l.mu.Lock()
+	l.pendingLSN = lsn
+	l.mu.Unlock()
 }
 
 // flushLocked writes the active memtable to a new on-disk segment, appends the
@@ -108,6 +143,7 @@ func (l *LSM) Apply(batch *engine.WriteBatch, commitVersion uint64) error {
 // the sole cross-restart record, so durability is unchanged.
 func (l *LSM) flushLocked() error {
 	mem := l.mem
+	sealedLSN := l.memMaxLSN
 	seg, err := writeSegment(l.pgr, func(emit func(ik, val []byte) bool) {
 		mem.scan(emit)
 	})
@@ -115,9 +151,23 @@ func (l *LSM) flushLocked() error {
 		return err
 	}
 	if seg.numCells > 0 {
+		// Record the segment in the MANIFEST before publishing it to the live set, so a
+		// segment a reader can see is always one the catalog will name after a restart.
+		if err := l.appendEditLocked(manifestAdd, seg.footer); err != nil {
+			return err
+		}
 		l.segments = append(l.segments, seg)
 	}
+	// Every batch in the sealed memtable now lives in the segment, so the host may
+	// reclaim the WAL up to its largest LSN once the checkpoint folds these pages. The
+	// fold happens before the WAL resets, so advancing the mark here is safe even though
+	// the pages are not yet on disk; a crash before the fold simply loses this in-memory
+	// advance and the kept WAL replays the batches again.
+	if sealedLSN > l.durableLSN {
+		l.durableLSN = sealedLSN
+	}
 	l.mem = newMemtable(defaultArenaCap)
+	l.memMaxLSN = 0
 	return nil
 }
 
@@ -149,20 +199,25 @@ func (l *LSM) Reclaim(budget int) (int, error) { return 0, nil }
 
 // DurableLSN reports the highest WAL LSN whose effects the engine has persisted to
 // the main file, the mark past which the host must not fold and reset the WAL
-// (spec 06 §4). The LSM core's applied writes live in the memtable until a flush
-// turns it into an on-disk segment; this slice has no flush, so nothing is durable
-// in the file and the engine reports 0. The host therefore keeps the whole WAL and
-// replays it into the memtable on every open, the bring-up tradeoff flush removes:
-// once a memtable is flushed, this advances to that batch's LSN and the WAL past it
-// becomes reclaimable. The B-tree core, whose every Apply lands in pages the
-// checkpoint folds, does not implement this method and the host folds the entire
-// log.
-func (l *LSM) DurableLSN() uint64 { return 0 }
+// (spec 06 §4). The LSM core's applied writes live in the memtable until a flush turns
+// it into an on-disk segment the MANIFEST records; the mark is the largest LSN any
+// such flush has captured. It starts at the pager's checkpoint boundary, since the
+// segments Open loaded hold every batch durable through it, and advances on each
+// flush. The host folds to this mark and keeps the WAL frames past it, replaying them
+// into a fresh memtable on the next open. The B-tree core, whose every Apply lands in
+// pages the checkpoint folds, does not implement this method and the host folds the
+// entire log.
+func (l *LSM) DurableLSN() uint64 {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.durableLSN
+}
 
-// RecoverFinished implements engine.Engine. The B-tree core does nothing here; the
-// LSM core will, in a later slice, replay the MANIFEST to rebuild its level
-// structure. With no segments yet, the WAL replay into Apply has already restored
-// the full memtable, so there is nothing more to do.
+// RecoverFinished implements engine.Engine. The LSM core rebuilds its segment set from
+// the MANIFEST at Open, before redo, so by here the on-disk runs and the redone
+// memtable are both in place and there is nothing left to do. The hook remains the
+// point a later slice will settle any recovery-time invariants the level structure
+// needs.
 func (l *LSM) RecoverFinished(lastVersion uint64) error { return nil }
 
 // NewReader implements engine.Engine.
