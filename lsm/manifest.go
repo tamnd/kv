@@ -27,8 +27,11 @@ const (
 	// manifestHeaderSize is a MANIFEST page's header: the common 8-byte preamble,
 	// whose overflow slot points at the next-older MANIFEST page (0 ends the chain).
 	manifestHeaderSize = format.CommonHeaderSize
-	// manifestEntrySize is one edit: a tag byte plus the segment footer page number.
-	manifestEntrySize = 1 + 4
+	// manifestEntrySize is one edit: a tag byte, the level byte the segment belongs to,
+	// and the segment footer page number. The level lets the replay rebuild the level
+	// structure, not just the flat set, and lets a compaction record an input's old
+	// level and an output's new one.
+	manifestEntrySize = 1 + 1 + 4
 )
 
 const (
@@ -49,11 +52,19 @@ func manifestEntriesPerPage(usable int) int {
 // appendEditLocked records one MANIFEST edit, allocating a new head page only when the
 // current head is full. The caller holds l.mu. The dirtied page and the header's
 // updated engine root are folded by the next checkpoint, so the edit becomes durable
-// at the same moment the segment it names does.
-func (l *LSM) appendEditLocked(tag byte, footer format.PageNo) error {
+// at the same moment the segment it names does. level is the segment's level: an add
+// records where the segment enters, a remove records where it left (the replay ignores
+// a remove's level, but it is stored for symmetry and debugging).
+func (l *LSM) appendEditLocked(tag byte, level uint8, footer format.PageNo) error {
 	usable := l.pgr.Header().UsablePageSize()
 	maxEntries := manifestEntriesPerPage(usable)
 	head := l.pgr.Header().EngineRoot
+
+	writeEntry := func(data []byte, off int) {
+		data[off] = tag
+		data[off+1] = level
+		binary.BigEndian.PutUint32(data[off+2:], footer)
+	}
 
 	if head != format.NoPage {
 		fr, err := l.pgr.Get(head, pager.Write)
@@ -63,9 +74,7 @@ func (l *LSM) appendEditLocked(tag byte, footer format.PageNo) error {
 		data := fr.Data()
 		h := format.DecodeCommonHeader(data)
 		if h.Type == format.PageLSMManifest && int(h.CellCount) < maxEntries {
-			off := manifestHeaderSize + int(h.CellCount)*manifestEntrySize
-			data[off] = tag
-			binary.BigEndian.PutUint32(data[off+1:], footer)
+			writeEntry(data, manifestHeaderSize+int(h.CellCount)*manifestEntrySize)
 			h.CellCount++
 			h.Encode(data)
 			l.pgr.Unpin(fr, true)
@@ -80,18 +89,17 @@ func (l *LSM) appendEditLocked(tag byte, footer format.PageNo) error {
 	}
 	data := fr.Data()
 	format.CommonHeader{Type: format.PageLSMManifest, CellCount: 1, Overflow: head}.Encode(data)
-	off := manifestHeaderSize
-	data[off] = tag
-	binary.BigEndian.PutUint32(data[off+1:], footer)
+	writeEntry(data, manifestHeaderSize)
 	l.pgr.Unpin(fr, true)
 	l.pgr.Header().EngineRoot = pgno
 	return nil
 }
 
 // loadManifestLocked walks the MANIFEST chain from the engine root, applies every edit
-// in chronological order, and opens each surviving segment into l.segments. It runs at
-// Open, before any redo, so the live set the last checkpoint recorded is in place
-// before the WAL tail replays the batches committed after it. The caller holds l.mu.
+// in chronological order, and opens each surviving segment into its level in l.levels.
+// It runs at Open, before any redo, so the level structure the last checkpoint recorded
+// is in place before the WAL tail replays the batches committed after it. The caller
+// holds l.mu.
 func (l *LSM) loadManifestLocked() error {
 	// Collect each page's edits, walking the chain newest page to oldest.
 	var pages [][]manifestEdit
@@ -111,7 +119,8 @@ func (l *LSM) loadManifestLocked() error {
 		for i := 0; i < int(h.CellCount); i++ {
 			edits = append(edits, manifestEdit{
 				tag:    data[off],
-				footer: binary.BigEndian.Uint32(data[off+1:]),
+				level:  data[off+1],
+				footer: binary.BigEndian.Uint32(data[off+2:]),
 			})
 			off += manifestEntrySize
 		}
@@ -122,11 +131,14 @@ func (l *LSM) loadManifestLocked() error {
 	}
 
 	// Apply edits oldest first: the last page in the walk is the oldest, and within a
-	// page entries were appended left to right. An add inserts a footer, a remove drops
-	// it, so a segment added then later removed ends absent regardless of which pages
-	// the two edits landed on.
+	// page entries were appended left to right. An add records a footer at its level, a
+	// remove drops it, and a later add at a different level moves it (the level-aware
+	// compaction's trivial move), so the final state is each live footer at the level of
+	// its most recent add. order preserves first-seen order so a level's segments load in
+	// a stable sequence; level tracks the current level of each live footer.
 	var order []format.PageNo
-	at := make(map[format.PageNo]int) // footer -> 1-based slot in order, 0 when absent
+	at := make(map[format.PageNo]int)      // footer -> 1-based slot in order, 0 when absent
+	level := make(map[format.PageNo]uint8) // footer -> current level, for live footers
 	for i := len(pages) - 1; i >= 0; i-- {
 		for _, e := range pages[i] {
 			switch e.tag {
@@ -135,10 +147,12 @@ func (l *LSM) loadManifestLocked() error {
 					order = append(order, e.footer)
 					at[e.footer] = len(order)
 				}
+				level[e.footer] = e.level
 			case manifestRemove:
 				if slot := at[e.footer]; slot != 0 {
 					order[slot-1] = format.NoPage
 					at[e.footer] = 0
+					delete(level, e.footer)
 				}
 			default:
 				return fmt.Errorf("lsm: unknown MANIFEST edit tag %d", e.tag)
@@ -154,7 +168,7 @@ func (l *LSM) loadManifestLocked() error {
 		if err != nil {
 			return err
 		}
-		l.segments = append(l.segments, seg)
+		l.addSegmentLocked(int(level[footer]), seg)
 	}
 	return nil
 }
@@ -162,5 +176,6 @@ func (l *LSM) loadManifestLocked() error {
 // manifestEdit is one decoded MANIFEST entry.
 type manifestEdit struct {
 	tag    byte
+	level  uint8
 	footer format.PageNo
 }

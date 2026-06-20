@@ -81,7 +81,7 @@ func TestManifestPersistAcrossReopen(t *testing.T) {
 		want[key] = val
 	}
 	l.flushActive(t) // seal the tail so all ten keys are on disk
-	if len(l.segments) == 0 {
+	if len(l.allSegmentsLocked()) == 0 {
 		t.Fatal("expected segments before checkpoint")
 	}
 
@@ -94,7 +94,7 @@ func TestManifestPersistAcrossReopen(t *testing.T) {
 
 	pgr2 := reopenPager(t, fs, pgr)
 	l2 := openLSM(t, pgr2)
-	if len(l2.segments) == 0 {
+	if len(l2.allSegmentsLocked()) == 0 {
 		t.Fatal("reopened engine restored no segments from the MANIFEST")
 	}
 	if got := l2.DurableLSN(); got != dl {
@@ -175,8 +175,8 @@ func TestManifestSpansMultiplePages(t *testing.T) {
 		applyLSN(t, l, uint64(i), uint64(i), func(b *engine.WriteBatch) { b.Set([]byte(key), []byte("v")) })
 		l.flushActive(t) // one segment per key
 	}
-	if len(l.segments) != n {
-		t.Fatalf("wrote %d segments, want %d", len(l.segments), n)
+	if len(l.allSegmentsLocked()) != n {
+		t.Fatalf("wrote %d segments, want %d", len(l.allSegmentsLocked()), n)
 	}
 
 	if err := pgr.Checkpoint(l.DurableLSN()); err != nil {
@@ -184,8 +184,8 @@ func TestManifestSpansMultiplePages(t *testing.T) {
 	}
 	pgr2 := reopenPager(t, fs, pgr)
 	l2 := openLSM(t, pgr2)
-	if len(l2.segments) != n {
-		t.Fatalf("restored %d segments from MANIFEST, want %d", len(l2.segments), n)
+	if len(l2.allSegmentsLocked()) != n {
+		t.Fatalf("restored %d segments from MANIFEST, want %d", len(l2.allSegmentsLocked()), n)
 	}
 
 	rd, err := l2.NewReader(engine.Snapshot{Version: uint64(n) + 1})

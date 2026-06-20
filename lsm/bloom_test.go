@@ -70,7 +70,7 @@ func TestSegmentBloomBuiltAndProbed(t *testing.T) {
 		applyBatch(t, l, uint64(i+1), func(b *engine.WriteBatch) { b.Set([]byte(key), []byte("v")) })
 	}
 	l.flushActive(t)
-	seg := l.segments[0]
+	seg := l.allSegmentsLocked()[0]
 	if seg.filter == nil {
 		t.Fatal("flushed segment carries no Bloom filter")
 	}
@@ -111,10 +111,10 @@ func TestSegmentBloomSurvivesReopen(t *testing.T) {
 
 	pgr2 := reopenPager(t, fs, pgr)
 	l2 := openLSM(t, pgr2)
-	if len(l2.segments) == 0 {
+	if len(l2.allSegmentsLocked()) == 0 {
 		t.Fatal("reopened engine restored no segments")
 	}
-	seg := l2.segments[0]
+	seg := l2.allSegmentsLocked()[0]
 	if seg.filter == nil {
 		t.Fatal("reopened segment lost its Bloom filter")
 	}
@@ -144,8 +144,8 @@ func TestSegmentBloomGetCorrectness(t *testing.T) {
 		}
 		l.flushActive(t)
 	}
-	if len(l.segments) != 3 {
-		t.Fatalf("expected three segments, got %d", len(l.segments))
+	if len(l.allSegmentsLocked()) != 3 {
+		t.Fatalf("expected three segments, got %d", len(l.allSegmentsLocked()))
 	}
 
 	for _, prefix := range bands {

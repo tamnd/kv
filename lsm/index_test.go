@@ -52,10 +52,10 @@ func TestSegmentBlockIndexPointGet(t *testing.T) {
 		applyBatch(t, l, uint64(i+1), func(b *engine.WriteBatch) { b.Set([]byte(key), []byte(val)) })
 	}
 	l.flushActive(t)
-	if len(l.segments) != 1 {
-		t.Fatalf("expected one segment, got %d", len(l.segments))
+	if len(l.allSegmentsLocked()) != 1 {
+		t.Fatalf("expected one segment, got %d", len(l.allSegmentsLocked()))
 	}
-	seg := l.segments[0]
+	seg := l.allSegmentsLocked()[0]
 	if len(seg.index) < 2 {
 		t.Fatalf("expected a multi-page segment, got %d index entries", len(seg.index))
 	}
@@ -96,7 +96,7 @@ func TestSegmentGroupSpansPages(t *testing.T) {
 	applyBatch(t, l, 2+versions, func(b *engine.WriteBatch) { b.Set([]byte("zzz"), []byte("z")) })
 	l.flushActive(t)
 
-	seg := l.segments[0]
+	seg := l.allSegmentsLocked()[0]
 	// The big group alone must have forced more pages than there are distinct keys.
 	if len(seg.index) < 3 {
 		t.Fatalf("expected the big group to span pages, got %d index entries", len(seg.index))
@@ -192,8 +192,8 @@ func TestSegmentRangeDelPointGet(t *testing.T) {
 	applyBatch(t, l, 100, func(b *engine.WriteBatch) { b.DeleteRange([]byte("k010"), []byte("k040")) })
 	l.flushActive(t)
 
-	if len(l.segments[0].rangeDels) != 1 {
-		t.Fatalf("expected the range delete persisted in the segment, got %d", len(l.segments[0].rangeDels))
+	if len(l.allSegmentsLocked()[0].rangeDels) != 1 {
+		t.Fatalf("expected the range delete persisted in the segment, got %d", len(l.allSegmentsLocked()[0].rangeDels))
 	}
 
 	for i := 0; i < 50; i++ {
@@ -229,8 +229,8 @@ func TestSegmentPointGetShadowing(t *testing.T) {
 	l.flushActive(t)
 	applyBatch(t, l, 4, func(b *engine.WriteBatch) { b.Set([]byte("b"), []byte("mem")) })
 
-	if len(l.segments) != 2 {
-		t.Fatalf("expected two segments, got %d", len(l.segments))
+	if len(l.allSegmentsLocked()) != 2 {
+		t.Fatalf("expected two segments, got %d", len(l.allSegmentsLocked()))
 	}
 	if v, ok := getAt(t, l, "a", 100); !ok || string(v) != "seg2" {
 		t.Fatalf("Get(a) = (%q,%v), want seg2 (newer segment wins)", v, ok)

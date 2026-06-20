@@ -16,8 +16,11 @@
 // it. A point read seeks each source for one key, the memtable through its skip list
 // and each segment through a persisted block index, and folds just that key's group;
 // a per-segment Bloom filter lets a point miss skip a segment without touching its
-// index. The range and iteration path still folds the full snapshot. What remains for
-// later slices is leveled compaction, the streaming heap-merge, and value separation.
+// index. The range and iteration path streams a k-way merge across the sources. The
+// segments are organized into levels (L0 overlapping, L1 down disjoint), and Maintain
+// runs a level-aware compaction that merges a level into the one below, dropping dead
+// versions at the watermark and tombstones at the bottom. What remains for later slices
+// is the lazy-leveling tiered bottom and Monkey filter tuning, and value separation.
 package lsm
 
 import (
@@ -45,10 +48,30 @@ const defaultMemtableCap = 64 << 20 // 64 MiB
 type LSM struct {
 	pgr *pager.Pager
 
-	mu          sync.RWMutex
-	mem         *memtable
-	segments    []*segment
+	mu  sync.RWMutex
+	mem *memtable
+	// levels is the on-disk tree: levels[0] is L0, the overlapping run of flushed
+	// memtables, and levels[i>=1] hold key-range-disjoint segments sorted by minKey,
+	// the classic leveled invariant. A read folds every segment regardless of level;
+	// the level structure exists so compaction can bound read fan-in and reclaim the
+	// space shadowed versions waste.
+	levels      [][]*segment
 	memtableCap int
+
+	// Compaction policy knobs (spec 06 §6). l0Trigger is the L0 segment count that
+	// makes L0 a compaction candidate; levelRatio T is the size multiple between
+	// adjacent levels; l1TargetBytes is L1's size target, from which each deeper level's
+	// target grows by T; segTargetBytes is the size a compaction output segment is cut
+	// at, so a level holds several runs and a later compaction touches only the
+	// overlapping subset.
+	l0Trigger      int
+	levelRatio     int
+	l1TargetBytes  int64
+	segTargetBytes int
+	// compactCursor[i] is the user key the next level-i compaction starts at or after,
+	// rotating the picked segment across the level so work spreads instead of hammering
+	// one key range.
+	compactCursor map[int][]byte
 
 	// LSN tracking for the durable-mark seam. pendingLSN is the commit LSN the host
 	// noted for the batch about to be applied; memMaxLSN is the largest LSN of any
@@ -65,7 +88,16 @@ type LSM struct {
 // New returns an LSM core bound to a pager. The pager is the durable substrate
 // flushes write segments to and that this core reads them back from.
 func New(pgr *pager.Pager) *LSM {
-	return &LSM{pgr: pgr, mem: newMemtable(defaultArenaCap), memtableCap: defaultMemtableCap}
+	return &LSM{
+		pgr:            pgr,
+		mem:            newMemtable(defaultArenaCap),
+		memtableCap:    defaultMemtableCap,
+		l0Trigger:      defaultL0Trigger,
+		levelRatio:     defaultLevelRatio,
+		l1TargetBytes:  defaultL1TargetBytes,
+		segTargetBytes: defaultSegTargetBytes,
+		compactCursor:  map[int][]byte{},
+	}
 }
 
 // Kind implements engine.Engine.
@@ -155,11 +187,12 @@ func (l *LSM) flushLocked() error {
 	}
 	if seg.numCells > 0 {
 		// Record the segment in the MANIFEST before publishing it to the live set, so a
-		// segment a reader can see is always one the catalog will name after a restart.
-		if err := l.appendEditLocked(manifestAdd, seg.footer); err != nil {
+		// segment a reader can see is always one the catalog will name after a restart. A
+		// flushed segment enters L0, the overlapping level that receives memtables.
+		if err := l.appendEditLocked(manifestAdd, 0, seg.footer); err != nil {
 			return err
 		}
-		l.segments = append(l.segments, seg)
+		l.addSegmentLocked(0, seg)
 	}
 	// Every batch in the sealed memtable now lives in the segment, so the host may
 	// reclaim the WAL up to its largest LSN once the checkpoint folds these pages. The
@@ -174,44 +207,26 @@ func (l *LSM) flushLocked() error {
 	return nil
 }
 
-// Maintain implements engine.Engine. It runs a compaction when the segment count has
-// grown past the fan-in the core tolerates and the budget permits work, merging the
-// segment set into one and dropping the versions no reader at or below the watermark
-// can still observe. A zero budget, the host's "do nothing" signal, is honored by
-// skipping the merge. The compaction is a whole-set major merge that is not yet bounded
-// to the budget's page count; the incremental, level-aware policy that picks a partial
-// input set per call and stays within MaxPages is a later slice.
+// Maintain implements engine.Engine. It runs at most one compaction per call: the
+// level-aware Fluid policy scores every level against its size target, picks the one
+// most over target, and merges a bounded input set from it into the level below,
+// dropping the versions no reader at or below the watermark can still observe and, at
+// the deepest level, the point tombstones nothing lives under (spec 06 §6). A zero
+// budget, the host's "do nothing" signal, is honored by skipping the work. Running one
+// compaction unit per call, with each output segment cut at segTargetBytes, keeps a
+// single Maintain from monopolizing I/O; the host calls it repeatedly to work a backlog
+// down.
 func (l *LSM) Maintain(ctx context.Context, budget engine.MaintBudget) (engine.MaintReport, error) {
 	if budget.MaxPages <= 0 && budget.MaxBytes <= 0 {
 		return engine.MaintReport{}, nil
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if len(l.segments) < compactionTrigger {
+	src, ok := l.pickCompactionLocked()
+	if !ok {
 		return engine.MaintReport{}, nil
 	}
-	pageSize := int64(l.pgr.PageSize())
-	before := int64(0)
-	for _, seg := range l.segments {
-		before += int64(seg.pages) * pageSize
-	}
-	merged, err := l.compactLocked(budget.Watermark)
-	if err != nil {
-		return engine.MaintReport{}, err
-	}
-	after := int64(0)
-	for _, seg := range l.segments {
-		after += int64(seg.pages) * pageSize
-	}
-	reclaimed := before - after
-	if reclaimed < 0 {
-		reclaimed = 0
-	}
-	return engine.MaintReport{
-		PagesCompacted: merged,
-		BytesWritten:   after,
-		BytesReclaimed: reclaimed,
-	}, nil
+	return l.runCompactionLocked(src, budget.Watermark)
 }
 
 // Stats implements engine.Engine, reporting the memtable footprint plus the on-disk
@@ -222,7 +237,7 @@ func (l *LSM) Stats() engine.EngineStats {
 	defer l.mu.RUnlock()
 	physical := int64(l.mem.size())
 	pageSize := int64(l.pgr.PageSize())
-	for _, seg := range l.segments {
+	for _, seg := range l.allSegmentsLocked() {
 		physical += int64(seg.pages) * pageSize
 	}
 	return engine.EngineStats{
@@ -296,9 +311,10 @@ func (l *LSM) foldRange(snap engine.Snapshot, lower, upper []byte) ([]resolved, 
 	// each segment's persisted list, the same union the point path folds against.
 	rangeDels := l.liveRangeDels()
 
-	sources := make([]mergeSource, 0, 1+len(l.segments))
+	segs := l.allSegmentsLocked()
+	sources := make([]mergeSource, 0, 1+len(segs))
 	sources = append(sources, &memSource{sl: l.mem.sl})
-	for _, seg := range l.segments {
+	for _, seg := range segs {
 		sources = append(sources, &segSource{pgr: l.pgr, seg: seg})
 	}
 	var target []byte
@@ -382,7 +398,7 @@ func (r *reader) Get(userKey []byte) ([]byte, error) {
 		return true
 	}
 	l.mem.getGroup(userKey, collect)
-	for _, seg := range l.segments {
+	for _, seg := range l.allSegmentsLocked() {
 		// The Bloom filter answers a miss definitively, so a segment it rejects holds
 		// no version of the key and its block index need never be touched. A segment
 		// without a filter has a nil one, whose mayContain passes, so it is still read.
@@ -424,7 +440,7 @@ func (r *reader) Get(userKey []byte) ([]byte, error) {
 func (l *LSM) liveRangeDels() []format.RangeDel {
 	dels := make([]format.RangeDel, 0, len(l.mem.rangeDels))
 	dels = append(dels, l.mem.rangeDels...)
-	for _, seg := range l.segments {
+	for _, seg := range l.allSegmentsLocked() {
 		dels = append(dels, seg.rangeDels...)
 	}
 	return dels
