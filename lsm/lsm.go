@@ -21,13 +21,17 @@
 // runs a level-aware compaction that merges a level into the one below, dropping dead
 // versions at the watermark and tombstones at the bottom. Each segment's Bloom filter is
 // sized by the Monkey allocation for the level it is written at, spending more bits on
-// the small shallow levels and fewer on the large deep ones. What remains for later
-// slices is the lazy-leveling tiered bottom and value separation.
+// the small shallow levels and fewer on the large deep ones. A large value is separated
+// out of the segment into a value log at flush, leaving a pointer in the cell so a later
+// compaction moves the pointer instead of rewriting the value (WiscKey), which also lets
+// the engine hold a value larger than a page. What remains for later slices is the value
+// log's garbage collection and the REMIX range index.
 package lsm
 
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"sort"
 	"sync"
 
@@ -82,6 +86,15 @@ type LSM struct {
 	// one key range.
 	compactCursor map[int][]byte
 
+	// vlog is the WiscKey value log: when value separation is on, a flush writes a large
+	// value into it and the segment cell keeps only a pointer, so compaction moves the
+	// pointer instead of rewriting the value (spec 06 §7). valueSepThreshold is the value
+	// size at or above which a flush separates; zero means separation is off, except that
+	// a value too large to fit a segment cell is always separated so the cell ceiling
+	// never rejects a write.
+	vlog              *vlog
+	valueSepThreshold int
+
 	// LSN tracking for the durable-mark seam. pendingLSN is the commit LSN the host
 	// noted for the batch about to be applied; memMaxLSN is the largest LSN of any
 	// batch in the active memtable; durableLSN is the largest LSN whose data a flush
@@ -107,6 +120,7 @@ func New(pgr *pager.Pager) *LSM {
 		segTargetBytes: defaultSegTargetBytes,
 		tierFanout:     defaultTierFanout,
 		compactCursor:  map[int][]byte{},
+		vlog:           newVLog(pgr),
 	}
 }
 
@@ -124,6 +138,9 @@ func (l *LSM) Open(env *engine.Env) error {
 	defer l.mu.Unlock()
 	if env != nil && env.Options.MemtableSize > 0 {
 		l.memtableCap = env.Options.MemtableSize
+	}
+	if env != nil && env.Options.ValueSepThreshold > 0 {
+		l.valueSepThreshold = env.Options.ValueSepThreshold
 	}
 	l.durableLSN = l.pgr.CheckpointLSN()
 	return l.loadManifestLocked()
@@ -189,10 +206,31 @@ func (l *LSM) NoteLSN(lsn uint64) {
 func (l *LSM) flushLocked() error {
 	mem := l.mem
 	sealedLSN := l.memMaxLSN
+	// A flush is the one place values separate. Each cell the memtable yields is passed
+	// through separateForFlush, which writes a large value into the vLog and rewrites the
+	// cell as a KindSetSep pointer; small values and non-set kinds pass through untouched.
+	// Separating only at flush, never at compaction, is the WiscKey win: once a value is in
+	// the vLog every later compaction of its key moves the pointer, not the bytes.
+	var sepErr error
 	seg, err := writeSegment(l.pgr, bloomBitsForLevel(0, l.levelRatio), func(emit func(ik, val []byte) bool) {
-		mem.scan(emit)
+		mem.scan(func(ik, val []byte) bool {
+			oik, oval, e := l.separateForFlush(ik, val)
+			if e != nil {
+				sepErr = e
+				return false
+			}
+			return emit(oik, oval)
+		})
 	})
 	if err != nil {
+		return err
+	}
+	if sepErr != nil {
+		return sepErr
+	}
+	// Persist the vLog tail before the segment becomes visible, so every pointer the
+	// segment carries resolves to durable bytes the moment a reader can see it.
+	if err := l.vlog.sync(); err != nil {
 		return err
 	}
 	if seg.numCells > 0 {
@@ -215,6 +253,71 @@ func (l *LSM) flushLocked() error {
 	l.mem = newMemtable(defaultArenaCap)
 	l.memMaxLSN = 0
 	return nil
+}
+
+// separateForFlush decides whether a cell's value moves to the value log and, if so,
+// rewrites the cell. Only a plain set separates: a tombstone has no value, and a merge
+// operand or a TTL-framed value keeps its existing in-cell encoding (a value of either
+// kind larger than a page is still rejected by the segment writer, the documented bound
+// this slice does not lift). When shouldSeparate says yes, the value is appended to the
+// vLog and the cell becomes a KindSetSep whose value field is the encoded pointer, the
+// same user key and version. The caller holds l.mu.
+func (l *LSM) separateForFlush(ik, val []byte) ([]byte, []byte, error) {
+	if format.KindOf(ik) != format.KindSet || !l.shouldSeparate(ik, val) {
+		return ik, val, nil
+	}
+	ptr, err := l.vlog.append(val)
+	if err != nil {
+		return nil, nil, err
+	}
+	nik := format.EncodeInternalKey(format.UserKey(ik), format.Version(ik), format.KindSetSep)
+	return nik, format.AppendValuePointer(nil, ptr), nil
+}
+
+// shouldSeparate is true when the cell's value should move to the value log: when it
+// reaches the configured threshold, or, regardless of the threshold, when the whole
+// cell would not fit a segment data page. The second clause is what lets the engine
+// store a value larger than a page at all, so it holds even with separation nominally
+// off (threshold zero).
+func (l *LSM) shouldSeparate(ik, val []byte) bool {
+	if l.valueSepThreshold > 0 && len(val) >= l.valueSepThreshold {
+		return true
+	}
+	maxCell := l.pgr.Header().UsablePageSize() - segDataHeaderSize
+	cellLen := uvarintLen(uint64(len(ik))) + len(ik) + uvarintLen(uint64(len(val))) + len(val)
+	return cellLen > maxCell
+}
+
+// materializeOp turns one gathered cell into the format.Op the shared resolver folds,
+// dereferencing a separated value through the vLog along the way. A KindSetSep cell is
+// presented to Fold as an ordinary set: under keysOnly the value is left nil and the
+// vLog is never touched, honoring the KeysOnly contract that a key-only scan reads no
+// value; otherwise the pointer is followed and the literal bytes fill the op. Every
+// other kind goes straight through format.OpFromCell, so the resolver, the oracle, and
+// the B-tree core never see a KindSetSep. The returned op owns its value bytes, so the
+// caller may keep it past the next source advance. The caller holds l.mu.
+func (l *LSM) materializeOp(ik, val []byte, now uint64, keysOnly bool) (format.Op, bool, error) {
+	if format.KindOf(ik) == format.KindSetSep {
+		op := format.Op{Version: format.Version(ik), Kind: format.KindSet}
+		if keysOnly {
+			return op, true, nil
+		}
+		ptr, ok := format.DecodeValuePointer(val)
+		if !ok {
+			return format.Op{}, false, fmt.Errorf("lsm: corrupt value pointer in cell")
+		}
+		bytes, err := l.vlog.read(ptr)
+		if err != nil {
+			return format.Op{}, false, err
+		}
+		op.Value = bytes
+		return op, true, nil
+	}
+	op, ok := format.OpFromCell(ik, val, now)
+	if ok && op.Value != nil {
+		op.Value = append([]byte(nil), op.Value...)
+	}
+	return op, ok, nil
 }
 
 // Maintain implements engine.Engine. It runs at most one compaction per call: the
@@ -318,7 +421,7 @@ type srcCell struct {
 // produced and any divergence is a bug in this plumbing, never in resolution. Because
 // the merge seeks to lower and stops past upper, a narrow scan touches only the pages
 // its range covers instead of reading the whole database.
-func (l *LSM) foldRange(snap engine.Snapshot, lower, upper []byte) ([]resolved, error) {
+func (l *LSM) foldRange(snap engine.Snapshot, lower, upper []byte, keysOnly bool) ([]resolved, error) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 
@@ -368,9 +471,15 @@ func (l *LSM) foldRange(snap engine.Snapshot, lower, upper []byte) ([]resolved, 
 		if groupKey == nil {
 			groupKey = append([]byte(nil), uk...)
 		}
-		// A range marker resolves through rangeDels, not as an op; OpFromCell rejects it.
-		if op, ok := format.OpFromCell(ik, mi.value(), snap.Now); ok {
-			op.Value = append([]byte(nil), op.Value...) // the source slice dies on the next advance
+		// A range marker resolves through rangeDels, not as an op; materializeOp rejects
+		// it. materializeOp also owns the value bytes it returns (it copies the borrowed
+		// source value, and a separated value comes back fresh from the vLog), so nothing
+		// here aliases mi.value(), which dies on the next advance.
+		op, ok, err := l.materializeOp(ik, mi.value(), snap.Now, keysOnly)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
 			ops = append(ops, op)
 		}
 		if err := mi.next(); err != nil {
@@ -431,7 +540,12 @@ func (r *reader) Get(userKey []byte) ([]byte, error) {
 	})
 	var ops []format.Op
 	for _, c := range cells {
-		op, ok := format.OpFromCell(c.ik, c.val, r.snap.Now)
+		// A point Get always wants the value, so keysOnly is false: a separated value is
+		// dereferenced through the vLog here.
+		op, ok, err := l.materializeOp(c.ik, c.val, r.snap.Now, false)
+		if err != nil {
+			return nil, err
+		}
 		if !ok {
 			continue // range markers resolve through rangeDels, not as ops
 		}
@@ -470,7 +584,7 @@ func (r *reader) NewIter(opts engine.IterOptions) (engine.Cursor, error) {
 	// foldRange resolves only the requested range, so the cursor over the result holds
 	// just those keys; the bidirectional cursor protocol is served from that materialized
 	// slice, which is now the size of the range rather than the whole keyspace.
-	view, err := r.l.foldRange(r.snap, lower, upper)
+	view, err := r.l.foldRange(r.snap, lower, upper, opts.KeysOnly)
 	if err != nil {
 		return nil, err
 	}
