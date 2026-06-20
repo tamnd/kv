@@ -96,3 +96,8 @@ type EngineStats struct {
 // ErrNotFound is returned by Reader.Get when no version of the key is visible at
 // the snapshot. The public kv package re-exports it (spec 15).
 var ErrNotFound = errors.New("kv: key not found")
+
+// ErrBatchCorrupt is returned by DecodeBatch when a serialized batch is truncated
+// or internally inconsistent, so a torn WAL frame is rejected outright rather than
+// half-applied.
+var ErrBatchCorrupt = errors.New("kv: corrupt write batch")
