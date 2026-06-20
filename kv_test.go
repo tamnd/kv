@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/tamnd/kv"
 )
@@ -228,6 +229,33 @@ func TestStatsReportsSpaceAndVersion(t *testing.T) {
 	}
 	if after.Version != 20 {
 		t.Fatalf("version = %d after checkpoint, want 20", after.Version)
+	}
+}
+
+// TestAutoCheckpointBoundsWAL checks the public WithAutoCheckpoint option wires the
+// background checkpointer so a long run of commits keeps the WAL backlog bounded
+// (spec 09 §1.3) without the caller ever calling Checkpoint.
+func TestAutoCheckpointBoundsWAL(t *testing.T) {
+	const threshold = 8
+	d := open(t, kv.WithAutoCheckpoint(threshold))
+	for i := 0; i < 300; i++ {
+		if err := d.Update(func(txn *kv.Txn) error {
+			return txn.Set([]byte(fmt.Sprintf("k%04d", i)), []byte("v"))
+		}); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	var last uint64
+	for time.Now().Before(deadline) {
+		last = d.Stats().WALBacklog
+		if last < threshold {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if last >= threshold {
+		t.Fatalf("WAL backlog %d never fell below threshold %d", last, threshold)
 	}
 }
 
