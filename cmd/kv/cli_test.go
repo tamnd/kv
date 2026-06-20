@@ -320,3 +320,120 @@ func withStdin(t *testing.T, input string, fn func()) {
 	fn()
 	os.Stdin = orig
 }
+
+// shellSession runs the interactive shell on a fresh database, feeding it the script on
+// stdin, and returns what it wrote to stdout. The shell's chrome (banner, prompt, notices)
+// goes to stderr and is not captured, so the returned string is just command results.
+func shellSession(t *testing.T, script string) string {
+	t.Helper()
+	p := dbPath(t)
+	return capture(t, func() {
+		withStdin(t, script, func() {
+			if code := run([]string{p}); code != exitOK {
+				t.Fatalf("shell: exit %d", code)
+			}
+		})
+	})
+}
+
+// TestShellSetGetExists drives the core data verbs through the REPL and checks the results
+// stream that reaches stdout.
+func TestShellSetGetExists(t *testing.T) {
+	out := shellSession(t, "set k v1\nget k\nexists k\nexists missing\n.exit\n")
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	want := []string{"v1", "true", "false"}
+	if len(lines) != len(want) {
+		t.Fatalf("got %d result lines %q, want %d", len(lines), lines, len(want))
+	}
+	for i := range want {
+		if lines[i] != want[i] {
+			t.Fatalf("line %d = %q, want %q", i, lines[i], want[i])
+		}
+	}
+}
+
+// TestShellQuotedValue confirms the shell tokenizer keeps a single-quoted value with
+// spaces and embedded double quotes intact, the sqlite3-shell convention.
+func TestShellQuotedValue(t *testing.T) {
+	out := shellSession(t, "set doc '{\"name\": \"a b\"}'\nget doc\n.exit\n")
+	if got := strings.TrimSpace(out); got != `{"name": "a b"}` {
+		t.Fatalf("get doc = %q, want the quoted JSON intact", got)
+	}
+}
+
+// TestShellScanAndCount checks a prefix scan and a count run against the open file, with
+// the format dot-command selecting the rendering.
+func TestShellScanAndCount(t *testing.T) {
+	out := shellSession(t, ".format raw\nset user:1 a\nset user:2 b\nset other x\nscan --prefix user: --keys-only\ncount --prefix user:\n.exit\n")
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	// raw key-only scan prints the two user keys, then count prints 2.
+	want := []string{"user:1", "user:2", "2"}
+	if len(lines) != len(want) {
+		t.Fatalf("got %q, want %q", lines, want)
+	}
+	for i := range want {
+		if lines[i] != want[i] {
+			t.Fatalf("line %d = %q, want %q", i, lines[i], want[i])
+		}
+	}
+}
+
+// TestShellTransactionRollback proves an explicit transaction holds writes until commit and
+// drops them on rollback.
+func TestShellTransactionRollback(t *testing.T) {
+	out := shellSession(t, ".begin\nset tmp 1\nget tmp\n.rollback\nexists tmp\n.begin\nset keep 1\n.commit\nexists keep\n.exit\n")
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	// get tmp (inside txn) -> 1, exists tmp (after rollback) -> false, exists keep -> true.
+	want := []string{"1", "false", "true"}
+	if len(lines) != len(want) {
+		t.Fatalf("got %q, want %q", lines, want)
+	}
+	for i := range want {
+		if lines[i] != want[i] {
+			t.Fatalf("line %d = %q, want %q", i, lines[i], want[i])
+		}
+	}
+}
+
+// TestShellDotCommands checks the meta-commands that print to stdout: .info, .check, and
+// .stats all produce their expected shapes against a populated file.
+func TestShellDotCommands(t *testing.T) {
+	out := shellSession(t, "set a 1\nset b 2\n.checkpoint\n.info\n.check\n.stats\n.exit\n")
+	if !strings.Contains(out, "engine") || !strings.Contains(out, "page count") {
+		t.Fatalf(".info output missing expected fields:\n%s", out)
+	}
+	if !strings.Contains(out, "ok") {
+		t.Fatalf(".check did not report ok:\n%s", out)
+	}
+	var stats struct {
+		Engine    string `json:"engine"`
+		PageCount int    `json:"page_count"`
+	}
+	// The .stats object is the last JSON document in the stream; find its opening brace.
+	if i := strings.LastIndex(out, "{"); i >= 0 {
+		if err := json.Unmarshal([]byte(out[i:]), &stats); err != nil {
+			t.Fatalf("decode .stats: %v\n%s", err, out)
+		}
+	}
+	if stats.Engine == "" {
+		t.Fatalf(".stats engine empty:\n%s", out)
+	}
+}
+
+// TestShellUnknownCommandContinues confirms a bad statement is reported but does not end
+// the session: a following good statement still runs.
+func TestShellUnknownCommandContinues(t *testing.T) {
+	out := shellSession(t, "bogus arg\nset k v\nget k\n.exit\n")
+	if got := strings.TrimSpace(out); got != "v" {
+		t.Fatalf("session output = %q, want just v (the good statement after the bad one)", got)
+	}
+}
+
+// TestShellOpensOnlyExistingFile confirms `kv <name>` for a path that does not exist is an
+// unknown-command usage error, not a shell on a missing file.
+func TestShellOpensOnlyExistingFile(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "nope.kv")
+	if code := run([]string{missing}); code != exitUsage {
+		t.Fatalf("run on missing file = exit %d, want %d (usage)", code, exitUsage)
+	}
+}

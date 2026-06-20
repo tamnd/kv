@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"text/tabwriter"
 
@@ -62,8 +63,16 @@ func cmdInfo(args []string) int {
 	}
 	defer d.Close()
 
-	s := d.Stats()
-	tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	if err := writeInfo(os.Stdout, d.Stats()); err != nil {
+		return fail(err)
+	}
+	return exitOK
+}
+
+// writeInfo renders the human-readable info table for a stats snapshot to w. It is shared
+// by the info command and the shell's .info dot-command so both print the same summary.
+func writeInfo(w io.Writer, s kv.Stats) error {
+	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
 	fmt.Fprintf(tw, "engine\t%s\n", s.Engine)
 	fmt.Fprintf(tw, "page size\t%d bytes\n", s.PageSize)
 	fmt.Fprintf(tw, "page count\t%d\n", s.PageCount)
@@ -79,7 +88,7 @@ func cmdInfo(args []string) int {
 	fmt.Fprintf(tw, "wal frames\t%d\n", s.WALFrames)
 	fmt.Fprintf(tw, "wal backlog\t%d frames\n", s.WALBacklog)
 	fmt.Fprintf(tw, "syncs\t%d\n", s.Syncs)
-	return flushErr(tw)
+	return tw.Flush()
 }
 
 // cmdStats prints the same accounting as machine-readable JSON, the form a monitoring
