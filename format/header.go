@@ -78,6 +78,13 @@ type Header struct {
 	PageCountAtVac   uint32       // offset 88
 	VersionValidFor  uint32       // offset 92
 	WriterVersionNum uint32       // offset 96
+	// LastCommitVersion is the highest MVCC commit version durably folded into the
+	// file (offset 100). It persists the version counter across restart so a
+	// reopened database never reissues a version <= one already on disk, which
+	// would make a fresh write sort as older than an existing one (spec 10 §1). It
+	// lives in the header's reserved headroom; an older reader that does not know
+	// the field simply ignores it.
+	LastCommitVersion uint64 // offset 100
 }
 
 // Encode writes the header into the first 128 bytes of page, zeroing reserved
@@ -110,6 +117,7 @@ func (h *Header) Encode(page []byte) {
 	binary.BigEndian.PutUint32(page[88:92], h.PageCountAtVac)
 	binary.BigEndian.PutUint32(page[92:96], h.VersionValidFor)
 	binary.BigEndian.PutUint32(page[96:100], h.WriterVersionNum)
+	binary.BigEndian.PutUint64(page[100:108], h.LastCommitVersion)
 }
 
 // ErrBadMagic means the file does not begin with the kv magic string.
@@ -135,29 +143,30 @@ func DecodeHeader(page []byte) (*Header, error) {
 		return nil, ErrBadPageSize
 	}
 	h := &Header{
-		PageSize:         ps,
-		FormatWrite:      page[18],
-		FormatRead:       page[19],
-		ReservedPerPage:  page[20],
-		Engine:           EngineKind(page[21]),
-		Flags:            page[22],
-		Checksum:         ChecksumAlgo(page[23]),
-		ChangeCounter:    binary.BigEndian.Uint32(page[24:28]),
-		DBSize:           binary.BigEndian.Uint32(page[28:32]),
-		FreelistTrunk:    binary.BigEndian.Uint32(page[32:36]),
-		FreelistPages:    binary.BigEndian.Uint32(page[36:40]),
-		MetaCookie:       binary.BigEndian.Uint32(page[40:44]),
-		EngineRoot:       binary.BigEndian.Uint32(page[44:48]),
-		CacheSizeHint:    binary.BigEndian.Uint32(page[48:52]),
-		HighWaterMark:    binary.BigEndian.Uint32(page[52:56]),
-		Collation:        binary.BigEndian.Uint32(page[56:60]),
-		UserVersion:      binary.BigEndian.Uint32(page[60:64]),
-		ApplicationID:    binary.BigEndian.Uint32(page[64:68]),
-		CheckpointLSN:    binary.BigEndian.Uint64(page[68:76]),
-		OldestVersion:    binary.BigEndian.Uint64(page[76:84]),
-		PageCountAtVac:   binary.BigEndian.Uint32(page[88:92]),
-		VersionValidFor:  binary.BigEndian.Uint32(page[92:96]),
-		WriterVersionNum: binary.BigEndian.Uint32(page[96:100]),
+		PageSize:          ps,
+		FormatWrite:       page[18],
+		FormatRead:        page[19],
+		ReservedPerPage:   page[20],
+		Engine:            EngineKind(page[21]),
+		Flags:             page[22],
+		Checksum:          ChecksumAlgo(page[23]),
+		ChangeCounter:     binary.BigEndian.Uint32(page[24:28]),
+		DBSize:            binary.BigEndian.Uint32(page[28:32]),
+		FreelistTrunk:     binary.BigEndian.Uint32(page[32:36]),
+		FreelistPages:     binary.BigEndian.Uint32(page[36:40]),
+		MetaCookie:        binary.BigEndian.Uint32(page[40:44]),
+		EngineRoot:        binary.BigEndian.Uint32(page[44:48]),
+		CacheSizeHint:     binary.BigEndian.Uint32(page[48:52]),
+		HighWaterMark:     binary.BigEndian.Uint32(page[52:56]),
+		Collation:         binary.BigEndian.Uint32(page[56:60]),
+		UserVersion:       binary.BigEndian.Uint32(page[60:64]),
+		ApplicationID:     binary.BigEndian.Uint32(page[64:68]),
+		CheckpointLSN:     binary.BigEndian.Uint64(page[68:76]),
+		OldestVersion:     binary.BigEndian.Uint64(page[76:84]),
+		PageCountAtVac:    binary.BigEndian.Uint32(page[88:92]),
+		VersionValidFor:   binary.BigEndian.Uint32(page[92:96]),
+		WriterVersionNum:  binary.BigEndian.Uint32(page[96:100]),
+		LastCommitVersion: binary.BigEndian.Uint64(page[100:108]),
 	}
 	return h, nil
 }
