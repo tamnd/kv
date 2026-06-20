@@ -20,6 +20,12 @@ type Mem struct {
 	// fsyncgate. 0 disables fault injection.
 	faultAfter int
 	syncs      int
+	// freezeAt, when >0, captures the durable image of every file the moment the
+	// freezeAt-th Sync completes; a later Crash reverts to that frozen image
+	// instead of the latest durable bytes. This pins a crash to an exact fsync
+	// boundary so a single continuous workload can be crashed at every sync point.
+	freezeAt int
+	frozen   map[string][]byte
 }
 
 // NewMem returns an empty in-memory filesystem.
@@ -84,15 +90,61 @@ func (m *Mem) SetSyncFault(nth int) {
 	m.mu.Unlock()
 }
 
+// CrashAfterSync arms the filesystem so the durable image of every file is frozen the
+// moment the nth Sync (1-based, counted since open) completes. A later Crash then reverts
+// to that frozen snapshot rather than the latest durable bytes, which lets a test crash a
+// single continuous workload at an exact fsync boundary and prove the durable-prefix
+// property (spec 08 §8, spec 23 §4). Syncs past n still succeed and advance the durable
+// image, but they do not move the frozen point. Pass 0 to disable. A file created after the
+// freeze point is absent (empty) in the snapshot, exactly as it would be after a crash at
+// that point.
+func (m *Mem) CrashAfterSync(n int) {
+	m.mu.Lock()
+	m.freezeAt = n
+	m.frozen = nil
+	m.mu.Unlock()
+}
+
+// SyncCount reports how many Sync calls have succeeded since open, so a crash harness can
+// learn a workload's sync boundaries before sweeping a crash across each one.
+func (m *Mem) SyncCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.syncs
+}
+
+// maybeFreeze snapshots the durable image of every file when the freeze boundary is hit.
+// It runs after the nth Sync has updated its file's durable bytes, so the snapshot captures
+// the exact committed-prefix state visible right after that fsync.
+func (m *Mem) maybeFreeze(n int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.freezeAt <= 0 || n != m.freezeAt || m.frozen != nil {
+		return
+	}
+	m.frozen = make(map[string][]byte, len(m.files))
+	for path, d := range m.files {
+		d.mu.Lock()
+		m.frozen[path] = append([]byte(nil), d.durable...)
+		d.mu.Unlock()
+	}
+}
+
 // Crash discards all unsynced writes across every file, modelling a power
-// failure: each file reverts to the bytes last made durable by a Sync. Shared
-// memory (the wal-index) is also dropped, as it would be after a process exit.
+// failure: each file reverts to the bytes last made durable by a Sync. When a
+// freeze point was armed with CrashAfterSync, each file reverts to its frozen
+// snapshot instead. Shared memory (the wal-index) is also dropped, as it would
+// be after a process exit.
 func (m *Mem) Crash() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for path, d := range m.files {
 		d.mu.Lock()
-		d.live = append([]byte(nil), d.durable...)
+		if m.frozen != nil {
+			d.live = append([]byte(nil), m.frozen[path]...)
+		} else {
+			d.live = append([]byte(nil), d.durable...)
+		}
 		d.mu.Unlock()
 		m.shm.drop(path)
 	}
@@ -133,7 +185,8 @@ func (f *memFile) WriteAt(p []byte, off int64) (int, error) {
 func (f *memFile) Sync(mode SyncMode) error {
 	f.fs.mu.Lock()
 	f.fs.syncs++
-	fault := f.fs.faultAfter > 0 && f.fs.syncs >= f.fs.faultAfter
+	n := f.fs.syncs
+	fault := f.fs.faultAfter > 0 && n >= f.fs.faultAfter
 	f.fs.mu.Unlock()
 	if fault {
 		return fmt.Errorf("kv/vfs: injected sync fault on %q", f.path)
@@ -141,6 +194,7 @@ func (f *memFile) Sync(mode SyncMode) error {
 	f.data.mu.Lock()
 	f.data.durable = append([]byte(nil), f.data.live...)
 	f.data.mu.Unlock()
+	f.fs.maybeFreeze(n)
 	return nil
 }
 
