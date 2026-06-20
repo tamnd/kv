@@ -280,6 +280,30 @@ func TestCLICheckJSON(t *testing.T) {
 	}
 }
 
+// TestCLIVacuum confirms the vacuum command runs cleanly over a populated file, prints a
+// freed-pages summary, and leaves the file sound. The tree core does not yet return pages
+// to the freelist, so the run reclaims zero pages today; the command still must succeed
+// and report its result (spec 09 §3.1, spec 16).
+func TestCLIVacuum(t *testing.T) {
+	p := dbPath(t)
+	for _, k := range []string{"a", "b", "c", "d"} {
+		if code := run([]string{"set", p, k, "v"}); code != exitOK {
+			t.Fatalf("set %s: exit %d", k, code)
+		}
+	}
+	out := capture(t, func() {
+		if code := run([]string{"vacuum", p, "-n", "16"}); code != exitOK {
+			t.Fatalf("vacuum: exit %d, want 0", code)
+		}
+	})
+	if !strings.Contains(out, "freed") || !strings.Contains(out, "remain") {
+		t.Fatalf("vacuum output = %q, want a freed/remain summary", out)
+	}
+	if code := run([]string{"check", p}); code != exitOK {
+		t.Fatalf("check after vacuum: exit %d, want 0", code)
+	}
+}
+
 // withStdin runs fn with os.Stdin replaced by a pipe carrying the given input.
 func withStdin(t *testing.T, input string, fn func()) {
 	t.Helper()

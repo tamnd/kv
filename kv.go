@@ -249,6 +249,19 @@ func (kdb *DB) Checkpoint() error {
 	return wrap(kdb.d.Checkpoint())
 }
 
+// Vacuum performs an incremental vacuum, returning trailing free pages to the operating
+// system so the file shrinks after large deletes (spec 09 §3.1). It first folds the WAL
+// with a checkpoint, then truncates the maximal run of free pages at the end of the file.
+// budget caps the pages reclaimed this round so the caller can bound the work and the
+// writer-lock hold; a non-positive budget reclaims the whole trailing run. It returns the
+// number of pages freed. Free pages buried in the middle of the file stay on the freelist
+// for reallocation rather than being returned to the OS; this is the kv analog of
+// SQLite's incremental_vacuum.
+func (kdb *DB) Vacuum(budget int) (int, error) {
+	freed, err := kdb.d.Vacuum(budget)
+	return freed, wrap(err)
+}
+
 // CheckProblem is one structural violation found by Check: a corruption class, the page
 // it was found on (zero for a file-wide problem), and a human-readable description
 // (spec 16 §4, spec 23 §3).

@@ -179,6 +179,17 @@ func (p *Pager) Checkpoint(checkpointLSN uint64) error {
 	p.header.CheckpointLSN = checkpointLSN
 	p.header.ChangeCounter++
 	p.header.VersionValidFor = p.header.ChangeCounter
+	if err := p.flushHeaderLocked(); err != nil {
+		return err
+	}
+	return p.file.Sync(vfs.SyncFull)
+}
+
+// flushHeaderLocked encodes the live header onto page 1 and writes it to the file,
+// preserving any non-header bytes already on the page and keeping the resident
+// frame, if any, in sync. It does not fsync; the caller decides when to make the
+// write durable. The caller must hold p.mu.
+func (p *Pager) flushHeaderLocked() error {
 	page1 := make([]byte, p.pageSize)
 	// Preserve any non-header bytes already on page 1 by reading the resident
 	// frame if present, else the file.
@@ -195,7 +206,84 @@ func (p *Pager) Checkpoint(checkpointLSN uint64) error {
 	if _, err := p.file.WriteAt(page1, 0); err != nil {
 		return err
 	}
-	return p.file.Sync(vfs.SyncFull)
+	return nil
+}
+
+// TruncateTail returns trailing free pages to the operating system by shrinking the
+// file (spec 09 §3.1, incremental vacuum). It reclaims the maximal contiguous run of
+// free pages at the very end of the file: as long as the highest page number is on
+// the freelist it is dropped from the freelist and the high-water mark falls by one,
+// stopping at the first reachable page or when budget pages have been freed (a
+// non-positive budget reclaims the whole trailing run). It then persists the smaller
+// freelist and header, fsyncs, truncates the file, and fsyncs again, so a clean run
+// hands the freed space back to the filesystem. Page 1, the header, is never freed.
+//
+// Only pages physically at the tail can be returned to the OS; free pages buried in
+// the middle of the file stay on the freelist for reallocation (spec 09 §3.1). The
+// caller is expected to have folded the WAL with a checkpoint first so the freelist
+// reflects all committed frees.
+func (p *Pager) TruncateTail(budget int) (int, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	// Index the freelist for O(1) tail membership tests.
+	freeset := make(map[uint32]struct{}, len(p.free))
+	for _, pg := range p.free {
+		freeset[pg] = struct{}{}
+	}
+	freed := 0
+	for p.dbSize > 1 {
+		if _, ok := freeset[p.dbSize]; !ok {
+			break
+		}
+		if budget > 0 && freed >= budget {
+			break
+		}
+		delete(freeset, p.dbSize)
+		// Drop any cached frame for the page being reclaimed.
+		if fr, ok := p.index[p.dbSize]; ok {
+			delete(p.index, p.dbSize)
+			fr.pgno = 0
+			fr.dirty = false
+			fr.ref = false
+		}
+		p.dbSize--
+		freed++
+	}
+	if freed == 0 {
+		return 0, nil
+	}
+	// Rebuild the in-memory freelist without the reclaimed tail pages, preserving
+	// order of the survivors.
+	survivors := p.free[:0:0]
+	for _, pg := range p.free {
+		if _, ok := freeset[pg]; ok {
+			survivors = append(survivors, pg)
+		}
+	}
+	p.free = survivors
+
+	// Persist the smaller freelist and header before shrinking the file. The trunk
+	// pages persistFreelistLocked reserves come from the surviving freelist, all
+	// below the new high-water mark, so they live inside the truncated file.
+	if err := p.persistFreelistLocked(); err != nil {
+		return 0, err
+	}
+	p.header.DBSize = p.dbSize
+	p.header.HighWaterMark = p.dbSize
+	if err := p.flushHeaderLocked(); err != nil {
+		return 0, err
+	}
+	if err := p.file.Sync(vfs.SyncFull); err != nil {
+		return 0, err
+	}
+	if err := p.file.Truncate(int64(p.dbSize) * int64(p.pageSize)); err != nil {
+		return 0, err
+	}
+	if err := p.file.Sync(vfs.SyncFull); err != nil {
+		return 0, err
+	}
+	return freed, nil
 }
 
 // Close flushes nothing implicitly; it just releases the file. Callers checkpoint

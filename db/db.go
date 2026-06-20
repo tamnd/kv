@@ -658,7 +658,13 @@ func (d *DB) backgroundErr() error {
 func (d *DB) Checkpoint() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	return d.checkpointLocked()
+}
 
+// checkpointLocked is the body of Checkpoint; the caller holds d.mu. It is factored
+// out so other writer-lock operations that must fold the WAL first, such as Vacuum,
+// can reuse it without releasing and reacquiring the lock.
+func (d *DB) checkpointLocked() error {
 	// Persist the durable commit version from the oracle, the single source of truth.
 	// A live commit keeps the header's version current through applyCommitted, but a
 	// version reconstructed by redo reaches the engine through eng.Apply directly and
@@ -672,6 +678,26 @@ func (d *DB) Checkpoint() error {
 		return err
 	}
 	return d.wal.Checkpointed(foldedLSN)
+}
+
+// Vacuum runs one round of incremental vacuum (spec 09 §3.1): it folds the WAL with a
+// checkpoint so the freelist reflects every committed free, then hands trailing free
+// pages back to the operating system by shrinking the file. budget caps how many pages
+// it returns in this round, so a caller can bound the truncation work and the time the
+// writer lock is held; a non-positive budget reclaims the whole trailing free run. It
+// returns the number of pages freed.
+//
+// Only pages physically at the end of the file can be returned; free pages in the
+// middle stay on the freelist for reallocation. Callers wanting steady reclamation run
+// it after large deletes, or periodically with a small budget, the kv analog of
+// SQLite's "PRAGMA incremental_vacuum(N)".
+func (d *DB) Vacuum(budget int) (int, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if err := d.checkpointLocked(); err != nil {
+		return 0, err
+	}
+	return d.pgr.TruncateTail(budget)
 }
 
 // Close releases the database without an implicit checkpoint: committed data is
