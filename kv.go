@@ -17,6 +17,8 @@
 package kv
 
 import (
+	"context"
+
 	"github.com/tamnd/kv/db"
 	"github.com/tamnd/kv/engine"
 	"github.com/tamnd/kv/format"
@@ -219,6 +221,36 @@ func (s *Snapshot) View(fn func(txn *Txn) error) error {
 // Close releases the version the snapshot pinned so it can again be garbage collected. It
 // is idempotent; further View calls then return an error.
 func (s *Snapshot) Close() error { return wrap(s.s.Close()) }
+
+// ChangeKind classifies a mutation on the change feed (spec 15 §7). It distinguishes a
+// point upsert, a point delete, a merge operand, and a range delete, so a feed consumer
+// sees the faithful committed operation rather than a lossy point-only projection.
+type ChangeKind = db.ChangeKind
+
+// The change kinds delivered by Subscribe.
+const (
+	ChangeSet         = db.ChangeSet
+	ChangeDelete      = db.ChangeDelete
+	ChangeMerge       = db.ChangeMerge
+	ChangeRangeDelete = db.ChangeRangeDelete
+)
+
+// Change is one committed mutation delivered to a Subscribe callback (spec 15 §7). For a
+// range delete, Key is the inclusive lower bound and Value the exclusive upper bound; for
+// a delete, Value is nil; for a merge, Value is the operand. The slices are copies the
+// callback may retain, and Version is the commit version every Change in one batch shares.
+type Change = db.Change
+
+// Subscribe delivers a change feed of committed mutations whose key has prefix, invoking
+// fn once per committed batch in commit order (spec 15 §7). It blocks until ctx is
+// cancelled, fn returns an error, or the consumer falls too far behind (ErrSubscriberLagged),
+// returning the cause. A nil prefix matches every key. fn runs on the calling goroutine, so
+// a slow callback slows only its own feed and never the database's writers, and only
+// durable, committed mutations are ever delivered. It is the foundation for the server's
+// watch endpoints and replication (spec 17, spec 18).
+func (kdb *DB) Subscribe(ctx context.Context, prefix []byte, fn func([]Change) error) error {
+	return wrap(kdb.d.Subscribe(ctx, prefix, fn))
+}
 
 // WriteBatch is an explicit, memory-bounded builder for very large writes (spec 15 §6). It
 // buffers Set and Delete operations and flushes them in bounded chunks, so loading millions

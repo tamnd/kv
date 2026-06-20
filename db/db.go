@@ -148,6 +148,16 @@ type DB struct {
 
 	ckptErrMu sync.Mutex
 	ckptErr   error
+
+	// Change-feed subscribers (spec 15 §7). publish enqueues each committed batch's
+	// matching mutations onto every registered subscription's buffered channel under
+	// subsMu; the Subscribe caller drains it. subClosed is closed on Close to wake any
+	// blocked subscriber, and subsClosed fences Subscribe once the database is closing.
+	// All three are guarded by subsMu, a separate lock taken under d.mu by publish.
+	subsMu     sync.Mutex
+	subs       map[*subscription]struct{}
+	subClosed  chan struct{}
+	subsClosed bool
 }
 
 // Open opens the database at path, creating it if it does not exist, and runs crash
@@ -429,6 +439,10 @@ func (d *DB) applyCommitted(b *engine.WriteBatch, v uint64) error {
 	}
 	d.pgr.Header().LastCommitVersion = v
 	d.maybeCheckpoint()
+	// The commit is now durable and visible, so surface it to the change feed. publish
+	// only enqueues onto subscriber channels and never calls user code, so holding the
+	// write lock across it stays cheap (spec 15 §7).
+	d.publish(b, v)
 	return nil
 }
 
@@ -775,6 +789,14 @@ func (d *DB) Close() error {
 			close(d.ckptStop)
 			<-d.ckptDone
 		}
+		// Wake any blocked Subscribe and fence new ones, so a change feed returns
+		// promptly when the database closes instead of hanging on a dead commit path.
+		d.subsMu.Lock()
+		d.subsClosed = true
+		if d.subClosed != nil {
+			close(d.subClosed)
+		}
+		d.subsMu.Unlock()
 		bgErr = d.backgroundErr()
 	})
 
