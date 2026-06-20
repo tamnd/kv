@@ -1,6 +1,7 @@
 package db
 
 import (
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -271,6 +272,68 @@ func TestRepeatedCrashRecoveryIsIdempotent(t *testing.T) {
 		// Crash again without checkpointing: the WAL is unchanged, so the next round
 		// redoes the same frames.
 		fs.Crash()
+	}
+}
+
+// TestFatalSyncFencesAndRecovers is the fsyncgate proof (spec 07 §6, spec 23 §4). A
+// commit whose WAL fsync fails must not be acknowledged, must fence the database against
+// further writes until reopen, and must be absent after a crash-and-recover, while every
+// earlier committed write survives. Reads keep working throughout.
+func TestFatalSyncFencesAndRecovers(t *testing.T) {
+	fs := vfs.NewMem()
+	d, err := Open(fs, "test.kv", Options{PageSize: 4096, Sync: wal.SyncFull, AutoCheckpoint: -1})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	// A clean commit that must survive everything below.
+	if _, err := d.Write(func(b *engine.WriteBatch) { b.Set([]byte("k"), []byte("v1")) }); err != nil {
+		t.Fatalf("first write: %v", err)
+	}
+
+	// Arm the next fsync to fail, then attempt a commit whose durability cannot be
+	// confirmed. The commit sync is the first sync after arming, so it is the one that
+	// faults.
+	fs.SetSyncFault(1)
+	_, err = d.Write(func(b *engine.WriteBatch) { b.Set([]byte("k"), []byte("v2")) })
+	if !errors.Is(err, ErrFatalSync) {
+		t.Fatalf("write under sync fault = %v, want ErrFatalSync", err)
+	}
+
+	// The failed commit must not be acknowledged: a live read still sees v1, because
+	// Apply never ran for the un-synced batch.
+	if v, ok := get(t, d, "k"); !ok || v != "v1" {
+		t.Fatalf("k = %q,%v after failed commit, want v1 (commit not acknowledged)", v, ok)
+	}
+
+	// The database is now fenced: a later write is refused even once the underlying fault
+	// is cleared, because the fence, not the fault, is what bites.
+	fs.SetSyncFault(0)
+	if _, err := d.Write(func(b *engine.WriteBatch) { b.Set([]byte("z"), []byte("zz")) }); !errors.Is(err, ErrFatalSync) {
+		t.Fatalf("write after fence = %v, want ErrFatalSync", err)
+	}
+
+	// Power loss after the failed sync drops the un-synced bytes.
+	fs.Crash()
+
+	// Recovery runs against the durable log: v1 survives, the failed v2 is gone, and the
+	// reopened database accepts writes again.
+	d2, err := Open(fs, "test.kv", Options{AutoCheckpoint: -1})
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer d2.Close()
+	if v, ok := get(t, d2, "k"); !ok || v != "v1" {
+		t.Fatalf("k = %q,%v after recovery, want v1 (only the acked commit survives)", v, ok)
+	}
+	if v, ok := get(t, d2, "z"); ok {
+		t.Fatalf("z = %q present after recovery, want absent (it was written behind the fence)", v)
+	}
+	if _, err := d2.Write(func(b *engine.WriteBatch) { b.Set([]byte("k"), []byte("v3")) }); err != nil {
+		t.Fatalf("post-recovery write: %v", err)
+	}
+	if v, ok := get(t, d2, "k"); !ok || v != "v3" {
+		t.Fatalf("k = %q,%v after post-recovery write, want v3", v, ok)
 	}
 }
 

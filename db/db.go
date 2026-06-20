@@ -127,6 +127,12 @@ type DB struct {
 	syncMode   wal.Sync
 	isolation  Isolation
 
+	// fatal fences the database after a WAL durability failure (spec 07 §6). It is
+	// set under the write lock when a log append or commit sync fails and read at the
+	// top of every commit path; once set, no further write is admitted until reopen.
+	// Reads are unaffected: they continue to serve the last consistent state.
+	fatal error
+
 	// Auto-checkpointer (spec 09 §1.3). When ckptThreshold is positive a single
 	// long-lived goroutine folds the WAL in the background: a commit that pushes the
 	// backlog past the threshold signals ckptSig (non-blocking, coalesced through the
@@ -316,6 +322,9 @@ func (d *DB) Write(fn func(b *engine.WriteBatch)) (uint64, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
+	if d.fatal != nil {
+		return 0, d.fatal
+	}
 	// Under the single-writer lock the next version is stable between this peek and
 	// the formal commit, so the batch can be built at it before it is reserved.
 	v := d.orc.peekNext()
@@ -343,6 +352,9 @@ func (d *DB) commitTxn(readVersion uint64, ops []pendingOp, conflictKeys []strin
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
+	if d.fatal != nil {
+		return 0, d.fatal
+	}
 	v, ok := d.orc.newCommitTs(readVersion, conflictKeys)
 	if !ok {
 		return 0, ErrConflict
@@ -359,6 +371,9 @@ func (d *DB) commitTxnSerializable(readVersion uint64, ops []pendingOp, writeKey
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
+	if d.fatal != nil {
+		return 0, d.fatal
+	}
 	v, ok := d.orc.newCommitTsSerializable(readVersion, writeKeys, readKeys, ranges)
 	if !ok {
 		return 0, ErrConflict
@@ -396,11 +411,18 @@ func (d *DB) applyTxn(v uint64, ops []pendingOp) (uint64, error) {
 // and calls oracle.applied after, in version order (spec 07 §1, spec 10 §2).
 func (d *DB) applyCommitted(b *engine.WriteBatch, v uint64) error {
 	encoded := b.Encode()
+	// A failed log append or commit sync is a fatal durability fault (fsyncgate, spec
+	// 07 §6): the kernel may have dropped the un-synced bytes, so the commit must not
+	// be acknowledged and the database is fenced until reopen. Apply runs only after a
+	// durable commit, so a fault here leaves the engine untouched and this version
+	// unapplied, exactly the state recovery reconstructs from the durable log.
 	if err := d.wal.LogBatch(v, encoded); err != nil {
-		return err
+		d.fatal = fmt.Errorf("%w: %v", ErrFatalSync, err)
+		return d.fatal
 	}
 	if _, err := d.wal.Commit(v); err != nil {
-		return err
+		d.fatal = fmt.Errorf("%w: %v", ErrFatalSync, err)
+		return d.fatal
 	}
 	if err := d.eng.Apply(b, v); err != nil {
 		return err
