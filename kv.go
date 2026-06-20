@@ -191,6 +191,35 @@ func (kdb *DB) Begin(writable bool) *Txn {
 	return &Txn{t: kdb.d.Begin(writable)}
 }
 
+// Snapshot is a long-lived read snapshot: a single pinned committed version reusable
+// across many reads, for consistent multi-step reads or an online backup (spec 15 §7).
+// It holds the garbage-collection watermark back for its whole life, so a caller must
+// Close it. Open one with DB.Snapshot.
+type Snapshot struct {
+	s *db.Snapshot
+}
+
+// Snapshot pins the latest committed version and returns a snapshot reading at it. Every
+// read through the snapshot sees exactly that state regardless of later writes. The
+// returned snapshot must be Closed to release the version it pins.
+func (kdb *DB) Snapshot() *Snapshot {
+	return &Snapshot{s: kdb.d.Snapshot()}
+}
+
+// Version reports the committed version the snapshot reads at.
+func (s *Snapshot) Version() uint64 { return s.s.Version() }
+
+// View runs fn in a read-only transaction pinned at the snapshot's version. Reusing one
+// snapshot across many View calls is what makes a multi-step read consistent: each call
+// observes the identical committed state. Using a closed snapshot returns an error.
+func (s *Snapshot) View(fn func(txn *Txn) error) error {
+	return wrap(s.s.View(func(t *db.Txn) error { return fn(&Txn{t: t}) }))
+}
+
+// Close releases the version the snapshot pinned so it can again be garbage collected. It
+// is idempotent; further View calls then return an error.
+func (s *Snapshot) Close() error { return wrap(s.s.Close()) }
+
 // Stats is a point-in-time space-and-durability snapshot of an open database: page
 // counts, freelist depth, the engine's physical footprint and amplification, the latest
 // commit version, and the WAL frame backlog (spec 09 §4, spec 19). It is what the

@@ -2,6 +2,7 @@ package db
 
 import (
 	"errors"
+	"sync"
 
 	"github.com/tamnd/kv/engine"
 	"github.com/tamnd/kv/format"
@@ -24,6 +25,9 @@ var ErrTxnDone = errors.New("kv: transaction already finished")
 // implement the optional capability it needs, such as Verify on a core with no
 // structural verifier (spec 23 §3).
 var ErrUnsupported = errors.New("kv: operation not supported by this engine")
+
+// ErrSnapshotClosed is returned when a long-lived Snapshot is used after Close (spec 15 §7).
+var ErrSnapshotClosed = errors.New("kv: snapshot already closed")
 
 // Isolation selects a transaction's isolation level (spec 10 §3, §4). The zero value
 // is SnapshotIsolation, the high-performance default; Serializable adds read-set
@@ -98,6 +102,13 @@ type Txn struct {
 	reads      map[string]struct{}
 	readRanges []keyRange
 
+	// borrowed marks a read transaction whose readVersion belongs to a long-lived
+	// Snapshot, not to this transaction. The Snapshot took the oracle readMark and
+	// releases it on Close, so a borrowed transaction must not release it on Discard;
+	// otherwise the shared version would be unpinned while the Snapshot still expects
+	// it (spec 15 §7).
+	borrowed bool
+
 	done bool
 }
 
@@ -143,6 +154,56 @@ func (d *DB) Begin(writable bool) *Txn {
 		readVersion: d.orc.readTs(),
 		isolation:   d.isolation,
 	}
+}
+
+// Snapshot is a long-lived read snapshot: a single pinned read version reusable across
+// many read-only transactions, for consistent multi-step reads or an online backup (spec
+// 15 §7). It holds the oracle readMark back for its whole life, so versions newer than it
+// cannot be garbage-collected until it is closed; a caller must Close it.
+type Snapshot struct {
+	db      *DB
+	version uint64
+
+	mu     sync.Mutex
+	closed bool
+}
+
+// Snapshot pins the latest applied version and returns a snapshot at it. It registers one
+// oracle readMark, released by Close, so every read through the snapshot sees exactly the
+// same committed state regardless of writes that land afterward.
+func (d *DB) Snapshot() *Snapshot {
+	return &Snapshot{db: d, version: d.orc.readTs()}
+}
+
+// Version reports the committed version the snapshot reads at.
+func (s *Snapshot) Version() uint64 { return s.version }
+
+// View runs fn in a read-only transaction pinned at the snapshot's version. The inner
+// transaction borrows the snapshot's readMark rather than taking its own, so the pin is
+// held exactly once for the snapshot's whole life. It is an error to use a closed snapshot.
+func (s *Snapshot) View(fn func(*Txn) error) error {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return ErrSnapshotClosed
+	}
+	s.mu.Unlock()
+	txn := &Txn{db: s.db, writable: false, readVersion: s.version, isolation: s.db.isolation, borrowed: true}
+	defer txn.Discard()
+	return fn(txn)
+}
+
+// Close releases the snapshot's readMark so the pinned version can again be garbage
+// collected. It is idempotent and safe to call once; further View calls then fail.
+func (s *Snapshot) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil
+	}
+	s.closed = true
+	s.db.orc.doneRead(s.version)
+	return nil
 }
 
 // Get returns the newest value of key visible to the transaction: its own buffered
@@ -425,11 +486,14 @@ func (t *Txn) Discard() {
 	t.finish()
 }
 
-// finish releases the snapshot exactly once.
+// finish releases the snapshot exactly once. A borrowed read transaction leaves the
+// readMark alone: its owning Snapshot holds and releases it.
 func (t *Txn) finish() {
 	if t.done {
 		return
 	}
 	t.done = true
-	t.db.orc.doneRead(t.readVersion)
+	if !t.borrowed {
+		t.db.orc.doneRead(t.readVersion)
+	}
 }

@@ -453,3 +453,148 @@ func TestHeaderTagsPersist(t *testing.T) {
 		t.Fatalf("check found %d problem(s) after tag writes", len(rep.Problems))
 	}
 }
+
+// TestSnapshotIsolatesFromLaterWrites is the central guarantee of a long-lived snapshot
+// (spec 15 §7): once opened it pins one committed version, and every read through it sees
+// that version no matter how the database changes afterward. Here the snapshot is taken
+// when k == "v1", then the key is overwritten and a second key is added; the snapshot must
+// still report the old value and must not see the new key, while the live database does.
+func TestSnapshotIsolatesFromLaterWrites(t *testing.T) {
+	d := open(t)
+	if err := d.Update(func(txn *kv.Txn) error { return txn.Set([]byte("k"), []byte("v1")) }); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	snap := d.Snapshot()
+	defer snap.Close()
+
+	// Mutate after the snapshot is pinned: overwrite k and insert a fresh key.
+	if err := d.Update(func(txn *kv.Txn) error {
+		if err := txn.Set([]byte("k"), []byte("v2")); err != nil {
+			return err
+		}
+		return txn.Set([]byte("late"), []byte("x"))
+	}); err != nil {
+		t.Fatalf("mutate: %v", err)
+	}
+
+	// The snapshot still sees the pinned state.
+	if err := snap.View(func(txn *kv.Txn) error {
+		v, err := txn.Get([]byte("k"))
+		if err != nil {
+			return err
+		}
+		if string(v) != "v1" {
+			t.Fatalf("snapshot k = %q, want v1", v)
+		}
+		if _, err := txn.Get([]byte("late")); !errors.Is(err, kv.ErrNotFound) {
+			t.Fatalf("snapshot saw late key, err = %v, want ErrNotFound", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("snapshot view: %v", err)
+	}
+
+	// A live read sees the new state, proving the snapshot is a distinct pinned version.
+	if err := d.View(func(txn *kv.Txn) error {
+		v, err := txn.Get([]byte("k"))
+		if err != nil {
+			return err
+		}
+		if string(v) != "v2" {
+			t.Fatalf("live k = %q, want v2", v)
+		}
+		if _, err := txn.Get([]byte("late")); err != nil {
+			t.Fatalf("live missing late key: %v", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("live view: %v", err)
+	}
+}
+
+// TestSnapshotReusableAcrossViews proves one snapshot drives many consistent reads: the
+// same pinned version answers every View call, even as writes land between them. This is
+// what a multi-step consistent read or an online backup relies on.
+func TestSnapshotReusableAcrossViews(t *testing.T) {
+	d := open(t)
+	if err := d.Update(func(txn *kv.Txn) error { return txn.Set([]byte("k"), []byte("v1")) }); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	snap := d.Snapshot()
+	defer snap.Close()
+
+	read := func() string {
+		t.Helper()
+		var got string
+		if err := snap.View(func(txn *kv.Txn) error {
+			v, err := txn.Get([]byte("k"))
+			if err != nil {
+				return err
+			}
+			got = string(v)
+			return nil
+		}); err != nil {
+			t.Fatalf("snapshot view: %v", err)
+		}
+		return got
+	}
+
+	if first := read(); first != "v1" {
+		t.Fatalf("first read = %q, want v1", first)
+	}
+	if err := d.Update(func(txn *kv.Txn) error { return txn.Set([]byte("k"), []byte("v2")) }); err != nil {
+		t.Fatalf("mutate between reads: %v", err)
+	}
+	if second := read(); second != "v1" {
+		t.Fatalf("second read = %q after intervening write, want v1", second)
+	}
+}
+
+// TestSnapshotVersionMonotonic checks that a snapshot taken after a commit pins a version
+// no older than one taken before it, and that both report a non-zero pinned version.
+func TestSnapshotVersionMonotonic(t *testing.T) {
+	d := open(t)
+	if err := d.Update(func(txn *kv.Txn) error { return txn.Set([]byte("a"), []byte("1")) }); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	early := d.Snapshot()
+	defer early.Close()
+
+	if err := d.Update(func(txn *kv.Txn) error { return txn.Set([]byte("b"), []byte("2")) }); err != nil {
+		t.Fatalf("second write: %v", err)
+	}
+	late := d.Snapshot()
+	defer late.Close()
+
+	if early.Version() == 0 {
+		t.Fatalf("early snapshot version is 0")
+	}
+	if late.Version() < early.Version() {
+		t.Fatalf("late version %d < early version %d", late.Version(), early.Version())
+	}
+}
+
+// TestSnapshotClosedRejectsReads confirms Close releases the snapshot and is idempotent,
+// and that using a closed snapshot returns ErrSnapshotClosed rather than reading stale or
+// undefined state.
+func TestSnapshotClosedRejectsReads(t *testing.T) {
+	d := open(t)
+	if err := d.Update(func(txn *kv.Txn) error { return txn.Set([]byte("k"), []byte("v")) }); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	snap := d.Snapshot()
+	if err := snap.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	// Idempotent: a second close is a no-op, not an error.
+	if err := snap.Close(); err != nil {
+		t.Fatalf("second close: %v", err)
+	}
+	// A read after close is refused with the typed sentinel.
+	if err := snap.View(func(txn *kv.Txn) error { return nil }); !errors.Is(err, kv.ErrSnapshotClosed) {
+		t.Fatalf("view after close err = %v, want ErrSnapshotClosed", err)
+	}
+}
