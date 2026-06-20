@@ -262,6 +262,23 @@ func (kdb *DB) Vacuum(budget int) (int, error) {
 	return freed, wrap(err)
 }
 
+// ApplicationID returns the application-defined file tag stored in the header (spec 22 §2),
+// the value an application stamps so a tool can recognize its own files. kv never interprets
+// it.
+func (kdb *DB) ApplicationID() uint32 { return kdb.d.ApplicationID() }
+
+// SetApplicationID stamps the application-defined file tag and persists it durably (spec 22
+// §2). It is a persistent-runtime setting: the value survives reopen and a crash.
+func (kdb *DB) SetApplicationID(id uint32) error { return wrap(kdb.d.SetApplicationID(id)) }
+
+// UserVersion returns the application-defined version counter stored in the header (spec 22
+// §2), the kv analog of SQLite's user_version.
+func (kdb *DB) UserVersion() uint32 { return kdb.d.UserVersion() }
+
+// SetUserVersion records the application-defined version counter and persists it durably
+// (spec 22 §2). Like the application id it is persistent-runtime and fsynced before return.
+func (kdb *DB) SetUserVersion(v uint32) error { return wrap(kdb.d.SetUserVersion(v)) }
+
 // CheckProblem is one structural violation found by Check: a corruption class, the page
 // it was found on (zero for a file-wide problem), and a human-readable description
 // (spec 16 §4, spec 23 §3).

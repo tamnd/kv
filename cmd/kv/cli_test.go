@@ -437,3 +437,76 @@ func TestShellOpensOnlyExistingFile(t *testing.T) {
 		t.Fatalf("run on missing file = exit %d, want %d (usage)", code, exitUsage)
 	}
 }
+
+// TestPragmaReadAndPersistentSet drives the pragma command: reading a create-time knob, then
+// setting a persistent header tag and reading it back through a fresh open (a new process
+// would do the same), proving the value is durable.
+func TestPragmaReadAndPersistentSet(t *testing.T) {
+	p := dbPath(t)
+	if got := strings.TrimSpace(capture(t, func() { run([]string{"pragma", p, "engine"}) })); got != "btree" {
+		t.Fatalf("pragma engine = %q, want btree", got)
+	}
+	if code := run([]string{"pragma", p, "application_id=305419896"}); code != exitOK {
+		t.Fatalf("set application_id: exit %d", code)
+	}
+	// A second invocation opens the file afresh and must see the persisted tag.
+	if got := strings.TrimSpace(capture(t, func() { run([]string{"pragma", p, "application_id"}) })); got != "305419896" {
+		t.Fatalf("application_id after reopen = %q, want 305419896", got)
+	}
+	// Hex input is accepted and echoed back in decimal.
+	if got := strings.TrimSpace(capture(t, func() { run([]string{"pragma", p, "user_version=0x10"}) })); got != "16" {
+		t.Fatalf("set user_version=0x10 echoed %q, want 16", got)
+	}
+}
+
+// TestPragmaTierErrors confirms the wrong-tier and bad-input rejections all report a usage
+// error (exit 2), not an IO or corruption code.
+func TestPragmaTierErrors(t *testing.T) {
+	p := dbPath(t)
+	cases := []struct {
+		name string
+		expr string
+	}{
+		{"create-time", "page_size=8192"},
+		{"read-only", "page_count=5"},
+		{"unknown", "bogus_knob"},
+		{"bad-value", "application_id=not-a-number"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if code := run([]string{"pragma", p, tc.expr}); code != exitUsage {
+				t.Fatalf("pragma %s = exit %d, want %d (usage)", tc.expr, code, exitUsage)
+			}
+		})
+	}
+}
+
+// TestPragmaIncrementalVacuum confirms the incremental_vacuum action is reachable through the
+// pragma surface and reports how many pages it freed.
+func TestPragmaIncrementalVacuum(t *testing.T) {
+	p := dbPath(t)
+	out := strings.TrimSpace(capture(t, func() {
+		if code := run([]string{"pragma", p, "incremental_vacuum"}); code != exitOK {
+			t.Fatalf("incremental_vacuum: exit %d", code)
+		}
+	}))
+	if !strings.HasPrefix(out, "freed ") || !strings.HasSuffix(out, "page(s)") {
+		t.Fatalf("incremental_vacuum output = %q, want a freed-N-page(s) line", out)
+	}
+}
+
+// TestShellPragma drives the pragma surface through the shell: a persistent set then a read,
+// both on the data stream.
+func TestShellPragma(t *testing.T) {
+	out := shellSession(t, ".pragma application_id=123\n.pragma application_id\n.exit\n")
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	want := []string{"123", "123"}
+	if len(lines) != len(want) {
+		t.Fatalf("got %q, want %q", lines, want)
+	}
+	for i := range want {
+		if lines[i] != want[i] {
+			t.Fatalf("line %d = %q, want %q", i, lines[i], want[i])
+		}
+	}
+}

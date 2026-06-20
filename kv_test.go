@@ -394,3 +394,62 @@ func TestReopenPersists(t *testing.T) {
 		t.Fatalf("view: %v", err)
 	}
 }
+
+// TestHeaderTagsPersist confirms the application_id and user_version header tags (spec 22 §2)
+// are durable: a value set on one handle is readable after a full close and reopen, and the
+// surrounding key data is unharmed.
+func TestHeaderTagsPersist(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "data.kv")
+	d, err := kv.Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := d.Update(func(txn *kv.Txn) error { return txn.Set([]byte("k"), []byte("v")) }); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if got := d.ApplicationID(); got != 0 {
+		t.Fatalf("fresh application_id = %d, want 0", got)
+	}
+	if err := d.SetApplicationID(0xCAFEF00D); err != nil {
+		t.Fatalf("set application_id: %v", err)
+	}
+	if err := d.SetUserVersion(7); err != nil {
+		t.Fatalf("set user_version: %v", err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	d2, err := kv.Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer d2.Close()
+	if got := d2.ApplicationID(); got != 0xCAFEF00D {
+		t.Fatalf("application_id after reopen = %#x, want 0xcafef00d", got)
+	}
+	if got := d2.UserVersion(); got != 7 {
+		t.Fatalf("user_version after reopen = %d, want 7", got)
+	}
+	// The key data set before stamping the tags survived the header writes.
+	if err := d2.View(func(txn *kv.Txn) error {
+		v, err := txn.Get([]byte("k"))
+		if err != nil {
+			return err
+		}
+		if string(v) != "v" {
+			t.Fatalf("k = %q after tag writes, want v", v)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("view: %v", err)
+	}
+	// The file is still structurally sound after the header rewrites.
+	rep, err := d2.Check()
+	if err != nil {
+		t.Fatalf("check: %v", err)
+	}
+	if !rep.OK() {
+		t.Fatalf("check found %d problem(s) after tag writes", len(rep.Problems))
+	}
+}
