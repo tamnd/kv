@@ -15,7 +15,8 @@ import (
 // segment; a compaction merges several into one.
 //
 // The layout is a chain of data pages, a chain of index pages, an optional chain
-// of range-delete pages, and a footer page (spec 06 §4.1). A data page is a run of
+// of range-delete pages, an optional chain of Bloom-filter pages, and a footer page
+// (spec 06 §4.1). A data page is a run of
 // sorted (internalKey, value) cells, identical in shape to a B-tree leaf, and
 // carries the page number of the next data page in its common header's overflow
 // slot, so a full scan walks the chain without an index. The index pages hold one
@@ -34,10 +35,11 @@ import (
 // page. This is the segment analog of the B-tree's rule that a split never cuts a
 // version group.
 //
-// Deferred to later slices: the per-segment Bloom/Ribbon filter that skips a
-// segment on a point miss, block compression, and value separation for cells too
-// large to inline. A cell larger than the usable page area is rejected here for
-// that reason; the value log removes the limit.
+// The per-segment Bloom filter over the run's distinct user keys (its own page
+// chain, head and probe count in the footer) lets a point miss skip the segment
+// without touching its block index. Deferred to later slices: block compression and
+// value separation for cells too large to inline. A cell larger than the usable page
+// area is rejected here for that reason; the value log removes the limit.
 
 // segDataHeaderSize is a data page's header: the common 8-byte preamble, whose
 // overflow slot holds the next data page number (0 ends the chain). The index and
@@ -50,6 +52,7 @@ const (
 	footerFlag   byte = 0x01 // the footer page
 	indexFlag    byte = 0x02 // a block-index page
 	rangeDelFlag byte = 0x04 // a range-delete page
+	filterFlag   byte = 0x08 // a Bloom-filter page
 )
 
 // indexEntry is one block-index separator: the first user key of a data page and
@@ -69,6 +72,7 @@ type segment struct {
 	head       format.PageNo // first data page, or NoPage when the run is empty
 	indexHead  format.PageNo // first index page, or NoPage when the run is empty
 	rdHead     format.PageNo // first range-delete page, or NoPage when there are none
+	filterHead format.PageNo // first Bloom-filter page, or NoPage when there is none
 	minKey     []byte        // smallest user key, nil when empty
 	maxKey     []byte        // largest user key, nil when empty
 	maxVersion uint64        // largest commit version any cell carries
@@ -77,6 +81,7 @@ type segment struct {
 
 	index     []indexEntry      // one separator per data page, ascending by user key
 	rangeDels []format.RangeDel // the segment's range-delete intervals
+	filter    *bloomFilter      // membership filter over the segment's user keys
 }
 
 // pendingPage is one data page's cells, accumulated before the pages are allocated
@@ -110,6 +115,7 @@ func writeSegment(pgr *pager.Pager, src func(emit func(internalKey, value []byte
 		maxVersion uint64
 		numCells   int
 		rangeDels  []format.RangeDel
+		filterKeys [][]byte // one entry per distinct user key, for the Bloom filter
 		emitErr    error
 	)
 	startPage := func(firstUser []byte) {
@@ -145,6 +151,8 @@ func writeSegment(pgr *pager.Pager, src func(emit func(internalKey, value []byte
 		if len(group) == 0 {
 			return
 		}
+		// One filter entry per distinct user key, recorded as the group commits.
+		filterKeys = append(filterKeys, append([]byte(nil), groupUser...))
 		// Start the group on a fresh page when it will not fit on the current one,
 		// so the whole group stays together.
 		if cur.cells > 0 && len(cur.body)+groupLen > usable {
@@ -297,7 +305,23 @@ func writeSegment(pgr *pager.Pager, src func(emit func(internalKey, value []byte
 	}
 	seg.rdHead = rdHead
 
-	seg.pages = len(pgnos) + indexPages + rdPages + 1 // data + index + range-delete + footer
+	// Build the Bloom filter over the distinct user keys and persist it, so a point
+	// read can skip this whole segment when the filter says a key was never here.
+	var filterBlob []byte
+	if len(filterKeys) > 0 {
+		seg.filter = newBloom(len(filterKeys), bloomBitsPerKey)
+		for _, k := range filterKeys {
+			seg.filter.add(k)
+		}
+		filterBlob = seg.filter.bits
+	}
+	filterHead, filterPages, err := writeBlobPages(pgr, filterFlag, filterBlob)
+	if err != nil {
+		return nil, err
+	}
+	seg.filterHead = filterHead
+
+	seg.pages = len(pgnos) + indexPages + rdPages + filterPages + 1 // data + index + range-delete + filter + footer
 	footer, err := writeFooter(pgr, seg)
 	if err != nil {
 		return nil, err
@@ -368,6 +392,98 @@ func writeRecordPages(pgr *pager.Pager, flag byte, records [][]byte) (format.Pag
 	return pgnos[0], len(bodies), nil
 }
 
+// writeBlobPages packs an opaque byte blob into a chain of pages tagged with flag
+// and returns the head page number and the number of pages written. Unlike
+// writeRecordPages, which stores a count of length-prefixed records, a blob page
+// stores a raw slice of the blob and records its byte length in the common header's
+// cell-count slot, so the blob is reassembled by concatenating each page's payload.
+// The Bloom filter's bit array is stored this way: it is a flat array, not a run of
+// records. An empty blob yields no pages and a NoPage head.
+func writeBlobPages(pgr *pager.Pager, flag byte, blob []byte) (format.PageNo, int, error) {
+	if len(blob) == 0 {
+		return format.NoPage, 0, nil
+	}
+	usable := pgr.Header().UsablePageSize()
+	chunk := usable - segDataHeaderSize
+
+	var chunks [][]byte
+	for off := 0; off < len(blob); off += chunk {
+		end := off + chunk
+		if end > len(blob) {
+			end = len(blob)
+		}
+		chunks = append(chunks, blob[off:end])
+	}
+
+	pgnos := make([]format.PageNo, len(chunks))
+	frames := make([]*pager.Frame, len(chunks))
+	for i := range chunks {
+		pgno, fr, err := pgr.Allocate()
+		if err != nil {
+			return 0, 0, err
+		}
+		pgnos[i] = pgno
+		frames[i] = fr
+	}
+	for i := range chunks {
+		next := format.NoPage
+		if i+1 < len(chunks) {
+			next = pgnos[i+1]
+		}
+		body := make([]byte, segDataHeaderSize, usable)
+		body = append(body, chunks[i]...)
+		format.CommonHeader{Type: format.PageLSMBlock, Flags: flag, CellCount: uint16(len(chunks[i])), Overflow: next}.Encode(body)
+		data := frames[i].Data()
+		copy(data, body)
+		for j := len(body); j < len(data); j++ {
+			data[j] = 0
+		}
+		pgr.Unpin(frames[i], true)
+	}
+	return pgnos[0], len(chunks), nil
+}
+
+// loadBlobPages walks a blob-page chain from head and returns the reassembled blob.
+// A NoPage head yields a nil blob.
+func loadBlobPages(pgr *pager.Pager, head format.PageNo, flag byte) ([]byte, error) {
+	var blob []byte
+	for pgno := head; pgno != format.NoPage; {
+		fr, err := pgr.Get(pgno, pager.Read)
+		if err != nil {
+			return nil, err
+		}
+		data := fr.Data()
+		h := format.DecodeCommonHeader(data)
+		if h.Type != format.PageLSMBlock || h.Flags != flag {
+			pgr.Unpin(fr, false)
+			return nil, fmt.Errorf("lsm: page %d in blob chain has the wrong flag", pgno)
+		}
+		n := int(h.CellCount)
+		blob = append(blob, data[segDataHeaderSize:segDataHeaderSize+n]...)
+		next := h.Overflow
+		pgr.Unpin(fr, false)
+		pgno = next
+	}
+	return blob, nil
+}
+
+// loadFilter reconstructs the segment's Bloom filter from its page chain. A NoPage
+// head leaves seg.filter nil, so mayContain conservatively passes and the segment is
+// always read.
+func (s *segment) loadFilter(pgr *pager.Pager, filterK uint32) error {
+	if s.filterHead == format.NoPage {
+		return nil
+	}
+	bits, err := loadBlobPages(pgr, s.filterHead, filterFlag)
+	if err != nil {
+		return err
+	}
+	if len(bits) > 0 {
+		s.filter = &bloomFilter{bits: bits, k: filterK}
+	}
+	return nil
+}
+
 // writeFooter writes the segment's footer page and returns its number. The footer
 // is small and fixed in shape, so it always fits one page.
 func writeFooter(pgr *pager.Pager, seg *segment) (format.PageNo, error) {
@@ -392,6 +508,13 @@ func writeFooter(pgr *pager.Pager, seg *segment) (format.PageNo, error) {
 	body = append(body, u32[:]...)
 	binary.BigEndian.PutUint32(u32[:], seg.rdHead)
 	body = append(body, u32[:]...)
+	binary.BigEndian.PutUint32(u32[:], seg.filterHead)
+	body = append(body, u32[:]...)
+	var filterK uint32
+	if seg.filter != nil {
+		filterK = seg.filter.k
+	}
+	body = format.AppendUvarint(body, uint64(filterK))
 	body = format.AppendUvarint(body, uint64(seg.pages))
 
 	usable := pgr.Header().UsablePageSize()
@@ -447,6 +570,10 @@ func openSegment(pgr *pager.Pager, footer format.PageNo) (*segment, error) {
 	off += 4
 	seg.rdHead = binary.BigEndian.Uint32(data[off:])
 	off += 4
+	seg.filterHead = binary.BigEndian.Uint32(data[off:])
+	off += 4
+	filterK, n := format.Uvarint(data[off:])
+	off += n
 	pageCount, n := format.Uvarint(data[off:])
 	seg.pages = int(pageCount)
 	pgr.Unpin(fr, false)
@@ -455,6 +582,9 @@ func openSegment(pgr *pager.Pager, footer format.PageNo) (*segment, error) {
 		return nil, err
 	}
 	if err := seg.loadRangeDels(pgr); err != nil {
+		return nil, err
+	}
+	if err := seg.loadFilter(pgr, uint32(filterK)); err != nil {
 		return nil, err
 	}
 	return seg, nil
