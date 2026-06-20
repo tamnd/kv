@@ -17,11 +17,12 @@ import (
 // intermediate versions again. Lazy node merge, which would reclaim the leaves GC
 // empties, is a later milestone; the SPI does not change when it lands.
 func (t *BTree) Maintain(ctx context.Context, budget engine.MaintBudget) (engine.MaintReport, error) {
-	if budget.Watermark == 0 {
-		// Nothing sits below version 0, so there is no dead history to reclaim.
+	if budget.Watermark == 0 && budget.Now == 0 {
+		// Nothing sits below version 0 to collapse, and with no clock there is no expiry
+		// to sweep, so there is no work to do.
 		return engine.MaintReport{}, nil
 	}
-	return t.gcVersions(budget.Watermark, budget.MaxPages)
+	return t.gcVersions(budget.Watermark, budget.Now, budget.MaxPages)
 }
 
 // gcVersions collapses dead version history at or below w in two phases over the
@@ -37,7 +38,7 @@ func (t *BTree) Maintain(ctx context.Context, budget engine.MaintBudget) (engine
 // could, after a checkpoint, leave a covered key further right resurrected. Phase one
 // only ever removes read-redundant cells, so it is safe to stop at any leaf and finish
 // the pass on a later call.
-func (t *BTree) gcVersions(w uint64, maxPages int) (engine.MaintReport, error) {
+func (t *BTree) gcVersions(w, sweepNow uint64, maxPages int) (engine.MaintReport, error) {
 	var report engine.MaintReport
 
 	// Resume a mid-chain pass only at the same watermark it adopted; otherwise start
@@ -67,9 +68,10 @@ func (t *BTree) gcVersions(w uint64, maxPages int) (engine.MaintReport, error) {
 		}
 		pages++
 		next := l.next
-		nl, changed := gcCollapseLeaf(l, w, t.rangeDels, t.merge)
+		nl, changed, swept := gcCollapseLeaf(l, w, sweepNow, t.rangeDels, t.merge)
 		if changed {
 			report.BytesReclaimed += int64(len(marshalLeaf(l)) - len(marshalLeaf(nl)))
+			report.ExpiredSwept += swept
 			if err := t.storeLeaf(pgno, nl); err != nil {
 				return report, err
 			}
@@ -103,14 +105,23 @@ func (t *BTree) gcVersions(w uint64, maxPages int) (engine.MaintReport, error) {
 }
 
 // gcCollapseLeaf rewrites one leaf, collapsing every user key's versions at or below
-// w into the single value a snapshot at w resolves. Versions above w are kept
-// verbatim, as is every range-delete marker (markers are dropped, when dead, only by
-// dropDeadMarkers after the whole chain is collapsed). It returns the original leaf
-// and false when nothing changed, or a fresh leaf and true otherwise; the returned
-// leaf's cells stay in ascending internal-key order and its B-link next is preserved.
-func gcCollapseLeaf(l *leaf, w uint64, rangeDels []format.RangeDel, merge func(existing, operand []byte) []byte) (*leaf, bool) {
+// w into the single value a snapshot at w resolves, and sweeping any expired TTL set
+// into a tombstone. Versions above w are kept verbatim, as is every range-delete marker
+// (markers are dropped, when dead, only by dropDeadMarkers after the whole chain is
+// collapsed). It returns the original leaf and false when nothing changed, or a fresh
+// leaf and true otherwise, plus the count of TTL sets swept; the returned leaf's cells
+// stay in ascending internal-key order and its B-link next is preserved.
+//
+// The sweep is version-independent: a TTL set whose expiry is at or before sweepNow is
+// invisible to every reader (read resolution already folds it to absent at the current
+// clock, and reads are never pinned in time), so rewriting it to a tombstone at its own
+// version changes nothing observable while reclaiming the framed value bytes. A swept
+// cell above w is kept as a verbatim tombstone; one at or below w folds with the rest of
+// the history. A sweepNow of zero disables the sweep, which is what recovery passes.
+func gcCollapseLeaf(l *leaf, w, sweepNow uint64, rangeDels []format.RangeDel, merge func(existing, operand []byte) []byte) (*leaf, bool, int64) {
 	out := &leaf{next: l.next}
 	changed := false
+	var swept int64
 
 	i := 0
 	for i < len(l.keys) {
@@ -125,14 +136,31 @@ func gcCollapseLeaf(l *leaf, w uint64, rangeDels []format.RangeDel, merge func(e
 			ik, val := l.keys[j], l.vals[j]
 			j++
 			k := format.KindOf(ik)
-			if k == format.KindRangeBegin || k == format.KindRangeEnd || k == format.KindSetWithTTL {
-				// Range markers resolve out of band, and a TTL set is kept verbatim so
-				// version GC never re-encodes its framed value as a plain set and silently
-				// strips the expiry. A TTL cell is thus never in leOps below, so the fold
-				// never expires one; expired cells are reclaimed by the sweep (spec 15 §6).
+			if k == format.KindRangeBegin || k == format.KindRangeEnd {
+				// Range markers resolve out of band, never as ops.
 				out.keys = append(out.keys, ik)
 				out.vals = append(out.vals, val)
 				continue
+			}
+			if k == format.KindSetWithTTL {
+				expiry, _ := format.DecodeTTLValue(val)
+				if sweepNow != 0 && expiry != 0 && expiry <= sweepNow {
+					// Sweep: the deadline has passed, so reclaim the framed value and leave a
+					// tombstone at the same version. It then either stands verbatim (above w)
+					// or folds with the rest of the history (at or below w) below.
+					ik = format.EncodeInternalKey(uk, format.Version(ik), format.KindDelete)
+					val = nil
+					k = format.KindDelete
+					changed = true
+					swept++
+				} else {
+					// A live or non-expiring TTL set is kept verbatim so a later read still
+					// resolves it; version GC never re-encodes its framed value as a plain set
+					// and silently strips the expiry.
+					out.keys = append(out.keys, ik)
+					out.vals = append(out.vals, val)
+					continue
+				}
 			}
 			if format.Version(ik) > w {
 				out.keys = append(out.keys, ik)
@@ -167,10 +195,10 @@ func gcCollapseLeaf(l *leaf, w uint64, rangeDels []format.RangeDel, merge func(e
 	}
 
 	if !changed {
-		return l, false
+		return l, false, 0
 	}
 	sortLeafCells(out)
-	return out, true
+	return out, true, swept
 }
 
 // dropDeadMarkers removes the range-delete marker cells at or below w from every leaf
