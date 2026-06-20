@@ -161,6 +161,12 @@ func changesFor(entries []engine.BatchEntry, prefix []byte, v uint64) []Change {
 		switch format.KindOf(ik) {
 		case format.KindSet:
 			out = append(out, Change{Kind: ChangeSet, Key: clone(uk), Value: clone(e.Value), Version: v})
+		case format.KindSetWithTTL:
+			// A TTL set surfaces as an ordinary set carrying the user's value: the expiry
+			// frame is an internal storage detail the feed strips, so a watch or replication
+			// consumer sees the value it would read (spec 15 §6, §7).
+			_, uv := format.DecodeTTLValue(e.Value)
+			out = append(out, Change{Kind: ChangeSet, Key: clone(uk), Value: clone(uv), Version: v})
 		case format.KindDelete:
 			out = append(out, Change{Kind: ChangeDelete, Key: clone(uk), Version: v})
 		case format.KindMerge:

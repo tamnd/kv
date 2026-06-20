@@ -100,11 +100,11 @@ func resolveStream(entries []entry, snap engine.Snapshot, merge func(existing, o
 			ik := entries[j].ik
 			val := entries[j].val
 			j++
-			k := format.KindOf(ik)
-			if k == format.KindRangeBegin || k == format.KindRangeEnd {
-				continue
+			op, ok := format.OpFromCell(ik, val, snap.Now)
+			if !ok {
+				continue // range markers resolve through rangeDels, not as ops
 			}
-			ops = append(ops, format.Op{Version: format.Version(ik), Kind: k, Value: val})
+			ops = append(ops, op)
 		}
 		i = j
 

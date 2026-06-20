@@ -70,7 +70,7 @@ func (t *Txn) NewIterator(opts engine.IterOptions) (*Iterator, error) {
 func (d *DB) rangeSnapshot(version uint64, lower, upper []byte, keysOnly bool) ([]iterItem, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	rd, err := d.eng.NewReader(engine.Snapshot{Version: version})
+	rd, err := d.eng.NewReader(engine.Snapshot{Version: version, Now: d.now()})
 	if err != nil {
 		return nil, err
 	}

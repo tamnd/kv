@@ -1,6 +1,10 @@
 package kv
 
-import "github.com/tamnd/kv/db"
+import (
+	"time"
+
+	"github.com/tamnd/kv/db"
+)
 
 // Txn is a transaction: a fixed read snapshot plus, for a writable transaction, a
 // private buffer of mutations applied atomically at commit (spec 15 §2). A Txn is not
@@ -36,6 +40,20 @@ func (t *Txn) Exists(key []byte) (bool, error) {
 
 // Set buffers an upsert of key to value, applied at commit.
 func (t *Txn) Set(key, value []byte) error { return wrap(t.t.Set(key, value)) }
+
+// SetWithTTL buffers an upsert of key to value that expires after ttl (spec 15 §6).
+// The deadline is computed once, here, from the database clock, and stored as an
+// absolute time, so it is honored consistently across reads and survives reopen rather
+// than restarting on recovery. A reader past the deadline sees the key as absent before
+// any background sweep reclaims it. A non-positive ttl means the key never expires,
+// equivalent to a plain Set.
+func (t *Txn) SetWithTTL(key, value []byte, ttl time.Duration) error {
+	var expiry uint64
+	if ttl > 0 {
+		expiry = t.t.Now() + uint64(ttl.Nanoseconds())
+	}
+	return wrap(t.t.SetWithTTL(key, value, expiry))
+}
 
 // Delete buffers a tombstone for key, applied at commit.
 func (t *Txn) Delete(key []byte) error { return wrap(t.t.Delete(key)) }

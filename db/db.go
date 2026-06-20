@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/tamnd/kv/btree"
 	"github.com/tamnd/kv/engine"
@@ -59,6 +60,11 @@ type Options struct {
 	// auto-checkpointing entirely, leaving the WAL to grow until an explicit
 	// Checkpoint or a clean close.
 	AutoCheckpoint int
+	// Clock returns the current wall-clock time in Unix nanoseconds, the time base a
+	// TTL set's absolute expiry is compared against during read resolution (spec 15
+	// §6). Zero selects the real monotonic-corrected system clock; a test injects a
+	// controllable clock here to drive expiry deterministically.
+	Clock func() uint64
 }
 
 func (o Options) maxRetries() int {
@@ -95,6 +101,15 @@ func (o Options) autoCheckpoint() int {
 	return o.AutoCheckpoint
 }
 
+// clock resolves the wall-clock source for TTL expiry: the injected clock if any,
+// else the real system clock read as Unix nanoseconds (spec 15 §6).
+func (o Options) clock() func() uint64 {
+	if o.Clock != nil {
+		return o.Clock
+	}
+	return func() uint64 { return uint64(time.Now().UnixNano()) }
+}
+
 func (o Options) sync() wal.Sync {
 	// SyncFull is the iota-zero value of wal.Sync's predecessor SyncOff, so the zero
 	// Options must map to SyncFull explicitly rather than relying on the zero value.
@@ -126,6 +141,13 @@ type DB struct {
 	maxRetries int
 	syncMode   wal.Sync
 	isolation  Isolation
+
+	// now is the wall-clock source, in Unix nanoseconds, that read resolution compares
+	// a TTL set's absolute expiry against (spec 15 §6). It is the real system clock by
+	// default and an injected clock under test, so expiry is deterministic in tests and
+	// honest in production. Reads thread it into engine.Snapshot.Now; a zero Now there
+	// disables expiry, which is what background GC and recovery want.
+	now func() uint64
 
 	// fatal fences the database after a WAL durability failure (spec 07 §6). It is
 	// set under the write lock when a log append or commit sync fails and read at the
@@ -198,7 +220,7 @@ func create(fs vfs.FS, path string, opts Options) (*DB, error) {
 		return nil, err
 	}
 	d := &DB{fs: fs, path: path, pgr: pgr, wal: w, eng: eng, orc: newOracle(0),
-		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation}
+		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, now: opts.clock()}
 	if err := d.openEngine(opts.Merge); err != nil {
 		w.Close()
 		pgr.Close()
@@ -221,7 +243,7 @@ func openExisting(fs vfs.FS, path string, opts Options) (*DB, error) {
 		return nil, err
 	}
 	d := &DB{fs: fs, path: path, pgr: pgr, eng: eng,
-		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation}
+		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, now: opts.clock()}
 	if err := d.openEngine(opts.Merge); err != nil {
 		pgr.Close()
 		return nil, err
@@ -400,6 +422,8 @@ func (d *DB) applyTxn(v uint64, ops []pendingOp) (uint64, error) {
 		switch op.kind {
 		case opSet:
 			b.Set(op.key, op.value)
+		case opSetTTL:
+			b.SetWithTTL(op.key, op.value, op.expiry)
 		case opDelete:
 			b.Delete(op.key)
 		case opMerge:
@@ -468,7 +492,7 @@ func batchKeys(b *engine.WriteBatch) []string {
 func (d *DB) snapshotGet(version uint64, key []byte) ([]byte, bool, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	rd, err := d.eng.NewReader(engine.Snapshot{Version: version})
+	rd, err := d.eng.NewReader(engine.Snapshot{Version: version, Now: d.now()})
 	if err != nil {
 		return nil, false, err
 	}
@@ -494,7 +518,7 @@ func (d *DB) Version() uint64 {
 // lifetime; for snapshot-isolated reads prefer View/Begin, which manage the
 // snapshot and its watermark registration.
 func (d *DB) NewReader(version uint64) (engine.Reader, error) {
-	return d.eng.NewReader(engine.Snapshot{Version: version})
+	return d.eng.NewReader(engine.Snapshot{Version: version, Now: d.now()})
 }
 
 // Get reads userKey at the latest committed snapshot, a convenience over a View

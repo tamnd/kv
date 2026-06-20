@@ -12,6 +12,7 @@ const (
 	KindMerge      Kind = 0x02 // merge operand
 	KindRangeBegin Kind = 0x03 // range-delete start
 	KindRangeEnd   Kind = 0x04 // range-delete end
+	KindSetWithTTL Kind = 0x05 // value set with an expiry prefix on the value (spec 15 §6)
 )
 
 // String renders a Kind for diagnostics.
@@ -27,6 +28,8 @@ func (k Kind) String() string {
 		return "rangebegin"
 	case KindRangeEnd:
 		return "rangeend"
+	case KindSetWithTTL:
+		return "setttl"
 	default:
 		return "kind?"
 	}
