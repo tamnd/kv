@@ -50,6 +50,9 @@ type Options struct {
 	// MaxRetries bounds how many times Update re-runs its closure on a write-write
 	// conflict (spec 15 §2.1). Zero selects a small default.
 	MaxRetries int
+	// Isolation is the isolation level every transaction runs at (spec 10 §3, §4).
+	// Zero is SnapshotIsolation, the default; Serializable adds read-set validation.
+	Isolation Isolation
 }
 
 func (o Options) maxRetries() int {
@@ -103,6 +106,7 @@ type DB struct {
 	merge      func(existing, operand []byte) []byte
 	maxRetries int
 	syncMode   wal.Sync
+	isolation  Isolation
 }
 
 // Open opens the database at path, creating it if it does not exist, and runs crash
@@ -143,7 +147,7 @@ func create(fs vfs.FS, path string, opts Options) (*DB, error) {
 		return nil, err
 	}
 	d := &DB{fs: fs, path: path, pgr: pgr, wal: w, eng: eng, orc: newOracle(0),
-		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync()}
+		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation}
 	if err := d.openEngine(opts.Merge); err != nil {
 		w.Close()
 		pgr.Close()
@@ -165,7 +169,7 @@ func openExisting(fs vfs.FS, path string, opts Options) (*DB, error) {
 		return nil, err
 	}
 	d := &DB{fs: fs, path: path, pgr: pgr, eng: eng,
-		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync()}
+		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation}
 	if err := d.openEngine(opts.Merge); err != nil {
 		pgr.Close()
 		return nil, err
@@ -306,6 +310,29 @@ func (d *DB) commitTxn(readVersion uint64, ops []pendingOp, conflictKeys []strin
 	if !ok {
 		return 0, ErrConflict
 	}
+	return d.applyTxn(v, ops)
+}
+
+// commitTxnSerializable is the serializable-isolation commit path (spec 10 §4): it is
+// commitTxn with the oracle's read-set validation in place of the plain write-write
+// check. writeKeys is the resolved write set (first-committer-wins), readKeys and
+// ranges are what the transaction read (rw-antidependency detection). It returns the
+// assigned commit version, or ErrConflict if either check fails.
+func (d *DB) commitTxnSerializable(readVersion uint64, ops []pendingOp, writeKeys, readKeys []string, ranges []keyRange) (uint64, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	v, ok := d.orc.newCommitTsSerializable(readVersion, writeKeys, readKeys, ranges)
+	if !ok {
+		return 0, ErrConflict
+	}
+	return d.applyTxn(v, ops)
+}
+
+// applyTxn builds the write batch for an admitted commit at version v, applies it
+// through the write-ahead path, and makes the version visible. The caller holds d.mu
+// and has already cleared conflict detection.
+func (d *DB) applyTxn(v uint64, ops []pendingOp) (uint64, error) {
 	b := engine.NewWriteBatch(v)
 	for _, op := range ops {
 		switch op.kind {

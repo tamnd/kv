@@ -48,6 +48,11 @@ func (t *Txn) NewIterator(opts engine.IterOptions) (*Iterator, error) {
 		upper = format.PrefixSuccessor(opts.Prefix)
 	}
 
+	// A serializable transaction depends on every key in the scanned interval, so the
+	// predicate is tracked for commit-time validation (spec 10 §4); this is what gives
+	// a scan phantom protection a per-key read set could not.
+	t.trackRange(lower, upper)
+
 	base, err := t.db.rangeSnapshot(t.readVersion, lower, upper, opts.KeysOnly)
 	if err != nil {
 		return nil, err
