@@ -42,6 +42,11 @@ type Options struct {
 	CacheFrames int
 	// Engine selects the storage core for a fresh file; zero means the B-tree core.
 	Engine format.EngineKind
+	// Checksum selects the per-page checksum algorithm stamped into a fresh file
+	// (spec 02 §3.2). Zero selects CRC32C, the spec default, so every database detects
+	// torn writes and bit rot out of the box; set format.ChecksumXXH64 for the wider
+	// digest. Ignored when opening an existing file (its header's choice wins).
+	Checksum format.ChecksumAlgo
 	// Sync is the WAL durability level (spec 07 §6). Zero is SyncFull, the safe
 	// default: every acked commit survives a crash.
 	Sync wal.Sync
@@ -86,6 +91,17 @@ func (o Options) engineKind() format.EngineKind {
 		return format.EngineBTree
 	}
 	return o.Engine
+}
+
+// checksum resolves the per-page checksum algorithm for a fresh file: the zero value
+// selects CRC32C, the spec default (spec 02 §3.2), so the high-level API always
+// creates an integrity-checked database. ChecksumNone shares the zero byte and so is
+// not reachable here by design; integrity is not an opt-out at this layer.
+func (o Options) checksum() format.ChecksumAlgo {
+	if o.Checksum == 0 {
+		return format.ChecksumCRC32C
+	}
+	return o.Checksum
 }
 
 // autoCheckpoint resolves the WAL backlog threshold in frames: zero takes the 1000
@@ -203,6 +219,7 @@ func create(fs vfs.FS, path string, opts Options) (*DB, error) {
 		PageSize:    opts.pageSize(),
 		CacheFrames: opts.CacheFrames,
 		Engine:      opts.engineKind(),
+		Checksum:    opts.checksum(),
 		Flags:       format.FlagWAL,
 	})
 	if err != nil {

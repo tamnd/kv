@@ -338,6 +338,76 @@ func TestCLICheckJSON(t *testing.T) {
 	}
 }
 
+// TestCLICheckDetectsCorruption is the M3 exit-gate test at the command boundary: a
+// populated file whose data page bit-rots on disk makes `kv check` exit exitCorrupt(4)
+// and report the checksum class, while the same file before corruption exits 0. It drives
+// the whole stack the way a release gate or a CI soundness check does, through the real OS
+// filesystem (spec 02 §3.2, spec 23 §3, spec 24 M3).
+func TestCLICheckDetectsCorruption(t *testing.T) {
+	p := dbPath(t)
+	for i := 0; i < 20; i++ {
+		k := fmt.Sprintf("k%02d", i)
+		if code := run([]string{"set", p, k, "value"}); code != exitOK {
+			t.Fatalf("set %s: exit %d", k, code)
+		}
+	}
+	// Fold the writes into the main file so the data pages carry stamped checksums on disk.
+	if code := run([]string{"checkpoint", p}); code != exitOK {
+		t.Fatalf("checkpoint: exit %d", code)
+	}
+	// A sound file passes.
+	if code := run([]string{"check", p}); code != exitOK {
+		t.Fatalf("check on a sound file = exit %d, want %d", code, exitOK)
+	}
+
+	// Corrupt the first data page (page 2) directly on the OS file, behind the database.
+	const pageSize = 4096
+	corruptCLIPage(t, p, 2, pageSize)
+
+	// check must now flag the file and exit with the corruption code.
+	if code := run([]string{"check", p}); code != exitCorrupt {
+		t.Fatalf("check on a bit-rotted file = exit %d, want %d", code, exitCorrupt)
+	}
+	// The machine-readable form reports ok=false so a script can gate on it.
+	out := capture(t, func() {
+		if code := run([]string{"check", p, "-f", "json"}); code != exitCorrupt {
+			t.Fatalf("check -f json on a corrupt file = exit %d, want %d", code, exitCorrupt)
+		}
+	})
+	var got struct {
+		OK bool `json:"ok"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("decode %q: %v", out, err)
+	}
+	if got.OK {
+		t.Fatalf("check json ok = true on a corrupt file: %q", out)
+	}
+}
+
+// corruptCLIPage flips one content byte of a page directly in the on-disk file, modelling
+// bit rot under the real OS filesystem the CLI runs on.
+func corruptCLIPage(t *testing.T, path string, pgno int, pageSize int) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open %s: %v", path, err)
+	}
+	defer f.Close()
+	buf := make([]byte, pageSize)
+	off := int64(pgno-1) * int64(pageSize)
+	if _, err := f.ReadAt(buf, off); err != nil {
+		t.Fatalf("read page %d: %v", pgno, err)
+	}
+	buf[pageSize/2] ^= 0xFF
+	if _, err := f.WriteAt(buf, off); err != nil {
+		t.Fatalf("write page %d: %v", pgno, err)
+	}
+	if err := f.Sync(); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+}
+
 // TestCLIVacuum confirms the vacuum command runs cleanly over a populated file, prints a
 // freed-pages summary, and leaves the file sound. The tree core does not yet return pages
 // to the freelist, so the run reclaims zero pages today; the command still must succeed

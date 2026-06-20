@@ -190,6 +190,7 @@ func NewHeader(pageSize int, engine EngineKind, flags byte, checksum ChecksumAlg
 		PageSize:         pageSize,
 		FormatWrite:      FormatLevel,
 		FormatRead:       FormatLevel,
+		ReservedPerPage:  byte(checksum.ChecksumSize()),
 		Engine:           engine,
 		Flags:            flags,
 		Checksum:         checksum,

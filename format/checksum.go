@@ -1,6 +1,68 @@
 package format
 
-import "hash/crc32"
+import (
+	"encoding/binary"
+	"errors"
+	"hash/crc32"
+)
+
+// ErrCorrupt reports that on-disk bytes failed an integrity check: a page whose
+// stored checksum does not match its contents (a torn write or bit rot, spec 02
+// §3.2), or any structurally impossible image the lower layers refuse to trust.
+// It is the sentinel the read path returns so a caller can tell corruption from a
+// transient I/O error and surface it as the corrupt-file condition (spec 16 §4,
+// exit code 4).
+var ErrCorrupt = errors.New("kv/format: corrupt page (checksum mismatch)")
+
+// StampPageChecksum writes the page's checksum into its trailer, the last
+// ChecksumSize bytes of the full page, computed over everything before it (the
+// usable area, spec 02 §3.2). It is a no-op when the algorithm is none, so a file
+// created without checksums is written byte-for-byte as before. The page slice is
+// the whole physical page; the engine's usable area is page[:len(page)-size] and
+// the reserved trailer page[len(page)-size:] is exactly this checksum.
+func StampPageChecksum(page []byte, algo ChecksumAlgo) {
+	size := algo.ChecksumSize()
+	if size == 0 || len(page) <= size {
+		return
+	}
+	sum := algo.Sum(page[:len(page)-size])
+	putChecksum(page[len(page)-size:], sum, size)
+}
+
+// VerifyPageChecksum recomputes the page's checksum over its usable area and
+// compares it to the stored trailer, returning ErrCorrupt on a mismatch. It is a
+// no-op (returns nil) when the algorithm is none, so an un-checksummed file always
+// verifies. The caller passes the whole physical page.
+func VerifyPageChecksum(page []byte, algo ChecksumAlgo) error {
+	size := algo.ChecksumSize()
+	if size == 0 || len(page) <= size {
+		return nil
+	}
+	want := readChecksum(page[len(page)-size:], size)
+	got := algo.Sum(page[:len(page)-size])
+	if got != want {
+		return ErrCorrupt
+	}
+	return nil
+}
+
+// putChecksum stores a checksum into the trailer big-endian: CRC32C in the low 4
+// bytes, xxHash64 in 8. A 4-byte trailer holds only the low 32 bits of the sum.
+func putChecksum(trailer []byte, sum uint64, size int) {
+	if size == 4 {
+		binary.BigEndian.PutUint32(trailer[:4], uint32(sum))
+		return
+	}
+	binary.BigEndian.PutUint64(trailer[:8], sum)
+}
+
+// readChecksum reads a checksum from the trailer written by putChecksum.
+func readChecksum(trailer []byte, size int) uint64 {
+	if size == 4 {
+		return uint64(binary.BigEndian.Uint32(trailer[:4]))
+	}
+	return binary.BigEndian.Uint64(trailer[:8])
+}
 
 // ChecksumAlgo selects the page/WAL checksum function (header offset 23,
 // spec 02 §3.2). Algorithm 2 (xxHash64-truncated) is reserved for a later

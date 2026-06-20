@@ -18,6 +18,7 @@
 package btree
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/tamnd/kv/engine"
@@ -29,7 +30,12 @@ import (
 type BTree struct {
 	pgr      *pager.Pager
 	pageSize int
-	merge    func(existing, operand []byte) []byte
+	// usable is the page bytes a node body may occupy: the full page minus the
+	// reserved trailer the pager stamps the per-page checksum into (spec 02 §3.2). Every
+	// split and fit test bounds the body by usable, not pageSize, so the checksum never
+	// overwrites a cell. It equals pageSize when the file carries no checksums.
+	usable int
+	merge  func(existing, operand []byte) []byte
 	// rangeDels is the live set of range-delete intervals. It is rebuilt from the
 	// marker cells at Open and extended on Apply, so a read can fold a range delete
 	// whose marker cell lives in a leaf the read never visits (spec 11 §4).
@@ -48,7 +54,7 @@ type BTree struct {
 // New returns a B-tree core bound to pgr. Call Open to finish wiring it to the
 // shared substrate and to materialize an empty root for a fresh database.
 func New(pgr *pager.Pager) *BTree {
-	return &BTree{pgr: pgr, pageSize: pgr.PageSize()}
+	return &BTree{pgr: pgr, pageSize: pgr.PageSize(), usable: pgr.UsablePageSize()}
 }
 
 // Kind implements engine.Engine.
@@ -63,7 +69,9 @@ func (t *BTree) SetMergeFunc(f func(existing, operand []byte) []byte) { t.merge 
 // the header's engine-root field at it.
 func (t *BTree) Open(env *engine.Env) error {
 	if env != nil && env.Options.PageSize != 0 {
+		reserved := t.pageSize - t.usable
 		t.pageSize = env.Options.PageSize
+		t.usable = t.pageSize - reserved
 	}
 	if t.root() == format.NoPage {
 		pgno, err := t.storeLeafNew(&leaf{})
@@ -78,10 +86,19 @@ func (t *BTree) Open(env *engine.Env) error {
 // rebuildRangeDels reconstructs the in-memory range-delete interval set by scanning
 // the marker cells in the tree. It runs at Open so a database reopened after a crash
 // or clean close resolves range deletes the same way it did before (spec 11 §4).
+//
+// A corrupt page encountered during the scan does not fail the open: the database still
+// opens so the integrity checker (`kv check`) and recovery tools can run on it, with a
+// best-effort (possibly empty) range-delete set. Reads that later touch the corrupt page
+// still fail fast with format.ErrCorrupt, so tolerating the open never serves torn data
+// silently (spec 02 §3.2, spec 16 §4).
 func (t *BTree) rebuildRangeDels() error {
 	t.rangeDels = nil
 	entries, err := t.collectRange(nil, nil)
 	if err != nil {
+		if errors.Is(err, format.ErrCorrupt) {
+			return nil
+		}
 		return err
 	}
 	for _, e := range entries {
@@ -128,7 +145,7 @@ func (t *BTree) Apply(batch *engine.WriteBatch, commitVersion uint64) error {
 // insertOne descends to the target leaf, inserts the internal-key cell, and splits
 // upward as far as needed.
 func (t *BTree) insertOne(ik, value []byte) error {
-	if nodeHeaderSize+len(ik)+len(value)+8 > t.pageSize {
+	if nodeHeaderSize+len(ik)+len(value)+8 > t.usable {
 		return fmt.Errorf("btree: entry of %d bytes exceeds page (overflow values are deferred)", len(ik)+len(value))
 	}
 	uk := format.UserKey(ik)
@@ -158,7 +175,7 @@ func (t *BTree) insertOne(ik, value []byte) error {
 		return err
 	}
 	l.insert(ik, value)
-	if len(marshalLeaf(l)) <= t.pageSize {
+	if len(marshalLeaf(l)) <= t.usable {
 		return t.storeLeaf(pgno, l)
 	}
 
@@ -195,7 +212,7 @@ func (t *BTree) propagateSplit(path []format.PageNo, uk []byte, leftChild format
 		}
 		p := in.childFor(uk) // the index we descended through == leftChild's slot
 		in.insertChild(p, sep, newChild)
-		if len(marshalInterior(in)) <= t.pageSize {
+		if len(marshalInterior(in)) <= t.usable {
 			return t.storeInterior(ppgno, in)
 		}
 		// Interior overflowed: split, pushing the middle separator up.
@@ -263,8 +280,8 @@ func (t *BTree) storeInterior(pgno format.PageNo, in *interior) error {
 }
 
 func (t *BTree) writePage(pgno format.PageNo, body []byte) error {
-	if len(body) > t.pageSize {
-		return fmt.Errorf("btree: node body %d exceeds page size %d", len(body), t.pageSize)
+	if len(body) > t.usable {
+		return fmt.Errorf("btree: node body %d exceeds usable page size %d", len(body), t.usable)
 	}
 	fr, err := t.pgr.Get(pgno, pager.Write)
 	if err != nil {
