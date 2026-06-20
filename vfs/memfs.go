@@ -68,6 +68,22 @@ func (m *Mem) Delete(path string, syncDir bool) error {
 	return nil
 }
 
+// Rename implements FS by repointing the destination name at the source's byte image and
+// dropping the source name, which is atomic under the namespace lock: a concurrent Open of
+// newPath sees either the old file or the new one, never a torn state. The moved file keeps
+// both its live and durable bytes, so a later Crash reverts it to whatever was last synced.
+func (m *Mem) Rename(oldPath, newPath string, syncDir bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	d, ok := m.files[oldPath]
+	if !ok {
+		return &os.PathError{Op: "rename", Path: oldPath, Err: os.ErrNotExist}
+	}
+	m.files[newPath] = d
+	delete(m.files, oldPath)
+	return nil
+}
+
 // Exists implements FS.
 func (m *Mem) Exists(path string) (bool, error) {
 	m.mu.Lock()

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -301,6 +302,48 @@ func TestCLIVacuum(t *testing.T) {
 	}
 	if code := run([]string{"check", p}); code != exitOK {
 		t.Fatalf("check after vacuum: exit %d, want 0", code)
+	}
+}
+
+// TestCLIVacuumFull confirms the full-vacuum command rebuilds a churned file, prints a
+// before/after page summary, and leaves every live key readable through the swapped-in file
+// while the deleted keys stay gone (spec 09 §3.2, spec 16).
+func TestCLIVacuumFull(t *testing.T) {
+	p := dbPath(t)
+	for i := 0; i < 200; i++ {
+		k := fmt.Sprintf("k%04d", i)
+		if code := run([]string{"set", p, k, "v" + k}); code != exitOK {
+			t.Fatalf("set %s: exit %d", k, code)
+		}
+	}
+	for i := 0; i < 100; i++ {
+		if code := run([]string{"del", p, fmt.Sprintf("k%04d", i)}); code != exitOK {
+			t.Fatalf("del: exit %d", code)
+		}
+	}
+
+	out := capture(t, func() {
+		if code := run([]string{"vacuum", p, "--full"}); code != exitOK {
+			t.Fatalf("vacuum --full: exit %d, want 0", code)
+		}
+	})
+	if !strings.Contains(out, "compacted") {
+		t.Fatalf("vacuum --full output = %q, want a compacted summary", out)
+	}
+
+	if code := run([]string{"check", p}); code != exitOK {
+		t.Fatalf("check after full vacuum: exit %d, want 0", code)
+	}
+	if code := run([]string{"get", p, "k0000"}); code != exitNotFound {
+		t.Fatalf("deleted key after full vacuum = exit %d, want %d", code, exitNotFound)
+	}
+	got := capture(t, func() {
+		if code := run([]string{"get", p, "k0150"}); code != exitOK {
+			t.Fatalf("get survivor: exit %d", code)
+		}
+	})
+	if !strings.Contains(got, "vk0150") {
+		t.Fatalf("survivor value = %q, want vk0150", got)
 	}
 }
 

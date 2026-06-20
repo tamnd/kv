@@ -55,6 +55,12 @@ type FS interface {
 	// Delete removes a file. If syncDir is set, the containing directory is
 	// flushed so the unlink is durable.
 	Delete(path string, syncDir bool) error
+	// Rename atomically renames oldPath to newPath, replacing newPath if it
+	// already exists. The replacement is all-or-nothing across a crash: newPath
+	// names either the old bytes or the new bytes, never a blend. If syncDir is
+	// set the containing directory is flushed so the rename survives power loss.
+	// Full vacuum (spec 09 §3.2) uses it to swap a freshly rebuilt file into place.
+	Rename(oldPath, newPath string, syncDir bool) error
 	// Exists reports whether path names an existing file.
 	Exists(path string) (bool, error)
 	// ShmMap returns a shared-memory region backing the -shm wal-index (spec 07).

@@ -48,6 +48,35 @@ func runFSContract(t *testing.T, fs FS, path string) {
 	if err != nil || !ok {
 		t.Fatalf("exists = %v, %v", ok, err)
 	}
+
+	// Rename moves the bytes to a new name, replacing the destination if it exists, and
+	// leaves the old name gone.
+	dst := path + ".renamed"
+	if df, err := fs.Open(dst, OpenReadWrite|OpenCreate); err != nil {
+		t.Fatalf("open dst: %v", err)
+	} else {
+		df.WriteAt([]byte("stale"), 0)
+		df.Sync(SyncFull)
+		df.Close()
+	}
+	if err := fs.Rename(path, dst, true); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	if ok, _ := fs.Exists(path); ok {
+		t.Fatalf("source %q still exists after rename", path)
+	}
+	rf, err := fs.Open(dst, OpenRead)
+	if err != nil {
+		t.Fatalf("open renamed: %v", err)
+	}
+	defer rf.Close()
+	back := make([]byte, len(want))
+	if _, err := rf.ReadAt(back, 0); err != nil {
+		t.Fatalf("read renamed: %v", err)
+	}
+	if !bytes.Equal(back, want) {
+		t.Fatalf("renamed file holds %q, want the source bytes %q", back, want)
+	}
 }
 
 func TestOSContract(t *testing.T) {

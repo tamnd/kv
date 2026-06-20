@@ -57,6 +57,25 @@ func (OS) Delete(path string, syncDir bool) error {
 	return nil
 }
 
+// Rename implements FS. POSIX rename(2) replaces the destination atomically, so a
+// concurrent reader of newPath always sees one whole file. The directory fsync after the
+// rename makes the new directory entry durable, which is what a crash-safe swap needs.
+func (OS) Rename(oldPath, newPath string, syncDir bool) error {
+	if err := os.Rename(oldPath, newPath); err != nil {
+		return err
+	}
+	if syncDir {
+		d, err := os.Open(filepath.Dir(newPath))
+		if err != nil {
+			return err
+		}
+		defer d.Close()
+		// Best-effort directory flush so the new entry is durable.
+		_ = d.Sync()
+	}
+	return nil
+}
+
 // Exists implements FS.
 func (OS) Exists(path string) (bool, error) {
 	_, err := os.Stat(path)
