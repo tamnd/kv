@@ -24,14 +24,15 @@
 // the small shallow levels and fewer on the large deep ones. A large value is separated
 // out of the segment into a value log at flush, leaving a pointer in the cell so a later
 // compaction moves the pointer instead of rewriting the value (WiscKey), which also lets
-// the engine hold a value larger than a page. What remains for later slices is the value
-// log's garbage collection and the REMIX range index.
+// the engine hold a value larger than a page. When no segment compaction is due, Maintain
+// instead runs the value log's garbage collector, which walks the chain, marks the pages
+// any live pointer still references, and frees the dead ones back to the freelist. What
+// remains for a later slice is the REMIX range index.
 package lsm
 
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"sort"
 	"sync"
 
@@ -94,6 +95,11 @@ type LSM struct {
 	// never rejects a write.
 	vlog              *vlog
 	valueSepThreshold int
+	// vlogHeadRecorded is the value-log head the MANIFEST last recorded, so a flush or GC
+	// emits a manifestVLogHead edit only when the head actually moves: a flush moves it off
+	// NoPage when the first value separates, the GC moves it forward when it frees the old
+	// head. It is seeded from the MANIFEST at Open.
+	vlogHeadRecorded format.PageNo
 
 	// LSN tracking for the durable-mark seam. pendingLSN is the commit LSN the host
 	// noted for the batch about to be applied; memMaxLSN is the largest LSN of any
@@ -233,6 +239,11 @@ func (l *LSM) flushLocked() error {
 	if err := l.vlog.sync(); err != nil {
 		return err
 	}
+	// Record the value-log head in the MANIFEST the first time a flush separates a value,
+	// so a reopen can walk the chain from it. The edit is emitted only when the head moved.
+	if err := l.persistVLogHeadLocked(); err != nil {
+		return err
+	}
 	if seg.numCells > 0 {
 		// Record the segment in the MANIFEST before publishing it to the live set, so a
 		// segment a reader can see is always one the catalog will name after a restart. A
@@ -274,6 +285,22 @@ func (l *LSM) separateForFlush(ik, val []byte) ([]byte, []byte, error) {
 	return nik, format.AppendValuePointer(nil, ptr), nil
 }
 
+// persistVLogHeadLocked records the current value-log head in the MANIFEST when it has
+// moved since the last edit, the state Open needs to rebuild the append cursor and the GC
+// needs to walk the chain. It is a no-op while the head is unchanged, so a steady stream
+// of flushes that all append into the same chain emits the head edit just once. The
+// caller holds l.mu.
+func (l *LSM) persistVLogHeadLocked() error {
+	if l.vlog.head == l.vlogHeadRecorded {
+		return nil
+	}
+	if err := l.appendEditLocked(manifestVLogHead, 0, l.vlog.head); err != nil {
+		return err
+	}
+	l.vlogHeadRecorded = l.vlog.head
+	return nil
+}
+
 // shouldSeparate is true when the cell's value should move to the value log: when it
 // reaches the configured threshold, or, regardless of the threshold, when the whole
 // cell would not fit a segment data page. The second clause is what lets the engine
@@ -304,7 +331,7 @@ func (l *LSM) materializeOp(ik, val []byte, now uint64, keysOnly bool) (format.O
 		}
 		ptr, ok := format.DecodeValuePointer(val)
 		if !ok {
-			return format.Op{}, false, fmt.Errorf("lsm: corrupt value pointer in cell")
+			return format.Op{}, false, errCorruptPointer
 		}
 		bytes, err := l.vlog.read(ptr)
 		if err != nil {
@@ -343,7 +370,9 @@ func (l *LSM) Maintain(ctx context.Context, budget engine.MaintBudget) (engine.M
 	case compactSelfMerge:
 		return l.runSelfMergeLocked(c.level, budget.Watermark)
 	default:
-		return engine.MaintReport{}, nil
+		// No segment compaction is due, so spend the budget reclaiming dead value-log
+		// space instead, the vLog's analog of compaction (spec 06 §7).
+		return l.runVLogGCLocked(budget)
 	}
 }
 
