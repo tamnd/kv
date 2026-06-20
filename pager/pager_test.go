@@ -193,6 +193,106 @@ func TestBufferPoolExhaustion(t *testing.T) {
 	}
 }
 
+// TestTruncateTailShrinksFile allocates a run of pages, frees the ones at the very end,
+// and confirms TruncateTail hands them back to the file (the page count and on-disk size
+// both fall), while a free page buried in the middle is left on the freelist (spec 09 §3.1).
+func TestTruncateTailShrinksFile(t *testing.T) {
+	fs, p := newTestPager(t, Options{PageSize: 4096, CacheFrames: 64})
+
+	var pages []uint32
+	for i := 0; i < 20; i++ {
+		pgno, fr, err := p.Allocate()
+		if err != nil {
+			t.Fatalf("allocate %d: %v", i, err)
+		}
+		pages = append(pages, pgno)
+		p.Unpin(fr, true)
+	}
+	if err := p.Checkpoint(1); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	sizeBefore := p.DBSize()
+
+	// Free a buried page (must survive) and the top three pages (must be reclaimed).
+	p.Free(pages[5])
+	top := pages[len(pages)-3:]
+	for _, pg := range top {
+		p.Free(pg)
+	}
+
+	freed, err := p.TruncateTail(0)
+	if err != nil {
+		t.Fatalf("truncate tail: %v", err)
+	}
+	if freed != 3 {
+		t.Fatalf("freed = %d, want 3 trailing pages", freed)
+	}
+	if got, want := p.DBSize(), sizeBefore-3; got != want {
+		t.Fatalf("page count = %d after truncate, want %d", got, want)
+	}
+	// The buried free page is still reclaimable for reallocation.
+	if p.FreeCount() != 1 {
+		t.Fatalf("freelist depth = %d after truncate, want 1 (the buried page)", p.FreeCount())
+	}
+	// The file on disk shrank to the new high-water mark.
+	f, err := fs.Open("test.kv", vfs.OpenReadWrite)
+	if err != nil {
+		t.Fatalf("open for size: %v", err)
+	}
+	defer f.Close()
+	sz, err := f.Size()
+	if err != nil {
+		t.Fatalf("size: %v", err)
+	}
+	if want := int64(p.DBSize()) * int64(p.PageSize()); sz != want {
+		t.Fatalf("file size = %d after truncate, want %d", sz, want)
+	}
+}
+
+// TestTruncateTailBudgetAndReopen confirms a budget caps how many tail pages a single
+// call returns, and that the smaller file and surviving freelist round-trip through a
+// reopen.
+func TestTruncateTailBudgetAndReopen(t *testing.T) {
+	fs, p := newTestPager(t, Options{PageSize: 4096, CacheFrames: 64})
+
+	var pages []uint32
+	for i := 0; i < 12; i++ {
+		pgno, fr, _ := p.Allocate()
+		pages = append(pages, pgno)
+		p.Unpin(fr, true)
+	}
+	if err := p.Checkpoint(1); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	// Free the top four pages; reclaim only two this round.
+	for _, pg := range pages[len(pages)-4:] {
+		p.Free(pg)
+	}
+	freed, err := p.TruncateTail(2)
+	if err != nil {
+		t.Fatalf("truncate tail: %v", err)
+	}
+	if freed != 2 {
+		t.Fatalf("freed = %d under budget 2, want 2", freed)
+	}
+	sizeAfter := p.DBSize()
+	freeAfter := p.FreeCount()
+	if err := p.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	p2, err := Open(fs, "test.kv", Options{})
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if got := p2.DBSize(); got != sizeAfter {
+		t.Fatalf("page count after reopen = %d, want %d", got, sizeAfter)
+	}
+	if got := p2.FreeCount(); got != freeAfter {
+		t.Fatalf("freelist depth after reopen = %d, want %d", got, freeAfter)
+	}
+}
+
 // writePattern fills a page with a repeating big-endian encoding of seed so a
 // later read can detect corruption or a stale frame.
 func writePattern(p []byte, seed uint32) {
