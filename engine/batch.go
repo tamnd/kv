@@ -60,3 +60,60 @@ func (b *WriteBatch) Delete(userKey []byte) {
 func (b *WriteBatch) Merge(userKey, operand []byte) {
 	b.Add(format.EncodeInternalKey(userKey, b.version, format.KindMerge), operand)
 }
+
+// Encode serializes the batch to its wire form. This is the exact payload the WAL
+// logs as a kv-batch frame (spec 07 §2.2), so "what is durable" and "what is
+// applied" are byte-identical. The layout is varint version, varint entry count,
+// then per entry: varint internal-key length, key bytes, varint value length,
+// value bytes. Lengths are varints because keys and values are small and the
+// common case packs into one byte each.
+func (b *WriteBatch) Encode() []byte {
+	dst := make([]byte, 0, 16+b.size+2*len(b.entries))
+	dst = format.AppendUvarint(dst, b.version)
+	dst = format.AppendUvarint(dst, uint64(len(b.entries)))
+	for _, e := range b.entries {
+		dst = format.AppendUvarint(dst, uint64(len(e.InternalKey)))
+		dst = append(dst, e.InternalKey...)
+		dst = format.AppendUvarint(dst, uint64(len(e.Value)))
+		dst = append(dst, e.Value...)
+	}
+	return dst
+}
+
+// DecodeBatch reconstructs a batch from its wire form (the inverse of Encode). It
+// returns ErrBatchCorrupt if the bytes are truncated or internally inconsistent,
+// so a torn WAL frame is rejected rather than half-applied.
+func DecodeBatch(p []byte) (*WriteBatch, error) {
+	version, n := format.Uvarint(p)
+	if n <= 0 {
+		return nil, ErrBatchCorrupt
+	}
+	p = p[n:]
+	count, n := format.Uvarint(p)
+	if n <= 0 {
+		return nil, ErrBatchCorrupt
+	}
+	p = p[n:]
+	b := NewWriteBatch(version)
+	for i := uint64(0); i < count; i++ {
+		klen, n := format.Uvarint(p)
+		if n <= 0 || uint64(len(p)-n) < klen {
+			return nil, ErrBatchCorrupt
+		}
+		p = p[n:]
+		key := append([]byte(nil), p[:klen]...)
+		p = p[klen:]
+		vlen, n := format.Uvarint(p)
+		if n <= 0 || uint64(len(p)-n) < vlen {
+			return nil, ErrBatchCorrupt
+		}
+		p = p[n:]
+		var val []byte
+		if vlen > 0 {
+			val = append([]byte(nil), p[:vlen]...)
+		}
+		p = p[vlen:]
+		b.Add(key, val)
+	}
+	return b, nil
+}
