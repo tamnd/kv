@@ -115,6 +115,14 @@ type KV struct {
 	Value []byte
 }
 
+// mergeSetter is implemented by engines that resolve merge operands during reads.
+// CheckEngine installs the test's merge resolver through it so the engine folds
+// merges the same way the oracle does. Both the Model and the B-tree core satisfy
+// it; an engine without merge support simply does not implement it.
+type mergeSetter interface {
+	SetMergeFunc(func(existing, operand []byte) []byte)
+}
+
 // CheckEngine drives eng through the same sequence of committed batches as the
 // oracle and verifies that point reads and full scans agree at a range of
 // snapshots. It returns the first divergence as an error, or nil if the engine
@@ -124,7 +132,7 @@ type KV struct {
 // its commit version. snaps lists the snapshot versions to verify at; if empty,
 // every commit version plus the final version is checked.
 func CheckEngine(eng Engine, batches []*WriteBatch, mergeFn func(existing, operand []byte) []byte) error {
-	if m, ok := eng.(*Model); ok {
+	if m, ok := eng.(mergeSetter); ok {
 		m.SetMergeFunc(mergeFn)
 	}
 	oracle := NewOracle(mergeFn)
