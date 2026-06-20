@@ -1,0 +1,119 @@
+// Package engine defines the storage-engine SPI: the seam that the two cores —
+// B-tree (spec 05) and LSM (spec 06) — implement, and the contract that lets
+// every layer above it (transactions, iterators, cache, API, CLI, server) be
+// written once, engine-agnostic (spec 04).
+//
+// The design rule for the seam is to push everything that can be shared above it
+// and confine to it only the physics that genuinely differ between an in-place
+// tree and a stack of sorted runs: how keys are physically laid out, how a point
+// read and a range scan are served, how a batch of writes is applied, how space
+// is reclaimed, and how the engine recovers. Everything else — the file
+// container, the pager, the WAL, MVCC versioning, the iterator protocol,
+// durability, the API — lives above the seam and is identical for both cores.
+//
+// The host injects its shared substrate into a core through Env. Spec 04 sketches
+// those dependencies as concrete pointers (*Pager, *WAL, ...); this
+// implementation declares them as interfaces local to this package so the cores
+// can be built and tested (against the model engine) before the concrete pager
+// and WAL exist, and so engine never imports those lower packages. The concrete
+// types in the pager and wal packages satisfy these interfaces.
+package engine
+
+import (
+	"context"
+
+	"github.com/tamnd/kv/format"
+)
+
+// Kind names a storage core. It reuses the on-disk engine selector from the file
+// header (spec 02 offset 21) so the value an Engine reports is the same byte
+// recorded in the file.
+type Kind = format.EngineKind
+
+const (
+	BTree = format.EngineBTree
+	LSM   = format.EngineLSM
+)
+
+// Engine is the top-level handle for an opened core (spec 04 §2.1).
+type Engine interface {
+	// Kind reports which core this is.
+	Kind() Kind
+
+	// Open binds the core to its durable substrate. It is called once, after the
+	// pager is up and recovery has replayed the WAL.
+	Open(env *Env) error
+	// Close releases the core. It does not flush; the host checkpoints first.
+	Close() error
+
+	// NewReader returns a consistent read view at a snapshot version.
+	NewReader(snap Snapshot) (Reader, error)
+
+	// Apply installs a committed batch of internal-key mutations into the
+	// engine's in-memory and on-disk structures. The batch is ALREADY durable in
+	// the WAL by the time Apply is called, so a crash mid-Apply is harmless:
+	// recovery re-derives the same Apply from the WAL. commitVersion is the
+	// version stamped on every entry's internal key.
+	Apply(batch *WriteBatch, commitVersion uint64) error
+
+	// Maintain performs engine-scheduled background work (LSM compaction, B-tree
+	// rebalance, vLog GC) up to a budget. The host calls it opportunistically and
+	// on a timer; the engine decides what, if anything, to do.
+	Maintain(ctx context.Context, budget MaintBudget) (MaintReport, error)
+
+	// Stats reports space accounting and the data the checkpoint/vacuum driver
+	// needs (spec 09).
+	Stats() EngineStats
+
+	// Reclaim returns pages the engine no longer needs to the freelist, up to the
+	// given budget. Used by vacuum (spec 09).
+	Reclaim(budget int) (freed int, err error)
+
+	// RecoverFinished is called after the WAL has been replayed into Apply calls,
+	// so the engine can reconstruct any in-memory index it needs (the LSM core
+	// rebuilds its level structure from the MANIFEST; the B-tree core does
+	// nothing, since all its state lives in pages). See spec 08.
+	RecoverFinished(lastVersion uint64) error
+}
+
+// Reader is a point/range read interface at a fixed snapshot (spec 04 §2.2). The
+// host's transaction layer holds a Reader for the life of a read transaction.
+type Reader interface {
+	// Get returns the value for userKey visible at the reader's snapshot, or
+	// ErrNotFound. The engine resolves MVCC versions using the shared
+	// internal-key ordering, returning the newest committed version <= snapshot
+	// and skipping tombstones.
+	Get(userKey []byte) (value []byte, err error)
+
+	// NewIter returns a cursor over a key range at the snapshot. The returned
+	// Cursor implements the shared protocol (spec 11).
+	NewIter(opts IterOptions) (Cursor, error)
+
+	Close() error
+}
+
+// Cursor is the low-level iterator primitive both cores expose (spec 04 §2.3).
+// The rich caller-facing iterator (spec 11) is built on top of it above the
+// seam.
+type Cursor interface {
+	SeekGE(userKey []byte) bool // position at first key >= userKey
+	SeekLT(userKey []byte) bool // position at last key < userKey
+	First() bool
+	Last() bool
+	Next() bool
+	Prev() bool
+	Valid() bool
+
+	// Key returns the user key at the cursor, with the version suffix stripped.
+	Key() []byte
+	// InternalKey returns the full internal key, used by the merge layer above
+	// the seam to resolve versions across sources.
+	InternalKey() []byte
+	// Value returns the value, possibly a lazy pointer that defers fetching a
+	// separated value (vLog/overflow) until the caller reads it, so a key-only
+	// scan never touches the value store.
+	Value() (LazyValue, error)
+
+	Error() error
+	Close() error
+}
