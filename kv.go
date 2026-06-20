@@ -160,6 +160,21 @@ func Open(path string, opts ...Option) (*DB, error) {
 	return &DB{d: d}, nil
 }
 
+// Compact runs a full vacuum on the database at path (spec 09 §3.2): it rebuilds the file
+// from scratch into a fresh, maximally compact copy holding only the live data and swaps it
+// in atomically, reclaiming all the space that obsolete versions, tombstones, and freelist
+// holes were holding. It is an offline operation: path must not be open elsewhere while it
+// runs, and it needs room on disk for a second copy of the live data. Open the database
+// again afterward to use it.
+func Compact(path string, opts ...Option) error {
+	c := &config{}
+	for _, o := range opts {
+		o(c)
+	}
+	c.resolveCache()
+	return wrap(db.Compact(vfs.NewOS(), path, c.opts))
+}
+
 // resolveCache converts a byte cache budget into the frame count the pager wants,
 // using the configured page size or the 4 KiB default when none was set.
 func (c *config) resolveCache() {
