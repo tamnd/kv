@@ -1,0 +1,69 @@
+package kv
+
+import "github.com/tamnd/kv/db"
+
+// Txn is a transaction: a fixed read snapshot plus, for a writable transaction, a
+// private buffer of mutations applied atomically at commit (spec 15 §2). A Txn is not
+// safe for concurrent use by multiple goroutines; a *DB is.
+type Txn struct {
+	t *db.Txn
+}
+
+// Get returns the newest value of key visible to the transaction, overlaying its own
+// buffered writes on the snapshot (read-your-writes), or ErrNotFound if absent or
+// tombstoned. The bytes are valid only until the transaction ends and may alias engine
+// memory; use GetCopy to retain them (spec 15 §3).
+func (t *Txn) Get(key []byte) ([]byte, error) {
+	v, err := t.t.Get(key)
+	return v, wrap(err)
+}
+
+// GetCopy is Get returning an owned copy of the value, safe to keep past the
+// transaction (spec 15 §3).
+func (t *Txn) GetCopy(key []byte) ([]byte, error) {
+	v, err := t.t.Get(key)
+	if err != nil {
+		return nil, wrap(err)
+	}
+	return append([]byte(nil), v...), nil
+}
+
+// Exists reports whether key has a visible value without fetching it (spec 15 §3).
+func (t *Txn) Exists(key []byte) (bool, error) {
+	ok, err := t.t.Exists(key)
+	return ok, wrap(err)
+}
+
+// Set buffers an upsert of key to value, applied at commit.
+func (t *Txn) Set(key, value []byte) error { return wrap(t.t.Set(key, value)) }
+
+// Delete buffers a tombstone for key, applied at commit.
+func (t *Txn) Delete(key []byte) error { return wrap(t.t.Delete(key)) }
+
+// DeleteRange buffers a deletion of the half-open interval [lo, hi), applied at commit
+// as a single range-delete marker (spec 11 §4).
+func (t *Txn) DeleteRange(lo, hi []byte) error { return wrap(t.t.DeleteRange(lo, hi)) }
+
+// Merge buffers a merge operand for key, folded through the registered operator at read
+// and commit time (spec 15 §5). It needs no read, so a contended counter becomes blind
+// appends the engine collapses.
+func (t *Txn) Merge(key, operand []byte) error { return wrap(t.t.Merge(key, operand)) }
+
+// NewIterator returns a snapshot-consistent iterator over the transaction's snapshot,
+// overlaid with its own buffered writes (spec 11). The caller must Close it.
+func (t *Txn) NewIterator(opts IterOptions) (*Iterator, error) {
+	it, err := t.t.NewIterator(opts)
+	if err != nil {
+		return nil, wrap(err)
+	}
+	return &Iterator{it: it}, nil
+}
+
+// Commit durably applies a writable transaction's buffered writes, or returns
+// ErrConflict if it lost a write-write or SSI race (spec 15 §2.2).
+func (t *Txn) Commit() error { return wrap(t.t.Commit()) }
+
+// Discard releases the transaction's snapshot without applying its writes. It is a
+// no-op after Commit and must always be called (deferred) to free the snapshot's
+// readMark registration (spec 15 §2.2).
+func (t *Txn) Discard() { t.t.Discard() }
