@@ -49,6 +49,8 @@ func wrap(err error) error {
 		return ErrReadOnly
 	case errors.Is(err, db.ErrTxnDone):
 		return ErrClosed
+	case errors.Is(err, db.ErrFatalSync):
+		return ErrNeedsRecovery
 	default:
 		return err
 	}

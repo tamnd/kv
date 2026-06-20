@@ -29,6 +29,14 @@ var ErrUnsupported = errors.New("kv: operation not supported by this engine")
 // ErrSnapshotClosed is returned when a long-lived Snapshot is used after Close (spec 15 §7).
 var ErrSnapshotClosed = errors.New("kv: snapshot already closed")
 
+// ErrFatalSync fences a database whose WAL durability failed mid-commit: a failed
+// fsync or log append is treated as fatal and non-retryable (fsyncgate, spec 07 §6).
+// The in-flight commit is not acknowledged, and every later write returns this until
+// the database is closed and reopened, so recovery runs against the durable log rather
+// than a process whose kernel may have silently dropped the un-synced bytes. It wraps
+// the underlying I/O error for context. The public package maps it to ErrNeedsRecovery.
+var ErrFatalSync = errors.New("kv: fatal write fault; reopen to recover")
+
 // Isolation selects a transaction's isolation level (spec 10 §3, §4). The zero value
 // is SnapshotIsolation, the high-performance default; Serializable adds read-set
 // tracking and rw-antidependency detection at commit to give full serializability.
