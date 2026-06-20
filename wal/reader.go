@@ -31,6 +31,13 @@ type RecoverResult struct {
 	// DurableLSN is the LSN of the last frame that chained correctly; the tail is
 	// torn or stale beyond it.
 	DurableLSN uint64
+	// DurableEndOff is the file offset just past the last frame that chained
+	// correctly -- the point a resumed writer appends from, overwriting any torn
+	// or stale tail (used by wal.Open).
+	DurableEndOff int64
+	// DurableSum is the running chained checksum at DurableEndOff, the seed the
+	// resumed writer's next frame chains from.
+	DurableSum uint64
 	// Salt is the WAL generation's salt read from the header.
 	Salt uint64
 	// TornTail is true if the scan stopped at a frame that failed the chain,
@@ -72,6 +79,10 @@ func Recover(readAt func(p []byte, off int64) (int, error), size int64) (Recover
 
 	// Seed the chain from the header checksum, matching the writer.
 	prevSum := binary.BigEndian.Uint64(hdr[24:32])
+	// With no durable frames the resume point is just past the header, chaining
+	// from the header checksum.
+	res.DurableEndOff = int64(headerSize)
+	res.DurableSum = prevSum
 
 	off := int64(headerSize)
 	var pending []CommittedBatch // batches logged but not yet committed
@@ -125,6 +136,8 @@ func Recover(readAt func(p []byte, off int64) (int, error), size int64) (Recover
 		prevSum = sum
 		res.DurableLSN = lsn
 		off = end
+		res.DurableEndOff = off
+		res.DurableSum = prevSum
 	}
 	// pending (uncommitted trailing) batches are dropped: not durable.
 	return res, nil

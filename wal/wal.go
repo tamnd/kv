@@ -133,6 +133,42 @@ func Create(fs vfs.FS, path string, opts Options) (*WAL, error) {
 	return w, nil
 }
 
+// Open reopens an existing -wal file and positions the writer to append after the
+// durable tail. It runs the durable-tail scan (Recover) to recover the generation
+// salt, the next LSN, the append offset, and the running checksum, so a frame
+// appended next chains correctly onto the last durable frame and any torn or stale
+// tail is overwritten. The returned RecoverResult carries the committed batches the
+// caller must redo before serving (spec 08 §2-3). If the file does not exist or its
+// header is unreadable, Open returns an error and the caller falls back to Create.
+func Open(fs vfs.FS, path string, opts Options) (*WAL, RecoverResult, error) {
+	f, err := fs.Open(path, vfs.OpenReadWrite)
+	if err != nil {
+		return nil, RecoverResult{}, err
+	}
+	size, err := f.Size()
+	if err != nil {
+		f.Close()
+		return nil, RecoverResult{}, err
+	}
+	res, err := Recover(f.ReadAt, size)
+	if err != nil {
+		f.Close()
+		return nil, RecoverResult{}, err
+	}
+	w := &WAL{
+		fs:       fs,
+		file:     f,
+		path:     path,
+		pageSize: opts.PageSize,
+		syncMode: opts.Sync,
+		salt:     res.Salt,
+		lsn:      res.DurableLSN + 1,
+		lastSum:  res.DurableSum,
+		tailOff:  res.DurableEndOff,
+	}
+	return w, res, nil
+}
+
 // writeHeader encodes and writes the 32-byte WAL header at offset 0.
 func (w *WAL) writeHeader() error {
 	h := make([]byte, headerSize)
