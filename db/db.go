@@ -70,6 +70,11 @@ type Options struct {
 	// §6). Zero selects the real monotonic-corrected system clock; a test injects a
 	// controllable clock here to drive expiry deterministically.
 	Clock func() uint64
+	// MemtableSize is the byte size at which the LSM core flushes its active memtable
+	// to an on-disk segment (spec 06 §2). Zero takes the engine default; the B-tree
+	// core ignores it. A smaller value flushes sooner, bounding memory and the WAL
+	// backlog at the cost of more, smaller segments.
+	MemtableSize int
 }
 
 func (o Options) maxRetries() int {
@@ -153,10 +158,11 @@ type DB struct {
 	eng engine.Engine
 	orc *oracle
 
-	merge      func(existing, operand []byte) []byte
-	maxRetries int
-	syncMode   wal.Sync
-	isolation  Isolation
+	merge        func(existing, operand []byte) []byte
+	maxRetries   int
+	syncMode     wal.Sync
+	isolation    Isolation
+	memtableSize int
 
 	// now is the wall-clock source, in Unix nanoseconds, that read resolution compares
 	// a TTL set's absolute expiry against (spec 15 §6). It is the real system clock by
@@ -237,7 +243,7 @@ func create(fs vfs.FS, path string, opts Options) (*DB, error) {
 		return nil, err
 	}
 	d := &DB{fs: fs, path: path, pgr: pgr, wal: w, eng: eng, orc: newOracle(0),
-		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, now: opts.clock()}
+		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, now: opts.clock()}
 	if err := d.openEngine(opts.Merge); err != nil {
 		w.Close()
 		pgr.Close()
@@ -260,7 +266,7 @@ func openExisting(fs vfs.FS, path string, opts Options) (*DB, error) {
 		return nil, err
 	}
 	d := &DB{fs: fs, path: path, pgr: pgr, eng: eng,
-		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, now: opts.clock()}
+		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, now: opts.clock()}
 	if err := d.openEngine(opts.Merge); err != nil {
 		pgr.Close()
 		return nil, err
@@ -315,8 +321,11 @@ func openExisting(fs vfs.FS, path string, opts Options) (*DB, error) {
 // openEngine wires the engine to its substrate and installs the merge resolver.
 func (d *DB) openEngine(merge func(existing, operand []byte) []byte) error {
 	env := &engine.Env{
-		Pager:   d.pgr,
-		Options: engine.EngineOptions{PageSize: d.pgr.PageSize()},
+		Pager: d.pgr,
+		Options: engine.EngineOptions{
+			PageSize:     d.pgr.PageSize(),
+			MemtableSize: d.memtableSize,
+		},
 	}
 	if err := d.eng.Open(env); err != nil {
 		return err
@@ -341,6 +350,7 @@ func (d *DB) redo(rec wal.RecoverResult) (uint64, error) {
 		if err != nil {
 			return 0, fmt.Errorf("kv: corrupt committed batch at LSN %d: %w", cb.LSN, err)
 		}
+		d.noteLSN(cb.LSN)
 		if err := d.eng.Apply(b, cb.Version); err != nil {
 			return 0, fmt.Errorf("kv: redo Apply at version %d: %w", cb.Version, err)
 		}
@@ -567,10 +577,14 @@ func (d *DB) applyCommitted(b *engine.WriteBatch, v uint64) error {
 		d.fatal = fmt.Errorf("%w: %v", ErrFatalSync, err)
 		return d.fatal
 	}
-	if _, err := d.wal.Commit(v); err != nil {
+	commitLSN, err := d.wal.Commit(v)
+	if err != nil {
 		d.fatal = fmt.Errorf("%w: %v", ErrFatalSync, err)
 		return d.fatal
 	}
+	// Tell an LSN-tracking engine (the LSM core) the batch's WAL position before
+	// applying it, so its durable mark can later report how far a flush has reached.
+	d.noteLSN(commitLSN)
 	if err := d.eng.Apply(b, v); err != nil {
 		return err
 	}
@@ -930,6 +944,16 @@ func (d *DB) engineDurableLSN() (lsn uint64, tracked bool) {
 		return e.DurableLSN(), true
 	}
 	return 0, false
+}
+
+// noteLSN passes a batch's WAL commit LSN to an engine that tracks a durable mark,
+// the companion of engineDurableLSN. The host calls it just before Apply on both the
+// live commit and redo paths; an engine that does not track LSNs (the B-tree core)
+// does not implement it and the call is a no-op.
+func (d *DB) noteLSN(lsn uint64) {
+	if n, ok := d.eng.(interface{ NoteLSN(uint64) }); ok {
+		n.NoteLSN(lsn)
+	}
 }
 
 // Vacuum runs one round of incremental vacuum (spec 09 §3.1): it folds the WAL with a
