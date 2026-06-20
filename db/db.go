@@ -700,6 +700,44 @@ func (d *DB) Vacuum(budget int) (int, error) {
 	return d.pgr.TruncateTail(budget)
 }
 
+// ApplicationID reports the application-defined file tag stored in the header (spec 22 §2).
+// It is a free-form identifier an application stamps so a tool can recognize its own files.
+func (d *DB) ApplicationID() uint32 {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.pgr.Header().ApplicationID
+}
+
+// SetApplicationID records an application-defined file tag in the header and persists it
+// durably (spec 22 §2). It is a persistent-runtime setting: the value survives reopen. The
+// change is folded into the main file by a checkpoint, which writes a coherent image (header
+// plus all committed data) and fsyncs, so the tag is durable even across a crash and the
+// header never desyncs from the WAL.
+func (d *DB) SetApplicationID(id uint32) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.pgr.Header().ApplicationID = id
+	return d.checkpointLocked()
+}
+
+// UserVersion reports the application-defined schema/version counter stored in the header
+// (spec 22 §2), the kv analog of SQLite's user_version. kv never interprets it.
+func (d *DB) UserVersion() uint32 {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.pgr.Header().UserVersion
+}
+
+// SetUserVersion records the application-defined version counter in the header and persists
+// it durably (spec 22 §2). Like SetApplicationID it is a persistent-runtime setting folded
+// into the main file by a checkpoint.
+func (d *DB) SetUserVersion(v uint32) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.pgr.Header().UserVersion = v
+	return d.checkpointLocked()
+}
+
 // Close releases the database without an implicit checkpoint: committed data is
 // already durable in the WAL and recovers on the next open. For a clean shutdown
 // that leaves an empty WAL, call Checkpoint first.

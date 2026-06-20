@@ -468,9 +468,7 @@ func (sh *shell) dot(toks []string) (quit bool) {
 	case ".rollback":
 		sh.doRollback()
 	case ".pragma":
-		// Pragmas (spec 22) are a later slice; surface that plainly rather than silently
-		// accept a setting the shell does not yet honor.
-		fmt.Fprintln(sh.errOut, "kv: .pragma is not supported yet")
+		sh.doPragma(toks[1:])
 	default:
 		fmt.Fprintf(sh.errOut, "kv: unknown dot-command %q (try .help)\n", toks[0])
 	}
@@ -509,6 +507,26 @@ func (sh *shell) doVacuum(args []string) {
 		return
 	}
 	fmt.Fprintf(sh.errOut, "freed %d page(s), %d page(s) remain\n", freed, sh.db.Stats().PageCount)
+}
+
+// doPragma reads or sets one configuration knob through the shared pragma registry, the
+// shell face of `kv pragma` (spec 22). With no argument it lists the known knobs; `help`
+// does the same. A knob's value, or a set confirmation, prints to out; errors go to errOut.
+func (sh *shell) doPragma(args []string) {
+	expr := strings.Join(args, "")
+	if expr == "" || strings.EqualFold(expr, "help") {
+		fmt.Fprintln(sh.errOut, "usage: .pragma <name>[=<value>]")
+		for _, line := range pragmaHelpLines() {
+			fmt.Fprintln(sh.errOut, line)
+		}
+		return
+	}
+	out, err := applyPragma(sh.db, expr)
+	if err != nil {
+		fmt.Fprintf(sh.errOut, "kv: %v\n", err)
+		return
+	}
+	fmt.Fprintln(sh.out, out)
 }
 
 func (sh *shell) doFormat(args []string) {
@@ -609,6 +627,7 @@ Meta-commands:
   .check                    verify structural integrity
   .checkpoint               fold the WAL into the main file
   .vacuum [N]               return up to N trailing free pages to the OS (0 = all)
+  .pragma <name>[=<value>]  read or set a configuration knob (.pragma help lists them)
   .format <fmt>             set scan output: table, jsonl, json, raw, auto
   .encoding <enc>           set default key/value encoding: text, hex, base64
   .timer [on|off]           toggle per-statement timing

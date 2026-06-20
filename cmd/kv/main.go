@@ -56,6 +56,7 @@ func commands() []command {
 		{"load", "bulk-load key/value pairs from stdin or a file", cmdLoad},
 		{"checkpoint", "fold the WAL into the main file", cmdCheckpoint},
 		{"vacuum", "return trailing free pages to the OS; shrink the file", cmdVacuum},
+		{"pragma", "read or set a configuration knob (engine, application_id, ...)", cmdPragma},
 		{"check", "verify structural integrity; exit 4 on any violation", cmdCheck},
 		{"info", "print a human summary of the database", cmdInfo},
 		{"stats", "print space and durability accounting as JSON", cmdStats},
