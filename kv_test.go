@@ -195,6 +195,42 @@ func TestSerializableOption(t *testing.T) {
 	}
 }
 
+// TestStatsReportsSpaceAndVersion checks the public Stats surface reflects writes, the
+// checkpoint backlog, and that a checkpoint drains the backlog and persists the version.
+func TestStatsReportsSpaceAndVersion(t *testing.T) {
+	d := open(t)
+	for i := 0; i < 20; i++ {
+		if err := d.Update(func(txn *kv.Txn) error {
+			return txn.Set([]byte(fmt.Sprintf("k%02d", i)), []byte("v"))
+		}); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+	s := d.Stats()
+	if s.Engine != kv.BTree {
+		t.Fatalf("engine = %v, want btree", s.Engine)
+	}
+	if s.Version != 20 {
+		t.Fatalf("version = %d, want 20", s.Version)
+	}
+	if s.PageSize <= 0 || s.PageCount == 0 {
+		t.Fatalf("page accounting = %d size / %d count, want positive", s.PageSize, s.PageCount)
+	}
+	if s.WALBacklog == 0 {
+		t.Fatalf("wal backlog = 0 before checkpoint, want pending frames")
+	}
+	if err := d.Checkpoint(); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	after := d.Stats()
+	if after.WALBacklog != 0 {
+		t.Fatalf("wal backlog = %d after checkpoint, want 0", after.WALBacklog)
+	}
+	if after.Version != 20 {
+		t.Fatalf("version = %d after checkpoint, want 20", after.Version)
+	}
+}
+
 // TestReopenPersists checks data survives Close and reopen of the same path.
 func TestReopenPersists(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "data.kv")

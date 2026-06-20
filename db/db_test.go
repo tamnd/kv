@@ -133,6 +133,66 @@ func TestCrashAfterCheckpoint(t *testing.T) {
 	}
 }
 
+// TestCheckpointFoldsRedoneVersions is the regression for the durable-version bug: a
+// checkpoint that runs in a process which rebuilt its state from the WAL (rather than
+// from live commits) must persist the recovered commit version, not a stale zero. A
+// live commit updates the header's version through applyCommitted, but redo applies
+// batches straight through eng.Apply and never touches the header, so the checkpoint
+// must take the version from the oracle. Without that, the folded pages persist under
+// version 0 and the next open reads a snapshot below every commit, finding the data
+// invisible even though it is physically present (spec 08 §5, spec 10 §1).
+func TestCheckpointFoldsRedoneVersions(t *testing.T) {
+	fs := vfs.NewMem()
+	// Several commits across separate opens, none checkpointed: the data lives only in
+	// the WAL and is replayed on each open, exactly as repeated CLI invocations do.
+	for i := 0; i < 5; i++ {
+		d, err := Open(fs, "test.kv", Options{PageSize: 4096})
+		if err != nil {
+			t.Fatalf("open %d: %v", i, err)
+		}
+		if _, err := d.Write(func(b *engine.WriteBatch) {
+			b.Set([]byte(fmt.Sprintf("k%d", i)), []byte(fmt.Sprintf("v%d", i)))
+		}); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+		if err := d.Close(); err != nil {
+			t.Fatalf("close %d: %v", i, err)
+		}
+	}
+
+	// A fresh process rebuilds from the WAL, then checkpoints: this is the path the
+	// header-version bug lived on.
+	d, err := Open(fs, "test.kv", Options{})
+	if err != nil {
+		t.Fatalf("reopen for checkpoint: %v", err)
+	}
+	if got := d.Version(); got != 5 {
+		t.Fatalf("recovered version = %d, want 5", got)
+	}
+	if err := d.Checkpoint(); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// Reopen against the folded main file with an empty WAL: every key must be visible
+	// and the version must resume at 5.
+	d2, err := Open(fs, "test.kv", Options{})
+	if err != nil {
+		t.Fatalf("reopen after checkpoint: %v", err)
+	}
+	defer d2.Close()
+	if got := d2.Version(); got != 5 {
+		t.Fatalf("post-checkpoint version = %d, want 5", got)
+	}
+	for i := 0; i < 5; i++ {
+		if v, ok := get(t, d2, fmt.Sprintf("k%d", i)); !ok || v != fmt.Sprintf("v%d", i) {
+			t.Fatalf("k%d = %q,%v after checkpoint+reopen, want v%d", i, v, ok, i)
+		}
+	}
+}
+
 // TestSyncNormalLosesUncheckpointed verifies that at SyncNormal a crash before any
 // checkpoint loses the commits (they were never fsynced), with no corruption.
 func TestSyncNormalLosesUncheckpointed(t *testing.T) {

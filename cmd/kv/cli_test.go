@@ -196,6 +196,42 @@ func TestCLIOpenMissingFile(t *testing.T) {
 	}
 }
 
+func TestCLIInfo(t *testing.T) {
+	p := dbPath(t)
+	run([]string{"set", p, "k", "v"})
+	out := capture(t, func() {
+		if code := run([]string{"info", p}); code != exitOK {
+			t.Fatalf("info: exit %d", code)
+		}
+	})
+	if !strings.Contains(out, "engine") || !strings.Contains(out, "btree") {
+		t.Fatalf("info output missing engine line:\n%s", out)
+	}
+	if !strings.Contains(out, "commit version") {
+		t.Fatalf("info output missing version line:\n%s", out)
+	}
+}
+
+func TestCLIStatsJSON(t *testing.T) {
+	p := dbPath(t)
+	run([]string{"set", p, "k", "v"})
+	out := capture(t, func() {
+		if code := run([]string{"stats", p, "-f", "jsonl"}); code != exitOK {
+			t.Fatalf("stats: exit %d", code)
+		}
+	})
+	var s statsJSON
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &s); err != nil {
+		t.Fatalf("stats output not JSON: %v\n%s", err, out)
+	}
+	if s.Engine != "btree" {
+		t.Fatalf("stats engine = %q, want btree", s.Engine)
+	}
+	if s.Version != 1 {
+		t.Fatalf("stats version = %d, want 1", s.Version)
+	}
+}
+
 // withStdin runs fn with os.Stdin replaced by a pipe carrying the given input.
 func withStdin(t *testing.T, input string, fn func()) {
 	t.Helper()

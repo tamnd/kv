@@ -303,10 +303,14 @@ func (t *BTree) storeInteriorNew(in *interior) (format.PageNo, error) {
 
 // --- remaining Engine SPI ---
 
-// Stats implements engine.Engine with a best-effort page-count footprint.
+// Stats implements engine.Engine with a best-effort page-count footprint. It
+// reports the physical size and freelist depth cheaply; live key/byte counts that
+// would need a full tree walk are left zero, since Stats is meant to be O(1) for the
+// observability surface (spec 09 §4).
 func (t *BTree) Stats() engine.EngineStats {
 	return engine.EngineStats{
 		PhysicalBytes: int64(t.pgr.DBSize()) * int64(t.pageSize),
+		FreePages:     int64(t.pgr.FreeCount()),
 		Amplification: 1,
 	}
 }
