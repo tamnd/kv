@@ -598,3 +598,51 @@ func TestSnapshotClosedRejectsReads(t *testing.T) {
 		t.Fatalf("view after close err = %v, want ErrSnapshotClosed", err)
 	}
 }
+
+// TestWriteBatchBulkLoad exercises the public WriteBatch builder end to end: many sets across
+// a small chunk size land every key, Count tracks the issued operations, and a use after
+// Close is refused with ErrBatchClosed.
+func TestWriteBatchBulkLoad(t *testing.T) {
+	d := open(t)
+	wb := d.NewWriteBatch(50)
+
+	const n = 500
+	for i := 0; i < n; i++ {
+		if err := wb.Set([]byte(fmt.Sprintf("k%04d", i)), []byte(fmt.Sprintf("v%d", i))); err != nil {
+			t.Fatalf("set %d: %v", i, err)
+		}
+	}
+	if err := wb.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if got := wb.Count(); got != n {
+		t.Fatalf("count = %d, want %d", got, n)
+	}
+
+	// Every key is readable, and the file is structurally sound after the chunked load.
+	if err := d.View(func(txn *kv.Txn) error {
+		for i := 0; i < n; i++ {
+			v, err := txn.Get([]byte(fmt.Sprintf("k%04d", i)))
+			if err != nil {
+				return err
+			}
+			if string(v) != fmt.Sprintf("v%d", i) {
+				t.Fatalf("k%04d = %q, want v%d", i, v, i)
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("view: %v", err)
+	}
+	rep, err := d.Check()
+	if err != nil {
+		t.Fatalf("check: %v", err)
+	}
+	if !rep.OK() {
+		t.Fatalf("check found %d problem(s) after bulk load", len(rep.Problems))
+	}
+
+	if err := wb.Set([]byte("x"), []byte("y")); !errors.Is(err, kv.ErrBatchClosed) {
+		t.Fatalf("set after close = %v, want ErrBatchClosed", err)
+	}
+}

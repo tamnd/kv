@@ -55,8 +55,9 @@ func cmdDump(args []string) int {
 	return exitOK
 }
 
-// cmdLoad bulk-loads JSONL key/value records from a file or stdin, batching writes so a
-// large import commits in bounded transactions rather than one giant one (spec 16 §4).
+// cmdLoad bulk-loads JSONL key/value records from a file or stdin through the explicit
+// WriteBatch builder, which buffers each record and commits in bounded chunks so a huge
+// import never holds the whole stream in memory (spec 16 §4, spec 15 §6).
 func cmdLoad(args []string) int {
 	fs := flag.NewFlagSet("load", flag.ContinueOnError)
 	e := encFlags(fs)
@@ -87,35 +88,9 @@ func cmdLoad(args []string) int {
 		in = f
 	}
 
+	wb := d.NewWriteBatch(*batch)
 	sc := bufio.NewScanner(in)
 	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
-	pending := make([]record, 0, *batch)
-	flush := func() int {
-		if len(pending) == 0 {
-			return exitOK
-		}
-		if err := d.Update(func(txn *kv.Txn) error {
-			for _, r := range pending {
-				key, err := e.decode(r.Key)
-				if err != nil {
-					return err
-				}
-				val, err := e.decode(r.Value)
-				if err != nil {
-					return err
-				}
-				if err := txn.Set(key, val); err != nil {
-					return err
-				}
-			}
-			return nil
-		}); err != nil {
-			return fail(err)
-		}
-		pending = pending[:0]
-		return exitOK
-	}
-
 	line := 0
 	for sc.Scan() {
 		line++
@@ -127,18 +102,23 @@ func cmdLoad(args []string) int {
 		if err := json.Unmarshal(raw, &r); err != nil {
 			return usageErr("line %d: bad JSON: %v", line, err)
 		}
-		pending = append(pending, r)
-		if len(pending) >= *batch {
-			if code := flush(); code != exitOK {
-				return code
-			}
+		key, err := e.decode(r.Key)
+		if err != nil {
+			return usageErr("line %d: bad key: %v", line, err)
+		}
+		val, err := e.decode(r.Value)
+		if err != nil {
+			return usageErr("line %d: bad value: %v", line, err)
+		}
+		if err := wb.Set(key, val); err != nil {
+			return fail(err)
 		}
 	}
 	if err := sc.Err(); err != nil {
 		return fail(err)
 	}
-	if code := flush(); code != exitOK {
-		return code
+	if err := wb.Close(); err != nil {
+		return fail(err)
 	}
 	return exitOK
 }
