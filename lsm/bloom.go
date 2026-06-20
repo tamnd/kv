@@ -1,5 +1,7 @@
 package lsm
 
+import "math"
+
 // bloomFilter is a per-segment Bloom filter over the segment's distinct user keys
 // (spec 06 §5). A point read consults it before touching a segment's block index or
 // data pages: a negative answer is definitive, so the segment is skipped; a positive
@@ -9,14 +11,61 @@ package lsm
 //
 // The construction is the classic double-hashing Bloom filter (Kirsch-Mitzenmacher):
 // one base hash of the key yields two 32-bit values, and the k probe positions are
-// h1 + i*h2 for i in [0, k). The bit budget is a fixed bits-per-key, so a segment's
-// filter scales with its key count; the per-level bit allocation that spends more
-// bits on the levels a read hits most (Monkey) is a later refinement that rides on
-// the same on-disk shape, once leveled compaction gives the levels meaning.
+// h1 + i*h2 for i in [0, k). The bit budget is a per-key rate, and that rate now varies
+// by level: a segment carries its own probe count k in its footer and its bit-array
+// length in its filter pages, so two segments can hold filters of different sizes with
+// no format change. bloomBitsForLevel is the Monkey allocation that picks the rate from
+// the level a segment is written at.
 
-// bloomBitsPerKey is the bit budget per distinct key. Ten bits gives roughly a one
-// percent false-positive rate at the optimal probe count, the usual default.
-const bloomBitsPerKey = 10
+const (
+	// bloomBitsTop is the bit budget per key at L0 and L1, the smallest and most
+	// frequently probed levels. Twelve bits gives roughly a quarter-percent
+	// false-positive rate at the optimal probe count, cheap because these levels hold
+	// few keys.
+	bloomBitsTop = 12
+	// bloomBitsFloor is the budget the deepest levels fall to. They hold most of the
+	// keys, so a bit spent there buys the least reduction in total false positives, and
+	// Monkey starves them first. Four bits is roughly a fifteen-percent rate, which still
+	// skips most segments a key was never in.
+	bloomBitsFloor = 4
+	// bloomBitsPerKey is the flat default a filter built without level context uses: a
+	// direct construction in a test, or any caller that does not pin a level. Ten bits is
+	// the usual one-percent-rate default.
+	bloomBitsPerKey = 10
+)
+
+// monkeyStep is the bits-per-key Monkey removes for each level deeper, ln(T)/ln(2)^2,
+// the additive step that makes each level's false-positive rate a factor of T larger
+// than the level above it (Dayan, Athanassoulis, Idreos; Monkey, SIGMOD 2017). Under a
+// fixed total bit budget that allocation minimizes the sum of false positives across the
+// tree, because the levels with the most keys are the least cost-effective to filter. It
+// is clamped to at least one so the budget always decreases with depth.
+func monkeyStep(levelRatio int) int {
+	if levelRatio < 2 {
+		return 1
+	}
+	step := int(math.Round(math.Log(float64(levelRatio)) / (math.Ln2 * math.Ln2)))
+	if step < 1 {
+		step = 1
+	}
+	return step
+}
+
+// bloomBitsForLevel is the Monkey bit budget for a segment written at the given level:
+// the top budget for L0 and L1, dropping by monkeyStep for each level below L1, floored.
+// A shallower (smaller) level gets more bits because its filter is cheap and a read
+// probes it as often as any other; the deepest (largest) levels fall to the floor
+// because the same bits buy far fewer avoided false positives there.
+func bloomBitsForLevel(level, levelRatio int) int {
+	if level <= 1 {
+		return bloomBitsTop
+	}
+	bits := bloomBitsTop - (level-1)*monkeyStep(levelRatio)
+	if bits < bloomBitsFloor {
+		bits = bloomBitsFloor
+	}
+	return bits
+}
 
 // bloomFilter holds the bit array and the probe count. A nil filter, or one with no
 // bits, means "no filter", and mayContain conservatively returns true so the read

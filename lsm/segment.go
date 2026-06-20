@@ -99,8 +99,10 @@ type pendingPage struct {
 // split across a page boundary (a single group too large for a page is the lone
 // exception). The pages are allocated from the pager's freelist or the file tail
 // and left dirty for the next checkpoint to fold, the same path every engine write
-// takes.
-func writeSegment(pgr *pager.Pager, src func(emit func(internalKey, value []byte) bool)) (*segment, error) {
+// takes. bitsPerKey sizes the Bloom filter: the caller passes the Monkey budget for
+// the level the segment is written at, so a deep segment carries a smaller filter than
+// a shallow one. A non-positive value falls back to the flat default.
+func writeSegment(pgr *pager.Pager, bitsPerKey int, src func(emit func(internalKey, value []byte) bool)) (*segment, error) {
 	usable := pgr.Header().UsablePageSize()
 	// The most a single cell can occupy: two length varints plus the bytes. A page
 	// must hold at least one whole cell, so a cell larger than the usable area minus
@@ -309,7 +311,10 @@ func writeSegment(pgr *pager.Pager, src func(emit func(internalKey, value []byte
 	// read can skip this whole segment when the filter says a key was never here.
 	var filterBlob []byte
 	if len(filterKeys) > 0 {
-		seg.filter = newBloom(len(filterKeys), bloomBitsPerKey)
+		if bitsPerKey < 1 {
+			bitsPerKey = bloomBitsPerKey
+		}
+		seg.filter = newBloom(len(filterKeys), bitsPerKey)
 		for _, k := range filterKeys {
 			seg.filter.add(k)
 		}
