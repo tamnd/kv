@@ -122,6 +122,105 @@ func TestVerifyDetectsDoubleAlloc(t *testing.T) {
 	}
 }
 
+// TestVerifyDetectsOrderViolation duplicates a key inside a leaf so two adjacent internal
+// keys are no longer strictly ascending, and confirms the verifier reports an order problem.
+// Equal adjacent keys are an ordering fault and nothing else, so the report isolates the
+// class.
+func TestVerifyDetectsOrderViolation(t *testing.T) {
+	bt := newBTree(t, 512, 64)
+	applyKeys(t, bt, 300)
+	leaf := firstLeaf(t, bt)
+
+	l, err := bt.loadLeaf(leaf)
+	if err != nil {
+		t.Fatalf("load leaf %d: %v", leaf, err)
+	}
+	if len(l.keys) < 2 {
+		t.Fatalf("leaf %d has %d keys, need at least 2 to break ordering", leaf, len(l.keys))
+	}
+	// Make cell 1 equal to cell 0: a strictly-ascending check fails on equality.
+	l.keys[1] = append([]byte(nil), l.keys[0]...)
+	if err := bt.storeLeaf(leaf, l); err != nil {
+		t.Fatalf("store leaf %d: %v", leaf, err)
+	}
+
+	rep, err := bt.Verify()
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if rep.OK() {
+		t.Fatal("verify passed a leaf with non-ascending keys")
+	}
+	if !hasClass(rep, "order") {
+		t.Fatalf("want an order problem, got %+v", rep.Problems)
+	}
+}
+
+// TestVerifyDetectsBoundsViolation lowers the root's first separator below every real key, so
+// the leftmost child subtree now routes keys that sit at or above the upper bound the parent
+// claims for it, and confirms the verifier reports a bounds problem. Only the separator bytes
+// change, so the in-order key sequence stays sound and the report isolates the bounds class.
+func TestVerifyDetectsBoundsViolation(t *testing.T) {
+	bt := newBTree(t, 512, 64)
+	applyKeys(t, bt, 300)
+
+	root := bt.root()
+	typ, err := bt.typeOf(root)
+	if err != nil {
+		t.Fatalf("typeOf root %d: %v", root, err)
+	}
+	if typ != format.PageBTreeInterior {
+		t.Fatalf("root %d is not interior; need a multi-level tree", root)
+	}
+	in, err := bt.loadInterior(root)
+	if err != nil {
+		t.Fatalf("load interior %d: %v", root, err)
+	}
+	if len(in.seps) < 1 {
+		t.Fatalf("root %d has no separators", root)
+	}
+	// "a" sorts below every "key%05d", so the leftmost subtree's hi bound is now violated by
+	// all of its keys, while the separators stay strictly ascending (no order fault).
+	in.seps[0] = []byte("a")
+	if err := bt.storeInterior(root, in); err != nil {
+		t.Fatalf("store interior %d: %v", root, err)
+	}
+
+	rep, err := bt.Verify()
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if rep.OK() {
+		t.Fatal("verify passed a tree whose child keys escape their parent's bound")
+	}
+	if !hasClass(rep, "bounds") {
+		t.Fatalf("want a bounds problem, got %+v", rep.Problems)
+	}
+}
+
+// TestVerifyDetectsFreelistViolation puts an out-of-range page number on the freelist and
+// confirms the verifier reports a freelist problem. An out-of-range entry is skipped before
+// the space accounting tallies it, so the file still balances and the report isolates the
+// freelist class.
+func TestVerifyDetectsFreelistViolation(t *testing.T) {
+	bt := newBTree(t, 512, 64)
+	applyKeys(t, bt, 300)
+
+	// A page number well past the file's high-water mark can never be a real free page.
+	bt.pgr.Free(bt.pgr.DBSize() + 1000)
+
+	rep, err := bt.Verify()
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if rep.OK() {
+		t.Fatal("verify passed a freelist holding an out-of-range page")
+	}
+	if !hasClass(rep, "freelist") {
+		t.Fatalf("want a freelist problem, got %+v", rep.Problems)
+	}
+}
+
 // hasClass reports whether the report contains a problem of the given class.
 func hasClass(rep *engine.VerifyReport, class string) bool {
 	for _, p := range rep.Problems {
