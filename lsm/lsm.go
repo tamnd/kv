@@ -15,8 +15,9 @@
 // replays the batches committed after the last checkpoint into a fresh memtable over
 // it. A point read seeks each source for one key, the memtable through its skip list
 // and each segment through a persisted block index, and folds just that key's group;
-// the range and iteration path still folds the full snapshot. What remains for later
-// slices is the per-segment filters, leveled compaction, and value separation.
+// a per-segment Bloom filter lets a point miss skip a segment without touching its
+// index. The range and iteration path still folds the full snapshot. What remains for
+// later slices is leveled compaction, the streaming heap-merge, and value separation.
 package lsm
 
 import (
@@ -340,6 +341,12 @@ func (r *reader) Get(userKey []byte) ([]byte, error) {
 	}
 	l.mem.getGroup(userKey, collect)
 	for _, seg := range l.segments {
+		// The Bloom filter answers a miss definitively, so a segment it rejects holds
+		// no version of the key and its block index need never be touched. A segment
+		// without a filter has a nil one, whose mayContain passes, so it is still read.
+		if !seg.filter.mayContain(userKey) {
+			continue
+		}
 		if err := seg.getGroup(l.pgr, userKey, collect); err != nil {
 			return nil, err
 		}
