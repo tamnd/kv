@@ -174,10 +174,44 @@ func (l *LSM) flushLocked() error {
 	return nil
 }
 
-// Maintain implements engine.Engine. Compaction and flush land in later slices; for
-// now the memtable-only core has no background work.
+// Maintain implements engine.Engine. It runs a compaction when the segment count has
+// grown past the fan-in the core tolerates and the budget permits work, merging the
+// segment set into one and dropping the versions no reader at or below the watermark
+// can still observe. A zero budget, the host's "do nothing" signal, is honored by
+// skipping the merge. The compaction is a whole-set major merge that is not yet bounded
+// to the budget's page count; the incremental, level-aware policy that picks a partial
+// input set per call and stays within MaxPages is a later slice.
 func (l *LSM) Maintain(ctx context.Context, budget engine.MaintBudget) (engine.MaintReport, error) {
-	return engine.MaintReport{}, nil
+	if budget.MaxPages <= 0 && budget.MaxBytes <= 0 {
+		return engine.MaintReport{}, nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.segments) < compactionTrigger {
+		return engine.MaintReport{}, nil
+	}
+	pageSize := int64(l.pgr.PageSize())
+	before := int64(0)
+	for _, seg := range l.segments {
+		before += int64(seg.pages) * pageSize
+	}
+	merged, err := l.compactLocked(budget.Watermark)
+	if err != nil {
+		return engine.MaintReport{}, err
+	}
+	after := int64(0)
+	for _, seg := range l.segments {
+		after += int64(seg.pages) * pageSize
+	}
+	reclaimed := before - after
+	if reclaimed < 0 {
+		reclaimed = 0
+	}
+	return engine.MaintReport{
+		PagesCompacted: merged,
+		BytesWritten:   after,
+		BytesReclaimed: reclaimed,
+	}, nil
 }
 
 // Stats implements engine.Engine, reporting the memtable footprint plus the on-disk
