@@ -32,4 +32,8 @@ jobs:
       - name: Build
         run: go build ./...
       - name: Test
+        # The race detector requires cgo; the build above already proves the
+        # pure-Go (CGO_ENABLED=0) path compiles.
+        env:
+          CGO_ENABLED: "1"
         run: go test -race ./...
