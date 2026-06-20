@@ -1,0 +1,232 @@
+package kv_test
+
+import (
+	"errors"
+	"fmt"
+	"path/filepath"
+	"testing"
+
+	"github.com/tamnd/kv"
+)
+
+// open creates a fresh database in a temp dir, registering its cleanup.
+func open(t *testing.T, opts ...kv.Option) *kv.DB {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "data.kv")
+	d, err := kv.Open(path, opts...)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { d.Close() })
+	return d
+}
+
+// TestOpenSetGet round-trips a value through the public Update/View surface.
+func TestOpenSetGet(t *testing.T) {
+	d := open(t)
+	if err := d.Update(func(txn *kv.Txn) error {
+		return txn.Set([]byte("hello"), []byte("world"))
+	}); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if err := d.View(func(txn *kv.Txn) error {
+		v, err := txn.Get([]byte("hello"))
+		if err != nil {
+			return err
+		}
+		if string(v) != "world" {
+			t.Fatalf("get = %q, want world", v)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("view: %v", err)
+	}
+}
+
+// TestNotFound checks the public ErrNotFound sentinel is matchable.
+func TestNotFound(t *testing.T) {
+	d := open(t)
+	err := d.View(func(txn *kv.Txn) error {
+		_, err := txn.Get([]byte("absent"))
+		return err
+	})
+	if !errors.Is(err, kv.ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+}
+
+// TestReadOnlyTxnRejectsWrite checks a write on a View transaction surfaces ErrReadOnly.
+func TestReadOnlyTxnRejectsWrite(t *testing.T) {
+	d := open(t)
+	err := d.View(func(txn *kv.Txn) error {
+		return txn.Set([]byte("k"), []byte("v"))
+	})
+	if !errors.Is(err, kv.ErrReadOnly) {
+		t.Fatalf("err = %v, want ErrReadOnly", err)
+	}
+}
+
+// TestExplicitConflict checks the explicit Begin/Commit surface and ErrConflict.
+func TestExplicitConflict(t *testing.T) {
+	d := open(t)
+	if err := d.Update(func(txn *kv.Txn) error { return txn.Set([]byte("k"), []byte("0")) }); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	t1 := d.Begin(true)
+	defer t1.Discard()
+	t2 := d.Begin(true)
+	defer t2.Discard()
+
+	if _, err := t1.Get([]byte("k")); err != nil {
+		t.Fatalf("t1 get: %v", err)
+	}
+	if _, err := t2.Get([]byte("k")); err != nil {
+		t.Fatalf("t2 get: %v", err)
+	}
+	t1.Set([]byte("k"), []byte("1"))
+	t2.Set([]byte("k"), []byte("2"))
+
+	if err := t1.Commit(); err != nil {
+		t.Fatalf("t1 commit: %v", err)
+	}
+	if err := t2.Commit(); !errors.Is(err, kv.ErrConflict) {
+		t.Fatalf("t2 commit = %v, want ErrConflict", err)
+	}
+}
+
+// TestIterator walks a prefix scan through the public iterator.
+func TestIterator(t *testing.T) {
+	d := open(t)
+	if err := d.Update(func(txn *kv.Txn) error {
+		for i := 0; i < 5; i++ {
+			txn.Set([]byte(fmt.Sprintf("user:%d", i)), []byte(fmt.Sprintf("v%d", i)))
+		}
+		txn.Set([]byte("other"), []byte("x"))
+		return nil
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	var got []string
+	if err := d.View(func(txn *kv.Txn) error {
+		it, err := txn.NewIterator(kv.IterOptions{Prefix: []byte("user:")})
+		if err != nil {
+			return err
+		}
+		defer it.Close()
+		for it.First(); it.Valid(); it.Next() {
+			got = append(got, string(it.Key()))
+		}
+		return it.Error()
+	}); err != nil {
+		t.Fatalf("iterate: %v", err)
+	}
+	if len(got) != 5 {
+		t.Fatalf("scanned %d keys, want 5: %v", len(got), got)
+	}
+}
+
+// TestMergeOperator checks a registered associative operator folds blind operands.
+func TestMergeOperator(t *testing.T) {
+	add := func(existing, operand []byte) []byte {
+		var sum int
+		if len(existing) > 0 {
+			fmt.Sscanf(string(existing), "%d", &sum)
+		}
+		var inc int
+		fmt.Sscanf(string(operand), "%d", &inc)
+		return []byte(fmt.Sprintf("%d", sum+inc))
+	}
+	d := open(t, kv.WithMergeOperator("add", add))
+
+	for i := 0; i < 3; i++ {
+		if err := d.Update(func(txn *kv.Txn) error {
+			return txn.Merge([]byte("hits"), []byte("1"))
+		}); err != nil {
+			t.Fatalf("merge %d: %v", i, err)
+		}
+	}
+	if err := d.View(func(txn *kv.Txn) error {
+		v, err := txn.Get([]byte("hits"))
+		if err != nil {
+			return err
+		}
+		if string(v) != "3" {
+			t.Fatalf("hits = %q, want 3", v)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("view: %v", err)
+	}
+}
+
+// TestSerializableOption checks WithIsolation(Serializable) aborts write skew through
+// the public surface.
+func TestSerializableOption(t *testing.T) {
+	d := open(t, kv.WithIsolation(kv.Serializable))
+	if err := d.Update(func(txn *kv.Txn) error {
+		txn.Set([]byte("x"), []byte("1"))
+		txn.Set([]byte("y"), []byte("1"))
+		return nil
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	t1 := d.Begin(true)
+	defer t1.Discard()
+	t2 := d.Begin(true)
+	defer t2.Discard()
+	for _, tx := range []*kv.Txn{t1, t2} {
+		if _, err := tx.Get([]byte("x")); err != nil {
+			t.Fatalf("read x: %v", err)
+		}
+		if _, err := tx.Get([]byte("y")); err != nil {
+			t.Fatalf("read y: %v", err)
+		}
+	}
+	t1.Set([]byte("x"), []byte("0"))
+	t2.Set([]byte("y"), []byte("0"))
+	if err := t1.Commit(); err != nil {
+		t.Fatalf("t1 commit: %v", err)
+	}
+	if err := t2.Commit(); !errors.Is(err, kv.ErrConflict) {
+		t.Fatalf("t2 commit = %v, want ErrConflict under Serializable", err)
+	}
+}
+
+// TestReopenPersists checks data survives Close and reopen of the same path.
+func TestReopenPersists(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "data.kv")
+	d, err := kv.Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := d.Update(func(txn *kv.Txn) error { return txn.Set([]byte("k"), []byte("v")) }); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if err := d.Checkpoint(); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	d2, err := kv.Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer d2.Close()
+	if err := d2.View(func(txn *kv.Txn) error {
+		v, err := txn.Get([]byte("k"))
+		if err != nil {
+			return err
+		}
+		if string(v) != "v" {
+			t.Fatalf("after reopen k = %q, want v", v)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("view: %v", err)
+	}
+}
