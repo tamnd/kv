@@ -489,6 +489,20 @@ func (d *DB) Maintain(maxPages int) (engine.MaintReport, error) {
 	return d.eng.Maintain(context.Background(), budget)
 }
 
+// Verify runs the engine's structural self-check and returns its report (spec 16 §4,
+// spec 23 §3). It takes the writer lock so the walk sees a stable tree, not one mid
+// commit or mid checkpoint. It returns ErrUnsupported when the engine has no verifier,
+// so the CLI can say so plainly rather than reporting a silent pass.
+func (d *DB) Verify() (*engine.VerifyReport, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	v, ok := d.eng.(engine.Verifier)
+	if !ok {
+		return nil, ErrUnsupported
+	}
+	return v.Verify()
+}
+
 // Stats is a point-in-time space-and-durability snapshot of the database, aggregating
 // the engine's space accounting (spec 09 §4) with the pager's page counts and the
 // WAL's frame backlog. It is what the info/stats CLI surface and the observability

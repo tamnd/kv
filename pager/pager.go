@@ -196,3 +196,13 @@ func (p *Pager) FreeCount() int {
 	defer p.mu.Unlock()
 	return len(p.free)
 }
+
+// FreePages returns a copy of the in-memory freelist, the page numbers available for
+// reallocation. The structural verifier (spec 23 §3) uses it to prove no page is both
+// free and reachable from the tree, and that the freelist, reachable, and metadata
+// pages account for the whole file.
+func (p *Pager) FreePages() []uint32 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]uint32(nil), p.free...)
+}

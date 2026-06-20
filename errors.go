@@ -29,6 +29,9 @@ var (
 	// ErrNeedsRecovery means a prior fatal fsync error fenced the database; reopen to
 	// recover (spec 07 §6).
 	ErrNeedsRecovery = errors.New("kv: needs recovery")
+	// ErrUnsupported means the open engine does not implement an optional capability the
+	// operation needs, such as a structural verifier behind Check (spec 23 §3).
+	ErrUnsupported = db.ErrUnsupported
 )
 
 // wrap maps the internal db/engine sentinels onto the public ones so callers match the
