@@ -220,6 +220,41 @@ func (s *Snapshot) View(fn func(txn *Txn) error) error {
 // is idempotent; further View calls then return an error.
 func (s *Snapshot) Close() error { return wrap(s.s.Close()) }
 
+// WriteBatch is an explicit, memory-bounded builder for very large writes (spec 15 §6). It
+// buffers Set and Delete operations and flushes them in bounded chunks, so loading millions
+// of keys never holds them all in memory. It is the bulk-load path, not a transaction: it
+// spans many commits, one per chunk, so it is not atomic across chunks. Within a chunk the
+// last write for a key wins. Open one with DB.NewWriteBatch and Close it to flush the tail.
+type WriteBatch struct {
+	b *db.WriteBatch
+}
+
+// NewWriteBatch returns a batch that flushes every maxOps operations; a non-positive maxOps
+// selects a default. The batch must be Closed to flush its final partial chunk.
+func (kdb *DB) NewWriteBatch(maxOps int) *WriteBatch {
+	return &WriteBatch{b: kdb.d.NewWriteBatch(maxOps)}
+}
+
+// Set buffers an upsert of key to value, auto-flushing the chunk when it fills.
+func (w *WriteBatch) Set(key, value []byte) error { return wrap(w.b.Set(key, value)) }
+
+// Delete buffers a tombstone for key, auto-flushing the chunk when it fills.
+func (w *WriteBatch) Delete(key []byte) error { return wrap(w.b.Delete(key)) }
+
+// Flush commits the buffered chunk now. The first failing flush fences the batch, so a
+// partial load never silently continues past an I/O fault.
+func (w *WriteBatch) Flush() error { return wrap(w.b.Flush()) }
+
+// Count reports how many operations the caller has recorded over the batch's life.
+func (w *WriteBatch) Count() int { return w.b.Count() }
+
+// Pending reports how many operations are buffered but not yet flushed.
+func (w *WriteBatch) Pending() int { return w.b.Pending() }
+
+// Close flushes the final partial chunk and marks the batch done. It is idempotent; further
+// operations return ErrBatchClosed.
+func (w *WriteBatch) Close() error { return wrap(w.b.Close()) }
+
 // Stats is a point-in-time space-and-durability snapshot of an open database: page
 // counts, freelist depth, the engine's physical footprint and amplification, the latest
 // commit version, and the WAL frame backlog (spec 09 §4, spec 19). It is what the

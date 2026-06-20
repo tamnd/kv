@@ -34,6 +34,8 @@ var (
 	ErrUnsupported = db.ErrUnsupported
 	// ErrSnapshotClosed means a long-lived Snapshot was used after Close (spec 15 §7).
 	ErrSnapshotClosed = db.ErrSnapshotClosed
+	// ErrBatchClosed means a WriteBatch was used after Close (spec 15 §6).
+	ErrBatchClosed = db.ErrBatchClosed
 )
 
 // wrap maps the internal db/engine sentinels onto the public ones so callers match the
