@@ -451,6 +451,76 @@ func (d *DB) Maintain(maxPages int) (engine.MaintReport, error) {
 	return d.eng.Maintain(context.Background(), budget)
 }
 
+// Stats is a point-in-time space-and-durability snapshot of the database, aggregating
+// the engine's space accounting (spec 09 §4) with the pager's page counts and the
+// WAL's frame backlog. It is what the info/stats CLI surface and the observability
+// layer read (spec 19). Every field is gathered cheaply under a read lock; counts that
+// would need a full tree walk (live keys/bytes) are left to the engine and may be zero.
+type Stats struct {
+	// Engine is the storage core the file was created with (spec 02).
+	Engine format.EngineKind
+	// PageSize is the file's page size in bytes.
+	PageSize int
+	// PageCount is the file's high-water page count (its logical size in pages).
+	PageCount uint32
+	// FreePages is the number of pages on the freelist, reusable before the file grows.
+	FreePages int64
+	// PhysicalBytes is the engine's on-disk footprint including not-yet-reclaimed dead
+	// versions.
+	PhysicalBytes int64
+	// LiveKeys and LiveBytes are the engine's live-data counts at the newest snapshot,
+	// or zero when the engine does not compute them cheaply.
+	LiveKeys  int64
+	LiveBytes int64
+	// Amplification is the engine's space-amplification estimate (physical / live).
+	Amplification float64
+	// Version is the latest committed commit version (spec 10 §1).
+	Version uint64
+	// WALFrames is the next WAL frame LSN: the count of frames the log has written.
+	WALFrames uint64
+	// WALBacklog is the number of WAL frames committed but not yet folded into the main
+	// file by a checkpoint; it is the read-overhead and recovery-time signal (spec 09 §1.3).
+	WALBacklog uint64
+	// Syncs is how many fsyncs the WAL has performed since open (spec 19).
+	Syncs uint64
+}
+
+// Stats gathers a Stats snapshot under a read lock, so it is consistent against a
+// concurrent commit without blocking one for long (spec 09 §4).
+func (d *DB) Stats() Stats {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	es := d.eng.Stats()
+	// LSN is the next frame number to assign, so the last frame written is LSN-1, and a
+	// checkpoint records that LSN as folded. Frames still unfolded are those numbered
+	// above the checkpoint mark and at or below the last written frame.
+	lsn := d.wal.LSN()
+	var written uint64
+	if lsn > 0 {
+		written = lsn - 1
+	}
+	folded := d.pgr.CheckpointLSN()
+	var backlog uint64
+	if written > folded {
+		backlog = written - folded
+	}
+	return Stats{
+		Engine:        d.pgr.Header().Engine,
+		PageSize:      d.pgr.PageSize(),
+		PageCount:     d.pgr.DBSize(),
+		FreePages:     es.FreePages,
+		PhysicalBytes: es.PhysicalBytes,
+		LiveKeys:      es.LiveKeys,
+		LiveBytes:     es.LiveBytes,
+		Amplification: es.Amplification,
+		Version:       d.orc.lastCommitted(),
+		WALFrames:     written,
+		WALBacklog:    backlog,
+		Syncs:         d.wal.Syncs(),
+	}
+}
+
 // Checkpoint folds the WAL into the main file and resets the log, in the strict
 // order that makes an interrupted checkpoint safe: fold dirty pages and fsync the
 // main file (recording the folded LSN and the durable version in its header), then
@@ -460,6 +530,14 @@ func (d *DB) Maintain(maxPages int) (engine.MaintReport, error) {
 func (d *DB) Checkpoint() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+
+	// Persist the durable commit version from the oracle, the single source of truth.
+	// A live commit keeps the header's version current through applyCommitted, but a
+	// version reconstructed by redo reaches the engine through eng.Apply directly and
+	// never touches the header, so without this the checkpoint would fold the redone
+	// pages under a stale version. The next open would then open a snapshot below those
+	// commits and find the data invisible (spec 08 §5, spec 10 §1).
+	d.pgr.Header().LastCommitVersion = d.orc.lastCommitted()
 
 	foldedLSN := d.wal.LSN() - 1
 	if err := d.pgr.Checkpoint(foldedLSN); err != nil {

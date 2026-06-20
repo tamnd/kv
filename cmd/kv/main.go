@@ -55,6 +55,8 @@ func commands() []command {
 		{"dump", "stream all key/value pairs as JSONL", cmdDump},
 		{"load", "bulk-load key/value pairs from stdin or a file", cmdLoad},
 		{"checkpoint", "fold the WAL into the main file", cmdCheckpoint},
+		{"info", "print a human summary of the database", cmdInfo},
+		{"stats", "print space and durability accounting as JSON", cmdStats},
 	}
 }
 

@@ -188,3 +188,11 @@ func (p *Pager) DBSize() uint32 {
 	defer p.mu.Unlock()
 	return p.dbSize
 }
+
+// FreeCount reports how many pages are currently on the in-memory freelist,
+// available for reallocation before the file grows (spec 09 §2, §4).
+func (p *Pager) FreeCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.free)
+}

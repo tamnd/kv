@@ -183,6 +183,59 @@ func (kdb *DB) Begin(writable bool) *Txn {
 	return &Txn{t: kdb.d.Begin(writable)}
 }
 
+// Stats is a point-in-time space-and-durability snapshot of an open database: page
+// counts, freelist depth, the engine's physical footprint and amplification, the latest
+// commit version, and the WAL frame backlog (spec 09 §4, spec 19). It is what the
+// info/stats CLI prints and what an operator watches to decide whether to checkpoint or
+// vacuum.
+type Stats struct {
+	// Engine is the storage core the file was created with.
+	Engine EngineKind
+	// PageSize is the file's page size in bytes.
+	PageSize int
+	// PageCount is the file's size in pages (high-water mark).
+	PageCount uint32
+	// FreePages is the freelist depth: pages reusable before the file grows.
+	FreePages int64
+	// PhysicalBytes is the on-disk footprint, dead versions included.
+	PhysicalBytes int64
+	// LiveKeys and LiveBytes are live-data counts at the newest snapshot, zero when the
+	// engine does not compute them cheaply.
+	LiveKeys  int64
+	LiveBytes int64
+	// Amplification is the space-amplification estimate (physical / live).
+	Amplification float64
+	// Version is the latest committed commit version.
+	Version uint64
+	// WALFrames is how many frames the WAL has written.
+	WALFrames uint64
+	// WALBacklog is the frames committed but not yet folded by a checkpoint, the
+	// read-overhead and recovery-time signal.
+	WALBacklog uint64
+	// Syncs is how many fsyncs the WAL has performed since open.
+	Syncs uint64
+}
+
+// Stats returns a current space-and-durability snapshot of the database (spec 09 §4).
+// It is cheap and lock-light, safe to poll.
+func (kdb *DB) Stats() Stats {
+	s := kdb.d.Stats()
+	return Stats{
+		Engine:        s.Engine,
+		PageSize:      s.PageSize,
+		PageCount:     s.PageCount,
+		FreePages:     s.FreePages,
+		PhysicalBytes: s.PhysicalBytes,
+		LiveKeys:      s.LiveKeys,
+		LiveBytes:     s.LiveBytes,
+		Amplification: s.Amplification,
+		Version:       s.Version,
+		WALFrames:     s.WALFrames,
+		WALBacklog:    s.WALBacklog,
+		Syncs:         s.Syncs,
+	}
+}
+
 // Checkpoint folds the WAL into the main file and resets the log (spec 09).
 func (kdb *DB) Checkpoint() error {
 	return wrap(kdb.d.Checkpoint())
