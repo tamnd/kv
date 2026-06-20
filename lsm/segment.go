@@ -45,6 +45,7 @@ type segment struct {
 	maxKey     []byte        // largest user key, nil when empty
 	maxVersion uint64        // largest commit version any cell carries
 	numCells   int           // total cells across the chain
+	pages      int           // data pages plus the footer, for space accounting
 }
 
 // pendingPage is one data page's cells, accumulated before the pages are allocated
@@ -170,6 +171,7 @@ func writeSegment(pgr *pager.Pager, src func(emit func(internalKey, value []byte
 		return nil, err
 	}
 	seg.footer = footer
+	seg.pages = len(pgnos) + 1 // data pages plus the footer
 	return seg, nil
 }
 
