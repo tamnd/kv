@@ -147,6 +147,28 @@ func (sl *skiplist) insert(key, value []byte) {
 	sl.count++
 }
 
+// seek returns the offset of the first node whose key is >= the target by
+// CompareInternal, or 0 if every key is smaller. It descends the tower the same way
+// insert does, so a point read lands on a user key's group in logarithmic time
+// instead of scanning from the head.
+func (sl *skiplist) seek(key []byte) uint32 {
+	x := sl.head
+	for level := sl.height - 1; level >= 0; level-- {
+		for {
+			next := sl.nodeNext(x, level)
+			if next == 0 {
+				break
+			}
+			if format.CompareInternal(sl.nodeKey(next), key) < 0 {
+				x = next
+				continue
+			}
+			break
+		}
+	}
+	return sl.nodeNext(x, 0)
+}
+
 // first returns the offset of the lowest-keyed node, or 0 if the list is empty.
 func (sl *skiplist) first() uint32 { return sl.nodeNext(sl.head, 0) }
 

@@ -13,8 +13,10 @@
 // the flushed batch's LSN through DurableLSN so the host reclaims the WAL behind it.
 // On open the engine loads the MANIFEST to rebuild the segment set, then the WAL tail
 // replays the batches committed after the last checkpoint into a fresh memtable over
-// it. What remains for later slices is the block index for in-segment seeks, the
-// per-segment filters, leveled compaction, and value separation.
+// it. A point read seeks each source for one key, the memtable through its skip list
+// and each segment through a persisted block index, and folds just that key's group;
+// the range and iteration path still folds the full snapshot. What remains for later
+// slices is the per-segment filters, leveled compaction, and value separation.
 package lsm
 
 import (
@@ -317,18 +319,66 @@ type reader struct {
 	snap engine.Snapshot
 }
 
+// Get resolves one user key without materializing the whole keyspace: it gathers
+// the key's version group from the memtable, seeking its skip list, and from each
+// segment, seeking its block index, then folds that group with the range deletes
+// that cover the key. Only the pages that may hold the key are read, so a point read
+// no longer scans every source. The range and iteration path still folds the full
+// snapshot until the streaming heap-merge lands.
 func (r *reader) Get(userKey []byte) ([]byte, error) {
-	view, err := r.l.snapshot(r.snap)
-	if err != nil {
-		return nil, err
+	l := r.l
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	var cells []srcCell
+	collect := func(ik, val []byte) bool {
+		cells = append(cells, srcCell{
+			ik:  append([]byte(nil), ik...),
+			val: append([]byte(nil), val...),
+		})
+		return true
 	}
-	idx := sort.Search(len(view), func(i int) bool {
-		return bytes.Compare(view[i].uk, userKey) >= 0
+	l.mem.getGroup(userKey, collect)
+	for _, seg := range l.segments {
+		if err := seg.getGroup(l.pgr, userKey, collect); err != nil {
+			return nil, err
+		}
+	}
+
+	// Order the gathered group newest version first, the order Fold expects.
+	sort.SliceStable(cells, func(i, j int) bool {
+		return format.CompareInternal(cells[i].ik, cells[j].ik) < 0
 	})
-	if idx < len(view) && bytes.Equal(view[idx].uk, userKey) {
-		return append([]byte(nil), view[idx].val...), nil
+	var ops []format.Op
+	for _, c := range cells {
+		op, ok := format.OpFromCell(c.ik, c.val, r.snap.Now)
+		if !ok {
+			continue // range markers resolve through rangeDels, not as ops
+		}
+		ops = append(ops, op)
 	}
-	return nil, engine.ErrNotFound
+
+	// The deletes that may cover the key live in the memtable's live set and in each
+	// segment's persisted range-delete list, so the fold sees every covering marker
+	// without scanning the runs for them.
+	rd := format.NewestCoveringRangeDel(l.liveRangeDels(), userKey, r.snap.Version)
+	val, ok := format.Fold(ops, r.snap.Version, rd, l.merge)
+	if !ok {
+		return nil, engine.ErrNotFound
+	}
+	return append([]byte(nil), val...), nil
+}
+
+// liveRangeDels gathers every range-delete interval the engine holds, from the
+// memtable's live set and each segment's persisted list, the set the fold filters to
+// the markers that cover a key. The caller holds l.mu.
+func (l *LSM) liveRangeDels() []format.RangeDel {
+	dels := make([]format.RangeDel, 0, len(l.mem.rangeDels))
+	dels = append(dels, l.mem.rangeDels...)
+	for _, seg := range l.segments {
+		dels = append(dels, seg.rangeDels...)
+	}
+	return dels
 }
 
 func (r *reader) NewIter(opts engine.IterOptions) (engine.Cursor, error) {
