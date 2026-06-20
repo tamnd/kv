@@ -326,6 +326,26 @@ func (w *WAL) Checkpointed(foldedLSN uint64) error {
 	return w.Flush()
 }
 
+// TruncateFile shrinks the on-disk WAL to just its header, returning the frame space to
+// the operating system. It is the extra step the TRUNCATE checkpoint mode performs over
+// RESTART (spec 09 §1.2): the caller has already folded and reset the log with
+// Checkpointed, so the live tail is the header alone, and truncating to it leaves a valid
+// empty-generation log the next open still reads cleanly. It is a no-op if the file is
+// already at or below the header.
+func (w *WAL) TruncateFile() error {
+	sz, err := w.file.Size()
+	if err != nil {
+		return err
+	}
+	if sz <= int64(w.tailOff) {
+		return nil
+	}
+	if err := w.file.Truncate(int64(w.tailOff)); err != nil {
+		return err
+	}
+	return w.Flush()
+}
+
 // nextSalt deterministically derives the next generation's salt. It avoids any
 // runtime randomness (the build forbids Math.random-style entropy in some paths);
 // mixing the old salt with the folded LSN is enough to make a stale frame's salt

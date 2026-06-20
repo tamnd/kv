@@ -367,9 +367,31 @@ func (kdb *DB) Stats() Stats {
 	}
 }
 
-// Checkpoint folds the WAL into the main file and resets the log (spec 09).
+// CheckpointMode selects how aggressively a checkpoint reclaims the WAL (spec 09 §1.2),
+// the kv analog of SQLite's wal_checkpoint modes.
+type CheckpointMode = db.CheckpointMode
+
+const (
+	// CheckpointPassive folds every committed frame and resets the log without blocking.
+	CheckpointPassive = db.CheckpointPassive
+	// CheckpointFull folds every committed frame and resets the log.
+	CheckpointFull = db.CheckpointFull
+	// CheckpointRestart folds and resets so the next writer reuses the log from its start.
+	CheckpointRestart = db.CheckpointRestart
+	// CheckpointTruncate folds, resets, and truncates the -wal file to its header.
+	CheckpointTruncate = db.CheckpointTruncate
+)
+
+// Checkpoint folds the WAL into the main file and resets the log (spec 09), in PASSIVE
+// mode. Use CheckpointMode for a tighter mode such as TRUNCATE.
 func (kdb *DB) Checkpoint() error {
 	return wrap(kdb.d.Checkpoint())
+}
+
+// CheckpointMode folds the WAL and resets the log, then applies the reclamation the mode
+// asks for (spec 09 §1.2). TRUNCATE additionally shrinks the -wal file to its header.
+func (kdb *DB) CheckpointMode(m CheckpointMode) error {
+	return wrap(kdb.d.CheckpointMode(m))
 }
 
 // Vacuum performs an incremental vacuum, returning trailing free pages to the operating

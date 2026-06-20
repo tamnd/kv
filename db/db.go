@@ -805,16 +805,54 @@ func (d *DB) backgroundErr() error {
 	return d.ckptErr
 }
 
+// CheckpointMode selects how aggressively a checkpoint reclaims the WAL (spec 09 §1.2),
+// mirroring SQLite's wal_checkpoint modes. This implementation logs commits as a logical
+// redo stream and serves reads from the engine over the buffer pool, not by scanning WAL
+// frames, so no reader ever pins a frame and a fold is never bounded short: PASSIVE, FULL,
+// and RESTART all fold every committed frame and reset the log to its start. TRUNCATE adds
+// the one behavioral difference the architecture leaves room for: it returns the WAL file's
+// frame space to the operating system.
+type CheckpointMode int
+
+const (
+	// CheckpointPassive folds every committed frame and resets the log without blocking;
+	// the background autocheckpoint runs in this mode. It is the default.
+	CheckpointPassive CheckpointMode = iota
+	// CheckpointFull folds every committed frame and resets the log. Equivalent to PASSIVE
+	// here, since a fold is never bounded by a reader.
+	CheckpointFull
+	// CheckpointRestart folds and resets so the next writer reuses the log from its start.
+	// Equivalent to FULL here, since Checkpointed already restarts the log on every fold.
+	CheckpointRestart
+	// CheckpointTruncate folds, resets, and truncates the -wal file to its header, the
+	// tightest mode, used on idle or close.
+	CheckpointTruncate
+)
+
 // Checkpoint folds the WAL into the main file and resets the log, in the strict
 // order that makes an interrupted checkpoint safe: fold dirty pages and fsync the
 // main file (recording the folded LSN and the durable version in its header), then
 // append the checkpoint frame, rotate the salt, and reset the WAL (spec 08 §5). A
 // crash between the two steps re-folds harmlessly on the next open because redo is
-// idempotent.
+// idempotent. It runs in PASSIVE mode; CheckpointMode selects a tighter one.
 func (d *DB) Checkpoint() error {
+	return d.CheckpointMode(CheckpointPassive)
+}
+
+// CheckpointMode folds the WAL and resets the log like Checkpoint, then applies the extra
+// reclamation the mode asks for (spec 09 §1.2). Only TRUNCATE differs behaviorally in this
+// architecture: it shrinks the -wal file to its header after the fold, returning the frame
+// space to the operating system.
+func (d *DB) CheckpointMode(m CheckpointMode) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return d.checkpointLocked()
+	if err := d.checkpointLocked(); err != nil {
+		return err
+	}
+	if m == CheckpointTruncate {
+		return d.wal.TruncateFile()
+	}
+	return nil
 }
 
 // checkpointLocked is the body of Checkpoint; the caller holds d.mu. It is factored
