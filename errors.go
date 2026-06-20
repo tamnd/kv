@@ -32,6 +32,8 @@ var (
 	// ErrUnsupported means the open engine does not implement an optional capability the
 	// operation needs, such as a structural verifier behind Check (spec 23 §3).
 	ErrUnsupported = db.ErrUnsupported
+	// ErrSnapshotClosed means a long-lived Snapshot was used after Close (spec 15 §7).
+	ErrSnapshotClosed = db.ErrSnapshotClosed
 )
 
 // wrap maps the internal db/engine sentinels onto the public ones so callers match the
