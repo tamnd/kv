@@ -167,6 +167,38 @@ func TestTTLScanExcludesExpired(t *testing.T) {
 	}
 }
 
+// TestTTLSweepReclaims checks the db-level maintenance sweep reclaims an expired TTL
+// key's value through the database clock: after the clock advances past the deadline, a
+// Maintain pass reports the key swept and bytes reclaimed, the key stays absent, and a
+// still-live TTL key survives.
+func TestTTLSweepReclaims(t *testing.T) {
+	clk := &testClock{}
+	clk.set(10)
+	d := openMemClock(t, clk, Options{})
+
+	setTTL(t, d, "dead", "gone", 100)
+	setTTL(t, d, "live", "stay", 1000)
+
+	clk.set(200)
+	rep, err := d.Maintain(0)
+	if err != nil {
+		t.Fatalf("maintain: %v", err)
+	}
+	if rep.ExpiredSwept != 1 {
+		t.Fatalf("swept = %d, want 1", rep.ExpiredSwept)
+	}
+	if rep.BytesReclaimed <= 0 {
+		t.Fatalf("bytes reclaimed = %d, want > 0", rep.BytesReclaimed)
+	}
+
+	if _, ok := txnGet(t, d, "dead"); ok {
+		t.Fatalf("swept key still present")
+	}
+	if v, ok := txnGet(t, d, "live"); !ok || v != "stay" {
+		t.Fatalf("live ttl key = %q,%v, want stay", v, ok)
+	}
+}
+
 // TestTTLPersistsAcrossReopen checks the absolute deadline is durable: a key written
 // with a TTL is still governed by the same deadline after the database is closed and
 // reopened, rather than restarting the clock on recovery.

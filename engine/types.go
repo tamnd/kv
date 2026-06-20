@@ -75,6 +75,13 @@ type MaintBudget struct {
 	// value a snapshot at the watermark resolves. Zero disables version GC for the
 	// call.
 	Watermark uint64
+	// Now is the wall-clock time in nanoseconds the TTL sweeper compares expiries
+	// against (spec 15 §6). A TTL set whose expiry is at or before Now is swept into a
+	// tombstone so its value bytes are reclaimed and version GC can collapse it. Reads
+	// already resolve such a key absent before the sweep, so the sweep is purely a
+	// space optimization. Zero disables sweeping for the call, the same way GC and
+	// recovery disable read-time expiry.
+	Now uint64
 }
 
 // MaintReport summarizes what a Maintain call did.
@@ -82,6 +89,9 @@ type MaintReport struct {
 	PagesCompacted int
 	BytesWritten   int64
 	BytesReclaimed int64
+	// ExpiredSwept is the number of expired TTL sets the sweeper turned into tombstones
+	// this call (spec 15 §6), for observability; it does not bound the call.
+	ExpiredSwept int64
 	// More is true if the engine has more maintenance pending and would like to
 	// be called again.
 	More bool

@@ -545,7 +545,7 @@ func (d *DB) Get(userKey []byte) ([]byte, error) {
 func (d *DB) Maintain(maxPages int) (engine.MaintReport, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	budget := engine.MaintBudget{MaxPages: maxPages, Watermark: d.orc.readMark()}
+	budget := engine.MaintBudget{MaxPages: maxPages, Watermark: d.orc.readMark(), Now: d.now()}
 	return d.eng.Maintain(context.Background(), budget)
 }
 
