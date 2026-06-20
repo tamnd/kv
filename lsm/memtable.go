@@ -47,6 +47,26 @@ func (m *memtable) size() int { return m.sl.a.size() }
 // count reports how many distinct internal-key cells the memtable holds.
 func (m *memtable) count() int { return m.sl.count }
 
+// getGroup calls fn for every cell of userKey's version group, in ascending
+// internal-key order (newest version first), seeking the skip list to the group
+// rather than scanning from the head. The slices alias the arena and are valid only
+// for the duration of the call, so fn copies anything it retains. It stops early if
+// fn returns false.
+func (m *memtable) getGroup(userKey []byte, fn func(internalKey, value []byte) bool) {
+	// The smallest internal key for a user key inverts the largest version to zero
+	// and uses the lowest kind, so a forward seek lands on the group's newest cell.
+	seekKey := format.EncodeInternalKey(userKey, format.MaxVersion, format.KindDelete)
+	for off := m.sl.seek(seekKey); off != 0; off = m.sl.next(off) {
+		ik := m.sl.nodeKey(off)
+		if format.CompareUser(format.UserKey(ik), userKey) != 0 {
+			return
+		}
+		if !fn(ik, m.sl.nodeValue(off)) {
+			return
+		}
+	}
+}
+
 // scan calls fn for every (internalKey, value) cell in ascending internal-key
 // order. The slices alias the arena and are valid only for the duration of the
 // call, so fn copies anything it retains. It stops early if fn returns false.

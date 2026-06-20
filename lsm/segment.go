@@ -1,8 +1,10 @@
 package lsm
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
+	"sort"
 
 	"github.com/tamnd/kv/format"
 	"github.com/tamnd/kv/pager"
@@ -10,42 +12,71 @@ import (
 
 // A segment is one immutable on-disk sorted run, the single-file analog of a
 // classic LSM's SST (spec 06 §1). A flush turns one sealed memtable into a
-// segment; a compaction merges several into one. This slice builds the segment's
-// on-disk format and its reader in isolation, ahead of the flush that produces one
-// and the MANIFEST that catalogs one, so the format is settled and tested before
-// anything depends on it.
+// segment; a compaction merges several into one.
 //
-// The layout is a chain of data pages plus a footer page (spec 06 §4.1). A data
-// page is a run of sorted (internalKey, value) cells, identical in shape to a
-// B-tree leaf, and carries the page number of the next data page in its common
-// header's overflow slot, so a scan walks the chain without a separate index. The
-// footer page records the chain head and the segment's metadata: its key range, its
-// largest version, and its cell count. The footer is the page the MANIFEST will
-// reference, the segment's durable root.
+// The layout is a chain of data pages, a chain of index pages, an optional chain
+// of range-delete pages, and a footer page (spec 06 §4.1). A data page is a run of
+// sorted (internalKey, value) cells, identical in shape to a B-tree leaf, and
+// carries the page number of the next data page in its common header's overflow
+// slot, so a full scan walks the chain without an index. The index pages hold one
+// separator per data page, the data page's first user key paired with its page
+// number, so a point read binary-searches to the page that may hold a key instead
+// of scanning the run. The range-delete pages hold the segment's range-delete
+// intervals, so a point read can fold the deletes that cover a key without scanning
+// the run for their markers. The footer records the chain heads and the segment's
+// metadata: its key range, its largest version, its cell count, and its total page
+// count. The footer is the page the MANIFEST references, the segment's durable root.
 //
-// Deferred to later slices: a persistent block index for in-segment seeks, the
-// Bloom/Ribbon filter that skips a segment on a point miss, block compression, and
-// value separation for cells too large to inline. A cell larger than the usable
-// page area is rejected here for that reason; the value log removes the limit.
+// Packing keeps a user key's whole version group on one data page (a group larger
+// than a page is the one exception and spills onto continuation pages that repeat
+// its first user key), so the index seek lands on the page that holds the group's
+// newest version and a point read never misses a fresher version on an earlier
+// page. This is the segment analog of the B-tree's rule that a split never cuts a
+// version group.
+//
+// Deferred to later slices: the per-segment Bloom/Ribbon filter that skips a
+// segment on a point miss, block compression, and value separation for cells too
+// large to inline. A cell larger than the usable page area is rejected here for
+// that reason; the value log removes the limit.
 
+// segDataHeaderSize is a data page's header: the common 8-byte preamble, whose
+// overflow slot holds the next data page number (0 ends the chain). The index and
+// range-delete pages reuse the same preamble.
+const segDataHeaderSize = format.CommonHeaderSize
+
+// Flags-byte markers distinguishing the LSM block page roles that share the
+// PageLSMBlock type. A data page carries no flag.
 const (
-	// segDataHeaderSize is a data page's header: the common 8-byte preamble, whose
-	// overflow slot holds the next data page number (0 ends the chain).
-	segDataHeaderSize = format.CommonHeaderSize
-	// segFooterHeaderSize is the footer page's header; its payload follows.
-	segFooterHeaderSize = format.CommonHeaderSize
+	footerFlag   byte = 0x01 // the footer page
+	indexFlag    byte = 0x02 // a block-index page
+	rangeDelFlag byte = 0x04 // a range-delete page
 )
 
+// indexEntry is one block-index separator: the first user key of a data page and
+// that page's number. The entries are globally ascending by user key, so a point
+// read binary-searches them.
+type indexEntry struct {
+	firstUser []byte
+	page      format.PageNo
+}
+
 // segment is a read handle to one on-disk run. The byte slices are owned copies, so
-// a handle outlives the pages it was read from.
+// a handle outlives the pages it was read from. The index and range-delete sets are
+// loaded into memory once, at write or open, so a point read needs no extra page
+// reads to locate a key or to learn which deletes cover it.
 type segment struct {
 	footer     format.PageNo // the page the MANIFEST records
 	head       format.PageNo // first data page, or NoPage when the run is empty
+	indexHead  format.PageNo // first index page, or NoPage when the run is empty
+	rdHead     format.PageNo // first range-delete page, or NoPage when there are none
 	minKey     []byte        // smallest user key, nil when empty
 	maxKey     []byte        // largest user key, nil when empty
 	maxVersion uint64        // largest commit version any cell carries
 	numCells   int           // total cells across the chain
-	pages      int           // data pages plus the footer, for space accounting
+	pages      int           // every page the segment owns, for space accounting
+
+	index     []indexEntry      // one separator per data page, ascending by user key
+	rangeDels []format.RangeDel // the segment's range-delete intervals
 }
 
 // pendingPage is one data page's cells, accumulated before the pages are allocated
@@ -53,14 +84,16 @@ type segment struct {
 type pendingPage struct {
 	body  []byte // cells, appended after the header is reserved
 	cells int
-	first []byte // first internal key on the page, for a future block index
+	first []byte // first user key on the page, the block-index separator
 }
 
 // writeSegment serializes the cells yielded by src, in ascending internal-key
 // order, into a fresh on-disk segment and returns its handle. src must emit cells
 // already ordered by format.CompareInternal, which is exactly what a memtable scan
-// produces. The pages are allocated from the pager's freelist or the file tail and
-// left dirty for the next checkpoint to fold, the same path every engine write
+// produces. The cells are packed a version group at a time so a group is never
+// split across a page boundary (a single group too large for a page is the lone
+// exception). The pages are allocated from the pager's freelist or the file tail
+// and left dirty for the next checkpoint to fold, the same path every engine write
 // takes.
 func writeSegment(pgr *pager.Pager, src func(emit func(internalKey, value []byte) bool)) (*segment, error) {
 	usable := pgr.Header().UsablePageSize()
@@ -76,56 +109,117 @@ func writeSegment(pgr *pager.Pager, src func(emit func(internalKey, value []byte
 		maxKey     []byte
 		maxVersion uint64
 		numCells   int
+		rangeDels  []format.RangeDel
 		emitErr    error
 	)
-	startPage := func(ik []byte) {
+	startPage := func(firstUser []byte) {
 		cur = pendingPage{
 			body:  make([]byte, segDataHeaderSize, usable),
-			first: append([]byte(nil), ik...),
+			first: append([]byte(nil), firstUser...),
 		}
 	}
+	flushPage := func() {
+		if cur.cells > 0 {
+			pages = append(pages, cur)
+			cur = pendingPage{}
+		}
+	}
+	appendCell := func(ik, val []byte) {
+		cur.body = format.AppendUvarint(cur.body, uint64(len(ik)))
+		cur.body = append(cur.body, ik...)
+		cur.body = format.AppendUvarint(cur.body, uint64(len(val)))
+		cur.body = append(cur.body, val...)
+		cur.cells++
+	}
+
+	// A version group is buffered whole, then committed onto a page that has room
+	// for all of it, so a group never straddles a page boundary unless it alone
+	// exceeds a page.
+	type cell struct{ ik, val []byte }
+	var (
+		group     []cell
+		groupUser []byte
+		groupLen  int
+	)
+	commitGroup := func() {
+		if len(group) == 0 {
+			return
+		}
+		// Start the group on a fresh page when it will not fit on the current one,
+		// so the whole group stays together.
+		if cur.cells > 0 && len(cur.body)+groupLen > usable {
+			flushPage()
+		}
+		if cur.cells == 0 {
+			startPage(groupUser)
+		}
+		for _, c := range group {
+			cellLen := uvarintLen(uint64(len(c.ik))) + len(c.ik) + uvarintLen(uint64(len(c.val))) + len(c.val)
+			// A group larger than a page spills onto continuation pages that repeat
+			// its first user key, the only case a group spans pages.
+			if cur.cells > 0 && len(cur.body)+cellLen > usable {
+				flushPage()
+				startPage(groupUser)
+			}
+			appendCell(c.ik, c.val)
+
+			uk := format.UserKey(c.ik)
+			if minKey == nil {
+				minKey = append([]byte(nil), uk...)
+			}
+			maxKey = append(maxKey[:0], uk...)
+			if v := format.Version(c.ik); v > maxVersion {
+				maxVersion = v
+			}
+			if format.KindOf(c.ik) == format.KindRangeBegin {
+				rangeDels = append(rangeDels, format.RangeDel{
+					Lo:      append([]byte(nil), uk...),
+					Hi:      append([]byte(nil), c.val...),
+					Version: format.Version(c.ik),
+				})
+			}
+			numCells++
+		}
+		group = group[:0]
+		groupUser = nil
+		groupLen = 0
+	}
+
 	src(func(ik, val []byte) bool {
 		cellLen := uvarintLen(uint64(len(ik))) + len(ik) + uvarintLen(uint64(len(val))) + len(val)
 		if cellLen > maxCell {
 			emitErr = fmt.Errorf("lsm: cell of %d bytes exceeds the usable page area of %d; value separation is required", cellLen, maxCell)
 			return false
 		}
-		if cur.cells == 0 {
-			startPage(ik)
-		} else if len(cur.body)+cellLen > usable {
-			pages = append(pages, cur)
-			startPage(ik)
-		}
-		cur.body = format.AppendUvarint(cur.body, uint64(len(ik)))
-		cur.body = append(cur.body, ik...)
-		cur.body = format.AppendUvarint(cur.body, uint64(len(val)))
-		cur.body = append(cur.body, val...)
-		cur.cells++
-
 		uk := format.UserKey(ik)
-		if minKey == nil {
-			minKey = append([]byte(nil), uk...)
+		if groupUser != nil && !bytes.Equal(uk, groupUser) {
+			commitGroup()
 		}
-		maxKey = append(maxKey[:0], uk...)
-		if v := format.Version(ik); v > maxVersion {
-			maxVersion = v
+		if groupUser == nil {
+			groupUser = append([]byte(nil), uk...)
 		}
-		numCells++
+		group = append(group, cell{
+			ik:  append([]byte(nil), ik...),
+			val: append([]byte(nil), val...),
+		})
+		groupLen += cellLen
 		return true
 	})
 	if emitErr != nil {
 		return nil, emitErr
 	}
-	if cur.cells > 0 {
-		pages = append(pages, cur)
-	}
+	commitGroup()
+	flushPage()
 
 	seg := &segment{
 		head:       format.NoPage,
+		indexHead:  format.NoPage,
+		rdHead:     format.NoPage,
 		minKey:     minKey,
 		maxKey:     append([]byte(nil), maxKey...),
 		maxVersion: maxVersion,
 		numCells:   numCells,
+		rangeDels:  rangeDels,
 	}
 	if numCells == 0 {
 		seg.maxKey = nil
@@ -166,13 +260,112 @@ func writeSegment(pgr *pager.Pager, src func(emit func(internalKey, value []byte
 		seg.head = pgnos[0]
 	}
 
+	// Build the in-memory block index from the data-page first keys, then persist it.
+	seg.index = make([]indexEntry, len(pages))
+	indexRecords := make([][]byte, len(pages))
+	for i := range pages {
+		seg.index[i] = indexEntry{firstUser: pages[i].first, page: pgnos[i]}
+		rec := format.AppendUvarint(nil, uint64(len(pages[i].first)))
+		rec = append(rec, pages[i].first...)
+		var u32 [4]byte
+		binary.BigEndian.PutUint32(u32[:], pgnos[i])
+		rec = append(rec, u32[:]...)
+		indexRecords[i] = rec
+	}
+	indexHead, indexPages, err := writeRecordPages(pgr, indexFlag, indexRecords)
+	if err != nil {
+		return nil, err
+	}
+	seg.indexHead = indexHead
+
+	// Persist the range-delete intervals so a point read learns which deletes cover a
+	// key without scanning the run for their markers.
+	rdRecords := make([][]byte, len(rangeDels))
+	for i, rd := range rangeDels {
+		rec := format.AppendUvarint(nil, uint64(len(rd.Lo)))
+		rec = append(rec, rd.Lo...)
+		rec = format.AppendUvarint(rec, uint64(len(rd.Hi)))
+		rec = append(rec, rd.Hi...)
+		var u64 [8]byte
+		binary.BigEndian.PutUint64(u64[:], rd.Version)
+		rec = append(rec, u64[:]...)
+		rdRecords[i] = rec
+	}
+	rdHead, rdPages, err := writeRecordPages(pgr, rangeDelFlag, rdRecords)
+	if err != nil {
+		return nil, err
+	}
+	seg.rdHead = rdHead
+
+	seg.pages = len(pgnos) + indexPages + rdPages + 1 // data + index + range-delete + footer
 	footer, err := writeFooter(pgr, seg)
 	if err != nil {
 		return nil, err
 	}
 	seg.footer = footer
-	seg.pages = len(pgnos) + 1 // data pages plus the footer
 	return seg, nil
+}
+
+// writeRecordPages packs the records into a chain of pages tagged with flag and
+// returns the head page number and the number of pages written. Records are laid
+// out in order, each page filled until the next record would overflow, then chained
+// through the common header's overflow slot. No records yields no pages and a
+// NoPage head.
+func writeRecordPages(pgr *pager.Pager, flag byte, records [][]byte) (format.PageNo, int, error) {
+	if len(records) == 0 {
+		return format.NoPage, 0, nil
+	}
+	usable := pgr.Header().UsablePageSize()
+	var (
+		bodies [][]byte
+		counts []int
+		cur    = make([]byte, segDataHeaderSize, usable)
+		count  int
+	)
+	flush := func() {
+		bodies = append(bodies, cur)
+		counts = append(counts, count)
+		cur = make([]byte, segDataHeaderSize, usable)
+		count = 0
+	}
+	for _, rec := range records {
+		if len(rec) > usable-segDataHeaderSize {
+			return 0, 0, fmt.Errorf("lsm: record of %d bytes exceeds the usable page area of %d", len(rec), usable-segDataHeaderSize)
+		}
+		if count > 0 && len(cur)+len(rec) > usable {
+			flush()
+		}
+		cur = append(cur, rec...)
+		count++
+	}
+	if count > 0 {
+		flush()
+	}
+
+	pgnos := make([]format.PageNo, len(bodies))
+	frames := make([]*pager.Frame, len(bodies))
+	for i := range bodies {
+		pgno, fr, err := pgr.Allocate()
+		if err != nil {
+			return 0, 0, err
+		}
+		pgnos[i] = pgno
+		frames[i] = fr
+	}
+	for i := range bodies {
+		next := format.NoPage
+		if i+1 < len(bodies) {
+			next = pgnos[i+1]
+		}
+		format.CommonHeader{Type: format.PageLSMBlock, Flags: flag, CellCount: uint16(counts[i]), Overflow: next}.Encode(bodies[i])
+		data := frames[i].Data()
+		copy(data, bodies[i])
+		for j := len(bodies[i]); j < len(data); j++ {
+			data[j] = 0
+		}
+		pgr.Unpin(frames[i], true)
+	}
+	return pgnos[0], len(bodies), nil
 }
 
 // writeFooter writes the segment's footer page and returns its number. The footer
@@ -182,7 +375,7 @@ func writeFooter(pgr *pager.Pager, seg *segment) (format.PageNo, error) {
 	if err != nil {
 		return 0, err
 	}
-	body := make([]byte, segFooterHeaderSize)
+	body := make([]byte, segDataHeaderSize)
 	format.CommonHeader{Type: format.PageLSMBlock, Flags: footerFlag}.Encode(body)
 	var u32 [4]byte
 	binary.BigEndian.PutUint32(u32[:], seg.head)
@@ -195,6 +388,11 @@ func writeFooter(pgr *pager.Pager, seg *segment) (format.PageNo, error) {
 	body = append(body, seg.minKey...)
 	body = format.AppendUvarint(body, uint64(len(seg.maxKey)))
 	body = append(body, seg.maxKey...)
+	binary.BigEndian.PutUint32(u32[:], seg.indexHead)
+	body = append(body, u32[:]...)
+	binary.BigEndian.PutUint32(u32[:], seg.rdHead)
+	body = append(body, u32[:]...)
+	body = format.AppendUvarint(body, uint64(seg.pages))
 
 	usable := pgr.Header().UsablePageSize()
 	if len(body) > usable {
@@ -210,24 +408,21 @@ func writeFooter(pgr *pager.Pager, seg *segment) (format.PageNo, error) {
 	return pgno, nil
 }
 
-// footerFlag marks a footer page in its common header's flags byte, distinguishing
-// it from a data page of the same page type.
-const footerFlag byte = 0x01
-
-// openSegment reads a segment's footer page and returns the handle, the path
-// recovery takes to rebuild a segment from the page number the MANIFEST recorded.
+// openSegment reads a segment's footer page and the index and range-delete chains
+// it names, returning a handle ready to seek, the path recovery takes to rebuild a
+// segment from the page number the MANIFEST recorded.
 func openSegment(pgr *pager.Pager, footer format.PageNo) (*segment, error) {
 	fr, err := pgr.Get(footer, pager.Read)
 	if err != nil {
 		return nil, err
 	}
-	defer pgr.Unpin(fr, false)
 	data := fr.Data()
 	h := format.DecodeCommonHeader(data)
 	if h.Type != format.PageLSMBlock || h.Flags != footerFlag {
+		pgr.Unpin(fr, false)
 		return nil, fmt.Errorf("lsm: page %d is not a segment footer", footer)
 	}
-	off := segFooterHeaderSize
+	off := segDataHeaderSize
 	seg := &segment{footer: footer}
 	seg.head = binary.BigEndian.Uint32(data[off:])
 	off += 4
@@ -246,8 +441,172 @@ func openSegment(pgr *pager.Pager, footer format.PageNo) (*segment, error) {
 	off += n
 	if maxLen > 0 {
 		seg.maxKey = append([]byte(nil), data[off:off+int(maxLen)]...)
+		off += int(maxLen)
+	}
+	seg.indexHead = binary.BigEndian.Uint32(data[off:])
+	off += 4
+	seg.rdHead = binary.BigEndian.Uint32(data[off:])
+	off += 4
+	pageCount, n := format.Uvarint(data[off:])
+	seg.pages = int(pageCount)
+	pgr.Unpin(fr, false)
+
+	if err := seg.loadIndex(pgr); err != nil {
+		return nil, err
+	}
+	if err := seg.loadRangeDels(pgr); err != nil {
+		return nil, err
 	}
 	return seg, nil
+}
+
+// loadIndex walks the index-page chain into seg.index.
+func (s *segment) loadIndex(pgr *pager.Pager) error {
+	for pgno := s.indexHead; pgno != format.NoPage; {
+		fr, err := pgr.Get(pgno, pager.Read)
+		if err != nil {
+			return err
+		}
+		data := fr.Data()
+		h := format.DecodeCommonHeader(data)
+		if h.Type != format.PageLSMBlock || h.Flags != indexFlag {
+			pgr.Unpin(fr, false)
+			return fmt.Errorf("lsm: page %d in index chain is not an index page", pgno)
+		}
+		off := segDataHeaderSize
+		for i := 0; i < int(h.CellCount); i++ {
+			klen, m := format.Uvarint(data[off:])
+			off += m
+			key := append([]byte(nil), data[off:off+int(klen)]...)
+			off += int(klen)
+			page := binary.BigEndian.Uint32(data[off:])
+			off += 4
+			s.index = append(s.index, indexEntry{firstUser: key, page: page})
+		}
+		next := h.Overflow
+		pgr.Unpin(fr, false)
+		pgno = next
+	}
+	return nil
+}
+
+// loadRangeDels walks the range-delete-page chain into seg.rangeDels.
+func (s *segment) loadRangeDels(pgr *pager.Pager) error {
+	for pgno := s.rdHead; pgno != format.NoPage; {
+		fr, err := pgr.Get(pgno, pager.Read)
+		if err != nil {
+			return err
+		}
+		data := fr.Data()
+		h := format.DecodeCommonHeader(data)
+		if h.Type != format.PageLSMBlock || h.Flags != rangeDelFlag {
+			pgr.Unpin(fr, false)
+			return fmt.Errorf("lsm: page %d in range-delete chain is not a range-delete page", pgno)
+		}
+		off := segDataHeaderSize
+		for i := 0; i < int(h.CellCount); i++ {
+			loLen, m := format.Uvarint(data[off:])
+			off += m
+			lo := append([]byte(nil), data[off:off+int(loLen)]...)
+			off += int(loLen)
+			hiLen, m := format.Uvarint(data[off:])
+			off += m
+			hi := append([]byte(nil), data[off:off+int(hiLen)]...)
+			off += int(hiLen)
+			version := binary.BigEndian.Uint64(data[off:])
+			off += 8
+			s.rangeDels = append(s.rangeDels, format.RangeDel{Lo: lo, Hi: hi, Version: version})
+		}
+		next := h.Overflow
+		pgr.Unpin(fr, false)
+		pgno = next
+	}
+	return nil
+}
+
+// seekPage returns the index of the first data page that may hold userKey's version
+// group. Because a group is never split across pages, the group (if present) lies
+// wholly on this page, or on the run of continuation pages that begins here when the
+// group is too large for one page.
+func (s *segment) seekPage(userKey []byte) int {
+	n := len(s.index)
+	if n == 0 {
+		return 0
+	}
+	// First separator whose user key is >= the target.
+	idx := sort.Search(n, func(i int) bool {
+		return format.CompareUser(s.index[i].firstUser, userKey) >= 0
+	})
+	if idx < n && format.CompareUser(s.index[idx].firstUser, userKey) == 0 {
+		return idx // the group starts a page; take its leftmost page
+	}
+	if idx == 0 {
+		return 0 // the target is below the segment's first key
+	}
+	return idx - 1 // the group starts mid-page on the page before the first larger separator
+}
+
+// getGroup calls fn for every cell of userKey's version group, in ascending
+// internal-key order (newest version first), using the block index to seek the data
+// page that holds the group rather than scanning the run. The cell slices alias the
+// pinned page and are valid only for the duration of the call, so fn copies what it
+// keeps. It stops early if fn returns false.
+func (s *segment) getGroup(pgr *pager.Pager, userKey []byte, fn func(internalKey, value []byte) bool) error {
+	if len(s.index) == 0 {
+		return nil
+	}
+	// A key outside the segment's range cannot be present, so skip the read entirely.
+	if s.minKey != nil && (format.CompareUser(userKey, s.minKey) < 0 || format.CompareUser(userKey, s.maxKey) > 0) {
+		return nil
+	}
+	for i := s.seekPage(userKey); i < len(s.index); i++ {
+		fr, err := pgr.Get(s.index[i].page, pager.Read)
+		if err != nil {
+			return err
+		}
+		data := fr.Data()
+		h := format.DecodeCommonHeader(data)
+		if h.Type != format.PageLSMBlock {
+			pgr.Unpin(fr, false)
+			return fmt.Errorf("lsm: page %d in segment chain is not an LSM block", s.index[i].page)
+		}
+		off := segDataHeaderSize
+		stop := false
+		var lastUser []byte
+		for c := 0; c < int(h.CellCount); c++ {
+			klen, m := format.Uvarint(data[off:])
+			off += m
+			ik := data[off : off+int(klen)]
+			off += int(klen)
+			vlen, m := format.Uvarint(data[off:])
+			off += m
+			val := data[off : off+int(vlen)]
+			off += int(vlen)
+			lastUser = format.UserKey(ik)
+			cmp := format.CompareUser(lastUser, userKey)
+			if cmp < 0 {
+				continue
+			}
+			if cmp > 0 {
+				stop = true
+				break
+			}
+			if !fn(ik, val) {
+				stop = true
+				break
+			}
+		}
+		pgr.Unpin(fr, false)
+		if stop {
+			return nil
+		}
+		// Continue onto the next page only when the group reaches the page's end,
+		// which means a group too large for one page spills onto the next.
+		if lastUser == nil || format.CompareUser(lastUser, userKey) != 0 {
+			return nil
+		}
+	}
+	return nil
 }
 
 // scan calls fn for every (internalKey, value) cell in the segment in ascending
