@@ -65,10 +65,11 @@ func (o *Oracle) Get(userKey []byte, snap Snapshot) ([]byte, bool) {
 	vers := o.versions[string(userKey)]
 	ops := make([]format.Op, 0, len(vers))
 	for _, ver := range vers {
-		if ver.kind == format.KindRangeBegin || ver.kind == format.KindRangeEnd {
-			continue
+		op, ok := format.OpFromParts(ver.version, ver.kind, ver.value, snap.Now)
+		if !ok {
+			continue // range markers resolve through rangeDels, not as ops
 		}
-		ops = append(ops, format.Op{Version: ver.version, Kind: ver.kind, Value: ver.value})
+		ops = append(ops, op)
 	}
 	rd := format.NewestCoveringRangeDel(o.rangeDels, userKey, snap.Version)
 	return format.Fold(ops, snap.Version, rd, o.merge)

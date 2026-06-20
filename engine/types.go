@@ -8,6 +8,11 @@ import "errors"
 // added without changing the seam.
 type Snapshot struct {
 	Version uint64
+	// Now is the wall-clock time in nanoseconds used to evaluate TTL expiry during a
+	// read (spec 15 §6). A read treats a TTL set whose expiry is <= Now as absent. Zero
+	// disables expiry, so a read with no clock, and GC, never expire a value the
+	// background sweep has not yet removed.
+	Now uint64
 }
 
 // IterOptions controls a range scan (spec 11). All keys are user keys.

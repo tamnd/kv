@@ -64,6 +64,7 @@ type opKind uint8
 
 const (
 	opSet opKind = iota
+	opSetTTL
 	opDelete
 	opMerge
 	opRangeDelete
@@ -76,6 +77,11 @@ type pendingOp struct {
 	kind  opKind
 	key   []byte
 	value []byte // the set value or merge operand; nil for a delete; high bound for a range delete
+	// expiry is the absolute wall-clock deadline, in Unix nanoseconds, of an opSetTTL
+	// (spec 15 §6). It is zero for every other op kind and means "never expires" even
+	// for a TTL set. The value stays the user's raw bytes here; the expiry is framed in
+	// front of it only when the commit batch is built.
+	expiry uint64
 }
 
 // rangeCovers reports whether the half-open interval [lo, hi) contains key.
@@ -285,21 +291,46 @@ func (t *Txn) trackRange(lo, hi []byte) {
 // right order relative to the point ops on key. It returns the value and whether
 // the key is present.
 func (t *Txn) resolve(key []byte) ([]byte, bool, error) {
-	// Snapshot base: the engine value visible at the read version.
-	val, exists, err := t.db.snapshotGet(t.readVersion, key)
+	val, exists, ttl, expiry, err := t.resolveNet(key)
 	if err != nil {
 		return nil, false, err
+	}
+	// A buffered TTL set already past its deadline reads as absent, the same way the
+	// engine resolves an expired TTL cell at read time (spec 15 §6). A zero expiry
+	// never expires.
+	if ttl && expiry != 0 && expiry <= t.db.now() {
+		return nil, false, nil
+	}
+	return val, exists, nil
+}
+
+// resolveNet folds the transaction's buffered ops for key over the snapshot value,
+// chronologically, returning the net value, whether the key is present, and -- when
+// the effective write is a TTL set -- the TTL flag and its absolute expiry. It is the
+// shared core behind both resolve (the read path, which then applies expiry) and
+// finalize (the commit path, which must preserve the TTL framing rather than collapse
+// it to a plain set). The base snapshot value is never TTL-framed: the engine strips
+// the frame during its own read resolution, so the base always enters as a plain set.
+func (t *Txn) resolveNet(key []byte) (val []byte, exists bool, ttl bool, expiry uint64, err error) {
+	// Snapshot base: the engine value visible at the read version.
+	val, exists, err = t.db.snapshotGet(t.readVersion, key)
+	if err != nil {
+		return nil, false, false, 0, err
 	}
 	ks := string(key)
 	for _, op := range t.ops {
 		switch op.kind {
 		case opSet:
 			if string(op.key) == ks {
-				val, exists = op.value, true
+				val, exists, ttl, expiry = op.value, true, false, 0
+			}
+		case opSetTTL:
+			if string(op.key) == ks {
+				val, exists, ttl, expiry = op.value, true, true, op.expiry
 			}
 		case opDelete:
 			if string(op.key) == ks {
-				val, exists = nil, false
+				val, exists, ttl, expiry = nil, false, false, 0
 			}
 		case opMerge:
 			if string(op.key) == ks {
@@ -309,18 +340,49 @@ func (t *Txn) resolve(key []byte) ([]byte, bool, error) {
 					val = op.value
 				}
 				exists = true
+				// A merge folds onto whatever value stands, keeping any TTL the prior write
+				// carried: a merge on a TTL key inherits its deadline, a merge on a plain key
+				// stays plain.
 			}
 		case opRangeDelete:
 			if rangeCovers(op.key, op.value, key) {
-				val, exists = nil, false
+				val, exists, ttl, expiry = nil, false, false, 0
 			}
 		}
 	}
-	return val, exists, nil
+	return val, exists, ttl, expiry, nil
 }
+
+// Now returns the database clock in Unix nanoseconds, the time base a relative TTL is
+// turned into an absolute expiry against (spec 15 §6). The public library layer reads
+// it so a caller-facing duration becomes a stored absolute deadline through the same
+// clock read resolution uses, which keeps an injected test clock authoritative end to
+// end.
+func (t *Txn) Now() uint64 { return t.db.now() }
 
 // Set buffers an upsert of key to value, applied at commit.
 func (t *Txn) Set(key, value []byte) error { return t.record(opSet, key, value) }
+
+// SetWithTTL buffers an upsert of key to value that expires expiryNanos wall-clock
+// nanoseconds from the Unix epoch (spec 15 §6). A reader past the deadline resolves
+// the key absent before any sweep runs, and the commit stamps the deadline into the
+// stored cell so it survives reopen. A zero expiry never expires, the same as a plain
+// Set. The deadline is absolute, computed by the caller from the database clock, so it
+// is stable across recovery rather than relative to replay time.
+func (t *Txn) SetWithTTL(key, value []byte, expiryNanos uint64) error {
+	if t.done {
+		return ErrTxnDone
+	}
+	if !t.writable {
+		return ErrReadOnlyTxn
+	}
+	op := pendingOp{kind: opSetTTL, key: append([]byte(nil), key...), expiry: expiryNanos}
+	if value != nil {
+		op.value = append([]byte(nil), value...)
+	}
+	t.ops = append(t.ops, op)
+	return nil
+}
 
 // Delete buffers a tombstone for key, applied at commit.
 func (t *Txn) Delete(key []byte) error { return t.record(opDelete, key, nil) }
@@ -424,13 +486,20 @@ func (t *Txn) finalize() (ops []pendingOp, conflictKeys []string, err error) {
 			ops = append(ops, op)
 			continue
 		}
-		val, exists, rerr := t.resolve(op.key)
+		val, exists, ttl, expiry, rerr := t.resolveNet(op.key)
 		if rerr != nil {
 			return nil, nil, rerr
 		}
-		if exists {
+		switch {
+		case exists && ttl:
+			// Preserve the TTL framing: collapsing to a plain Set here would strip the
+			// expiry and the key would never expire (spec 15 §6). An already-past deadline
+			// is still emitted as a TTL set, not a delete, so a redo re-installs an
+			// identical cell and read-time resolution makes it absent.
+			ops = append(ops, pendingOp{kind: opSetTTL, key: op.key, value: val, expiry: expiry})
+		case exists:
 			ops = append(ops, pendingOp{kind: opSet, key: op.key, value: val})
-		} else {
+		default:
 			ops = append(ops, pendingOp{kind: opDelete, key: op.key})
 		}
 		conflictKeys = append(conflictKeys, ks)

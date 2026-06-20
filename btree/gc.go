@@ -125,7 +125,11 @@ func gcCollapseLeaf(l *leaf, w uint64, rangeDels []format.RangeDel, merge func(e
 			ik, val := l.keys[j], l.vals[j]
 			j++
 			k := format.KindOf(ik)
-			if k == format.KindRangeBegin || k == format.KindRangeEnd {
+			if k == format.KindRangeBegin || k == format.KindRangeEnd || k == format.KindSetWithTTL {
+				// Range markers resolve out of band, and a TTL set is kept verbatim so
+				// version GC never re-encodes its framed value as a plain set and silently
+				// strips the expiry. A TTL cell is thus never in leOps below, so the fold
+				// never expires one; expired cells are reclaimed by the sweep (spec 15 §6).
 				out.keys = append(out.keys, ik)
 				out.vals = append(out.vals, val)
 				continue

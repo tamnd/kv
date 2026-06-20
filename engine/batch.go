@@ -51,6 +51,14 @@ func (b *WriteBatch) Set(userKey, value []byte) {
 	b.Add(format.EncodeInternalKey(userKey, b.version, format.KindSet), value)
 }
 
+// SetWithTTL appends a set for userKey whose value carries an absolute expiry in wall
+// clock nanoseconds (spec 15 §6). It is stored under KindSetWithTTL with the expiry
+// framed in front of the value, so a redo of the same committed batch re-installs an
+// identical cell and a read past the expiry resolves the key absent.
+func (b *WriteBatch) SetWithTTL(userKey, value []byte, expiry uint64) {
+	b.Add(format.EncodeInternalKey(userKey, b.version, format.KindSetWithTTL), format.EncodeTTLValue(expiry, value))
+}
+
 // Delete appends a tombstone for userKey at the batch's version.
 func (b *WriteBatch) Delete(userKey []byte) {
 	b.Add(format.EncodeInternalKey(userKey, b.version, format.KindDelete), nil)

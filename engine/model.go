@@ -129,11 +129,11 @@ func (m *Model) snapshot(snap Snapshot) []resolved {
 		for j < len(iks) && bytes.Equal(format.UserKey(iks[j]), uk) {
 			ik := iks[j]
 			j++
-			k := format.KindOf(ik)
-			if k == format.KindRangeBegin || k == format.KindRangeEnd {
-				continue
+			op, ok := format.OpFromCell(ik, m.store[string(ik)], snap.Now)
+			if !ok {
+				continue // range markers resolve through rangeDels, not as ops
 			}
-			ops = append(ops, format.Op{Version: format.Version(ik), Kind: k, Value: m.store[string(ik)]})
+			ops = append(ops, op)
 		}
 		i = j
 
