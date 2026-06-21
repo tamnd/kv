@@ -15,6 +15,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/tamnd/kv/crypto"
 	"github.com/tamnd/kv/format"
 	"github.com/tamnd/kv/vfs"
 )
@@ -59,6 +60,17 @@ type Options struct {
 	Checksum format.ChecksumAlgo
 	// Flags are header flag bits for a fresh file (e.g. format.FlagWAL).
 	Flags byte
+	// Encryption, when non-nil, transparently encrypts every data page the pager
+	// writes and decrypts every data page it reads (spec 14). Page 1 (the header and
+	// the cleartext encryption descriptor) and the freelist trunk pages stay in the
+	// clear. On Create the pager widens the reserved trailer to fit the AEAD envelope,
+	// sets the encryption flag, and writes Descriptor onto page 1. On Open the caller
+	// is expected to have built the scheme from the on-disk descriptor and verified the
+	// key first; the pager trusts the scheme it is handed.
+	Encryption *crypto.Scheme
+	// Descriptor is the encoded cleartext encryption descriptor (crypto.Descriptor.Encode)
+	// written onto page 1 after the header at Create when Encryption is set. Ignored on Open.
+	Descriptor []byte
 }
 
 const defaultCacheFrames = 2000
@@ -72,6 +84,13 @@ type Pager struct {
 	mu       sync.Mutex
 	pageSize int
 	header   *format.Header
+
+	// crypto, when set, encrypts data pages on the way to disk and decrypts them on
+	// the way back (spec 14). It is nil for an unencrypted file, the default. encScratch
+	// is a single pageSize staging buffer the encrypted read and write paths reuse; both
+	// run under mu, so one buffer is enough.
+	crypto     *crypto.Scheme
+	encScratch []byte
 
 	index map[uint32]*Frame // resident frames by page number
 	pool  []*Frame          // all frames, pooled or free
@@ -127,10 +146,28 @@ func Create(fs vfs.FS, path string, opts Options) (*Pager, error) {
 	p := newPager(fs, f, path, ps, opts.CacheFrames)
 	p.header = h
 	p.dbSize = 1
+	if opts.Encryption != nil {
+		// Widen the reserved trailer to cover the per-page AEAD envelope on top of the
+		// checksum, so every data page's plaintext fits in UsablePageSize and its
+		// ciphertext, tag, and nonce land in the reserved tail (spec 14 §3). Record the
+		// encryption flag so a reader knows to expect a descriptor and a key.
+		h.ReservedPerPage += byte(crypto.Overhead)
+		h.Flags |= format.FlagEncryption
+		p.crypto = opts.Encryption
+		if format.HeaderSize+len(opts.Descriptor) > ps-checksum.ChecksumSize() {
+			f.Close()
+			return nil, fmt.Errorf("pager: encryption descriptor does not fit on page 1")
+		}
+	}
 	// Write page 1 (the header page) so the file is non-empty and valid, stamping its
 	// per-page checksum into the reserved trailer so a fresh file verifies on reopen.
+	// Page 1 itself is never encrypted: the header and the descriptor must stay readable
+	// without the key.
 	page1 := make([]byte, ps)
 	h.Encode(page1)
+	if opts.Encryption != nil {
+		copy(page1[format.HeaderSize:], opts.Descriptor)
+	}
 	format.StampPageChecksum(page1, h.Checksum)
 	if _, err := f.WriteAt(page1, 0); err != nil {
 		f.Close()
@@ -182,6 +219,16 @@ func Open(fs vfs.FS, path string, opts Options) (*Pager, error) {
 	}
 	p := newPager(fs, f, path, ps, opts.CacheFrames)
 	p.header = h
+	if h.Flags&format.FlagEncryption != 0 {
+		// The file is encrypted: the caller must supply the scheme it built from the
+		// on-disk descriptor and verified against the key. Without it the data pages are
+		// unreadable, so refuse rather than hand back ciphertext.
+		if opts.Encryption == nil {
+			f.Close()
+			return nil, ErrKeyRequired
+		}
+		p.crypto = opts.Encryption
+	}
 	p.dbSize = uint32(size / int64(ps))
 	if p.dbSize == 0 {
 		p.dbSize = 1
@@ -191,6 +238,43 @@ func Open(fs vfs.FS, path string, opts Options) (*Pager, error) {
 		return nil, err
 	}
 	return p, nil
+}
+
+// ErrKeyRequired is returned by Open when the file's header marks it encrypted but the
+// caller supplied no encryption scheme: the data pages cannot be read without the key.
+var ErrKeyRequired = fmt.Errorf("pager: file is encrypted, an encryption key is required")
+
+// ErrNotEncrypted is returned by ReadDescriptor when the file carries no encryption flag:
+// there is no descriptor to read, and a supplied key does not belong to this file.
+var ErrNotEncrypted = fmt.Errorf("pager: file is not encrypted")
+
+// ReadDescriptor reads the cleartext encryption descriptor from an existing file's first
+// page without opening a full pager (spec 14 §3, §4). The db layer calls it before Open
+// so it can build the encryption scheme from the on-disk cipher, epoch, and KDF
+// parameters and verify the key, then hand the verified scheme back through Options. It
+// returns ErrNotEncrypted when the file has no encryption flag.
+func ReadDescriptor(fs vfs.FS, path string) (*crypto.Descriptor, error) {
+	f, err := fs.Open(path, vfs.OpenReadWrite)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	hbuf := make([]byte, format.HeaderSize)
+	if _, err := f.ReadAt(hbuf, 0); err != nil {
+		return nil, fmt.Errorf("pager: read header: %w", err)
+	}
+	h, err := format.DecodeHeader(hbuf)
+	if err != nil {
+		return nil, err
+	}
+	if h.Flags&format.FlagEncryption == 0 {
+		return nil, ErrNotEncrypted
+	}
+	page1 := make([]byte, h.PageSize)
+	if _, err := f.ReadAt(page1, 0); err != nil {
+		return nil, fmt.Errorf("pager: read page 1: %w", err)
+	}
+	return crypto.DecodeDescriptor(page1[format.HeaderSize:])
 }
 
 func newPager(fs vfs.FS, f vfs.File, path string, pageSize, cacheFrames int) *Pager {

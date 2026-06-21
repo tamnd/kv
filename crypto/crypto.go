@@ -1,0 +1,192 @@
+package crypto
+
+import (
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"encoding/binary"
+	"errors"
+	"fmt"
+)
+
+// Cipher identifies the AEAD a file is encrypted with, recorded in the cleartext
+// descriptor so a reader knows how to open a page (spec 14 §3).
+type Cipher uint8
+
+const (
+	// CipherNone is the zero value: the file is not encrypted.
+	CipherNone Cipher = 0
+	// CipherAESGCM is AES-256-GCM, the spec default, hardware-accelerated through
+	// AES-NI on amd64 and arm64 via the standard library.
+	CipherAESGCM Cipher = 1
+	// CipherChaCha20 (ChaCha20-Poly1305) is named by the spec for platforms without
+	// AES acceleration. It lives in golang.org/x/crypto, which this project does not
+	// vendor, so it is reserved here and not yet selectable.
+	CipherChaCha20 Cipher = 2
+)
+
+// String renders a Cipher for logs and errors.
+func (c Cipher) String() string {
+	switch c {
+	case CipherNone:
+		return "none"
+	case CipherAESGCM:
+		return "aes-256-gcm"
+	case CipherChaCha20:
+		return "chacha20-poly1305"
+	default:
+		return "cipher?"
+	}
+}
+
+// KDF identifies how the master key was produced, recorded in the descriptor so a
+// reader knows whether to run a passphrase KDF or take a supplied raw key (spec 14 §4).
+type KDF uint8
+
+const (
+	// KDFRaw means a 32-byte key was supplied directly, the KMS-managed path: no
+	// passphrase stretching, the key is used as the master key as-is.
+	KDFRaw KDF = 0
+	// KDFArgon2id is the memory-hard passphrase KDF the spec defaults to. Argon2id
+	// needs BLAKE2b, which is not in the standard library, so it is reserved here and
+	// arrives in a later slice; today encryption is reached through the raw-key path.
+	KDFArgon2id KDF = 1
+)
+
+const (
+	// nonceSize is AES-GCM's standard 96-bit nonce.
+	nonceSize = 12
+	// tagSize is AES-GCM's 128-bit authentication tag.
+	tagSize = 16
+	// keySize is the 256-bit key length for AES-256 and every derived key.
+	keySize = 32
+	// Overhead is the per-page envelope cost in bytes: the AEAD tag plus the stored
+	// nonce. A page's usable area shrinks by this much when a file is encrypted, which
+	// the header's reserved-per-page byte accounts for (spec 02 §2, spec 14 §3).
+	Overhead = nonceSize + tagSize
+)
+
+// ErrWrongKey is returned when a key fails to authenticate against the file: a wrong
+// passphrase or key, or a corrupt or tampered descriptor. It is the clean error the
+// spec promises in place of garbage data (spec 14 §2, §4).
+var ErrWrongKey = errors.New("kv/crypto: wrong encryption key or corrupt descriptor")
+
+// ErrKeySize is returned when a supplied raw key is not 32 bytes.
+var ErrKeySize = errors.New("kv/crypto: encryption key must be 32 bytes")
+
+// ErrUnsupportedCipher is returned when a file names a cipher this build cannot
+// provide (today, anything but AES-256-GCM).
+var ErrUnsupportedCipher = errors.New("kv/crypto: unsupported cipher")
+
+// Scheme encrypts and decrypts pages under a file's master key (spec 14 §4). It holds
+// the master key, the current key epoch, and the epoch's derived data-encryption key
+// (DEK); per-page keys are derived from the DEK on each call so a single AEAD key never
+// spans many pages. It is safe for concurrent use: every method derives its own cipher
+// and touches no shared mutable state.
+type Scheme struct {
+	cipher Cipher
+	epoch  uint32
+	master []byte // the key the descriptor's verification tag is bound to
+	dek    []byte // data-encryption key for the current epoch
+}
+
+// NewScheme builds a Scheme from a 32-byte master key, the cipher, and the current key
+// epoch. The master key is the output of the KDF (or the raw supplied key); this
+// derives the epoch's DEK and is ready to seal and open pages.
+func NewScheme(master []byte, c Cipher, epoch uint32) (*Scheme, error) {
+	if len(master) != keySize {
+		return nil, ErrKeySize
+	}
+	if c != CipherAESGCM {
+		return nil, fmt.Errorf("%w: %s", ErrUnsupportedCipher, c)
+	}
+	s := &Scheme{
+		cipher: c,
+		epoch:  epoch,
+		master: append([]byte(nil), master...),
+		dek:    deriveDEK(master, epoch),
+	}
+	return s, nil
+}
+
+// Epoch reports the key epoch the scheme seals new pages under.
+func (s *Scheme) Epoch() uint32 { return s.epoch }
+
+// deriveDEK derives the data-encryption key for an epoch from the master key, so a key
+// rotation is a matter of bumping the epoch and re-deriving rather than re-deriving from
+// the passphrase (spec 14 §4, §5).
+func deriveDEK(master []byte, epoch uint32) []byte {
+	info := make([]byte, len("kv/dek")+4)
+	copy(info, "kv/dek")
+	binary.BigEndian.PutUint32(info[len("kv/dek"):], epoch)
+	return hkdf(nil, master, info, keySize)
+}
+
+// pageGCM derives the per-page key for pageNo from the epoch DEK and returns an
+// AES-256-GCM AEAD over it. Deriving a key per page number keeps any one AEAD key from
+// spanning many pages, so a random per-write nonce stays well within its safe budget for
+// the writes a single page sees (spec 14 §3, §4).
+func (s *Scheme) pageGCM(pageNo uint32) (cipher.AEAD, error) {
+	info := make([]byte, len("kv/page")+4)
+	copy(info, "kv/page")
+	binary.BigEndian.PutUint32(info[len("kv/page"):], pageNo)
+	pageKey := hkdf(nil, s.dek, info, keySize)
+	block, err := aes.NewCipher(pageKey)
+	if err != nil {
+		return nil, err
+	}
+	return cipher.NewGCM(block)
+}
+
+// pageAAD binds a page envelope to its page number and key epoch as additional
+// authenticated data, so a ciphertext page cannot be silently relocated to another page
+// number or replayed from another epoch without failing authentication (spec 14 §3).
+func pageAAD(pageNo, epoch uint32) []byte {
+	aad := make([]byte, 8)
+	binary.BigEndian.PutUint32(aad[0:4], pageNo)
+	binary.BigEndian.PutUint32(aad[4:8], epoch)
+	return aad
+}
+
+// SealPage encrypts plaintext for pageNo and returns the on-disk envelope, laid out as
+// ciphertext, then the 16-byte tag, then the 12-byte nonce: len(plaintext)+Overhead
+// bytes. The nonce is freshly random per call and stored in the envelope, so a page that
+// is rewritten in place never reuses a (key, nonce) pair. dst is used for the result if
+// it has the capacity, else a new slice is allocated.
+func (s *Scheme) SealPage(dst, plaintext []byte, pageNo uint32) ([]byte, error) {
+	aead, err := s.pageGCM(pageNo)
+	if err != nil {
+		return nil, err
+	}
+	nonce := make([]byte, nonceSize)
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, err
+	}
+	// Seal writes ciphertext||tag into ctTag; the nonce is appended after it. Reusing
+	// dst's backing array when it is large enough keeps the write path allocation-free.
+	out := dst[:0]
+	out = aead.Seal(out, nonce, plaintext, pageAAD(pageNo, s.epoch))
+	out = append(out, nonce...)
+	return out, nil
+}
+
+// OpenPage decrypts an on-disk envelope (ciphertext||tag||nonce, as SealPage produced)
+// for pageNo, returning the plaintext. A failed authentication, the signature of a wrong
+// key or a tampered page, is reported as ErrWrongKey. dst is used for the plaintext if it
+// has the capacity, else a new slice is allocated.
+func (s *Scheme) OpenPage(dst, env []byte, pageNo uint32) ([]byte, error) {
+	if len(env) < Overhead {
+		return nil, ErrWrongKey
+	}
+	aead, err := s.pageGCM(pageNo)
+	if err != nil {
+		return nil, err
+	}
+	ctTag := env[:len(env)-nonceSize]
+	nonce := env[len(env)-nonceSize:]
+	pt, err := aead.Open(dst[:0], nonce, ctTag, pageAAD(pageNo, s.epoch))
+	if err != nil {
+		return nil, ErrWrongKey
+	}
+	return pt, nil
+}
