@@ -40,6 +40,7 @@ func (t *Txn) NewIterator(opts engine.IterOptions) (*Iterator, error) {
 	if t.done {
 		return nil, ErrTxnDone
 	}
+	t.db.counters.scan.Add(1)
 	lower, upper := opts.Lower, opts.Upper
 	if len(opts.Prefix) > 0 {
 		// A prefix scan is a bounded range scan over [prefix, prefix_successor)

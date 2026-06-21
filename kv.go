@@ -351,6 +351,21 @@ type Stats struct {
 	// amplification (spec 19, spec 21 §1).
 	PageReads uint64
 	CacheHits uint64
+	// Gets, Sets, Deletes, Merges, and Scans are the cumulative-since-open counts of each
+	// logical operation the database has served (spec 19 §1.1). A get counts a point read
+	// or existence check; a set counts a plain or TTL upsert; a delete counts a single-key
+	// or range delete; a scan counts an iterator opened. They count operations issued, so a
+	// fresh process starts at zero and a long-lived one accumulates.
+	Gets    uint64
+	Sets    uint64
+	Deletes uint64
+	Merges  uint64
+	Scans   uint64
+	// Commits is the number of durable commits acknowledged and CommitNanos their summed
+	// latency; CommitNanos over Commits is the average durable-commit cost. Only a
+	// successful, fsynced commit is counted, so the average is over acknowledged commits.
+	Commits     uint64
+	CommitNanos uint64
 }
 
 // Stats returns a current space-and-durability snapshot of the database (spec 09 §4).
@@ -372,6 +387,13 @@ func (kdb *DB) Stats() Stats {
 		Syncs:         s.Syncs,
 		PageReads:     s.PageReads,
 		CacheHits:     s.CacheHits,
+		Gets:          s.Ops.Gets,
+		Sets:          s.Ops.Sets,
+		Deletes:       s.Ops.Deletes,
+		Merges:        s.Ops.Merges,
+		Scans:         s.Ops.Scans,
+		Commits:       s.Ops.Commits,
+		CommitNanos:   s.Ops.CommitNanos,
 	}
 }
 

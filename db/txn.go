@@ -232,6 +232,7 @@ func (t *Txn) Get(key []byte) ([]byte, error) {
 	if t.done {
 		return nil, ErrTxnDone
 	}
+	t.db.counters.get.Add(1)
 	t.trackRead(key)
 	val, ok, err := t.resolve(key)
 	if err != nil {
@@ -248,6 +249,7 @@ func (t *Txn) Exists(key []byte) (bool, error) {
 	if t.done {
 		return false, ErrTxnDone
 	}
+	t.db.counters.get.Add(1)
 	t.trackRead(key)
 	_, ok, err := t.resolve(key)
 	return ok, err
@@ -376,6 +378,7 @@ func (t *Txn) SetWithTTL(key, value []byte, expiryNanos uint64) error {
 	if !t.writable {
 		return ErrReadOnlyTxn
 	}
+	t.db.counters.countWrite(opSetTTL)
 	op := pendingOp{kind: opSetTTL, key: append([]byte(nil), key...), expiry: expiryNanos}
 	if value != nil {
 		op.value = append([]byte(nil), value...)
@@ -404,6 +407,7 @@ func (t *Txn) DeleteRange(lo, hi []byte) error {
 	if !t.writable {
 		return ErrReadOnlyTxn
 	}
+	t.db.counters.countWrite(opRangeDelete)
 	t.ops = append(t.ops, pendingOp{
 		kind:  opRangeDelete,
 		key:   append([]byte(nil), lo...),
@@ -429,6 +433,7 @@ func (t *Txn) record(kind opKind, key, value []byte) error {
 	if !t.writable {
 		return ErrReadOnlyTxn
 	}
+	t.db.counters.countWrite(kind)
 	k := append([]byte(nil), key...)
 	var v []byte
 	if value != nil {

@@ -196,6 +196,11 @@ type DB struct {
 	bufferedInserts bool
 	compression     bool
 
+	// counters is the cumulative-since-open operation tally surfaced through Stats and
+	// the Prometheus exposition (spec 19 §1.1). Reads bump it on the transaction path,
+	// commits on applyCommitted; it is all atomics, so no lock guards it.
+	counters opCounters
+
 	// now is the wall-clock source, in Unix nanoseconds, that read resolution compares
 	// a TTL set's absolute expiry against (spec 15 §6). It is the real system clock by
 	// default and an injected clock under test, so expiry is deterministic in tests and
@@ -604,6 +609,11 @@ func (d *DB) applyTxn(v uint64, ops []pendingOp) (uint64, error) {
 // and calls oracle.applied after, in version order (spec 07 §1, spec 10 §2).
 func (d *DB) applyCommitted(b *engine.WriteBatch, v uint64) error {
 	encoded := b.Encode()
+	// Time the durable-commit sequence (log append plus fsync) for the commit-latency
+	// metric (spec 19 §1.1). time.Now is the right clock here, not d.now: this measures
+	// real fsync cost, independent of the injectable TTL clock, and Go's monotonic
+	// reading makes the delta immune to wall-clock steps.
+	commitStart := time.Now()
 	// A failed log append or commit sync is a fatal durability fault (fsyncgate, spec
 	// 07 §6): the kernel may have dropped the un-synced bytes, so the commit must not
 	// be acknowledged and the database is fenced until reopen. Apply runs only after a
@@ -618,6 +628,11 @@ func (d *DB) applyCommitted(b *engine.WriteBatch, v uint64) error {
 		d.fatal = fmt.Errorf("%w: %v", ErrFatalSync, err)
 		return d.fatal
 	}
+	// The batch is durable: count it and fold in its latency. Only a successful, durable
+	// commit is tallied, so the average latency is over acknowledged commits, never over
+	// the faults that fenced the database above.
+	d.counters.commits.Add(1)
+	d.counters.commitNanos.Add(uint64(time.Since(commitStart)))
 	// Tell an LSN-tracking engine (the LSM core) the batch's WAL position before
 	// applying it, so its durable mark can later report how far a flush has reached.
 	d.noteLSN(commitLSN)
@@ -764,6 +779,9 @@ type Stats struct {
 	// read amplification (spec 19, spec 21 §1).
 	PageReads uint64
 	CacheHits uint64
+	// Ops is the cumulative-since-open per-operation tally and durable-commit latency
+	// (spec 19 §1.1): the throughput counters a dashboard rates over time.
+	Ops OpStats
 }
 
 // Stats gathers a Stats snapshot under a read lock, so it is consistent against a
@@ -802,6 +820,7 @@ func (d *DB) Stats() Stats {
 		Syncs:         d.wal.Syncs(),
 		PageReads:     io.PageReads,
 		CacheHits:     io.CacheHits,
+		Ops:           d.counters.snapshot(),
 	}
 }
 

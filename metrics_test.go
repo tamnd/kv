@@ -28,6 +28,13 @@ func TestWriteMetricsRendersFromStats(t *testing.T) {
 		Syncs:         9,
 		PageReads:     25,
 		CacheHits:     75,
+		Gets:          400,
+		Sets:          120,
+		Deletes:       8,
+		Merges:        5,
+		Scans:         3,
+		Commits:       50,
+		CommitNanos:   2_000_000_000, // 2s over 50 commits -> 40ms average
 	}
 	var buf bytes.Buffer
 	if err := kv.WriteMetrics(&buf, s); err != nil {
@@ -46,6 +53,15 @@ func TestWriteMetricsRendersFromStats(t *testing.T) {
 		"kv_wal_checkpoint_backlog_frames 3",
 		"kv_live_keys 42",
 		"# HELP kv_space_amplification ",
+		"# TYPE kv_ops_total counter",
+		`kv_ops_total{op="get"} 400`,
+		`kv_ops_total{op="set"} 120`,
+		`kv_ops_total{op="delete"} 8`,
+		`kv_ops_total{op="merge"} 5`,
+		`kv_ops_total{op="scan"} 3`,
+		"# TYPE kv_commit_latency_seconds summary",
+		"kv_commit_latency_seconds_sum 2", // 2e9 ns rendered as 2 seconds
+		"kv_commit_latency_seconds_count 50",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("metrics output missing %q\n--- got ---\n%s", want, out)
@@ -125,5 +141,48 @@ func TestDBWriteMetricsIsWellFormed(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), `kv_engine_info{engine="btree"} 1`) {
 		t.Error("metrics should carry the btree engine label for a default database")
+	}
+}
+
+// TestDBMetricsCountOperations drives a known mix of reads, writes, and a scan, then checks
+// the per-op counters and the commit-latency pair reflect the work: 50 sets across 50
+// commits, one get, one scan, and a positive total commit latency.
+func TestDBMetricsCountOperations(t *testing.T) {
+	d := open(t)
+	for i := range 50 {
+		k := []byte{byte(i)}
+		if err := d.Update(func(txn *kv.Txn) error { return txn.Set(k, []byte("v")) }); err != nil {
+			t.Fatalf("set: %v", err)
+		}
+	}
+	if err := d.View(func(txn *kv.Txn) error {
+		if _, err := txn.Get([]byte{1}); err != nil {
+			return err
+		}
+		it, err := txn.NewIterator(kv.IterOptions{})
+		if err != nil {
+			return err
+		}
+		defer it.Close()
+		return nil
+	}); err != nil {
+		t.Fatalf("read txn: %v", err)
+	}
+
+	s := d.Stats()
+	if s.Sets != 50 {
+		t.Errorf("Sets = %d, want 50", s.Sets)
+	}
+	if s.Gets != 1 {
+		t.Errorf("Gets = %d, want 1", s.Gets)
+	}
+	if s.Scans != 1 {
+		t.Errorf("Scans = %d, want 1", s.Scans)
+	}
+	if s.Commits != 50 {
+		t.Errorf("Commits = %d, want 50", s.Commits)
+	}
+	if s.CommitNanos == 0 {
+		t.Error("CommitNanos should be positive after 50 durable commits")
 	}
 }

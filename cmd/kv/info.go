@@ -28,6 +28,17 @@ type statsJSON struct {
 	WALFrames     uint64  `json:"wal_frames"`
 	WALBacklog    uint64  `json:"wal_backlog"`
 	Syncs         uint64  `json:"syncs"`
+	// Operation counters, cumulative since the database was opened (spec 19 §1.1). On the
+	// CLI these read near zero, since each invocation is a fresh process that does no
+	// traffic before the snapshot; they carry real numbers on a long-lived embedded or
+	// served process.
+	Gets        uint64 `json:"gets"`
+	Sets        uint64 `json:"sets"`
+	Deletes     uint64 `json:"deletes"`
+	Merges      uint64 `json:"merges"`
+	Scans       uint64 `json:"scans"`
+	Commits     uint64 `json:"commits"`
+	CommitNanos uint64 `json:"commit_nanos"`
 }
 
 func toJSON(s kv.Stats) statsJSON {
@@ -44,6 +55,13 @@ func toJSON(s kv.Stats) statsJSON {
 		WALFrames:     s.WALFrames,
 		WALBacklog:    s.WALBacklog,
 		Syncs:         s.Syncs,
+		Gets:          s.Gets,
+		Sets:          s.Sets,
+		Deletes:       s.Deletes,
+		Merges:        s.Merges,
+		Scans:         s.Scans,
+		Commits:       s.Commits,
+		CommitNanos:   s.CommitNanos,
 	}
 }
 

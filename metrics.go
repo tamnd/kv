@@ -24,6 +24,7 @@ type metricKind string
 const (
 	counter metricKind = "counter"
 	gauge   metricKind = "gauge"
+	summary metricKind = "summary"
 )
 
 // WriteMetrics renders a Stats snapshot as Prometheus text exposition to w. Every metric
@@ -65,6 +66,25 @@ func WriteMetrics(w io.Writer, s Stats) error {
 	m.counterf("kv_page_reads_total", "Physical page reads against the main file since open.", float64(s.PageReads))
 	m.counterf("kv_cache_hits_total", "Gets served from a resident buffer-pool frame since open.", float64(s.CacheHits))
 	m.gaugef("kv_cache_hit_ratio", "Cache hits over total page accesses since open; 0 when idle.", hitRatio(s))
+
+	// Throughput (spec 19 §1.1): one counter name with an op label, the idiom for a family
+	// of related totals, so a dashboard rates kv_ops_total by op without a metric per verb.
+	m.help("kv_ops_total", "Logical operations served since open, by operation.")
+	m.typ("kv_ops_total", counter)
+	m.line("kv_ops_total", `op="get"`, float64(s.Gets))
+	m.line("kv_ops_total", `op="set"`, float64(s.Sets))
+	m.line("kv_ops_total", `op="delete"`, float64(s.Deletes))
+	m.line("kv_ops_total", `op="merge"`, float64(s.Merges))
+	m.line("kv_ops_total", `op="scan"`, float64(s.Scans))
+
+	// Commit latency (spec 19 §1.1) as a summary's sum-and-count pair: total seconds of
+	// durable-commit time over the count of durable commits. A scraper rates the sum over the
+	// count to get the average fsync cost without the database keeping a histogram. The sum is
+	// nanoseconds converted to seconds, the Prometheus base unit.
+	m.help("kv_commit_latency_seconds", "Durable-commit latency, as a summary sum and count; sum/count is the average.")
+	m.typ("kv_commit_latency_seconds", summary)
+	m.line("kv_commit_latency_seconds_sum", "", float64(s.CommitNanos)/1e9)
+	m.line("kv_commit_latency_seconds_count", "", float64(s.Commits))
 
 	if err := m.err; err != nil {
 		return wrap(err)
