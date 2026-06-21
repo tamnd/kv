@@ -40,6 +40,12 @@ type Config struct {
 	BatchSize int
 	// Seed fixes the PRNG so the draw sequence is identical across runs (spec 21 §5).
 	Seed int64
+
+	// Profile, when its Dir is set, captures pprof profiles around the measured window so a
+	// regression is diagnosable (spec 21 §5). It is off by default, which is what the
+	// regression gate and the microbenchmarks use, because profiling perturbs the timings they
+	// measure.
+	Profile ProfileSet
 }
 
 // DefaultConfig returns a modest cache-resident configuration good for a CI smoke run: a
@@ -125,13 +131,23 @@ func Run(cfg Config, w Workload) (Result, error) {
 	var readOps int64
 	var pageReadDelta uint64
 
+	profLabel := engineName(cfg.Engine) + "-" + w.Name
+
 	if w.MeasureLoad {
-		// The bulk-load workload measures the load itself: time and GC are captured around it.
+		// The bulk-load workload measures the load itself: time and GC are captured around it,
+		// and the profiler wraps exactly that window.
+		prof, err := startProfiling(cfg.Profile, profLabel)
+		if err != nil {
+			return Result{}, err
+		}
 		gcStart := readGC()
 		start := time.Now()
 		writes, err := loadPhase(db, loadGen, cfg.KeyCount, cfg.BatchSize, true)
 		dur := time.Since(start)
 		gcEnd := readGC()
+		if perr := prof.stop(); perr != nil {
+			return Result{}, perr
+		}
 		if err != nil {
 			return Result{}, err
 		}
@@ -148,7 +164,14 @@ func Run(cfg Config, w Workload) (Result, error) {
 		if err := settle(db); err != nil {
 			return Result{}, err
 		}
+		prof, err := startProfiling(cfg.Profile, profLabel)
+		if err != nil {
+			return Result{}, err
+		}
 		rr, err := runPhase(db, cfg, w)
+		if perr := prof.stop(); perr != nil {
+			return Result{}, perr
+		}
 		if err != nil {
 			return Result{}, err
 		}
