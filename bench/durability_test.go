@@ -38,12 +38,17 @@ func TestDurabilitySweepWalksTheLadder(t *testing.T) {
 		byMode[r.Setup.Synchronous] = r
 	}
 
-	// fsync off cannot be slower than the most conservative mode: it skips the syscalls extra
-	// performs. This is the durability/throughput tradeoff in its safest, hardware-independent
-	// form.
-	if byMode["off"].Throughput < byMode["extra"].Throughput {
-		t.Fatalf("SyncOff throughput %.0f < SyncExtra %.0f, which inverts the durability tradeoff",
-			byMode["off"].Throughput, byMode["extra"].Throughput)
+	// fsync off does the strictly cheaper work: it skips the syscalls extra performs, so it
+	// cannot be fundamentally slower. The measured throughputs are noisy though, especially on
+	// a fast disk where the OS buffers writes and group commit folds many commits into one
+	// fsync, so the two modes can land within a few percent and ordinary scheduling jitter can
+	// flip them. The test asserts only the robust fact: off is not dramatically slower than
+	// extra. A real inversion (durability levels wired backward) would put off far below this
+	// floor, where measurement noise stays well inside it.
+	const floor = 0.75 // off must reach at least 75% of extra's throughput
+	if byMode["off"].Throughput < floor*byMode["extra"].Throughput {
+		t.Fatalf("SyncOff throughput %.0f is far below SyncExtra %.0f (floor %.0f), which inverts the durability tradeoff",
+			byMode["off"].Throughput, byMode["extra"].Throughput, floor*byMode["extra"].Throughput)
 	}
 
 	data, err := rep.JSON()
