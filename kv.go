@@ -71,6 +71,10 @@ const (
 // it as kv.IterOptions.
 type IterOptions = engine.IterOptions
 
+// LevelStats is one LSM level's segment count and on-disk footprint, the per-level shape
+// reported in Stats for the compaction-backlog view (spec 19 §1.5).
+type LevelStats = engine.LevelStats
+
 // Option is a functional configuration knob passed to Open. Options split into
 // create-time (persisted in the header, immutable for the file) and open-time
 // (runtime, changeable across opens), per spec 15 §8.
@@ -366,6 +370,16 @@ type Stats struct {
 	// successful, fsynced commit is counted, so the average is over acknowledged commits.
 	Commits     uint64
 	CommitNanos uint64
+	// Levels is the per-level segment-and-byte shape of an LSM file, youngest level first,
+	// or nil for a B-tree file (spec 19 §1.5).
+	Levels []LevelStats
+	// CompactionScore is the urgency of the most-pending LSM compaction, normalized so 1.0
+	// is at-trigger; 0 when nothing is due or for a B-tree file (spec 19 §1.5).
+	CompactionScore float64
+	// OldestSnapshotAgeNanos is the wall-clock age in nanoseconds of the longest-held live
+	// read snapshot, 0 when none is live. A value that only climbs is a snapshot or
+	// iterator that was never closed, the leaked-reader signal (spec 19 §1.6).
+	OldestSnapshotAgeNanos uint64
 }
 
 // Stats returns a current space-and-durability snapshot of the database (spec 09 §4).
@@ -373,27 +387,30 @@ type Stats struct {
 func (kdb *DB) Stats() Stats {
 	s := kdb.d.Stats()
 	return Stats{
-		Engine:        s.Engine,
-		PageSize:      s.PageSize,
-		PageCount:     s.PageCount,
-		FreePages:     s.FreePages,
-		PhysicalBytes: s.PhysicalBytes,
-		LiveKeys:      s.LiveKeys,
-		LiveBytes:     s.LiveBytes,
-		Amplification: s.Amplification,
-		Version:       s.Version,
-		WALFrames:     s.WALFrames,
-		WALBacklog:    s.WALBacklog,
-		Syncs:         s.Syncs,
-		PageReads:     s.PageReads,
-		CacheHits:     s.CacheHits,
-		Gets:          s.Ops.Gets,
-		Sets:          s.Ops.Sets,
-		Deletes:       s.Ops.Deletes,
-		Merges:        s.Ops.Merges,
-		Scans:         s.Ops.Scans,
-		Commits:       s.Ops.Commits,
-		CommitNanos:   s.Ops.CommitNanos,
+		Engine:                 s.Engine,
+		PageSize:               s.PageSize,
+		PageCount:              s.PageCount,
+		FreePages:              s.FreePages,
+		PhysicalBytes:          s.PhysicalBytes,
+		LiveKeys:               s.LiveKeys,
+		LiveBytes:              s.LiveBytes,
+		Amplification:          s.Amplification,
+		Version:                s.Version,
+		WALFrames:              s.WALFrames,
+		WALBacklog:             s.WALBacklog,
+		Syncs:                  s.Syncs,
+		PageReads:              s.PageReads,
+		CacheHits:              s.CacheHits,
+		Gets:                   s.Ops.Gets,
+		Sets:                   s.Ops.Sets,
+		Deletes:                s.Ops.Deletes,
+		Merges:                 s.Ops.Merges,
+		Scans:                  s.Ops.Scans,
+		Commits:                s.Ops.Commits,
+		CommitNanos:            s.Ops.CommitNanos,
+		Levels:                 s.Levels,
+		CompactionScore:        s.CompactionScore,
+		OldestSnapshotAgeNanos: s.OldestSnapshotAgeNanos,
 	}
 }
 

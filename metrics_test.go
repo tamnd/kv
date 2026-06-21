@@ -69,6 +69,58 @@ func TestWriteMetricsRendersFromStats(t *testing.T) {
 	}
 }
 
+// TestWriteMetricsRendersLSMInternals checks the per-level segment and byte gauges and the
+// compaction score render with one labeled sample per level, and that the reader-age gauge
+// turns nanoseconds into seconds.
+func TestWriteMetricsRendersLSMInternals(t *testing.T) {
+	s := kv.Stats{
+		Engine: kv.LSM,
+		Levels: []kv.LevelStats{
+			{Segments: 4, Bytes: 8192},
+			{Segments: 2, Bytes: 65536},
+		},
+		CompactionScore:        1.75,
+		OldestSnapshotAgeNanos: 3_000_000_000, // 3s
+	}
+	var buf bytes.Buffer
+	if err := kv.WriteMetrics(&buf, s); err != nil {
+		t.Fatalf("WriteMetrics: %v", err)
+	}
+	out := buf.String()
+	for _, want := range []string{
+		"# TYPE kv_lsm_segments gauge",
+		`kv_lsm_segments{level="0"} 4`,
+		`kv_lsm_segments{level="1"} 2`,
+		`kv_lsm_level_bytes{level="0"} 8192`,
+		`kv_lsm_level_bytes{level="1"} 65536`,
+		"kv_lsm_compaction_score 1.75",
+		"kv_oldest_snapshot_age_seconds 3",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("metrics output missing %q\n--- got ---\n%s", want, out)
+		}
+	}
+}
+
+// TestWriteMetricsOmitsLSMInternalsForBTree checks a B-tree file, which has no level
+// structure, does not emit the per-level families at all rather than asserting a flat zero
+// for a shape it does not have. The reader-age gauge still renders, since it is engine-agnostic.
+func TestWriteMetricsOmitsLSMInternalsForBTree(t *testing.T) {
+	var buf bytes.Buffer
+	if err := kv.WriteMetrics(&buf, kv.Stats{Engine: kv.BTree}); err != nil {
+		t.Fatalf("WriteMetrics: %v", err)
+	}
+	out := buf.String()
+	for _, unwanted := range []string{"kv_lsm_segments", "kv_lsm_level_bytes", "kv_lsm_compaction_score"} {
+		if strings.Contains(out, unwanted) {
+			t.Errorf("%s should be omitted for a B-tree file, got:\n%s", unwanted, out)
+		}
+	}
+	if !strings.Contains(out, "kv_oldest_snapshot_age_seconds 0") {
+		t.Errorf("reader-age gauge should render for a B-tree file, got:\n%s", out)
+	}
+}
+
 // TestWriteMetricsHitRatioGuard confirms an idle database (no reads, no hits) reports a flat
 // zero hit ratio rather than a NaN that would poison a dashboard.
 func TestWriteMetricsHitRatioGuard(t *testing.T) {

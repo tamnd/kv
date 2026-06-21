@@ -169,7 +169,7 @@ func (d *DB) Begin(writable bool) *Txn {
 	return &Txn{
 		db:          d,
 		writable:    writable,
-		readVersion: d.orc.readTs(),
+		readVersion: d.orc.readTs(d.now()),
 		isolation:   d.isolation,
 	}
 }
@@ -190,7 +190,7 @@ type Snapshot struct {
 // oracle readMark, released by Close, so every read through the snapshot sees exactly the
 // same committed state regardless of writes that land afterward.
 func (d *DB) Snapshot() *Snapshot {
-	return &Snapshot{db: d, version: d.orc.readTs()}
+	return &Snapshot{db: d, version: d.orc.readTs(d.now())}
 }
 
 // Version reports the committed version the snapshot reads at.
