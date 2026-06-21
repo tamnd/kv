@@ -100,7 +100,8 @@ type EngineOptions struct {
 	BufferedInserts bool    // Bε buffered-insert mode
 
 	// LSM knobs.
-	MemtableSize      int // bytes before a memtable is flushed
-	LevelSizeRatio    int // size multiplier between levels
-	ValueSepThreshold int // value size above which WiscKey separates to vLog
+	MemtableSize      int  // bytes before a memtable is flushed
+	LevelSizeRatio    int  // size multiplier between levels
+	ValueSepThreshold int  // value size above which WiscKey separates to vLog
+	RangeIndex        bool // build the REMIX ordered index for scan-heavy workloads
 }
