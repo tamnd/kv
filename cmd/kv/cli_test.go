@@ -188,6 +188,46 @@ func TestCLIBackupRestoreRoundTrip(t *testing.T) {
 	}
 }
 
+func TestCLIShipReplayRoundTrip(t *testing.T) {
+	// Seed a primary and capture a base backup. backup checkpoints the primary, so writes
+	// made after it land in a fresh WAL generation that ship carries to the follower.
+	src := dbPath(t)
+	run([]string{"set", src, "k1", "v1"})
+	run([]string{"set", src, "k2", "v2"})
+
+	baseFile := filepath.Join(t.TempDir(), "base.kvbak")
+	if code := run([]string{"backup", src, "--output", baseFile}); code != exitOK {
+		t.Fatalf("backup: exit %d", code)
+	}
+	follower := filepath.Join(t.TempDir(), "follower.kv")
+	if code := run([]string{"restore", follower, "--input", baseFile}); code != exitOK {
+		t.Fatalf("restore base: exit %d", code)
+	}
+
+	// A post-base write the follower must learn through shipping.
+	run([]string{"set", src, "k3", "v3"})
+	deltaFile := filepath.Join(t.TempDir(), "delta.kvship")
+	if code := run([]string{"ship", src, "--output", deltaFile}); code != exitOK {
+		t.Fatalf("ship: exit %d", code)
+	}
+	if code := run([]string{"replay", follower, "--input", deltaFile}); code != exitOK {
+		t.Fatalf("replay: exit %d", code)
+	}
+
+	out := capture(t, func() { run([]string{"scan", follower, "-f", "jsonl"}) })
+	var got []string
+	sc := bufio.NewScanner(strings.NewReader(out))
+	for sc.Scan() {
+		var r record
+		json.Unmarshal(sc.Bytes(), &r)
+		got = append(got, r.Key+"="+r.Value)
+	}
+	sort.Strings(got)
+	if strings.Join(got, ",") != "k1=v1,k2=v2,k3=v3" {
+		t.Fatalf("follower = %v, want [k1=v1 k2=v2 k3=v3]", got)
+	}
+}
+
 func TestCLIDumpLoadRoundTrip(t *testing.T) {
 	src := dbPath(t)
 	run([]string{"set", src, "k1", "v1"})

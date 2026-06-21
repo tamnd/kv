@@ -119,3 +119,54 @@ func TestCheckpointTruncateDurableAcrossReopen(t *testing.T) {
 		}
 	}
 }
+
+// TestWriteAfterReopenAfterCheckpointSurvives guards a durability bug in the WAL
+// generation counter. A checkpoint folds the log and rotates to an empty generation,
+// recording the folded LSN in the pager header. On reopen the durable-tail scan finds no
+// frames in that empty generation and would position the writer at LSN 1, below the
+// checkpoint marker; a write committed there would be skipped by redo on the next open as
+// already folded, silently lost. The fix resumes the WAL past the checkpoint marker, so a
+// write made after a reopen that immediately followed a checkpoint must survive a second
+// reopen.
+func TestWriteAfterReopenAfterCheckpointSurvives(t *testing.T) {
+	fs := vfs.NewMem()
+	d, err := Open(fs, "test.kv", Options{AutoCheckpoint: -1})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if _, err := d.Write(func(b *engine.WriteBatch) { b.Set([]byte("a"), []byte("1")) }); err != nil {
+		t.Fatalf("write a: %v", err)
+	}
+	// Checkpoint, then close: the log ends on an empty new generation.
+	if err := d.CheckpointMode(CheckpointPassive); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// Reopen the freshly-checkpointed file and commit a new key into the empty generation.
+	d2, err := Open(fs, "test.kv", Options{AutoCheckpoint: -1})
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if _, err := d2.Write(func(b *engine.WriteBatch) { b.Set([]byte("b"), []byte("2")) }); err != nil {
+		t.Fatalf("write b: %v", err)
+	}
+	if err := d2.Close(); err != nil {
+		t.Fatalf("close 2: %v", err)
+	}
+
+	// The second reopen must redo b: its commit has to chain above the checkpoint marker.
+	d3, err := Open(fs, "test.kv", Options{})
+	if err != nil {
+		t.Fatalf("reopen 2: %v", err)
+	}
+	defer d3.Close()
+	if v, ok := get(t, d3, "a"); !ok || v != "1" {
+		t.Fatalf("a = %q,%v after second reopen", v, ok)
+	}
+	if v, ok := get(t, d3, "b"); !ok || v != "2" {
+		t.Fatalf("b = %q,%v after second reopen, want 2 (post-checkpoint write was dropped)", v, ok)
+	}
+}

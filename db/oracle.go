@@ -254,6 +254,23 @@ func (o *oracle) applied(v uint64) {
 	}
 }
 
+// advanceTo forces the version counters up to an externally assigned commit version,
+// the replica-apply path of spec 18 §4. A follower does not allocate its own versions;
+// it replays versions a primary already assigned, so applying a shipped batch at version
+// v moves nextVersion past it and marks it applied and visible. It never moves a counter
+// backward, so re-applying an already-seen ship is a no-op. The caller holds the database
+// write lock, so no local committer races this.
+func (o *oracle) advanceTo(v uint64) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if v >= o.nextVersion {
+		o.nextVersion = v + 1
+	}
+	if v > o.appliedVersion {
+		o.appliedVersion = v
+	}
+}
+
 // readMark is the version-GC horizon: the oldest version any live reader can still
 // observe, or the newest applied version when none is live. The maintenance driver
 // passes it to the engine so GC never reclaims a version a live snapshot needs
