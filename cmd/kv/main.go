@@ -60,6 +60,7 @@ func commands() []command {
 		{"check", "verify structural integrity; exit 4 on any violation", cmdCheck},
 		{"info", "print a human summary of the database", cmdInfo},
 		{"stats", "print space and durability accounting as JSON", cmdStats},
+		{"metrics", "print observability metrics in Prometheus text format", cmdMetrics},
 	}
 }
 

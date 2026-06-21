@@ -60,6 +60,28 @@ func TestCLISetGet(t *testing.T) {
 	}
 }
 
+func TestCLIMetrics(t *testing.T) {
+	p := dbPath(t)
+	run([]string{"set", p, "hello", "world"})
+	out := capture(t, func() {
+		if code := run([]string{"metrics", p}); code != exitOK {
+			t.Fatalf("metrics: exit %d", code)
+		}
+	})
+	// The output must be valid Prometheus exposition: the engine label, a HELP/TYPE pair, and a
+	// counter line are enough to prove the surface is wired and well-formed.
+	for _, want := range []string{
+		`kv_engine_info{engine="btree"} 1`,
+		"# TYPE kv_fsync_total counter",
+		"# HELP kv_page_count ",
+		"kv_cache_hit_ratio ",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("kv metrics output missing %q\n--- got ---\n%s", want, out)
+		}
+	}
+}
+
 func TestCLIGetMissingExit1(t *testing.T) {
 	p := dbPath(t)
 	if code := run([]string{"get", p, "absent"}); code != exitNotFound {
