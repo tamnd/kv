@@ -58,15 +58,9 @@ func RunRecovery(cfg Config) (RecoveryResult, error) {
 	path := filepath.Join(cfg.Dir, "bench.kv")
 
 	// Checkpointing is disabled for the whole run so the load accumulates in the log and the
-	// reopen has a real backlog to replay; a clean close would otherwise fold it away.
-	opts := []kv.Option{
-		kv.WithEngine(cfg.Engine),
-		kv.WithSynchronous(cfg.Sync),
-		kv.WithAutoCheckpoint(-1),
-	}
-	if cfg.PageSize > 0 {
-		opts = append(opts, kv.WithPageSize(cfg.PageSize))
-	}
+	// reopen has a real backlog to replay; a clean close would otherwise fold it away. The rest
+	// of the open options match a normal run, so the reopen sees the same database shape.
+	opts := append(openOptions(cfg), kv.WithAutoCheckpoint(-1))
 
 	setup := Setup{
 		GoVersion:    runtime.Version(),
@@ -81,6 +75,7 @@ func RunRecovery(cfg Config) (RecoveryResult, error) {
 		Synchronous:  syncName(cfg.Sync),
 		BatchSize:    cfg.BatchSize,
 		Concurrency:  1,
+		CacheBytes:   cfg.CacheBytes,
 	}
 	res := RecoveryResult{Engine: engineName(cfg.Engine), Setup: setup, Keys: cfg.KeyCount}
 
