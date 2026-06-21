@@ -88,6 +88,13 @@ type Options struct {
 	// levels where filters dominate the resident set, at some extra construction cost. The
 	// B-tree core ignores it.
 	Filter engine.FilterKind
+	// BufferedInserts turns on the B-tree core's Bε buffered write path (spec 05 §4):
+	// inserts park as messages in interior node buffers and flush one level down in
+	// batches, trading a little read-path work and interior fan-out for sharply lower
+	// per-key write amplification. Off by default, since the in-place tree's read
+	// latency is the engine's headline; it helps write-heavier workloads that still
+	// want the B-tree's tight space and ordered scans. The LSM core ignores it.
+	BufferedInserts bool
 }
 
 func (o Options) maxRetries() int {
@@ -171,13 +178,14 @@ type DB struct {
 	eng engine.Engine
 	orc *oracle
 
-	merge        func(existing, operand []byte) []byte
-	maxRetries   int
-	syncMode     wal.Sync
-	isolation    Isolation
-	memtableSize int
-	rangeIndex   bool
-	filter       engine.FilterKind
+	merge           func(existing, operand []byte) []byte
+	maxRetries      int
+	syncMode        wal.Sync
+	isolation       Isolation
+	memtableSize    int
+	rangeIndex      bool
+	filter          engine.FilterKind
+	bufferedInserts bool
 
 	// now is the wall-clock source, in Unix nanoseconds, that read resolution compares
 	// a TTL set's absolute expiry against (spec 15 §6). It is the real system clock by
@@ -258,7 +266,7 @@ func create(fs vfs.FS, path string, opts Options) (*DB, error) {
 		return nil, err
 	}
 	d := &DB{fs: fs, path: path, pgr: pgr, wal: w, eng: eng, orc: newOracle(0),
-		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, now: opts.clock()}
+		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, bufferedInserts: opts.BufferedInserts, now: opts.clock()}
 	if err := d.openEngine(opts.Merge); err != nil {
 		w.Close()
 		pgr.Close()
@@ -281,7 +289,7 @@ func openExisting(fs vfs.FS, path string, opts Options) (*DB, error) {
 		return nil, err
 	}
 	d := &DB{fs: fs, path: path, pgr: pgr, eng: eng,
-		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, now: opts.clock()}
+		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, bufferedInserts: opts.BufferedInserts, now: opts.clock()}
 	if err := d.openEngine(opts.Merge); err != nil {
 		pgr.Close()
 		return nil, err
@@ -338,10 +346,11 @@ func (d *DB) openEngine(merge func(existing, operand []byte) []byte) error {
 	env := &engine.Env{
 		Pager: d.pgr,
 		Options: engine.EngineOptions{
-			PageSize:     d.pgr.PageSize(),
-			MemtableSize: d.memtableSize,
-			RangeIndex:   d.rangeIndex,
-			Filter:       d.filter,
+			PageSize:        d.pgr.PageSize(),
+			MemtableSize:    d.memtableSize,
+			RangeIndex:      d.rangeIndex,
+			Filter:          d.filter,
+			BufferedInserts: d.bufferedInserts,
 		},
 	}
 	if err := d.eng.Open(env); err != nil {

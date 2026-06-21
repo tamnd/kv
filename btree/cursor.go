@@ -25,29 +25,65 @@ type reader struct {
 
 // Get returns the value for userKey visible at the reader's snapshot. A user key's
 // whole version group lives in one leaf (splitPoint never cuts a group), so Get
-// descends to that single leaf and resolves the group there.
+// descends to that single leaf and resolves the group there. In Bε mode it also
+// collects any buffered messages for the key parked in the interiors along the
+// descent: a pending write that has not yet reached its leaf is just a newer version
+// of the group, which resolveStream folds in the same fold (spec 05 §4).
 func (r *reader) Get(userKey []byte) ([]byte, error) {
-	pgno, err := r.t.leafCovering(userKey)
+	group, err := r.t.gatherPoint(userKey)
 	if err != nil {
 		return nil, err
-	}
-	l, err := r.t.loadLeaf(pgno)
-	if err != nil {
-		return nil, err
-	}
-	// Gather this user key's cells (ascending internal order == newest version
-	// first within the group).
-	var group []entry
-	for i := range l.keys {
-		if format.CompareUser(format.UserKey(l.keys[i]), userKey) == 0 {
-			group = append(group, entry{ik: l.keys[i], val: l.vals[i]})
-		}
 	}
 	res := resolveStream(group, r.snap, r.t.merge, r.t.rangeDels)
 	if len(res) == 0 {
 		return nil, engine.ErrNotFound
 	}
 	return append([]byte(nil), res[0].val...), nil
+}
+
+// gatherPoint descends from the root to the leaf covering userKey and returns the
+// key's whole version group in ascending internal-key order (newest first). On the way
+// down, in Bε mode, it picks up any buffered messages for the key from the interior
+// nodes on the path, then sorts the combined group so resolveStream sees one ordered
+// version list. With buffering off the interiors carry no messages and this collapses
+// to the single-leaf scan it replaces.
+func (t *BTree) gatherPoint(userKey []byte) ([]entry, error) {
+	var group []entry
+	pgno := t.root()
+	for {
+		typ, err := t.typeOf(pgno)
+		if err != nil {
+			return nil, err
+		}
+		if typ == format.PageBTreeLeaf {
+			l, err := t.loadLeaf(pgno)
+			if err != nil {
+				return nil, err
+			}
+			for i := range l.keys {
+				if format.CompareUser(format.UserKey(l.keys[i]), userKey) == 0 {
+					group = append(group, entry{ik: l.keys[i], val: l.vals[i]})
+				}
+			}
+			break
+		}
+		in, err := t.loadInterior(pgno)
+		if err != nil {
+			return nil, err
+		}
+		for i := range in.msgKeys {
+			if format.CompareUser(format.UserKey(in.msgKeys[i]), userKey) == 0 {
+				group = append(group, entry{ik: in.msgKeys[i], val: in.msgVals[i]})
+			}
+		}
+		pgno = in.children[in.childFor(userKey)]
+	}
+	if len(group) > 1 {
+		sort.Slice(group, func(i, j int) bool {
+			return format.CompareInternal(group[i].ik, group[j].ik) < 0
+		})
+	}
+	return group, nil
 }
 
 // NewIter returns a cursor over a user-key range at the snapshot.
@@ -195,6 +231,83 @@ func (t *BTree) collectRange(lower, upper []byte) ([]entry, error) {
 			break
 		}
 		pgno = l.next
+	}
+
+	// In Bε mode, messages still parked in interior buffers along this range have not
+	// reached the leaf chain, so the walk above missed them. Gather the in-range ones
+	// from the overlapping interior subtrees and merge them in, then sort the whole
+	// stream by internal key so resolveStream sees the same ascending, group-clustered
+	// order it gets from a single source.
+	if t.buffered {
+		buffered, err := t.collectBufferedRange(lower, upper)
+		if err != nil {
+			return nil, err
+		}
+		if len(buffered) > 0 {
+			out = append(out, buffered...)
+			sort.Slice(out, func(i, j int) bool {
+				return format.CompareInternal(out[i].ik, out[j].ik) < 0
+			})
+		}
+	}
+	return out, nil
+}
+
+// collectBufferedRange returns every buffered message whose user key falls in
+// [lower, upper) (nil bounds unbounded), gathered from the interior nodes whose subtree
+// overlaps the range. It descends only interiors, never leaves, and prunes children
+// whose key span is disjoint from the range, so a bounded scan reads a bounded slice of
+// the interior level rather than the whole tree.
+func (t *BTree) collectBufferedRange(lower, upper []byte) ([]entry, error) {
+	var out []entry
+	var walk func(pgno format.PageNo) error
+	walk = func(pgno format.PageNo) error {
+		typ, err := t.typeOf(pgno)
+		if err != nil {
+			return err
+		}
+		if typ == format.PageBTreeLeaf {
+			return nil
+		}
+		in, err := t.loadInterior(pgno)
+		if err != nil {
+			return err
+		}
+		for i := range in.msgKeys {
+			uk := format.UserKey(in.msgKeys[i])
+			if lower != nil && format.CompareUser(uk, lower) < 0 {
+				continue
+			}
+			if upper != nil && format.CompareUser(uk, upper) >= 0 {
+				continue
+			}
+			out = append(out, entry{ik: in.msgKeys[i], val: in.msgVals[i]})
+		}
+		for ci := 0; ci < len(in.children); ci++ {
+			// child ci covers [loBound, hiBound): loBound = seps[ci-1] (-inf at ci 0),
+			// hiBound = seps[ci] (+inf past the last separator). Skip a child whose span
+			// cannot intersect [lower, upper).
+			var loBound, hiBound []byte
+			if ci > 0 {
+				loBound = in.seps[ci-1]
+			}
+			if ci < len(in.seps) {
+				hiBound = in.seps[ci]
+			}
+			if upper != nil && loBound != nil && format.CompareUser(loBound, upper) >= 0 {
+				continue
+			}
+			if lower != nil && hiBound != nil && format.CompareUser(hiBound, lower) <= 0 {
+				continue
+			}
+			if err := walk(in.children[ci]); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := walk(t.root()); err != nil {
+		return nil, err
 	}
 	return out, nil
 }
