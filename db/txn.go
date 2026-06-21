@@ -3,6 +3,7 @@ package db
 import (
 	"errors"
 	"sync"
+	"time"
 
 	"github.com/tamnd/kv/engine"
 	"github.com/tamnd/kv/format"
@@ -233,6 +234,10 @@ func (t *Txn) Get(key []byte) ([]byte, error) {
 		return nil, ErrTxnDone
 	}
 	t.db.counters.get.Add(1)
+	if t.db.slowOpEnabled() {
+		start := time.Now()
+		defer func() { t.db.logSlowRead("get", key, time.Since(start)) }()
+	}
 	t.trackRead(key)
 	val, ok, err := t.resolve(key)
 	if err != nil {
@@ -250,6 +255,10 @@ func (t *Txn) Exists(key []byte) (bool, error) {
 		return false, ErrTxnDone
 	}
 	t.db.counters.get.Add(1)
+	if t.db.slowOpEnabled() {
+		start := time.Now()
+		defer func() { t.db.logSlowRead("exists", key, time.Since(start)) }()
+	}
 	t.trackRead(key)
 	_, ok, err := t.resolve(key)
 	return ok, err

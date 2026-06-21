@@ -18,6 +18,8 @@ package kv
 
 import (
 	"context"
+	"log/slog"
+	"time"
 
 	"github.com/tamnd/kv/db"
 	"github.com/tamnd/kv/engine"
@@ -129,6 +131,23 @@ func WithIsolation(level Isolation) Option {
 // auto-checkpointing, leaving the WAL to grow until an explicit Checkpoint or clean close.
 func WithAutoCheckpoint(frames int) Option {
 	return func(c *config) { c.opts.AutoCheckpoint = frames }
+}
+
+// WithLogger routes the database's structured operational log into logger (open-time,
+// spec 19 §3): lifecycle, crash recovery, checkpoint, maintenance, the fatal durability
+// fault, and, when WithSlowOpThreshold is also set, slow operations. The default is no
+// logger, which disables logging entirely and costs nothing. Pass a *slog.Logger to fold
+// these events into the application's own logging.
+func WithLogger(logger *slog.Logger) Option {
+	return func(c *config) { c.opts.Logger = logger }
+}
+
+// WithSlowOpThreshold arms the slow-op log (open-time, spec 19 §3): a commit or point
+// read that runs at least d is logged at WARN with its key range and, for a commit, a
+// durable/apply phase split. Zero, the default, disables it. It has effect only when
+// WithLogger is also set, and the read path reads no clock when it is off.
+func WithSlowOpThreshold(d time.Duration) Option {
+	return func(c *config) { c.opts.SlowOpThreshold = d }
 }
 
 // WithMergeOperator registers the associative merge operator Txn.Merge folds operands
