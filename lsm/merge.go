@@ -84,15 +84,21 @@ func (s *segSource) loadPage(i int) {
 	}
 	data := fr.Data()
 	h := format.DecodeCommonHeader(data)
-	off := segDataHeaderSize
+	body, derr := dataPageBody(data, h)
+	if derr != nil {
+		s.pgr.Unpin(fr, false)
+		s.err = derr
+		return
+	}
+	off := 0
 	for c := 0; c < int(h.CellCount); c++ {
-		klen, n := format.Uvarint(data[off:])
+		klen, n := format.Uvarint(body[off:])
 		off += n
-		ik := append([]byte(nil), data[off:off+int(klen)]...)
+		ik := append([]byte(nil), body[off:off+int(klen)]...)
 		off += int(klen)
-		vlen, n := format.Uvarint(data[off:])
+		vlen, n := format.Uvarint(body[off:])
 		off += n
-		val := append([]byte(nil), data[off:off+int(vlen)]...)
+		val := append([]byte(nil), body[off:off+int(vlen)]...)
 		off += int(vlen)
 		s.cells = append(s.cells, srcCell{ik: ik, val: val})
 	}

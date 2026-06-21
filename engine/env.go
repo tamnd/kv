@@ -117,4 +117,5 @@ type EngineOptions struct {
 	ValueSepThreshold int        // value size above which WiscKey separates to vLog
 	RangeIndex        bool       // build the REMIX ordered index for scan-heavy workloads
 	Filter            FilterKind // per-segment membership filter: Bloom (default) or Ribbon
+	Compression       bool       // heat-tiered block compression on the LSM data pages (spec 13)
 }

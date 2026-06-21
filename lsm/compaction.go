@@ -396,7 +396,7 @@ func (l *LSM) runCompactionLocked(src int, watermark uint64, wholeLevel bool) (e
 		return engine.MaintReport{}, err
 	}
 
-	outputs, err := l.writeSplitLocked(mi, watermark, dropTomb, bloomBitsForLevel(out, l.levelRatio))
+	outputs, err := l.writeSplitLocked(mi, watermark, dropTomb, bloomBitsForLevel(out, l.levelRatio), l.codecForLevel(out))
 	if err != nil {
 		return engine.MaintReport{}, err
 	}
@@ -477,7 +477,7 @@ func (l *LSM) runSelfMergeLocked(level int, watermark uint64) (engine.MaintRepor
 		return engine.MaintReport{}, err
 	}
 
-	outputs, err := l.writeSplitLocked(mi, watermark, dropTomb, bloomBitsForLevel(level, l.levelRatio))
+	outputs, err := l.writeSplitLocked(mi, watermark, dropTomb, bloomBitsForLevel(level, l.levelRatio), l.codecForLevel(level))
 	if err != nil {
 		return engine.MaintReport{}, err
 	}
@@ -524,7 +524,7 @@ func (l *LSM) runSelfMergeLocked(level int, watermark uint64) (engine.MaintRepor
 // Monkey budget bitsPerKey. The caller holds l.mu. An empty trailing segment (when the
 // final pull dropped every cell) is reclaimed rather than published, so a compaction
 // whose tail is all dead versions leaks no pages.
-func (l *LSM) writeSplitLocked(mi *mergeIter, watermark uint64, dropTomb bool, bitsPerKey int) ([]*segment, error) {
+func (l *LSM) writeSplitLocked(mi *mergeIter, watermark uint64, dropTomb bool, bitsPerKey int, cdc codecID) ([]*segment, error) {
 	target := l.segTargetBytes
 	if target < 1 {
 		target = 1
@@ -532,7 +532,7 @@ func (l *LSM) writeSplitLocked(mi *mergeIter, watermark uint64, dropTomb bool, b
 	sp := &splitter{mi: mi, watermark: watermark, dropTomb: dropTomb, target: target}
 	var outs []*segment
 	for !sp.exhausted {
-		seg, err := writeSegment(l.pgr, bitsPerKey, l.filterKind, sp.fill)
+		seg, err := writeSegment(l.pgr, bitsPerKey, l.filterKind, cdc, sp.fill)
 		if err != nil {
 			return nil, err
 		}

@@ -138,7 +138,7 @@ func TestRibbonThroughSegment(t *testing.T) {
 	for i := 0; i < n; i++ {
 		cells[i] = cell{ik(fmt.Sprintf("key%08d", i), 1), []byte(fmt.Sprintf("v%d", i))}
 	}
-	seg, err := writeSegment(pgr, bloomBitsPerKey, filterRibbon, sourceOf(cells))
+	seg, err := writeSegment(pgr, bloomBitsPerKey, filterRibbon, codecNone, sourceOf(cells))
 	if err != nil {
 		t.Fatalf("writeSegment: %v", err)
 	}
