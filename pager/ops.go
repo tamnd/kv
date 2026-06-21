@@ -3,6 +3,7 @@ package pager
 import (
 	"fmt"
 
+	"github.com/tamnd/kv/crypto"
 	"github.com/tamnd/kv/format"
 	"github.com/tamnd/kv/vfs"
 )
@@ -32,7 +33,16 @@ func (p *Pager) Get(pgno uint32, intent Intent) (*Frame, error) {
 	// read was issued, so it counts toward read amplification.
 	p.pageReads.Add(1)
 	off := int64(pgno-1) * int64(p.pageSize)
-	if _, err := p.file.ReadAt(fr.data, off); err != nil {
+	if p.crypto != nil && pgno != 1 {
+		// Encrypted data page: read the ciphertext envelope into the staging buffer,
+		// verify its checksum, and decrypt into the frame, which holds plaintext.
+		if err := p.readEncrypted(fr, pgno, off); err != nil {
+			delete(p.index, pgno)
+			fr.pgno = 0
+			fr.dirty = false
+			return nil, err
+		}
+	} else if _, err := p.file.ReadAt(fr.data, off); err != nil {
 		// A short read at the tail of a just-grown file is not an error; zero-fill.
 		for i := range fr.data {
 			fr.data[i] = 0
@@ -120,9 +130,84 @@ func (p *Pager) evict() *Frame {
 // the trailer the engine never uses, so it does not disturb the cached node body.
 // The caller must hold p.mu.
 func (p *Pager) writeBack(fr *Frame) error {
+	if p.crypto != nil && fr.pgno != 1 {
+		return p.writeBackEncrypted(fr)
+	}
 	format.StampPageChecksum(fr.data, p.header.Checksum)
 	off := int64(fr.pgno-1) * int64(p.pageSize)
 	if _, err := p.file.WriteAt(fr.data, off); err != nil {
+		return err
+	}
+	fr.dirty = false
+	return nil
+}
+
+// encScratchBuf returns the shared pageSize staging buffer the encrypted read and write
+// paths use, allocating it on first use. The caller must hold p.mu; both paths run under
+// the lock and use the buffer for the span of a single page operation, so one buffer
+// serves all of them without contention.
+func (p *Pager) encScratchBuf() []byte {
+	if cap(p.encScratch) < p.pageSize {
+		p.encScratch = make([]byte, p.pageSize)
+	}
+	return p.encScratch[:p.pageSize]
+}
+
+// readEncrypted reads an encrypted data page into a frame: it loads the on-disk envelope
+// into the staging buffer, verifies the page checksum, and decrypts the envelope into the
+// frame's plaintext window, zeroing the reserved tail. An all-zero page (a freshly grown
+// hole never written) or a short read at the file tail yields a zero plaintext frame, the
+// same as the cleartext path. A checksum mismatch or a failed decrypt is corruption and is
+// returned as an error. The caller must hold p.mu.
+func (p *Pager) readEncrypted(fr *Frame, pgno uint32, off int64) error {
+	buf := p.encScratchBuf()
+	if _, err := p.file.ReadAt(buf, off); err != nil {
+		for i := range fr.data {
+			fr.data[i] = 0
+		}
+		return nil
+	}
+	if allZero(buf) {
+		for i := range fr.data {
+			fr.data[i] = 0
+		}
+		return nil
+	}
+	if err := verifyPageChecksum(buf, p.header.Checksum); err != nil {
+		return fmt.Errorf("pager: page %d: %w", pgno, err)
+	}
+	env := buf[:p.header.UsablePageSize()+crypto.Overhead]
+	pt, err := p.crypto.OpenPage(fr.data[:0], env, pgno)
+	if err != nil {
+		return fmt.Errorf("pager: page %d: decrypt: %w", pgno, err)
+	}
+	// OpenPage wrote the plaintext into the frame's backing array; clear any bytes past
+	// it (the reserved trailer) so the engine never sees stale data there.
+	for i := len(pt); i < len(fr.data); i++ {
+		fr.data[i] = 0
+	}
+	return nil
+}
+
+// writeBackEncrypted flushes a dirty data page as ciphertext: it seals the frame's
+// plaintext window into the staging buffer, stamps the page checksum over the envelope,
+// and writes the whole page. The plaintext usable area, the AEAD tag and nonce, and the
+// checksum exactly fill the page, since the reserved trailer was widened to crypto.Overhead
+// plus the checksum size at Create (spec 14 §3). The caller must hold p.mu.
+func (p *Pager) writeBackEncrypted(fr *Frame) error {
+	buf := p.encScratchBuf()
+	env, err := p.crypto.SealPage(buf[:0], fr.data[:p.header.UsablePageSize()], fr.pgno)
+	if err != nil {
+		return err
+	}
+	// Zero anything between the envelope and the checksum trailer; for a full page the two
+	// meet exactly, so this only clears the trailer before the checksum is stamped over it.
+	for i := len(env); i < len(buf); i++ {
+		buf[i] = 0
+	}
+	format.StampPageChecksum(buf, p.header.Checksum)
+	off := int64(fr.pgno-1) * int64(p.pageSize)
+	if _, err := p.file.WriteAt(buf, off); err != nil {
 		return err
 	}
 	fr.dirty = false

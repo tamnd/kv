@@ -115,6 +115,18 @@ type Options struct {
 	// §3). Zero, the default, disables it, and the read path skips reading the clock
 	// when it is zero or Logger is nil. It has effect only when Logger is set.
 	SlowOpThreshold time.Duration
+	// EncryptionKey, when non-empty, encrypts the main file's data pages at rest under
+	// AES-256-GCM, the spec default cipher (spec 14). It must be exactly 32 bytes, a
+	// key supplied directly (the KMS-managed path); the passphrase KDF that stretches a
+	// human secret into this key arrives in a later slice. Page 1 (the header and the
+	// cleartext key descriptor) and the freelist stay in the clear so the file stays
+	// self-describing and a wrong key is a clean error rather than garbage.
+	//
+	// Slice-1 limitation: the write-ahead log sidecar is not yet encrypted, so data
+	// committed since the last checkpoint can sit in the .wal file in the clear. The
+	// public facade therefore does not expose this option yet; it becomes public once
+	// WAL frame encryption lands.
+	EncryptionKey []byte
 }
 
 func (o Options) maxRetries() int {
@@ -277,12 +289,18 @@ func Open(fs vfs.FS, path string, opts Options) (*DB, error) {
 
 // create initializes a fresh main file, a fresh WAL, and an empty engine root.
 func create(fs vfs.FS, path string, opts Options) (*DB, error) {
+	enc, descBytes, err := newEncryptionForCreate(opts)
+	if err != nil {
+		return nil, err
+	}
 	pgr, err := pager.Create(fs, path, pager.Options{
 		PageSize:    opts.pageSize(),
 		CacheFrames: opts.CacheFrames,
 		Engine:      opts.engineKind(),
 		Checksum:    opts.checksum(),
 		Flags:       format.FlagWAL,
+		Encryption:  enc,
+		Descriptor:  descBytes,
 	})
 	if err != nil {
 		return nil, err
@@ -313,7 +331,11 @@ func create(fs vfs.FS, path string, opts Options) (*DB, error) {
 // openExisting opens an existing main file, resumes or creates its WAL, and redoes
 // the committed tail.
 func openExisting(fs vfs.FS, path string, opts Options) (*DB, error) {
-	pgr, err := pager.Open(fs, path, pager.Options{CacheFrames: opts.CacheFrames})
+	enc, err := openEncryptionForExisting(fs, path, opts)
+	if err != nil {
+		return nil, err
+	}
+	pgr, err := pager.Open(fs, path, pager.Options{CacheFrames: opts.CacheFrames, Encryption: enc})
 	if err != nil {
 		return nil, err
 	}
