@@ -408,7 +408,7 @@ func (l *LSM) Maintain(ctx context.Context, budget engine.MaintBudget) (engine.M
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	c := l.pickCompactionLocked()
+	c, _ := l.pickCompactionLocked()
 	switch c.kind {
 	case compactPushDown:
 		return l.runCompactionLocked(c.level, budget.Watermark, c.wholeLevel)
@@ -427,14 +427,28 @@ func (l *LSM) Maintain(ctx context.Context, budget engine.MaintBudget) (engine.M
 func (l *LSM) Stats() engine.EngineStats {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
-	physical := int64(l.mem.size())
 	pageSize := int64(l.pgr.PageSize())
-	for _, seg := range l.allSegmentsLocked() {
-		physical += int64(seg.pages) * pageSize
+	physical := int64(l.mem.size())
+	// Per-level shape for the compaction-backlog view (spec 19 §1.5): one entry per
+	// level, youngest first, each carrying its segment count and on-disk bytes. The same
+	// walk that sums physical bytes fills it, so the metric costs no extra pass.
+	var levels []engine.LevelStats
+	for i := range l.levels {
+		var bytes int64
+		for _, seg := range l.levels[i] {
+			bytes += int64(seg.pages) * pageSize
+		}
+		physical += bytes
+		levels = append(levels, engine.LevelStats{Segments: len(l.levels[i]), Bytes: bytes})
 	}
+	// The most-pending compaction's urgency, read without acting on it: a climbing
+	// score is compaction losing to writes (spec 19 §1.5).
+	_, score := l.pickCompactionLocked()
 	return engine.EngineStats{
-		PhysicalBytes: physical,
-		Amplification: 1,
+		PhysicalBytes:   physical,
+		Amplification:   1,
+		Levels:          levels,
+		CompactionScore: score,
 	}
 }
 

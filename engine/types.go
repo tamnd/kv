@@ -113,6 +113,28 @@ type EngineStats struct {
 	// Amplification is the engine's current space amplification estimate
 	// (physical / live), for the RUM tradeoff observability (spec 19).
 	Amplification float64
+
+	// Levels is the per-level shape of a leveled or tiered engine, index 0 being the
+	// youngest level, for the LSM-internals metrics (spec 19 §1.5). It is nil for an
+	// engine with no level structure (the B-tree), which a renderer reads as "no
+	// per-level metrics for this engine" rather than as an empty engine.
+	Levels []LevelStats
+
+	// CompactionScore is the urgency of the most-pending compaction, normalized so 1.0
+	// means a level is exactly at its trigger and a larger value means further past it
+	// (spec 19 §1.5). It is 0 when nothing is due. A value that climbs and stays high is
+	// compaction losing to the write rate, the read-amplification and write-stall
+	// precursor an operator watches.
+	CompactionScore float64
+}
+
+// LevelStats is one level's segment count and on-disk footprint, the per-level shape
+// an LSM exposes for the compaction-backlog view (spec 19 §1.5).
+type LevelStats struct {
+	// Segments is the number of segments (sorted runs) resident at this level.
+	Segments int
+	// Bytes is the level's on-disk footprint in bytes.
+	Bytes int64
 }
 
 // ErrNotFound is returned by Reader.Get when no version of the key is visible at

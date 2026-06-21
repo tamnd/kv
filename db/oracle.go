@@ -50,6 +50,15 @@ type oracle struct {
 	// are trimmable.
 	readers map[uint64]int
 
+	// readerSince stamps the wall-clock time, in Unix nanoseconds, a version cohort
+	// first became live: set when readers[v] goes from absent to present, cleared when
+	// it empties. The oldest stamp over the live cohorts is the age of the
+	// longest-held snapshot, the leaked-reader signal of spec 19 §1.6. It tracks the
+	// cohort, not the individual reader, so continuous read traffic that keeps churning
+	// the newest version keeps its stamps fresh while a genuinely abandoned old snapshot
+	// keeps a stamp that only ages, which is the bias a leak detector wants.
+	readerSince map[uint64]uint64
+
 	// commits holds recent write sets in ascending version order, for write-write
 	// conflict detection (spec 10 §3). A record is trimmed once its version is at or
 	// below the readMark, because no live or future transaction reads from before
@@ -72,16 +81,21 @@ func newOracle(lastCommitted uint64) *oracle {
 		nextVersion:    lastCommitted + 1,
 		appliedVersion: lastCommitted,
 		readers:        make(map[uint64]int),
+		readerSince:    make(map[uint64]uint64),
 	}
 }
 
 // readTs registers a new read snapshot at the latest applied version and returns
-// it. The caller must pair it with doneRead (via Txn.Discard) so the version stops
-// pinning the watermark.
-func (o *oracle) readTs() uint64 {
+// it. nowNanos is the wall-clock registration time, used only to stamp a freshly
+// opened version cohort for the oldest-snapshot-age metric. The caller must pair it
+// with doneRead (via Txn.Discard) so the version stops pinning the watermark.
+func (o *oracle) readTs(nowNanos uint64) uint64 {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	v := o.appliedVersion
+	if o.readers[v] == 0 {
+		o.readerSince[v] = nowNanos
+	}
 	o.readers[v]++
 	return v
 }
@@ -92,9 +106,27 @@ func (o *oracle) doneRead(v uint64) {
 	defer o.mu.Unlock()
 	if o.readers[v] <= 1 {
 		delete(o.readers, v)
+		delete(o.readerSince, v)
 	} else {
 		o.readers[v]--
 	}
+}
+
+// oldestReaderSince reports the Unix-nanosecond stamp of the longest-held live read
+// snapshot, or 0 when no reader is live. The caller turns it into an age against the
+// current clock; a value that only grows is a reader that was never discarded
+// (spec 19 §1.6).
+func (o *oracle) oldestReaderSince() uint64 {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	var oldest uint64
+	first := true
+	for _, since := range o.readerSince {
+		if first || since < oldest {
+			oldest, first = since, false
+		}
+	}
+	return oldest
 }
 
 // lastCommitted reports the newest applied version, the default read snapshot.

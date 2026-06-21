@@ -274,7 +274,10 @@ type compaction struct {
 // and otherwise descends when it has outgrown its size target. Scores are normalized so
 // 1.0 means at threshold, so the larger score is the more urgent action whatever metric
 // it came from. The caller holds l.mu.
-func (l *LSM) pickCompactionLocked() compaction {
+// It returns the chosen action together with its normalized urgency score, so a caller
+// that only wants the backlog signal (the Stats path) reads the score without acting on
+// it, and the maintenance path ignores the score and runs the action.
+func (l *LSM) pickCompactionLocked() (compaction, float64) {
 	best := compaction{kind: compactNone}
 	var bestScore float64
 	consider := func(c compaction, score float64) {
@@ -312,7 +315,7 @@ func (l *LSM) pickCompactionLocked() compaction {
 			consider(compaction{kind: compactPushDown, level: i, wholeLevel: false}, score)
 		}
 	}
-	return best
+	return best, bestScore
 }
 
 // keyRangeOf returns the smallest and largest user key across a set of segments, the
