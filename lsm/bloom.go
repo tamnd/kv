@@ -134,6 +134,11 @@ func (f *bloomFilter) mayContain(key []byte) bool {
 	return true
 }
 
+// encode returns the blob the segment's filter pages hold for a Bloom filter: the raw
+// bit array. The probe count k travels in the footer beside the filter head, so the
+// blob itself is just the bits. This makes *bloomFilter satisfy segFilter.
+func (f *bloomFilter) encode() []byte { return f.bits }
+
 // bloomHash is a 32-bit FNV-1a hash, a self-contained dependency-free hash adequate
 // for a Bloom filter's probe derivation. The constant must stay frozen so a filter
 // written by one build is read identically by the next.

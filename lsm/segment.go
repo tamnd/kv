@@ -55,6 +55,28 @@ const (
 	filterFlag   byte = 0x08 // a Bloom-filter page
 )
 
+// segFilter is the per-segment membership filter seam (spec 06 §5). A point read
+// consults it before touching a segment's block index: mayContain returns false only
+// when the key was definitely never written to the segment, so the segment is skipped;
+// a true answer may be a false positive, so the read proceeds. encode returns the blob
+// the filter's pages hold, decoded back at open by the kind the footer records. Both
+// the default Bloom filter and the opt-in Ribbon filter implement it, so a segment
+// carries whichever the engine was configured with behind one field. A nil segFilter
+// means "no filter", and a read of such a segment always proceeds.
+type segFilter interface {
+	mayContain(key []byte) bool
+	encode() []byte
+}
+
+// filterKind discriminates the filter a segment's footer records, so open decodes its
+// filter blob as the right structure. It is stored as a uvarint in the footer.
+type filterKind uint8
+
+const (
+	filterBloom  filterKind = 0 // the default double-hashing Bloom filter
+	filterRibbon filterKind = 1 // the opt-in Standard Ribbon filter
+)
+
 // indexEntry is one block-index separator: the first user key of a data page and
 // that page's number. The entries are globally ascending by user key, so a point
 // read binary-searches them.
@@ -81,7 +103,7 @@ type segment struct {
 
 	index     []indexEntry      // one separator per data page, ascending by user key
 	rangeDels []format.RangeDel // the segment's range-delete intervals
-	filter    *bloomFilter      // membership filter over the segment's user keys
+	filter    segFilter         // membership filter over the segment's user keys, or nil
 }
 
 // pendingPage is one data page's cells, accumulated before the pages are allocated
@@ -99,10 +121,12 @@ type pendingPage struct {
 // split across a page boundary (a single group too large for a page is the lone
 // exception). The pages are allocated from the pager's freelist or the file tail
 // and left dirty for the next checkpoint to fold, the same path every engine write
-// takes. bitsPerKey sizes the Bloom filter: the caller passes the Monkey budget for
-// the level the segment is written at, so a deep segment carries a smaller filter than
-// a shallow one. A non-positive value falls back to the flat default.
-func writeSegment(pgr *pager.Pager, bitsPerKey int, src func(emit func(internalKey, value []byte) bool)) (*segment, error) {
+// takes. bitsPerKey sizes the filter: the caller passes the Monkey budget for the level
+// the segment is written at, so a deep segment carries a smaller filter than a shallow
+// one. A non-positive value falls back to the flat default. kind selects the filter
+// structure: filterBloom is the default, filterRibbon builds the opt-in Ribbon filter,
+// which falls back to Bloom when its construction cannot be seeded.
+func writeSegment(pgr *pager.Pager, bitsPerKey int, kind filterKind, src func(emit func(internalKey, value []byte) bool)) (*segment, error) {
 	usable := pgr.Header().UsablePageSize()
 	// The most a single cell can occupy: two length varints plus the bytes. A page
 	// must hold at least one whole cell, so a cell larger than the usable area minus
@@ -307,18 +331,17 @@ func writeSegment(pgr *pager.Pager, bitsPerKey int, src func(emit func(internalK
 	}
 	seg.rdHead = rdHead
 
-	// Build the Bloom filter over the distinct user keys and persist it, so a point
-	// read can skip this whole segment when the filter says a key was never here.
+	// Build the membership filter over the distinct user keys and persist it, so a point
+	// read can skip this whole segment when the filter says a key was never here. The
+	// kind is the engine's configured choice; a Ribbon build that cannot be seeded falls
+	// back to Bloom, so the writer never fails for want of a filter.
 	var filterBlob []byte
 	if len(filterKeys) > 0 {
 		if bitsPerKey < 1 {
 			bitsPerKey = bloomBitsPerKey
 		}
-		seg.filter = newBloom(len(filterKeys), bitsPerKey)
-		for _, k := range filterKeys {
-			seg.filter.add(k)
-		}
-		filterBlob = seg.filter.bits
+		seg.filter = buildSegFilter(kind, filterKeys, bitsPerKey)
+		filterBlob = seg.filter.encode()
 	}
 	filterHead, filterPages, err := writeBlobPages(pgr, filterFlag, filterBlob)
 	if err != nil {
@@ -472,19 +495,28 @@ func loadBlobPages(pgr *pager.Pager, head format.PageNo, flag byte) ([]byte, err
 	return blob, nil
 }
 
-// loadFilter reconstructs the segment's Bloom filter from its page chain. A NoPage
-// head leaves seg.filter nil, so mayContain conservatively passes and the segment is
+// loadFilter reconstructs the segment's membership filter from its page chain, decoding
+// the blob by the kind the footer recorded. A NoPage head, or an empty or undecodable
+// blob, leaves seg.filter nil, so mayContain conservatively passes and the segment is
 // always read.
-func (s *segment) loadFilter(pgr *pager.Pager, filterK uint32) error {
+func (s *segment) loadFilter(pgr *pager.Pager, filterK uint32, kind filterKind) error {
 	if s.filterHead == format.NoPage {
 		return nil
 	}
-	bits, err := loadBlobPages(pgr, s.filterHead, filterFlag)
+	blob, err := loadBlobPages(pgr, s.filterHead, filterFlag)
 	if err != nil {
 		return err
 	}
-	if len(bits) > 0 {
-		s.filter = &bloomFilter{bits: bits, k: filterK}
+	if len(blob) == 0 {
+		return nil
+	}
+	switch kind {
+	case filterRibbon:
+		if rf := decodeRibbon(blob); rf != nil {
+			s.filter = rf
+		}
+	default:
+		s.filter = &bloomFilter{bits: blob, k: filterK}
 	}
 	return nil
 }
@@ -515,11 +547,21 @@ func writeFooter(pgr *pager.Pager, seg *segment) (format.PageNo, error) {
 	body = append(body, u32[:]...)
 	binary.BigEndian.PutUint32(u32[:], seg.filterHead)
 	body = append(body, u32[:]...)
-	var filterK uint32
-	if seg.filter != nil {
-		filterK = seg.filter.k
+	// The filter kind discriminates how open decodes the filter blob; filterK carries the
+	// Bloom probe count and is unused (zero) for a Ribbon filter, whose parameters are
+	// self-describing in its blob.
+	var (
+		filterK uint32
+		kind    = filterBloom
+	)
+	switch f := seg.filter.(type) {
+	case *bloomFilter:
+		filterK = f.k
+	case *ribbonFilter:
+		kind = filterRibbon
 	}
 	body = format.AppendUvarint(body, uint64(filterK))
+	body = format.AppendUvarint(body, uint64(kind))
 	body = format.AppendUvarint(body, uint64(seg.pages))
 
 	usable := pgr.Header().UsablePageSize()
@@ -579,6 +621,8 @@ func openSegment(pgr *pager.Pager, footer format.PageNo) (*segment, error) {
 	off += 4
 	filterK, n := format.Uvarint(data[off:])
 	off += n
+	kind, n := format.Uvarint(data[off:])
+	off += n
 	pageCount, n := format.Uvarint(data[off:])
 	seg.pages = int(pageCount)
 	pgr.Unpin(fr, false)
@@ -589,7 +633,7 @@ func openSegment(pgr *pager.Pager, footer format.PageNo) (*segment, error) {
 	if err := seg.loadRangeDels(pgr); err != nil {
 		return nil, err
 	}
-	if err := seg.loadFilter(pgr, uint32(filterK)); err != nil {
+	if err := seg.loadFilter(pgr, uint32(filterK), filterKind(kind)); err != nil {
 		return nil, err
 	}
 	return seg, nil
