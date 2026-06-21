@@ -26,9 +26,18 @@ type leaf struct {
 // n+1 children: child[i] covers keys in [sep[i-1], sep[i]) with sep[-1] = -inf and
 // sep[n] = +inf, so child[n] (the rightmost) covers [sep[n-1], +inf). Separators are
 // USER keys; routing never needs the version (spec 05 §2.1).
+//
+// In Bε mode (spec 05 §4) an interior node also carries a message buffer: pending
+// inserts and deletes parked here instead of descending to their leaf, flushed one
+// level down in a batch when the buffer fills. Messages are full internal-key cells,
+// exactly like leaf cells, so MVCC and the engine seam are unchanged. The buffer is
+// empty in the default (unbuffered) mode, and an interior page written with no
+// messages encodes identically to before this slice, so the default path is untouched.
 type interior struct {
 	seps     [][]byte        // n separator user keys, ascending
 	children []format.PageNo // n+1 child pages
+	msgKeys  [][]byte        // Bε buffered message internal keys, ascending by CompareInternal
+	msgVals  [][]byte        // buffered message values, parallel to msgKeys
 }
 
 // marshalLeaf encodes l to its on-disk bytes (header + cells). The caller checks
@@ -69,7 +78,12 @@ func unmarshalLeaf(p []byte) *leaf {
 
 // marshalInterior encodes an interior node: header (with rightmost child in the
 // pointer slot), then per non-rightmost child a cell of (4-byte child, varint
-// separator length, separator bytes).
+// separator length, separator bytes). In Bε mode a non-empty message buffer is
+// appended after the pivot cells as a varint message count followed by that many
+// (varint klen, key, varint vlen, value) cells. When the buffer is empty nothing is
+// appended, so an unbuffered interior encodes byte for byte as it did before this
+// slice and unmarshalInterior reads the absent count back as zero from the page's
+// trailing zero padding.
 func marshalInterior(in *interior) []byte {
 	out := make([]byte, nodeHeaderSize)
 	format.CommonHeader{Type: format.PageBTreeInterior, CellCount: uint16(len(in.seps))}.Encode(out)
@@ -80,6 +94,15 @@ func marshalInterior(in *interior) []byte {
 		out = append(out, ptr[:]...)
 		out = format.AppendUvarint(out, uint64(len(in.seps[i])))
 		out = append(out, in.seps[i]...)
+	}
+	if len(in.msgKeys) > 0 {
+		out = format.AppendUvarint(out, uint64(len(in.msgKeys)))
+		for i := range in.msgKeys {
+			out = format.AppendUvarint(out, uint64(len(in.msgKeys[i])))
+			out = append(out, in.msgKeys[i]...)
+			out = format.AppendUvarint(out, uint64(len(in.msgVals[i])))
+			out = append(out, in.msgVals[i]...)
+		}
 	}
 	return out
 }
@@ -100,7 +123,60 @@ func unmarshalInterior(p []byte) *interior {
 		in.seps = append(in.seps, sep)
 	}
 	in.children = append(in.children, binary.BigEndian.Uint32(p[format.CommonHeaderSize:nodeHeaderSize]))
+	// The Bε message buffer follows the pivot cells. An unbuffered interior wrote no
+	// buffer section, so the count reads back as zero from the page's zero padding.
+	if off < len(p) {
+		mcount, n := format.Uvarint(p[off:])
+		off += n
+		for i := 0; i < int(mcount); i++ {
+			klen, n := format.Uvarint(p[off:])
+			off += n
+			key := append([]byte(nil), p[off:off+int(klen)]...)
+			off += int(klen)
+			vlen, n := format.Uvarint(p[off:])
+			off += n
+			val := append([]byte(nil), p[off:off+int(vlen)]...)
+			off += int(vlen)
+			in.msgKeys = append(in.msgKeys, key)
+			in.msgVals = append(in.msgVals, val)
+		}
+	}
 	return in
+}
+
+// bufferInsert parks (internalKey, value) in the interior's message buffer in sorted
+// internal-key order, overwriting an identical internal key so a redo of the same
+// committed batch re-injects the message as a no-op, the same idempotence leaf.insert
+// gives the leaf (spec 08 §3). The buffer stays ascending by CompareInternal so a
+// flush can partition it by child with a single forward pass and a read can fold it
+// with the leaf group without re-sorting.
+func (in *interior) bufferInsert(internalKey, value []byte) {
+	idx := in.bufferSearch(internalKey)
+	if idx < len(in.msgKeys) && format.CompareInternal(in.msgKeys[idx], internalKey) == 0 {
+		in.msgVals[idx] = append([]byte(nil), value...)
+		return
+	}
+	in.msgKeys = append(in.msgKeys, nil)
+	copy(in.msgKeys[idx+1:], in.msgKeys[idx:])
+	in.msgKeys[idx] = append([]byte(nil), internalKey...)
+
+	in.msgVals = append(in.msgVals, nil)
+	copy(in.msgVals[idx+1:], in.msgVals[idx:])
+	in.msgVals[idx] = append([]byte(nil), value...)
+}
+
+// bufferSearch returns the index of the first buffered message key >= internalKey.
+func (in *interior) bufferSearch(internalKey []byte) int {
+	lo, hi := 0, len(in.msgKeys)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if format.CompareInternal(in.msgKeys[mid], internalKey) < 0 {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return lo
 }
 
 // childFor returns the index of the child subtree that covers userKey: the first

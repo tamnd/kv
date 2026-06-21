@@ -49,6 +49,13 @@ type BTree struct {
 	gcActive  bool
 	gcResume  format.PageNo
 	gcResumeW uint64
+
+	// buffered turns on the Bε write path (spec 05 §4, buffer.go): inserts park as
+	// messages in interior buffers and flush down in batches instead of descending to
+	// their leaf one at a time. Off by default, set from EngineOptions.BufferedInserts
+	// at Open. When off, interior buffers stay empty and the engine behaves exactly as
+	// the in-place tree always has.
+	buffered bool
 }
 
 // New returns a B-tree core bound to pgr. Call Open to finish wiring it to the
@@ -72,6 +79,9 @@ func (t *BTree) Open(env *engine.Env) error {
 		reserved := t.pageSize - t.usable
 		t.pageSize = env.Options.PageSize
 		t.usable = t.pageSize - reserved
+	}
+	if env != nil && env.Options.BufferedInserts {
+		t.buffered = true
 	}
 	if t.root() == format.NoPage {
 		pgno, err := t.storeLeafNew(&leaf{})
@@ -128,7 +138,11 @@ func (t *BTree) setRoot(pgno format.PageNo) { t.pgr.Header().EngineRoot = pgno }
 // committed batch and the versioned-key inserts are idempotent (spec 04 §3).
 func (t *BTree) Apply(batch *engine.WriteBatch, commitVersion uint64) error {
 	for _, e := range batch.Entries() {
-		if err := t.insertOne(e.InternalKey, e.Value); err != nil {
+		if t.buffered {
+			if err := t.bufferedApply(e.InternalKey, e.Value); err != nil {
+				return err
+			}
+		} else if err := t.insertOne(e.InternalKey, e.Value); err != nil {
 			return err
 		}
 		if format.KindOf(e.InternalKey) == format.KindRangeBegin {
