@@ -24,6 +24,11 @@ type Config struct {
 	Dir string
 	// PageSize is the database page size; zero uses the kv default.
 	PageSize int
+	// CacheBytes caps the buffer pool. Zero uses the engine default. Setting it well below the
+	// working set forces the out-of-cache regime where reads miss to disk and read
+	// amplification becomes visible (spec 21 §3), the regime that distinguishes a B-tree's page
+	// discipline from an LSM's read cost.
+	CacheBytes int
 	// Sync is the WAL durability level the run discloses and pays for (spec 21 §3, §6).
 	Sync kv.Sync
 
@@ -94,6 +99,20 @@ func engineName(e kv.EngineKind) string {
 	return "btree"
 }
 
+// openOptions builds the kv.Open options a config asks for: engine, durability, and the
+// optional page-size and cache-size overrides. It is the single place the harness translates a
+// Config into open options, so the load and any reopen see exactly the same database shape.
+func openOptions(cfg Config) []kv.Option {
+	opts := []kv.Option{kv.WithEngine(cfg.Engine), kv.WithSynchronous(cfg.Sync)}
+	if cfg.PageSize > 0 {
+		opts = append(opts, kv.WithPageSize(cfg.PageSize))
+	}
+	if cfg.CacheBytes > 0 {
+		opts = append(opts, kv.WithCacheSize(cfg.CacheBytes))
+	}
+	return opts
+}
+
 // Run executes one workload under cfg and returns its measured Result. It opens a fresh
 // database in cfg.Dir, runs the load phase, settles the engine to a steady file shape, then
 // measures the run phase (or the load itself for a bulk-load workload). It is the single
@@ -104,11 +123,7 @@ func Run(cfg Config, w Workload) (Result, error) {
 	}
 	path := filepath.Join(cfg.Dir, "bench.kv")
 
-	opts := []kv.Option{kv.WithEngine(cfg.Engine), kv.WithSynchronous(cfg.Sync)}
-	if cfg.PageSize > 0 {
-		opts = append(opts, kv.WithPageSize(cfg.PageSize))
-	}
-	db, err := kv.Open(path, opts...)
+	db, err := kv.Open(path, openOptions(cfg)...)
 	if err != nil {
 		return Result{}, fmt.Errorf("open: %w", err)
 	}
@@ -127,6 +142,7 @@ func Run(cfg Config, w Workload) (Result, error) {
 		Synchronous:  syncName(cfg.Sync),
 		BatchSize:    cfg.BatchSize,
 		Concurrency:  concurrencyOf(cfg),
+		CacheBytes:   cfg.CacheBytes,
 	}
 	res := Result{Workload: w.Name, Engine: engineName(cfg.Engine), Setup: setup}
 

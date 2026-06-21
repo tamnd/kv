@@ -140,6 +140,7 @@ type Setup struct {
 	Synchronous  string `json:"synchronous"`
 	BatchSize    int    `json:"batch_size"`
 	Concurrency  int    `json:"concurrency"`
+	CacheBytes   int    `json:"cache_bytes"`
 }
 
 // JSON renders the result as indented, machine-readable JSON for storage and diffing.
