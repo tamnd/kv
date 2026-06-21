@@ -65,7 +65,7 @@ func TestSegmentRoundTrip(t *testing.T) {
 		{ik("banana", 5), []byte("b5")},
 		{ik("cherry", 1), []byte("c1")},
 	}
-	seg, err := writeSegment(pgr, bloomBitsPerKey, sourceOf(cells))
+	seg, err := writeSegment(pgr, bloomBitsPerKey, filterBloom, sourceOf(cells))
 	if err != nil {
 		t.Fatalf("writeSegment: %v", err)
 	}
@@ -99,7 +99,7 @@ func TestSegmentReopen(t *testing.T) {
 		{ik("k2", 1), []byte("v2")},
 		{ik("k3", 1), []byte("v3")},
 	}
-	seg, err := writeSegment(pgr, bloomBitsPerKey, sourceOf(cells))
+	seg, err := writeSegment(pgr, bloomBitsPerKey, filterBloom, sourceOf(cells))
 	if err != nil {
 		t.Fatalf("writeSegment: %v", err)
 	}
@@ -135,7 +135,7 @@ func TestSegmentMultiPage(t *testing.T) {
 	for i := 0; i < n; i++ {
 		cells[i] = cell{ik(fmt.Sprintf("key%06d", i), 1), []byte(fmt.Sprintf("value%06d", i))}
 	}
-	seg, err := writeSegment(pgr, bloomBitsPerKey, sourceOf(cells))
+	seg, err := writeSegment(pgr, bloomBitsPerKey, filterBloom, sourceOf(cells))
 	if err != nil {
 		t.Fatalf("writeSegment: %v", err)
 	}
@@ -167,7 +167,7 @@ func TestSegmentMultiPage(t *testing.T) {
 // empty segment that scans to nothing.
 func TestSegmentEmpty(t *testing.T) {
 	pgr := newSegPager(t)
-	seg, err := writeSegment(pgr, bloomBitsPerKey, sourceOf(nil))
+	seg, err := writeSegment(pgr, bloomBitsPerKey, filterBloom, sourceOf(nil))
 	if err != nil {
 		t.Fatalf("writeSegment: %v", err)
 	}
@@ -188,7 +188,7 @@ func TestSegmentScanEarlyStop(t *testing.T) {
 	for i := 0; i < n; i++ {
 		cells[i] = cell{ik(fmt.Sprintf("k%05d", i), 1), []byte("v")}
 	}
-	seg, err := writeSegment(pgr, bloomBitsPerKey, sourceOf(cells))
+	seg, err := writeSegment(pgr, bloomBitsPerKey, filterBloom, sourceOf(cells))
 	if err != nil {
 		t.Fatalf("writeSegment: %v", err)
 	}

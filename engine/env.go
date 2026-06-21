@@ -87,6 +87,18 @@ type Metrics interface {
 	Observe(name string, value float64)
 }
 
+// FilterKind selects the per-segment membership filter the LSM core builds (spec 06
+// §5). FilterBloom, the zero value and default, is the classic Bloom filter, fast to
+// probe on the hot levels. FilterRibbon is the opt-in Ribbon filter, which reaches the
+// same false-positive rate in meaningfully less space, attractive on the deep cold
+// levels where filters dominate the resident set. The B-tree core ignores it.
+type FilterKind uint8
+
+const (
+	FilterBloom  FilterKind = iota // the default Bloom filter
+	FilterRibbon                   // the opt-in Ribbon filter
+)
+
 // EngineOptions carries engine-specific tunables that travel from the header and
 // configuration into a core at Open (spec 04 §5, spec 22). Fields are populated
 // per engine; unset fields take engine defaults.
@@ -100,8 +112,9 @@ type EngineOptions struct {
 	BufferedInserts bool    // Bε buffered-insert mode
 
 	// LSM knobs.
-	MemtableSize      int  // bytes before a memtable is flushed
-	LevelSizeRatio    int  // size multiplier between levels
-	ValueSepThreshold int  // value size above which WiscKey separates to vLog
-	RangeIndex        bool // build the REMIX ordered index for scan-heavy workloads
+	MemtableSize      int        // bytes before a memtable is flushed
+	LevelSizeRatio    int        // size multiplier between levels
+	ValueSepThreshold int        // value size above which WiscKey separates to vLog
+	RangeIndex        bool       // build the REMIX ordered index for scan-heavy workloads
+	Filter            FilterKind // per-segment membership filter: Bloom (default) or Ribbon
 }

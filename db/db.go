@@ -81,6 +81,13 @@ type Options struct {
 	// comparisons and cursor switches. Off by default, since it helps only scan-heavy
 	// workloads and the B-tree core, a single ordered source, never needs it.
 	RangeIndex bool
+	// Filter selects the LSM core's per-segment membership filter (spec 06 §5).
+	// FilterBloom, the zero value, is the default double-hashing Bloom filter, fast to
+	// probe on the hot levels. FilterRibbon is the opt-in Ribbon filter, which reaches the
+	// same false-positive rate in meaningfully less space, attractive on the deep cold
+	// levels where filters dominate the resident set, at some extra construction cost. The
+	// B-tree core ignores it.
+	Filter engine.FilterKind
 }
 
 func (o Options) maxRetries() int {
@@ -170,6 +177,7 @@ type DB struct {
 	isolation    Isolation
 	memtableSize int
 	rangeIndex   bool
+	filter       engine.FilterKind
 
 	// now is the wall-clock source, in Unix nanoseconds, that read resolution compares
 	// a TTL set's absolute expiry against (spec 15 §6). It is the real system clock by
@@ -250,7 +258,7 @@ func create(fs vfs.FS, path string, opts Options) (*DB, error) {
 		return nil, err
 	}
 	d := &DB{fs: fs, path: path, pgr: pgr, wal: w, eng: eng, orc: newOracle(0),
-		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, now: opts.clock()}
+		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, now: opts.clock()}
 	if err := d.openEngine(opts.Merge); err != nil {
 		w.Close()
 		pgr.Close()
@@ -273,7 +281,7 @@ func openExisting(fs vfs.FS, path string, opts Options) (*DB, error) {
 		return nil, err
 	}
 	d := &DB{fs: fs, path: path, pgr: pgr, eng: eng,
-		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, now: opts.clock()}
+		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, now: opts.clock()}
 	if err := d.openEngine(opts.Merge); err != nil {
 		pgr.Close()
 		return nil, err
@@ -333,6 +341,7 @@ func (d *DB) openEngine(merge func(existing, operand []byte) []byte) error {
 			PageSize:     d.pgr.PageSize(),
 			MemtableSize: d.memtableSize,
 			RangeIndex:   d.rangeIndex,
+			Filter:       d.filter,
 		},
 	}
 	if err := d.eng.Open(env); err != nil {

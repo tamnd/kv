@@ -64,7 +64,7 @@ func TestMonkeyDeepSegmentsGetFewerBits(t *testing.T) {
 	}
 	topK := bloomK(bloomBitsForLevel(1, l.levelRatio))
 	for _, s := range l.levels[1] {
-		if s.filter == nil || s.filter.k != topK {
+		if k, ok := bloomProbes(s.filter); !ok || k != topK {
 			t.Fatalf("L1 segment carries %v probes, want the top budget %d", s.filter, topK)
 		}
 	}
@@ -84,7 +84,7 @@ func TestMonkeyDeepSegmentsGetFewerBits(t *testing.T) {
 		t.Fatalf("test setup: the L2 budget (%d probes) does not undercut L1 (%d)", deepK, topK)
 	}
 	for _, s := range l.levels[2] {
-		if s.filter == nil || s.filter.k != deepK {
+		if k, ok := bloomProbes(s.filter); !ok || k != deepK {
 			t.Fatalf("L2 segment carries %v probes, want the reduced budget %d", s.filter, deepK)
 		}
 		// The smaller filter still reports every key it holds.
@@ -113,8 +113,20 @@ func TestMonkeyDeepSegmentsGetFewerBits(t *testing.T) {
 		t.Fatalf("reopen lost L2, got shape %v", levelShape(l2))
 	}
 	for _, s := range l2.levels[2] {
-		if s.filter != nil && s.filter.k != deepK {
-			t.Fatalf("after reopen the L2 segment carries %d probes, want %d", s.filter.k, deepK)
+		if k, ok := bloomProbes(s.filter); ok && k != deepK {
+			t.Fatalf("after reopen the L2 segment carries %d probes, want %d", k, deepK)
 		}
 	}
+}
+
+// bloomProbes returns the probe count of a segment's filter when it is a Bloom filter,
+// the Monkey tests' window onto the per-level bit budget. A nil or non-Bloom filter
+// returns ok=false, so a test that pins a Bloom budget fails loudly rather than reading a
+// zero out of the wrong filter kind.
+func bloomProbes(f segFilter) (uint32, bool) {
+	bf, ok := f.(*bloomFilter)
+	if !ok {
+		return 0, false
+	}
+	return bf.k, true
 }

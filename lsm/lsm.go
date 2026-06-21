@@ -103,6 +103,11 @@ type LSM struct {
 	// one entry per level instead of one per segment. It is read from the options at Open
 	// and is off by default. See remix.go.
 	rangeIndex bool
+	// filterKind selects the per-segment membership filter a flush and a compaction build
+	// (spec 06 §5): filterBloom, the default, or filterRibbon, the opt-in Ribbon filter
+	// that reaches the same false-positive rate in less space on the deep cold levels. It
+	// is read from the options at Open. See ribbon.go.
+	filterKind filterKind
 	// vlogHeadRecorded is the value-log head the MANIFEST last recorded, so a flush or GC
 	// emits a manifestVLogHead edit only when the head actually moves: a flush moves it off
 	// NoPage when the first value separates, the GC moves it forward when it frees the old
@@ -158,6 +163,9 @@ func (l *LSM) Open(env *engine.Env) error {
 	}
 	if env != nil && env.Options.RangeIndex {
 		l.rangeIndex = true
+	}
+	if env != nil && env.Options.Filter == engine.FilterRibbon {
+		l.filterKind = filterRibbon
 	}
 	l.durableLSN = l.pgr.CheckpointLSN()
 	return l.loadManifestLocked()
@@ -229,7 +237,7 @@ func (l *LSM) flushLocked() error {
 	// Separating only at flush, never at compaction, is the WiscKey win: once a value is in
 	// the vLog every later compaction of its key moves the pointer, not the bytes.
 	var sepErr error
-	seg, err := writeSegment(l.pgr, bloomBitsForLevel(0, l.levelRatio), func(emit func(ik, val []byte) bool) {
+	seg, err := writeSegment(l.pgr, bloomBitsForLevel(0, l.levelRatio), l.filterKind, func(emit func(ik, val []byte) bool) {
 		mem.scan(func(ik, val []byte) bool {
 			oik, oval, e := l.separateForFlush(ik, val)
 			if e != nil {
@@ -561,10 +569,10 @@ func (r *reader) Get(userKey []byte) ([]byte, error) {
 	}
 	l.mem.getGroup(userKey, collect)
 	for _, seg := range l.allSegmentsLocked() {
-		// The Bloom filter answers a miss definitively, so a segment it rejects holds
-		// no version of the key and its block index need never be touched. A segment
-		// without a filter has a nil one, whose mayContain passes, so it is still read.
-		if !seg.filter.mayContain(userKey) {
+		// The membership filter answers a miss definitively, so a segment it rejects
+		// holds no version of the key and its block index need never be touched. A
+		// segment without a filter has a nil one, so the read always proceeds.
+		if seg.filter != nil && !seg.filter.mayContain(userKey) {
 			continue
 		}
 		if err := seg.getGroup(l.pgr, userKey, collect); err != nil {

@@ -532,7 +532,7 @@ func (l *LSM) writeSplitLocked(mi *mergeIter, watermark uint64, dropTomb bool, b
 	sp := &splitter{mi: mi, watermark: watermark, dropTomb: dropTomb, target: target}
 	var outs []*segment
 	for !sp.exhausted {
-		seg, err := writeSegment(l.pgr, bitsPerKey, sp.fill)
+		seg, err := writeSegment(l.pgr, bitsPerKey, l.filterKind, sp.fill)
 		if err != nil {
 			return nil, err
 		}
