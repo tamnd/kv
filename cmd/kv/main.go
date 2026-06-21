@@ -57,6 +57,8 @@ func commands() []command {
 		{"checkpoint", "fold the WAL into the main file", cmdCheckpoint},
 		{"backup", "stream a consistent physical image to a file or stdout", cmdBackup},
 		{"restore", "rebuild a database from a backup stream", cmdRestore},
+		{"ship", "stream the current WAL generation as a replication delta", cmdShip},
+		{"replay", "apply a shipped WAL delta onto a read-only follower", cmdReplay},
 		{"vacuum", "return trailing free pages to the OS; shrink the file", cmdVacuum},
 		{"pragma", "read or set a configuration knob (engine, application_id, ...)", cmdPragma},
 		{"check", "verify structural integrity; exit 4 on any violation", cmdCheck},

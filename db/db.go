@@ -128,6 +128,13 @@ type Options struct {
 	// public facade therefore does not expose this option yet; it becomes public once
 	// WAL frame encryption lands.
 	EncryptionKey []byte
+	// ReadReplica opens the database as a read-only follower (spec 18 §4). User writes
+	// are refused with ErrReadOnlyTxn; the only way state advances is ApplyWAL, which
+	// replays committed frames shipped from a primary through the same redo path
+	// recovery uses. A replica is always a consistent point-in-time copy of its primary,
+	// slightly behind it (asynchronous replication); promote one to a writable primary
+	// by reopening the file without this flag.
+	ReadReplica bool
 }
 
 func (o Options) maxRetries() int {
@@ -226,6 +233,14 @@ type DB struct {
 	bufferedInserts bool
 	compression     bool
 
+	// readReplica makes this a read-only follower (spec 18 §4): user writes are refused
+	// and state advances only through ApplyWAL replaying shipped frames. replicaHigh is
+	// the primary's commit version as of the last applied ship, so ReplicaLag (the gap to
+	// the follower's applied version) is observable in Stats. Both are guarded by d.mu:
+	// ApplyWAL writes them under the write lock, Stats reads them under the read lock.
+	readReplica bool
+	replicaHigh uint64
+
 	// counters is the cumulative-since-open operation tally surfaced through Stats and
 	// the Prometheus exposition (spec 19 §1.1). Reads bump it on the transaction path,
 	// commits on applyCommitted; it is all atomics, so no lock guards it.
@@ -323,7 +338,7 @@ func create(fs vfs.FS, path string, opts Options) (*DB, error) {
 		return nil, err
 	}
 	d := &DB{fs: fs, path: path, pgr: pgr, wal: w, eng: eng, orc: newOracle(0), crypto: enc,
-		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, bufferedInserts: opts.BufferedInserts, compression: opts.Compression, now: opts.clock(), logger: opts.Logger, slowOp: opts.SlowOpThreshold}
+		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, bufferedInserts: opts.BufferedInserts, compression: opts.Compression, now: opts.clock(), logger: opts.Logger, slowOp: opts.SlowOpThreshold, readReplica: opts.ReadReplica}
 	if err := d.openEngine(opts.Merge); err != nil {
 		w.Close()
 		pgr.Close()
@@ -351,7 +366,7 @@ func openExisting(fs vfs.FS, path string, opts Options) (*DB, error) {
 		return nil, err
 	}
 	d := &DB{fs: fs, path: path, pgr: pgr, eng: eng, crypto: enc,
-		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, bufferedInserts: opts.BufferedInserts, compression: opts.Compression, now: opts.clock(), logger: opts.Logger, slowOp: opts.SlowOpThreshold}
+		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, bufferedInserts: opts.BufferedInserts, compression: opts.Compression, now: opts.clock(), logger: opts.Logger, slowOp: opts.SlowOpThreshold, readReplica: opts.ReadReplica}
 	if err := d.openEngine(opts.Merge); err != nil {
 		pgr.Close()
 		return nil, err
@@ -372,6 +387,11 @@ func openExisting(fs vfs.FS, path string, opts Options) (*DB, error) {
 			return nil, err
 		}
 		d.wal = w
+		// A checkpoint that emptied the log leaves the next generation with no frames, so
+		// the durable-tail scan positions the writer at LSN 1 even though the pager's
+		// checkpoint marker sits at the folded LSN. Resume past that marker so the next
+		// commit lands above it and redo on a later open keeps it (spec 08 §5).
+		d.wal.ResumeFrom(d.pgr.CheckpointLSN() + 1)
 		// Count the committed batches recovery is about to replay before redo consumes
 		// them, so the recovery log can report exactly what was replayed and whether a
 		// torn tail was discarded.
@@ -478,6 +498,9 @@ func (d *DB) Write(fn func(b *engine.WriteBatch)) (uint64, error) {
 
 	if d.fatal != nil {
 		return 0, d.fatal
+	}
+	if d.readReplica {
+		return 0, ErrReadOnlyTxn
 	}
 	// Under the single-writer lock the next version is stable between this peek and
 	// the formal commit, so the batch can be built at it before it is reserved.
@@ -605,6 +628,9 @@ func (d *DB) commitTxn(readVersion uint64, ops []pendingOp, conflictKeys []strin
 	if d.fatal != nil {
 		return 0, d.fatal
 	}
+	if d.readReplica {
+		return 0, ErrReadOnlyTxn
+	}
 	v, ok := d.orc.newCommitTs(readVersion, conflictKeys)
 	if !ok {
 		return 0, ErrConflict
@@ -623,6 +649,9 @@ func (d *DB) commitTxnSerializable(readVersion uint64, ops []pendingOp, writeKey
 
 	if d.fatal != nil {
 		return 0, d.fatal
+	}
+	if d.readReplica {
+		return 0, ErrReadOnlyTxn
 	}
 	v, ok := d.orc.newCommitTsSerializable(readVersion, writeKeys, readKeys, ranges)
 	if !ok {
@@ -864,6 +893,14 @@ type Stats struct {
 	// in nanoseconds, 0 when no reader is live; a value that only climbs is a reader that
 	// was never discarded (spec 19 §1.6).
 	OldestSnapshotAgeNanos uint64
+	// ReadReplica reports whether the database was opened as a read-only follower
+	// (spec 18 §4).
+	ReadReplica bool
+	// ReplicaLag is the follower's distance behind its primary in commit versions: the
+	// primary's commit version as of the last applied ship minus the follower's applied
+	// version. It is 0 on a primary and on a fully caught-up replica; a value that climbs
+	// means ships are arriving slower than the primary commits (spec 18 §4).
+	ReplicaLag uint64
 }
 
 // Stats gathers a Stats snapshot under a read lock, so it is consistent against a
@@ -887,6 +924,10 @@ func (d *DB) Stats() Stats {
 		backlog = written - folded
 	}
 	io := d.pgr.IOStats()
+	var lag uint64
+	if applied := d.orc.lastCommitted(); d.replicaHigh > applied {
+		lag = d.replicaHigh - applied
+	}
 	return Stats{
 		Engine:                 d.pgr.Header().Engine,
 		PageSize:               d.pgr.PageSize(),
@@ -906,6 +947,8 @@ func (d *DB) Stats() Stats {
 		Levels:                 es.Levels,
 		CompactionScore:        es.CompactionScore,
 		OldestSnapshotAgeNanos: d.oldestSnapshotAgeNanos(),
+		ReadReplica:            d.readReplica,
+		ReplicaLag:             lag,
 	}
 }
 

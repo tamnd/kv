@@ -175,6 +175,15 @@ func WithMergeOperator(name string, fn func(existing, operand []byte) []byte) Op
 	}
 }
 
+// WithReadReplica opens the database as a read-only follower (spec 18 §4). Update, the
+// WriteBatch path, and any other write are refused with ErrReadOnly; the only way the
+// follower advances is ApplyWAL, replaying frames shipped from a primary. Promote a
+// follower to a primary by reopening its file without this option. Reads always work and
+// serve the follower's last applied version.
+func WithReadReplica() Option {
+	return func(c *config) { c.opts.ReadReplica = true }
+}
+
 // DB is an open database over one file, safe for concurrent use by many goroutines
 // (spec 15 §1). It is obtained from Open and must be Closed.
 type DB struct {
@@ -245,7 +254,10 @@ func (kdb *DB) View(fn func(txn *Txn) error) error {
 // on an error. It retries fn against a fresh snapshot on a write-write or SSI conflict,
 // up to the configured bound, so fn must be re-runnable (spec 15 §2.1).
 func (kdb *DB) Update(fn func(txn *Txn) error) error {
-	return kdb.d.Update(func(t *db.Txn) error { return fn(&Txn{t: t}) })
+	// wrap maps a commit-time sentinel onto the public surface, in particular the
+	// ErrReadOnlyTxn a read replica raises when a write reaches commit (spec 18 §4). A user
+	// error returned from fn passes through wrap unchanged.
+	return wrap(kdb.d.Update(func(t *db.Txn) error { return fn(&Txn{t: t}) }))
 }
 
 // Begin starts an explicit transaction at a fresh snapshot (spec 15 §2.2). The caller
@@ -423,6 +435,13 @@ type Stats struct {
 	// read snapshot, 0 when none is live. A value that only climbs is a snapshot or
 	// iterator that was never closed, the leaked-reader signal (spec 19 §1.6).
 	OldestSnapshotAgeNanos uint64
+	// ReadReplica reports whether the database was opened as a read-only follower with
+	// WithReadReplica (spec 18 §4).
+	ReadReplica bool
+	// ReplicaLag is a follower's distance behind its primary in commit versions, 0 on a
+	// primary or a caught-up replica. A climbing value means ApplyWAL is not keeping pace
+	// with the primary's commits (spec 18 §4).
+	ReplicaLag uint64
 }
 
 // Stats returns a current space-and-durability snapshot of the database (spec 09 §4).
@@ -454,6 +473,8 @@ func (kdb *DB) Stats() Stats {
 		Levels:                 s.Levels,
 		CompactionScore:        s.CompactionScore,
 		OldestSnapshotAgeNanos: s.OldestSnapshotAgeNanos,
+		ReadReplica:            s.ReadReplica,
+		ReplicaLag:             s.ReplicaLag,
 	}
 }
 
@@ -507,6 +528,29 @@ func (kdb *DB) Vacuum(budget int) (int, error) {
 // unrecoverable.
 func (kdb *DB) Backup(w io.Writer) (uint64, error) {
 	v, err := kdb.d.Backup(w)
+	return v, wrap(err)
+}
+
+// ShipWAL streams the current WAL generation to w as a replication delta and returns the
+// commit version it captured (spec 18 §4). It is the primary half of WAL shipping: a
+// follower's ApplyWAL replays the frames this writes, advancing it to the same version.
+// Ship repeatedly to keep a follower current. Shipping does not checkpoint, so it captures
+// the committed tail the follower still needs; an encrypted database ships ciphertext, so
+// the stream is encrypted at rest and the follower needs the same key (spec 18 §7).
+func (kdb *DB) ShipWAL(w io.Writer) (uint64, error) {
+	v, err := kdb.d.ShipWAL(w)
+	return v, wrap(err)
+}
+
+// ApplyWAL replays a shipped WAL generation from r onto a follower and returns the
+// follower's new applied version (spec 18 §4). It is the follower half of WAL shipping:
+// the frames apply through the same redo path recovery uses, and reads advance to the new
+// version once it returns. It is idempotent over already-applied versions and refuses with
+// ErrReplicaGap if the stream begins past the applied version, meaning the primary
+// checkpointed away the frames in between and the follower must re-seed from a full Backup.
+// Call it on a database opened WithReadReplica.
+func (kdb *DB) ApplyWAL(r io.Reader) (uint64, error) {
+	v, err := kdb.d.ApplyWAL(r)
 	return v, wrap(err)
 }
 

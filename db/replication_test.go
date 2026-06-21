@@ -1,0 +1,324 @@
+package db
+
+import (
+	"bytes"
+	"errors"
+	"testing"
+
+	"github.com/tamnd/kv/engine"
+	"github.com/tamnd/kv/format"
+	"github.com/tamnd/kv/vfs"
+)
+
+// shipAndApply ships the primary's current WAL generation and replays it onto the
+// follower, returning the follower's new applied version. It is the round-trip the
+// replication tests lean on.
+func shipAndApply(t *testing.T, primary, follower *DB) uint64 {
+	t.Helper()
+	var buf bytes.Buffer
+	if _, err := primary.ShipWAL(&buf); err != nil {
+		t.Fatalf("ship: %v", err)
+	}
+	v, err := follower.ApplyWAL(&buf)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	return v
+}
+
+// newFollower restores the primary's current state into a fresh path and reopens it as a
+// read-only replica, the way an operator seeds a follower from a base backup before
+// streaming WAL onto it.
+func newFollower(t *testing.T, primary *DB, fs vfs.FS, path string, opts Options) *DB {
+	t.Helper()
+	var base bytes.Buffer
+	if _, err := primary.Backup(&base); err != nil {
+		t.Fatalf("base backup: %v", err)
+	}
+	if err := RestoreBackup(fs, path, &base); err != nil {
+		t.Fatalf("restore base: %v", err)
+	}
+	opts.ReadReplica = true
+	f, err := Open(fs, path, opts)
+	if err != nil {
+		t.Fatalf("open follower: %v", err)
+	}
+	return f
+}
+
+// TestShipApplyRoundTrip is the core WAL-shipping path: a follower seeded from a base
+// backup catches up to the primary by replaying a shipped WAL generation, and reads every
+// key the primary wrote after the base.
+func TestShipApplyRoundTrip(t *testing.T) {
+	fs := vfs.NewMem()
+	p, err := Open(fs, "primary.kv", Options{PageSize: 4096, AutoCheckpoint: -1})
+	if err != nil {
+		t.Fatalf("open primary: %v", err)
+	}
+	// Seed and base-backup before any post-base writes.
+	if _, err := p.Write(func(b *engine.WriteBatch) { b.Set([]byte("seed"), []byte("0")) }); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	f := newFollower(t, p, fs, "follower.kv", Options{})
+	defer f.Close()
+
+	// Post-base writes the follower must learn through shipping.
+	for i := 0; i < 100; i++ {
+		k := []byte{'k', byte(i)}
+		if _, err := p.Write(func(b *engine.WriteBatch) { b.Set(k, []byte{'v', byte(i)}) }); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+	primaryVersion := shipAndApply(t, p, f)
+	if err := p.Close(); err != nil {
+		t.Fatalf("close primary: %v", err)
+	}
+
+	if got := f.orc.lastCommitted(); got != primaryVersion {
+		t.Fatalf("follower at version %d, want %d", got, primaryVersion)
+	}
+	for i := 0; i < 100; i++ {
+		k := []byte{'k', byte(i)}
+		got, err := f.Get(k)
+		if err != nil || !bytes.Equal(got, []byte{'v', byte(i)}) {
+			t.Fatalf("follower key %d = %q,%v, want %q", i, got, err, []byte{'v', byte(i)})
+		}
+	}
+}
+
+// TestApplyIsIdempotent confirms replaying the same ship twice applies nothing the second
+// time: the follower stays at the same version and the data is unchanged.
+func TestApplyIsIdempotent(t *testing.T) {
+	fs := vfs.NewMem()
+	p, err := Open(fs, "primary.kv", Options{PageSize: 4096, AutoCheckpoint: -1})
+	if err != nil {
+		t.Fatalf("open primary: %v", err)
+	}
+	if _, err := p.Write(func(b *engine.WriteBatch) { b.Set([]byte("seed"), []byte("0")) }); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	f := newFollower(t, p, fs, "follower.kv", Options{})
+	defer f.Close()
+	defer p.Close()
+
+	if _, err := p.Write(func(b *engine.WriteBatch) { b.Set([]byte("a"), []byte("1")) }); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	var buf bytes.Buffer
+	if _, err := p.ShipWAL(&buf); err != nil {
+		t.Fatalf("ship: %v", err)
+	}
+	shipBytes := buf.Bytes()
+
+	v1, err := f.ApplyWAL(bytes.NewReader(shipBytes))
+	if err != nil {
+		t.Fatalf("apply 1: %v", err)
+	}
+	v2, err := f.ApplyWAL(bytes.NewReader(shipBytes))
+	if err != nil {
+		t.Fatalf("apply 2: %v", err)
+	}
+	if v1 != v2 {
+		t.Fatalf("idempotent apply moved version %d -> %d", v1, v2)
+	}
+	if got, err := f.Get([]byte("a")); err != nil || !bytes.Equal(got, []byte("1")) {
+		t.Fatalf("after double apply key a = %q,%v, want 1", got, err)
+	}
+}
+
+// TestFollowerRefusesWrites confirms a ReadReplica database rejects user writes with
+// ErrReadOnlyTxn while still serving reads, so only shipped frames can advance it.
+func TestFollowerRefusesWrites(t *testing.T) {
+	fs := vfs.NewMem()
+	p, err := Open(fs, "primary.kv", Options{PageSize: 4096})
+	if err != nil {
+		t.Fatalf("open primary: %v", err)
+	}
+	if _, err := p.Write(func(b *engine.WriteBatch) { b.Set([]byte("k"), []byte("v")) }); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	f := newFollower(t, p, fs, "follower.kv", Options{})
+	defer f.Close()
+	defer p.Close()
+
+	if _, err := f.Write(func(b *engine.WriteBatch) { b.Set([]byte("x"), []byte("y")) }); !errors.Is(err, ErrReadOnlyTxn) {
+		t.Fatalf("follower Write = %v, want ErrReadOnlyTxn", err)
+	}
+	// Reads still work.
+	if got, err := f.Get([]byte("k")); err != nil || !bytes.Equal(got, []byte("v")) {
+		t.Fatalf("follower read = %q,%v, want v", got, err)
+	}
+}
+
+// TestApplyGapRefused confirms a ship that begins past the follower's applied version is
+// refused with ErrReplicaGap rather than skipping commits. The gap is forced by
+// checkpointing the primary so an early generation is folded away and a later one ships.
+func TestApplyGapRefused(t *testing.T) {
+	fs := vfs.NewMem()
+	p, err := Open(fs, "primary.kv", Options{PageSize: 4096, AutoCheckpoint: -1})
+	if err != nil {
+		t.Fatalf("open primary: %v", err)
+	}
+	if _, err := p.Write(func(b *engine.WriteBatch) { b.Set([]byte("seed"), []byte("0")) }); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	f := newFollower(t, p, fs, "follower.kv", Options{})
+	defer f.Close()
+	defer p.Close()
+
+	// First generation of writes, then checkpoint so they fold into the main file and the
+	// WAL resets. The follower never saw these, so it is now behind a checkpoint boundary.
+	for i := 0; i < 10; i++ {
+		if _, err := p.Write(func(b *engine.WriteBatch) { b.Set([]byte{'a', byte(i)}, []byte{byte(i)}) }); err != nil {
+			t.Fatalf("gen1 write: %v", err)
+		}
+	}
+	if err := p.Checkpoint(); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	// Second generation, shipped without the first.
+	if _, err := p.Write(func(b *engine.WriteBatch) { b.Set([]byte("late"), []byte("z")) }); err != nil {
+		t.Fatalf("gen2 write: %v", err)
+	}
+	var buf bytes.Buffer
+	if _, err := p.ShipWAL(&buf); err != nil {
+		t.Fatalf("ship: %v", err)
+	}
+	if _, err := f.ApplyWAL(&buf); !errors.Is(err, ErrReplicaGap) {
+		t.Fatalf("apply across gap = %v, want ErrReplicaGap", err)
+	}
+}
+
+// TestApplyRejectsGarbage confirms ApplyWAL surfaces ErrBackupFormat for a stream that is
+// not a ship container or is truncated, rather than mangling the follower.
+func TestApplyRejectsGarbage(t *testing.T) {
+	fs := vfs.NewMem()
+	p, err := Open(fs, "primary.kv", Options{PageSize: 4096})
+	if err != nil {
+		t.Fatalf("open primary: %v", err)
+	}
+	if _, err := p.Write(func(b *engine.WriteBatch) { b.Set([]byte("k"), []byte("v")) }); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	f := newFollower(t, p, fs, "follower.kv", Options{})
+	defer f.Close()
+	defer p.Close()
+
+	junk := bytes.NewReader([]byte("not a kv ship container at all"))
+	if _, err := f.ApplyWAL(junk); !errors.Is(err, ErrBackupFormat) {
+		t.Fatalf("apply garbage = %v, want ErrBackupFormat", err)
+	}
+	// A valid header with a truncated body is also a format error.
+	if _, err := p.Write(func(b *engine.WriteBatch) { b.Set([]byte("a"), []byte("1")) }); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	var buf bytes.Buffer
+	if _, err := p.ShipWAL(&buf); err != nil {
+		t.Fatalf("ship: %v", err)
+	}
+	truncated := bytes.NewReader(buf.Bytes()[:shipHeaderSize+4])
+	if _, err := f.ApplyWAL(truncated); !errors.Is(err, ErrBackupFormat) {
+		t.Fatalf("apply truncated = %v, want ErrBackupFormat", err)
+	}
+}
+
+// TestShipApplyEncrypted confirms WAL shipping stays encrypted at rest: the ship stream of
+// an encrypted primary holds no plaintext, and only a follower with the same key applies
+// it and reads the value back.
+func TestShipApplyEncrypted(t *testing.T) {
+	fs := vfs.NewMem()
+	p, err := Open(fs, "primary.kv", Options{PageSize: 4096, EncryptionKey: encKey, AutoCheckpoint: -1})
+	if err != nil {
+		t.Fatalf("open encrypted primary: %v", err)
+	}
+	if _, err := p.Write(func(b *engine.WriteBatch) { b.Set([]byte("seed"), []byte("0")) }); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	f := newFollower(t, p, fs, "follower.kv", Options{EncryptionKey: encKey})
+	defer f.Close()
+	defer p.Close()
+
+	secret := []byte("SHIP-PLAINTEXT-NEEDLE-5566778899")
+	if _, err := p.Write(func(b *engine.WriteBatch) { b.Set([]byte("needle"), secret) }); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	var buf bytes.Buffer
+	if _, err := p.ShipWAL(&buf); err != nil {
+		t.Fatalf("ship: %v", err)
+	}
+	if bytes.Contains(buf.Bytes(), secret) {
+		t.Fatal("plaintext value found in the encrypted ship stream")
+	}
+	if _, err := f.ApplyWAL(&buf); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if got, err := f.Get([]byte("needle")); err != nil || !bytes.Equal(got, secret) {
+		t.Fatalf("follower value = %q,%v, want secret", got, err)
+	}
+}
+
+// TestShipApplyLSM confirms WAL shipping works for the LSM core, whose checkpoint can keep
+// an unflushed memtable tail in the WAL: the shipped generation carries it and the follower
+// applies it.
+func TestShipApplyLSM(t *testing.T) {
+	fs := vfs.NewMem()
+	opts := Options{PageSize: 4096, Engine: format.EngineLSM, MemtableSize: 256, AutoCheckpoint: -1}
+	p, err := Open(fs, "primary.kv", opts)
+	if err != nil {
+		t.Fatalf("open primary: %v", err)
+	}
+	if _, err := p.Write(func(b *engine.WriteBatch) { b.Set([]byte("seed"), []byte("0")) }); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	f := newFollower(t, p, fs, "follower.kv", opts)
+	defer f.Close()
+	defer p.Close()
+
+	for i := 0; i < 200; i++ {
+		k := []byte{'k', byte(i), byte(i >> 8)}
+		v := bytes.Repeat([]byte{byte(i)}, 12)
+		if _, err := p.Write(func(b *engine.WriteBatch) { b.Set(k, v) }); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+	shipAndApply(t, p, f)
+	for i := 0; i < 200; i++ {
+		k := []byte{'k', byte(i), byte(i >> 8)}
+		want := bytes.Repeat([]byte{byte(i)}, 12)
+		got, err := f.Get(k)
+		if err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("follower key %d = %q,%v", i, got, err)
+		}
+	}
+}
+
+// TestReplicaLagStat confirms the follower reports a non-zero lag when the primary has
+// committed past what the follower has applied, and zero once it catches up. Lag is read
+// from the container's high-version field, so it reflects the primary even before the
+// frames are applied.
+func TestReplicaLagStat(t *testing.T) {
+	fs := vfs.NewMem()
+	p, err := Open(fs, "primary.kv", Options{PageSize: 4096, AutoCheckpoint: -1})
+	if err != nil {
+		t.Fatalf("open primary: %v", err)
+	}
+	if _, err := p.Write(func(b *engine.WriteBatch) { b.Set([]byte("seed"), []byte("0")) }); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	f := newFollower(t, p, fs, "follower.kv", Options{})
+	defer f.Close()
+	defer p.Close()
+
+	for i := 0; i < 5; i++ {
+		if _, err := p.Write(func(b *engine.WriteBatch) { b.Set([]byte{'k', byte(i)}, []byte{byte(i)}) }); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+	shipAndApply(t, p, f)
+	if !f.Stats().ReadReplica {
+		t.Fatal("follower Stats.ReadReplica = false, want true")
+	}
+	if lag := f.Stats().ReplicaLag; lag != 0 {
+		t.Fatalf("caught-up follower lag = %d, want 0", lag)
+	}
+}

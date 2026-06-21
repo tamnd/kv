@@ -56,6 +56,10 @@ var (
 	// ErrBackupFormat means a stream passed to RestoreBackup is not a kv backup container,
 	// is a format version this build does not understand, or is truncated (spec 18 §2).
 	ErrBackupFormat = db.ErrBackupFormat
+	// ErrReplicaGap means a stream passed to ApplyWAL begins past the version the follower
+	// has already applied, so the primary checkpointed away the frames in between; re-seed
+	// the follower from a fresh full Backup before resuming WAL shipping (spec 18 §4).
+	ErrReplicaGap = db.ErrReplicaGap
 )
 
 // wrap maps the internal db/engine sentinels onto the public ones so callers match the

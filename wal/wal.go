@@ -230,6 +230,21 @@ func (w *WAL) SetScheme(s *crypto.Scheme) { w.crypto = s }
 // LSN reports the next LSN that will be assigned.
 func (w *WAL) LSN() uint64 { return w.lsn }
 
+// ResumeFrom raises the next LSN to at least minNext when reopening a generation the
+// last checkpoint left empty. After a checkpoint folds and empties the log, the
+// durable-tail scan finds no frames in the new generation and positions the writer at
+// LSN 1, while the pager's persisted checkpoint marker still sits at the folded LSN.
+// Writing the next frame at LSN 1 would place it at or below that marker, and redo on the
+// following open would skip it as already folded, silently dropping a committed batch.
+// The host calls this with pager.CheckpointLSN()+1 right after Open so the next frame
+// always lands past the marker. It only ever raises the counter, so a generation that
+// already carries post-checkpoint frames keeps the position recovery gave it.
+func (w *WAL) ResumeFrom(minNext uint64) {
+	if minNext > w.lsn {
+		w.lsn = minNext
+	}
+}
+
 // Salt reports the current WAL generation's salt.
 func (w *WAL) Salt() uint64 { return w.salt }
 
