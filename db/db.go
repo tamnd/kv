@@ -15,6 +15,7 @@ package db
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -103,6 +104,17 @@ type Options struct {
 	// space-bound or write-heavy workloads on storage slower than the CPU. The B-tree core
 	// ignores it.
 	Compression bool
+	// Logger is the structured-logging sink for database lifecycle, recovery,
+	// checkpoint, maintenance, the fatal durability fault, and slow operations (spec
+	// 19 §3). Nil, the default, disables logging entirely: no event is formatted and
+	// no clock is read, so a build that does not set it pays nothing. A caller passes a
+	// *slog.Logger to route these events into its own logging.
+	Logger *slog.Logger
+	// SlowOpThreshold arms the slow-op log: a commit or point read that runs at least
+	// this long is logged at WARN with its key range and a phase breakdown (spec 19
+	// §3). Zero, the default, disables it, and the read path skips reading the clock
+	// when it is zero or Logger is nil. It has effect only when Logger is set.
+	SlowOpThreshold time.Duration
 }
 
 func (o Options) maxRetries() int {
@@ -201,6 +213,13 @@ type DB struct {
 	// commits on applyCommitted; it is all atomics, so no lock guards it.
 	counters opCounters
 
+	// logger is the structured-logging sink (spec 19 §3), nil when logging is off. Every
+	// emitter in logging.go guards on nil, so a disabled build formats no events. slowOp
+	// is the slow-op threshold from Options.SlowOpThreshold; the read path times an
+	// operation only when both a logger is set and slowOp is positive.
+	logger *slog.Logger
+	slowOp time.Duration
+
 	// now is the wall-clock source, in Unix nanoseconds, that read resolution compares
 	// a TTL set's absolute expiry against (spec 15 §6). It is the real system clock by
 	// default and an injected clock under test, so expiry is deterministic in tests and
@@ -280,13 +299,14 @@ func create(fs vfs.FS, path string, opts Options) (*DB, error) {
 		return nil, err
 	}
 	d := &DB{fs: fs, path: path, pgr: pgr, wal: w, eng: eng, orc: newOracle(0),
-		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, bufferedInserts: opts.BufferedInserts, compression: opts.Compression, now: opts.clock()}
+		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, bufferedInserts: opts.BufferedInserts, compression: opts.Compression, now: opts.clock(), logger: opts.Logger, slowOp: opts.SlowOpThreshold}
 	if err := d.openEngine(opts.Merge); err != nil {
 		w.Close()
 		pgr.Close()
 		return nil, err
 	}
 	d.startCheckpointer(opts.autoCheckpoint())
+	d.logOpened(0)
 	return d, nil
 }
 
@@ -303,7 +323,7 @@ func openExisting(fs vfs.FS, path string, opts Options) (*DB, error) {
 		return nil, err
 	}
 	d := &DB{fs: fs, path: path, pgr: pgr, eng: eng,
-		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, bufferedInserts: opts.BufferedInserts, compression: opts.Compression, now: opts.clock()}
+		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, bufferedInserts: opts.BufferedInserts, compression: opts.Compression, now: opts.clock(), logger: opts.Logger, slowOp: opts.SlowOpThreshold}
 	if err := d.openEngine(opts.Merge); err != nil {
 		pgr.Close()
 		return nil, err
@@ -324,11 +344,16 @@ func openExisting(fs vfs.FS, path string, opts Options) (*DB, error) {
 			return nil, err
 		}
 		d.wal = w
+		// Count the committed batches recovery is about to replay before redo consumes
+		// them, so the recovery log can report exactly what was replayed and whether a
+		// torn tail was discarded.
+		replayed := len(rec.CommittedAfter(d.pgr.CheckpointLSN()))
 		if maxVer, err = d.redo(rec); err != nil {
 			w.Close()
 			pgr.Close()
 			return nil, err
 		}
+		d.logRecovery(replayed, maxVer, rec.TornTail)
 	} else {
 		w, err := wal.Create(fs, walPath, wal.Options{PageSize: pgr.PageSize(), Sync: opts.sync()})
 		if err != nil {
@@ -352,6 +377,7 @@ func openExisting(fs vfs.FS, path string, opts Options) (*DB, error) {
 	}
 	d.orc = newOracle(last)
 	d.startCheckpointer(opts.autoCheckpoint())
+	d.logOpened(last)
 	return d, nil
 }
 
@@ -621,23 +647,37 @@ func (d *DB) applyCommitted(b *engine.WriteBatch, v uint64) error {
 	// unapplied, exactly the state recovery reconstructs from the durable log.
 	if err := d.wal.LogBatch(v, encoded); err != nil {
 		d.fatal = fmt.Errorf("%w: %v", ErrFatalSync, err)
+		d.logFatal(d.fatal)
 		return d.fatal
 	}
 	commitLSN, err := d.wal.Commit(v)
 	if err != nil {
 		d.fatal = fmt.Errorf("%w: %v", ErrFatalSync, err)
+		d.logFatal(d.fatal)
 		return d.fatal
 	}
 	// The batch is durable: count it and fold in its latency. Only a successful, durable
 	// commit is tallied, so the average latency is over acknowledged commits, never over
 	// the faults that fenced the database above.
+	durable := time.Since(commitStart)
 	d.counters.commits.Add(1)
-	d.counters.commitNanos.Add(uint64(time.Since(commitStart)))
+	d.counters.commitNanos.Add(uint64(durable))
 	// Tell an LSN-tracking engine (the LSM core) the batch's WAL position before
 	// applying it, so its durable mark can later report how far a flush has reached.
 	d.noteLSN(commitLSN)
+	applyStart := time.Now()
 	if err := d.eng.Apply(b, v); err != nil {
 		return err
+	}
+	// Slow-op log (spec 19 §3): if the commit ran past the threshold, name it with a
+	// durable/apply phase split so an operator can tell fsync cost from engine cost. The
+	// timing is read only when the slow-op log is armed, so a database with no logger
+	// pays nothing here.
+	if d.slowOpEnabled() {
+		apply := time.Since(applyStart)
+		if total := durable + apply; total >= d.slowOp {
+			d.logSlowCommit(b, v, durable, apply, total)
+		}
 	}
 	d.pgr.Header().LastCommitVersion = v
 	d.maybeCheckpoint()
@@ -724,7 +764,11 @@ func (d *DB) Maintain(maxPages int) (engine.MaintReport, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	budget := engine.MaintBudget{MaxPages: maxPages, Watermark: d.orc.readMark(), Now: d.now()}
-	return d.eng.Maintain(context.Background(), budget)
+	rep, err := d.eng.Maintain(context.Background(), budget)
+	if err == nil {
+		d.logMaintain(rep)
+	}
+	return rep, err
 }
 
 // Verify runs the engine's structural self-check and returns its report (spec 16 §4,
@@ -1020,6 +1064,7 @@ func (d *DB) checkpointLocked() error {
 	if err := d.pgr.Checkpoint(foldedLSN); err != nil {
 		return err
 	}
+	d.logCheckpoint(foldedLSN, d.orc.lastCommitted(), resetWAL)
 	if resetWAL {
 		return d.wal.Checkpointed(foldedLSN)
 	}
@@ -1131,6 +1176,7 @@ func (d *DB) Close() error {
 		}
 		d.subsMu.Unlock()
 		bgErr = d.backgroundErr()
+		d.logClosed()
 	})
 
 	d.mu.Lock()
