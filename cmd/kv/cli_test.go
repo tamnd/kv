@@ -155,6 +155,39 @@ func TestCLIScanReverseKeysOnly(t *testing.T) {
 	}
 }
 
+func TestCLIBackupRestoreRoundTrip(t *testing.T) {
+	src := dbPath(t)
+	run([]string{"set", src, "k1", "v1"})
+	run([]string{"set", src, "k2", "v2"})
+
+	backupFile := filepath.Join(t.TempDir(), "snap.kvbak")
+	if code := run([]string{"backup", src, "--output", backupFile}); code != exitOK {
+		t.Fatalf("backup: exit %d", code)
+	}
+
+	dst := filepath.Join(t.TempDir(), "dst.kv")
+	if code := run([]string{"restore", dst, "--input", backupFile}); code != exitOK {
+		t.Fatalf("restore: exit %d", code)
+	}
+	// Restore must refuse to clobber an existing file.
+	if code := run([]string{"restore", dst, "--input", backupFile}); code == exitOK {
+		t.Fatal("restore over existing file should not exit 0")
+	}
+
+	out := capture(t, func() { run([]string{"scan", dst, "-f", "jsonl"}) })
+	var got []string
+	sc := bufio.NewScanner(strings.NewReader(out))
+	for sc.Scan() {
+		var r record
+		json.Unmarshal(sc.Bytes(), &r)
+		got = append(got, r.Key+"="+r.Value)
+	}
+	sort.Strings(got)
+	if strings.Join(got, ",") != "k1=v1,k2=v2" {
+		t.Fatalf("restored = %v, want [k1=v1 k2=v2]", got)
+	}
+}
+
 func TestCLIDumpLoadRoundTrip(t *testing.T) {
 	src := dbPath(t)
 	run([]string{"set", src, "k1", "v1"})

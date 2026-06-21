@@ -53,6 +53,9 @@ var (
 	// ErrNotEncrypted means a key rotation was requested on a database that was not created
 	// with an encryption key, so there is no key to rotate (spec 14 §5).
 	ErrNotEncrypted = db.ErrNotEncrypted
+	// ErrBackupFormat means a stream passed to RestoreBackup is not a kv backup container,
+	// is a format version this build does not understand, or is truncated (spec 18 §2).
+	ErrBackupFormat = db.ErrBackupFormat
 )
 
 // wrap maps the internal db/engine sentinels onto the public ones so callers match the
