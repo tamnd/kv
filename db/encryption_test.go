@@ -10,6 +10,7 @@ import (
 	"github.com/tamnd/kv/format"
 	"github.com/tamnd/kv/pager"
 	"github.com/tamnd/kv/vfs"
+	"github.com/tamnd/kv/wal"
 )
 
 // encKey is a fixed 32-byte raw master key for the encryption tests.
@@ -233,6 +234,81 @@ func TestEncryptionKeyOnPlaintextRejected(t *testing.T) {
 	if _, err := Open(fs, "test.kv", Options{EncryptionKey: encKey}); !errors.Is(err, ErrKeyOnPlaintext) {
 		t.Fatalf("open plaintext with key = %v, want ErrKeyOnPlaintext", err)
 	}
+}
+
+// TestEncryptionWALRecovery confirms a committed-but-uncheckpointed encrypted write survives
+// a crash: the data lives only in the WAL when the process dies, so recovery has to decrypt
+// the log frames to redo it. It writes every key as its own SyncFull commit with checkpointing
+// disabled, abandons the handle, reverts the filesystem to its durable image, then reopens with
+// the key and reads every value back.
+func TestEncryptionWALRecovery(t *testing.T) {
+	fs := vfs.NewMem()
+	d, err := Open(fs, "test.kv", Options{PageSize: 4096, Sync: wal.SyncFull, AutoCheckpoint: -1, EncryptionKey: encKey})
+	if err != nil {
+		t.Fatalf("create encrypted: %v", err)
+	}
+	const n = 40
+	for i := 0; i < n; i++ {
+		k := []byte{'k', byte(i)}
+		v := []byte{'v', byte(i), byte(i)}
+		if _, err := d.Write(func(b *engine.WriteBatch) { b.Set(k, v) }); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+	// No checkpoint and no Close: the committed data lives entirely in the encrypted WAL.
+	fs.Crash()
+
+	d2, err := Open(fs, "test.kv", Options{Sync: wal.SyncFull, AutoCheckpoint: -1, EncryptionKey: encKey})
+	if err != nil {
+		t.Fatalf("reopen after crash with key: %v", err)
+	}
+	defer d2.Close()
+	for i := 0; i < n; i++ {
+		k := []byte{'k', byte(i)}
+		want := []byte{'v', byte(i), byte(i)}
+		got, err := d2.Get(k)
+		if err != nil {
+			t.Fatalf("get %d after recovery: %v", i, err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("get %d after recovery = %q, want %q", i, got, want)
+		}
+	}
+}
+
+// TestEncryptionWALCiphertextOnDisk confirms a distinctive value committed to an encrypted
+// database but not yet checkpointed does not appear in the clear in the WAL sidecar, while the
+// same value does in an unencrypted control. This pins the slice-2 guarantee that the log, not
+// just the main file, is sealed.
+func TestEncryptionWALCiphertextOnDisk(t *testing.T) {
+	secret := []byte("TOP-SECRET-WAL-NEEDLE-0987654321")
+
+	fs := vfs.NewMem()
+	d, err := Open(fs, "enc.kv", Options{PageSize: 4096, Sync: wal.SyncFull, AutoCheckpoint: -1, EncryptionKey: encKey})
+	if err != nil {
+		t.Fatalf("create encrypted: %v", err)
+	}
+	if _, err := d.Write(func(b *engine.WriteBatch) { b.Set([]byte("needle"), secret) }); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	// Deliberately no checkpoint: the value is in the WAL, not the main file.
+	if raw := readWholeFile(t, fs, "enc.kv-wal"); bytes.Contains(raw, secret) {
+		t.Fatal("plaintext value found in the encrypted WAL")
+	}
+	_ = d.Close()
+
+	fs2 := vfs.NewMem()
+	p, err := Open(fs2, "plain.kv", Options{PageSize: 4096, Sync: wal.SyncFull, AutoCheckpoint: -1})
+	if err != nil {
+		t.Fatalf("create plain: %v", err)
+	}
+	if _, err := p.Write(func(b *engine.WriteBatch) { b.Set([]byte("needle"), secret) }); err != nil {
+		t.Fatalf("write plain: %v", err)
+	}
+	if raw := readWholeFile(t, fs2, "plain.kv-wal"); !bytes.Contains(raw, secret) {
+		t.Fatal("sanity check failed: value not found in the unencrypted WAL")
+	}
+	_ = p.Close()
 }
 
 // TestEncryptionShortKeyRejected confirms a key that is not 32 bytes is refused at create.

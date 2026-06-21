@@ -138,6 +138,70 @@ func (s *Scheme) pageGCM(pageNo uint32) (cipher.AEAD, error) {
 	return cipher.NewGCM(block)
 }
 
+// walGCM derives the per-frame key for a WAL frame at lsn from the epoch DEK and returns
+// an AES-256-GCM AEAD over it. WAL frames live in a key namespace distinct from main-file
+// pages (the info label differs), so a frame key and a page key never coincide even at the
+// same numeric index, and the full 64-bit LSN keys the derivation so every frame in a
+// generation has its own key (spec 14 §3).
+func (s *Scheme) walGCM(lsn uint64) (cipher.AEAD, error) {
+	info := make([]byte, len("kv/wal")+8)
+	copy(info, "kv/wal")
+	binary.BigEndian.PutUint64(info[len("kv/wal"):], lsn)
+	frameKey := hkdf(nil, s.dek, info, keySize)
+	block, err := aes.NewCipher(frameKey)
+	if err != nil {
+		return nil, err
+	}
+	return cipher.NewGCM(block)
+}
+
+// walAAD binds a WAL frame envelope to its LSN and key epoch as additional authenticated
+// data, so a frame cannot be reordered to a different LSN or replayed from another epoch
+// without failing authentication (spec 14 §3).
+func walAAD(lsn uint64, epoch uint32) []byte {
+	aad := make([]byte, 12)
+	binary.BigEndian.PutUint64(aad[0:8], lsn)
+	binary.BigEndian.PutUint32(aad[8:12], epoch)
+	return aad
+}
+
+// SealWAL encrypts a WAL frame payload for lsn and returns the on-disk envelope
+// (ciphertext, tag, nonce), len(plaintext)+Overhead bytes, with the same layout SealPage
+// uses. The nonce is fresh per call. dst backs the result if it has the capacity.
+func (s *Scheme) SealWAL(dst, plaintext []byte, lsn uint64) ([]byte, error) {
+	aead, err := s.walGCM(lsn)
+	if err != nil {
+		return nil, err
+	}
+	nonce := make([]byte, nonceSize)
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, err
+	}
+	out := aead.Seal(dst[:0], nonce, plaintext, walAAD(lsn, s.epoch))
+	out = append(out, nonce...)
+	return out, nil
+}
+
+// OpenWAL decrypts a WAL frame envelope for lsn, returning the plaintext payload. A failed
+// authentication (a wrong key or a tampered frame) is reported as ErrWrongKey. dst backs
+// the plaintext if it has the capacity.
+func (s *Scheme) OpenWAL(dst, env []byte, lsn uint64) ([]byte, error) {
+	if len(env) < Overhead {
+		return nil, ErrWrongKey
+	}
+	aead, err := s.walGCM(lsn)
+	if err != nil {
+		return nil, err
+	}
+	ctTag := env[:len(env)-nonceSize]
+	nonce := env[len(env)-nonceSize:]
+	pt, err := aead.Open(dst[:0], nonce, ctTag, walAAD(lsn, s.epoch))
+	if err != nil {
+		return nil, ErrWrongKey
+	}
+	return pt, nil
+}
+
 // pageAAD binds a page envelope to its page number and key epoch as additional
 // authenticated data, so a ciphertext page cannot be silently relocated to another page
 // number or replayed from another epoch without failing authentication (spec 14 §3).

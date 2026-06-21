@@ -17,6 +17,7 @@ package wal
 import (
 	"encoding/binary"
 
+	"github.com/tamnd/kv/crypto"
 	"github.com/tamnd/kv/format"
 	"github.com/tamnd/kv/vfs"
 )
@@ -91,6 +92,8 @@ type WAL struct {
 	grew    bool   // whether the file has grown since the last sync (for SyncExtra)
 	batchN  uint32 // frames appended in the open (uncommitted) batch
 	syncs   uint64 // count of fsyncs performed, for observability
+
+	crypto *crypto.Scheme // encrypts kv-batch payloads when set; nil for a cleartext log
 }
 
 // Options configure a WAL at create/open.
@@ -100,6 +103,13 @@ type Options struct {
 	// Salt seeds the initial WAL generation. Recovery rotates it at each
 	// checkpoint; a caller may pass a fixed value for deterministic tests.
 	Salt uint64
+	// Encryption, when non-nil, encrypts each kv-batch frame's payload before it is
+	// written and decrypts it during recovery (spec 14). Frame headers, commit frames,
+	// and checkpoint frames stay in the clear so the durable-tail scan can chain and
+	// parse the log without the key; only the serialized batch, which carries user keys
+	// and values, is sealed. The chained checksum covers the ciphertext, so torn-tail
+	// detection is unchanged.
+	Encryption *crypto.Scheme
 }
 
 // Create initializes a fresh -wal file and returns an open WAL positioned to
@@ -118,6 +128,7 @@ func Create(fs vfs.FS, path string, opts Options) (*WAL, error) {
 		salt:     opts.Salt,
 		lsn:      1,
 		tailOff:  headerSize,
+		crypto:   opts.Encryption,
 	}
 	if err := w.writeHeader(); err != nil {
 		f.Close()
@@ -155,6 +166,20 @@ func Open(fs vfs.FS, path string, opts Options) (*WAL, RecoverResult, error) {
 		f.Close()
 		return nil, RecoverResult{}, err
 	}
+	// Decrypt the recovered kv-batch payloads now that the durable-tail scan has
+	// verified each frame's chained checksum over its ciphertext. Each batch was sealed
+	// under its own LSN, so it opens under the same LSN; a wrong key or a tampered frame
+	// surfaces here as crypto.ErrWrongKey before any batch reaches redo.
+	if opts.Encryption != nil {
+		for i := range res.Batches {
+			pt, derr := opts.Encryption.OpenWAL(nil, res.Batches[i].Encoded, res.Batches[i].LSN)
+			if derr != nil {
+				f.Close()
+				return nil, RecoverResult{}, derr
+			}
+			res.Batches[i].Encoded = pt
+		}
+	}
 	w := &WAL{
 		fs:       fs,
 		file:     f,
@@ -165,6 +190,7 @@ func Open(fs vfs.FS, path string, opts Options) (*WAL, RecoverResult, error) {
 		lsn:      res.DurableLSN + 1,
 		lastSum:  res.DurableSum,
 		tailOff:  res.DurableEndOff,
+		crypto:   opts.Encryption,
 	}
 	return w, res, nil
 }
@@ -244,6 +270,16 @@ func chain(prev uint64, headerSansSum, payload []byte) uint64 {
 // LogBatch appends a kv-batch frame carrying the serialized batch. It does not
 // commit; call Commit to make the batch durable and atomic.
 func (w *WAL) LogBatch(version uint64, encoded []byte) error {
+	if w.crypto != nil {
+		// Seal under the LSN this frame will take. appendFrame writes w.lsn into the
+		// frame header and increments it, so sealing with the current w.lsn binds the
+		// ciphertext to the same LSN recovery will open it under.
+		sealed, err := w.crypto.SealWAL(nil, encoded, w.lsn)
+		if err != nil {
+			return err
+		}
+		encoded = sealed
+	}
 	if err := w.appendFrame(FrameKVBatch, version, encoded); err != nil {
 		return err
 	}

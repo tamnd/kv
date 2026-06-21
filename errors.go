@@ -3,8 +3,10 @@ package kv
 import (
 	"errors"
 
+	"github.com/tamnd/kv/crypto"
 	"github.com/tamnd/kv/db"
 	"github.com/tamnd/kv/engine"
+	"github.com/tamnd/kv/pager"
 )
 
 // The typed error set callers branch on with errors.Is (spec 15 §9). They are the
@@ -39,6 +41,15 @@ var (
 	// ErrSubscriberLagged means a Subscribe callback fell too far behind the commit
 	// stream and was dropped to avoid stalling writers (spec 15 §7).
 	ErrSubscriberLagged = db.ErrSubscriberLagged
+	// ErrWrongKey means the supplied encryption key failed to authenticate against the
+	// file: a wrong key, or a corrupt or tampered descriptor (spec 14, WithEncryptionKey).
+	ErrWrongKey = crypto.ErrWrongKey
+	// ErrEncryptionKeyRequired means the file is encrypted but Open was called without
+	// WithEncryptionKey (spec 14).
+	ErrEncryptionKeyRequired = pager.ErrKeyRequired
+	// ErrKeyOnPlaintext means WithEncryptionKey was supplied for a file that was created
+	// unencrypted, so the key does not belong to it (spec 14).
+	ErrKeyOnPlaintext = db.ErrKeyOnPlaintext
 )
 
 // wrap maps the internal db/engine sentinels onto the public ones so callers match the

@@ -305,7 +305,7 @@ func create(fs vfs.FS, path string, opts Options) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	w, err := wal.Create(fs, path+walSuffix, wal.Options{PageSize: pgr.PageSize(), Sync: opts.sync()})
+	w, err := wal.Create(fs, path+walSuffix, wal.Options{PageSize: pgr.PageSize(), Sync: opts.sync(), Encryption: enc})
 	if err != nil {
 		pgr.Close()
 		return nil, err
@@ -360,7 +360,7 @@ func openExisting(fs vfs.FS, path string, opts Options) (*DB, error) {
 	}
 	var maxVer uint64
 	if walExists {
-		w, rec, err := wal.Open(fs, walPath, wal.Options{PageSize: pgr.PageSize(), Sync: opts.sync()})
+		w, rec, err := wal.Open(fs, walPath, wal.Options{PageSize: pgr.PageSize(), Sync: opts.sync(), Encryption: enc})
 		if err != nil {
 			pgr.Close()
 			return nil, err
@@ -377,7 +377,7 @@ func openExisting(fs vfs.FS, path string, opts Options) (*DB, error) {
 		}
 		d.logRecovery(replayed, maxVer, rec.TornTail)
 	} else {
-		w, err := wal.Create(fs, walPath, wal.Options{PageSize: pgr.PageSize(), Sync: opts.sync()})
+		w, err := wal.Create(fs, walPath, wal.Options{PageSize: pgr.PageSize(), Sync: opts.sync(), Encryption: enc})
 		if err != nil {
 			pgr.Close()
 			return nil, err
