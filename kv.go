@@ -150,6 +150,19 @@ func WithSlowOpThreshold(d time.Duration) Option {
 	return func(c *config) { c.opts.SlowOpThreshold = d }
 }
 
+// WithEncryptionKey encrypts the database at rest under a 32-byte master key (spec 14).
+// Every data page and every write-ahead-log batch payload is sealed with AES-256-GCM and
+// authenticated before it reaches the disk, so a wrong key or a tampered file fails cleanly
+// with ErrWrongKey rather than serving garbage. Encryption is fixed at create time: a file
+// created with a key is encrypted for its lifetime and must be opened with the same key,
+// opening an encrypted file without the key is refused, and offering a key to a file that
+// was created unencrypted is refused too. The key must be exactly 32 bytes; a passphrase
+// KDF arrives in a later slice, so for now derive the 32 bytes yourself, from a KMS or your
+// own stretching, and pass them here.
+func WithEncryptionKey(key []byte) Option {
+	return func(c *config) { c.opts.EncryptionKey = key }
+}
+
 // WithMergeOperator registers the associative merge operator Txn.Merge folds operands
 // through (spec 15 §5). The name identifies the operator's semantics; operator-name
 // persistence in the header is a later slice, so today the function must be re-supplied
