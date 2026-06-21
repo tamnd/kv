@@ -22,14 +22,16 @@ import (
 // a page is no problem. This is also what lifts the old inline-cell ceiling: a value
 // too large to fit a segment cell is no longer rejected, it is separated here.
 //
-// The append cursor is in-memory only. A pointer names an absolute page and offset, so
-// it resolves after a reopen without any cursor state: the pages it references are
-// allocated (never on the freelist) and folded by the checkpoint, so they survive a
-// restart, and a read just follows the chain from the page the pointer names. A fresh
-// open starts a new tail page and leaves the old chain in place for its pointers to
-// keep resolving. Reclaiming the space dead values leave behind is the value-log GC,
-// a later slice; until it lands a superseded value's bytes linger in the vLog the way a
-// superseded segment's pages linger until compaction.
+// A pointer names an absolute page and offset, so it resolves after a reopen without any
+// cursor state: the pages it references are allocated (never on the freelist) and folded
+// by the checkpoint, so they survive a restart, and a read just follows the chain from
+// the page the pointer names. The append cursor, where the next value lands, is not in
+// the pointer and so must be rebuilt on open: the head of the chain is recorded in the
+// MANIFEST (the manifestVLogHead edit), and Open walks from it to the tail to restore the
+// cursor, so a reopen keeps appending into the same chain instead of orphaning the old
+// one. The whole log is therefore one overflow-linked chain walkable from a single head,
+// which is what lets the garbage collector enumerate every vLog page and reclaim the dead
+// ones (vloggc.go).
 
 // vlog is the append cursor and reader for the value log. It is owned by the LSM and
 // guarded by the LSM's lock: appends happen under the write lock during a flush, reads
@@ -37,6 +39,7 @@ import (
 type vlog struct {
 	pgr    *pager.Pager
 	usable int           // bytes of a page that carry content, after the reserved tail
+	head   format.PageNo // the oldest page, start of the chain, NoPage when the log is empty
 	tail   format.PageNo // the page appends land on, NoPage before the first append
 	buf    []byte        // the tail page's working image, kept resident between appends
 	used   int           // body bytes written on the tail page so far
@@ -48,6 +51,7 @@ func newVLog(pgr *pager.Pager) *vlog {
 	return &vlog{
 		pgr:    pgr,
 		usable: pgr.Header().UsablePageSize(),
+		head:   format.NoPage,
 		tail:   format.NoPage,
 	}
 }
@@ -107,6 +111,7 @@ func (v *vlog) ensureTail() error {
 	}
 	v.pgr.Unpin(fr, false)
 	v.tail = format.PageNo(pgno)
+	v.head = format.PageNo(pgno) // the first page allocated is also the head of the chain
 	v.buf = make([]byte, v.usable)
 	v.used = 0
 	return nil
@@ -158,6 +163,109 @@ func (v *vlog) sync() error {
 		return nil
 	}
 	return v.writeTail(format.NoPage)
+}
+
+// restore rebuilds the append cursor from a head page recorded in the MANIFEST. It
+// walks the chain to its tail (the page whose overflow is NoPage), loads that page into
+// the resident buffer, and recovers how far it is filled from its cell count, so the
+// next append continues into the same chain instead of starting a fresh one and
+// orphaning the old pages. It runs at Open, before any redo flush. The caller holds the
+// LSM write lock.
+func (v *vlog) restore(head format.PageNo) error {
+	v.head = head
+	chain, err := v.walkChain()
+	if err != nil {
+		return err
+	}
+	if len(chain) == 0 {
+		v.head = format.NoPage
+		return nil
+	}
+	tail := chain[len(chain)-1]
+	fr, err := v.pgr.Get(uint32(tail), pager.Read)
+	if err != nil {
+		return err
+	}
+	data := fr.Data()
+	h := format.DecodeCommonHeader(data)
+	v.tail = tail
+	v.used = int(h.CellCount)
+	v.buf = make([]byte, v.usable)
+	copy(v.buf, data[:v.usable])
+	v.pgr.Unpin(fr, false)
+	return nil
+}
+
+// walkChain returns every page of the value log in chain order, head first and tail
+// last, following the common header's overflow slot. It is how the garbage collector
+// enumerates the log and how restore finds the tail. A log with no head yields nothing.
+// The caller holds the LSM lock.
+func (v *vlog) walkChain() ([]format.PageNo, error) {
+	var chain []format.PageNo
+	for pgno := v.head; pgno != format.NoPage; {
+		fr, err := v.pgr.Get(uint32(pgno), pager.Read)
+		if err != nil {
+			return nil, err
+		}
+		data := fr.Data()
+		h := format.DecodeCommonHeader(data)
+		if h.Type != format.PageVLog {
+			v.pgr.Unpin(fr, false)
+			return nil, fmt.Errorf("lsm: page %d in the value-log chain is not a vLog page", pgno)
+		}
+		next := h.Overflow
+		v.pgr.Unpin(fr, false)
+		chain = append(chain, pgno)
+		pgno = next
+	}
+	return chain, nil
+}
+
+// relink rewrites the overflow links of a run of surviving pages so each points at the
+// next, leaving the value log one walkable chain again after the garbage collector has
+// freed the dead pages between them. The last page (the tail) is left untouched, since
+// its overflow is already NoPage and its resident image must not be disturbed. A link
+// already correct is not rewritten, so a sweep that frees nothing dirties nothing. The
+// caller holds the LSM write lock.
+func (v *vlog) relink(survivors []format.PageNo) error {
+	for i := 0; i+1 < len(survivors); i++ {
+		if err := v.setOverflow(survivors[i], survivors[i+1]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// setOverflow points one page's overflow slot at next, preserving the rest of its
+// header. It no-ops when the link is already correct.
+func (v *vlog) setOverflow(pgno, next format.PageNo) error {
+	fr, err := v.pgr.Get(uint32(pgno), pager.Write)
+	if err != nil {
+		return err
+	}
+	data := fr.Data()
+	h := format.DecodeCommonHeader(data)
+	if h.Overflow == next {
+		v.pgr.Unpin(fr, false)
+		return nil
+	}
+	h.Overflow = next
+	h.Encode(data)
+	v.pgr.Unpin(fr, true)
+	return nil
+}
+
+// spanPages reports how many pages a value of the given length occupies when it starts
+// at offset within a page body, the page count the garbage collector marks live for a
+// pointer. The first page carries up to bodyCap-offset bytes and each page after carries
+// up to bodyCap, so the count follows from the bytes that spill past the first page.
+func (v *vlog) spanPages(offset, length int) int {
+	firstRoom := v.bodyCap() - offset
+	if length <= firstRoom {
+		return 1
+	}
+	rest := length - firstRoom
+	return 1 + (rest+v.bodyCap()-1)/v.bodyCap()
 }
 
 // read returns the value the pointer names, following the page chain from the pointer's

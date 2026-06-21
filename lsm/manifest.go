@@ -41,6 +41,12 @@ const (
 	// when it retires an input run. No writer emits one yet; the replay honors it so
 	// the format need not change when compaction lands.
 	manifestRemove byte = 2
+	// manifestVLogHead records the head page of the value-log chain (spec 06 §7). It is
+	// not a segment edit: its footer field carries the head page number, its level is
+	// unused, and the replay keeps the latest one so Open can walk the chain from it to
+	// rebuild the append cursor. A flush emits one when it allocates the log's first page,
+	// the garbage collector when it frees the old head and re-roots the chain.
+	manifestVLogHead byte = 3
 )
 
 // manifestEntriesPerPage reports how many edits fit on a page of the given usable
@@ -139,6 +145,7 @@ func (l *LSM) loadManifestLocked() error {
 	var order []format.PageNo
 	at := make(map[format.PageNo]int)      // footer -> 1-based slot in order, 0 when absent
 	level := make(map[format.PageNo]uint8) // footer -> current level, for live footers
+	vlogHead := format.NoPage              // latest recorded value-log head, NoPage when none
 	for i := len(pages) - 1; i >= 0; i-- {
 		for _, e := range pages[i] {
 			switch e.tag {
@@ -154,6 +161,11 @@ func (l *LSM) loadManifestLocked() error {
 					at[e.footer] = 0
 					delete(level, e.footer)
 				}
+			case manifestVLogHead:
+				// Not a segment edit: the footer field carries the head page. The latest
+				// one wins, so a GC that re-rooted the chain supersedes the flush that first
+				// recorded it.
+				vlogHead = e.footer
 			default:
 				return fmt.Errorf("lsm: unknown MANIFEST edit tag %d", e.tag)
 			}
@@ -169,6 +181,16 @@ func (l *LSM) loadManifestLocked() error {
 			return err
 		}
 		l.addSegmentLocked(int(level[footer]), seg)
+	}
+
+	// Rebuild the value-log append cursor from the recorded head, so a reopen keeps
+	// appending into the existing chain and the GC can walk it. A NoPage head means no
+	// value was ever separated, so the log stays empty.
+	if vlogHead != format.NoPage {
+		if err := l.vlog.restore(vlogHead); err != nil {
+			return err
+		}
+		l.vlogHeadRecorded = l.vlog.head
 	}
 	return nil
 }
