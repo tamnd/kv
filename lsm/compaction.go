@@ -17,25 +17,31 @@ import (
 // can still see and the tombstones nothing lives under, and frees the inputs' pages.
 //
 // The on-disk tree is a stack of levels. L0 receives flushed memtables and its segments
-// may overlap in key range. L1 and below hold key-range-disjoint segments sorted by
-// their first key, the classic leveled invariant, so each such level is one sorted run
-// split into several size-bounded pieces. Each level targets a size a fixed ratio T
-// larger than the one above it; a level over its target is a compaction candidate.
+// may overlap in key range. The middle levels are leveled: each holds key-range-disjoint
+// segments sorted by their first key, so the level is one sorted run split into several
+// size-bounded pieces. Each level targets a size a fixed ratio T larger than the one
+// above it; a level over its target is a compaction candidate.
 //
-// One Maintain call runs one compaction unit: pick the level most over target, take a
-// bounded input set from it (all of L0, or one segment of a deeper level) plus the
-// segments it overlaps in the level below, merge them with the shared streaming merge,
-// and write the survivors back as one or more size-bounded segments in the lower level.
-// Cutting the output at segTargetBytes is what makes the policy incremental: a level
-// holds several runs, so the next compaction touches only the overlapping subset rather
-// than rewriting the whole level. Version GC rides the merge, anchored on the host's
-// watermark (spec 10 §6); at the deepest level, where nothing lives below, point
-// tombstones at or below the watermark are dropped outright.
+// The largest (deepest) populated level is tiered, not leveled, the Dostoevsky
+// lazy-leveling shape (spec 06 §6). Most of the data lives at the bottom, and keeping it
+// as one perfectly sorted run is what costs the most write amplification: every
+// compaction into it would rewrite a slice of the whole keyspace. So a compaction into
+// the bottom adds its output as another run beside the runs already there rather than
+// merging into them, and the bottom self-merges only when it has stacked up tierFanout
+// runs over some region. That trades a little read and space cost at the cold bottom for
+// a factor of tierFanout fewer rewrites of it.
 //
-// This slice runs leveled compaction at every level. The lazy-leveling refinement
-// (tiered at the largest level) and the Monkey per-level filter tuning are later slices
-// built on this structure; the level machinery and the budgeted picker are what this
-// slice puts in place.
+// One Maintain call runs one compaction unit. The picker scores every level and runs the
+// most urgent of three actions: push one run from a leveled level (all of L0, or one
+// segment deeper) down into the level below, merging with the segments it overlaps there;
+// self-merge the tiered bottom when its runs have stacked too deep, folding them back to
+// one disjoint run; or descend the tiered bottom when it has outgrown its size target,
+// moving the whole level down a step so a new tiered bottom forms beneath the leveled
+// levels above. Cutting output at segTargetBytes keeps a leveled level several runs, so a
+// push-down touches only the overlapping subset. Version GC rides every merge, anchored
+// on the host's watermark (spec 10 §6); a point tombstone is dropped outright only in a
+// self-merge of the bottom, where every run is an input and nothing lives below for it to
+// shadow.
 
 const (
 	// defaultL0Trigger is the L0 segment count at or above which L0 is a compaction
@@ -49,6 +55,9 @@ const (
 	// defaultSegTargetBytes is the size a compaction output segment is cut at, so a
 	// level is several runs and a compaction touches only the overlapping ones.
 	defaultSegTargetBytes = 2 << 20 // 2 MiB
+	// defaultTierFanout is the run overlap the tiered bottom level accumulates over a
+	// region before it self-merges, the bottom-level analog of the level ratio.
+	defaultTierFanout = 10
 )
 
 // allSegmentsLocked returns every segment across every level, the flat view the read
@@ -140,6 +149,63 @@ func (l *LSM) hasSegmentsBelowLocked(level int) bool {
 	return false
 }
 
+// isTieredLocked reports whether a level is the tiered bottom: the deepest level that
+// still holds a segment. That level accumulates runs instead of merging into one, while
+// every level above it stays leveled. The caller holds l.mu.
+func (l *LSM) isTieredLocked(level int) bool {
+	if level < 1 || level >= len(l.levels) || len(l.levels[level]) == 0 {
+		return false
+	}
+	return !l.hasSegmentsBelowLocked(level)
+}
+
+// maxOverlapLocked returns the largest number of segments in a level that cover a single
+// user key, the run depth of a tiered level. A single disjoint run reports 1 however many
+// pieces it is cut into, and K runs stacked over the same region report K, so it is the
+// metric the tiered bottom self-merges on. It is computed by a sweep over the segments'
+// closed key ranges, which already live in their footers, so it needs no extra state and
+// recomputes correctly after a reopen. The caller holds l.mu.
+func (l *LSM) maxOverlapLocked(level int) int {
+	if level < 0 || level >= len(l.levels) {
+		return 0
+	}
+	segs := l.levels[level]
+	if len(segs) < 2 {
+		return len(segs)
+	}
+	type event struct {
+		key  []byte
+		open bool
+	}
+	evs := make([]event, 0, len(segs)*2)
+	for _, s := range segs {
+		if s.minKey == nil {
+			continue
+		}
+		evs = append(evs, event{s.minKey, true}, event{s.maxKey, false})
+	}
+	sort.Slice(evs, func(i, j int) bool {
+		if c := format.CompareUser(evs[i].key, evs[j].key); c != 0 {
+			return c < 0
+		}
+		// At an equal key an open sorts before a close, so two runs that touch at a
+		// boundary count as overlapping there (the ranges are closed).
+		return evs[i].open && !evs[j].open
+	})
+	cur, mx := 0, 0
+	for _, e := range evs {
+		if e.open {
+			cur++
+			if cur > mx {
+				mx = cur
+			}
+		} else {
+			cur--
+		}
+	}
+	return mx
+}
+
 // overlappingLocked returns the segments in a level whose key range intersects the
 // half-closed user-key span [lo, hi]. The caller holds l.mu.
 func (l *LSM) overlappingLocked(level int, lo, hi []byte) []*segment {
@@ -180,33 +246,73 @@ func (l *LSM) pickSegmentLocked(level int) *segment {
 	return pick
 }
 
-// pickCompactionLocked scores every level against its target and returns the level most
-// over it, or ok=false when no level needs compaction. L0 scores on segment count
-// against its trigger; deeper levels score on bytes against their size target. Both
-// scores are normalized so 1.0 means at target, so the larger score is the more urgent
-// level regardless of which metric it uses. The caller holds l.mu.
-func (l *LSM) pickCompactionLocked() (int, bool) {
-	best := -1
+// compactionKind names the action the picker chose for a Maintain call.
+type compactionKind int
+
+const (
+	// compactNone means no level needs work.
+	compactNone compactionKind = iota
+	// compactPushDown merges one run from a level down into the level below it.
+	compactPushDown
+	// compactSelfMerge folds the tiered bottom's stacked runs back into one disjoint run.
+	compactSelfMerge
+)
+
+// compaction is the picker's decision for one Maintain call: which action to run and at
+// which source level. wholeLevel says the input is the whole level (all of L0, or the
+// tiered bottom descending) rather than one picked segment.
+type compaction struct {
+	kind       compactionKind
+	level      int
+	wholeLevel bool
+}
+
+// pickCompactionLocked scores every level and returns the most urgent action, or a zero
+// compaction when nothing needs work. L0 scores on segment count against its trigger and
+// pushes down. A leveled middle level scores on bytes against its size target and pushes
+// one run down. The tiered bottom self-merges when its run overlap reaches tierFanout,
+// and otherwise descends when it has outgrown its size target. Scores are normalized so
+// 1.0 means at threshold, so the larger score is the more urgent action whatever metric
+// it came from. The caller holds l.mu.
+func (l *LSM) pickCompactionLocked() compaction {
+	best := compaction{kind: compactNone}
 	var bestScore float64
+	consider := func(c compaction, score float64) {
+		if score > bestScore {
+			best, bestScore = c, score
+		}
+	}
 	if len(l.levels) > 0 && len(l.levels[0]) >= l.l0Trigger {
-		best = 0
-		bestScore = float64(len(l.levels[0])) / float64(l.l0Trigger)
+		consider(compaction{kind: compactPushDown, level: 0, wholeLevel: true},
+			float64(len(l.levels[0]))/float64(l.l0Trigger))
 	}
 	for i := 1; i < len(l.levels); i++ {
 		if len(l.levels[i]) == 0 {
+			continue
+		}
+		if l.isTieredLocked(i) {
+			// The tiered bottom: fold the runs back together once they stack too deep,
+			// otherwise grow the tree a level once the bottom outgrows its target.
+			if ov := l.maxOverlapLocked(i); ov >= l.tierFanout {
+				consider(compaction{kind: compactSelfMerge, level: i}, float64(ov)/float64(l.tierFanout))
+				continue
+			}
+			if target := l.levelTargetBytesLocked(i); target > 0 {
+				if score := float64(l.levelBytesLocked(i)) / float64(target); score > 1 {
+					consider(compaction{kind: compactPushDown, level: i, wholeLevel: true}, score)
+				}
+			}
 			continue
 		}
 		target := l.levelTargetBytesLocked(i)
 		if target <= 0 {
 			continue
 		}
-		score := float64(l.levelBytesLocked(i)) / float64(target)
-		if score > 1 && score > bestScore {
-			best = i
-			bestScore = score
+		if score := float64(l.levelBytesLocked(i)) / float64(target); score > 1 {
+			consider(compaction{kind: compactPushDown, level: i, wholeLevel: false}, score)
 		}
 	}
-	return best, best >= 0
+	return best
 }
 
 // keyRangeOf returns the smallest and largest user key across a set of segments, the
@@ -226,26 +332,30 @@ func keyRangeOf(segs []*segment) (lo, hi []byte) {
 	return lo, hi
 }
 
-// runCompactionLocked merges a bounded input set from the source level into the level
-// below it, installs the result through the MANIFEST, and frees the inputs. The caller
-// holds l.mu. It returns a report of the work done, or a zero report when there was
-// nothing to merge.
+// runCompactionLocked merges a run from the source level into the level below it,
+// installs the result through the MANIFEST, and frees the inputs. The caller holds l.mu.
+// It returns a report of the work done, or a zero report when there was nothing to merge.
 //
-// The inputs are all of L0 (its segments overlap, so they compact as a unit) or one
-// segment of a deeper level, plus every segment they overlap in the level below. The
-// merge is the shared streaming k-way merge, so the output arrives in internal-key
-// order; the splitter applies version GC and tombstone dropping as the cells stream and
-// cuts the output into size-bounded segments. Every overlapping lower-level segment is
-// an input, so the outputs and the lower-level segments left behind stay
-// non-overlapping, preserving the leveled invariant.
-func (l *LSM) runCompactionLocked(src int, watermark uint64) (engine.MaintReport, error) {
+// The input is all of src when wholeLevel is set (L0, whose segments overlap and compact
+// as a unit, or the tiered bottom descending a level), otherwise one picked segment of a
+// leveled level. When the output level is the deepest, the merge is a tiered add: the
+// output joins the bottom's other runs and no lower-level segment is rewritten, which is
+// the lazy-leveling saving. When the output level is a middle leveled level, every
+// segment the input overlaps there is also an input, so the output and the segments left
+// behind stay disjoint, preserving the leveled invariant. The merge is the shared
+// streaming k-way merge, so the output arrives in internal-key order; the splitter
+// applies version GC and cuts the output into size-bounded segments. A point tombstone is
+// never dropped here, since the bottom's other runs (a tiered add) or a deeper level (a
+// leveled push-down) may hold an older version it still shadows; only a self-merge of the
+// whole bottom drops one.
+func (l *LSM) runCompactionLocked(src int, watermark uint64, wholeLevel bool) (engine.MaintReport, error) {
 	if src < 0 || src >= len(l.levels) || len(l.levels[src]) == 0 {
 		return engine.MaintReport{}, nil
 	}
 
 	var in0 []*segment
-	if src == 0 {
-		in0 = append(in0, l.levels[0]...)
+	if wholeLevel {
+		in0 = append(in0, l.levels[src]...)
 	} else {
 		seg := l.pickSegmentLocked(src)
 		if seg == nil {
@@ -256,7 +366,14 @@ func (l *LSM) runCompactionLocked(src int, watermark uint64) (engine.MaintReport
 
 	lo, hi := keyRangeOf(in0)
 	out := src + 1
-	in1 := l.overlappingLocked(out, lo, hi)
+	// A tiered add when the output is the deepest level: the run joins the bottom beside
+	// the runs already there, so nothing there is rewritten. Otherwise a leveled merge,
+	// which pulls in the overlapping segments of the lower level.
+	tieredOut := !l.hasSegmentsBelowLocked(out)
+	var in1 []*segment
+	if !tieredOut {
+		in1 = l.overlappingLocked(out, lo, hi)
+	}
 
 	inputs := make([]*segment, 0, len(in0)+len(in1))
 	inputs = append(inputs, in0...)
@@ -268,9 +385,7 @@ func (l *LSM) runCompactionLocked(src int, watermark uint64) (engine.MaintReport
 		before += int64(seg.pages) * pageSize
 	}
 
-	// The output is the deepest level reached when nothing lives below it, the case
-	// where a point tombstone shadows nothing and can be dropped outright.
-	dropTomb := !l.hasSegmentsBelowLocked(out)
+	const dropTomb = false
 
 	sources := make([]mergeSource, len(inputs))
 	for i, seg := range inputs {
@@ -310,6 +425,77 @@ func (l *LSM) runCompactionLocked(src int, watermark uint64) (engine.MaintReport
 	l.removeSegmentsLocked(out, setOf(in1))
 	for _, seg := range outputs {
 		l.addSegmentLocked(out, seg)
+	}
+
+	for _, seg := range inputs {
+		if err := l.freeSegmentPages(seg); err != nil {
+			return engine.MaintReport{}, err
+		}
+	}
+
+	var after int64
+	for _, seg := range outputs {
+		after += int64(seg.pages) * pageSize
+	}
+	reclaimed := before - after
+	if reclaimed < 0 {
+		reclaimed = 0
+	}
+	return engine.MaintReport{
+		PagesCompacted: len(inputs),
+		BytesWritten:   after,
+		BytesReclaimed: reclaimed,
+	}, nil
+}
+
+// runSelfMergeLocked folds every run at a tiered level back into one disjoint run, cut at
+// segTargetBytes, and installs it in place through the MANIFEST. It is what the bottom
+// pays for accumulating runs instead of merging on every push: it runs once per tierFanout
+// pushes rather than on each one. Because every run at the level is an input and nothing
+// lives below, this is the one merge that may drop a point tombstone that becomes the
+// base. The caller holds l.mu.
+func (l *LSM) runSelfMergeLocked(level int, watermark uint64) (engine.MaintReport, error) {
+	if level < 1 || level >= len(l.levels) || len(l.levels[level]) < 2 {
+		return engine.MaintReport{}, nil
+	}
+	inputs := append([]*segment(nil), l.levels[level]...)
+
+	pageSize := int64(l.pgr.PageSize())
+	var before int64
+	for _, seg := range inputs {
+		before += int64(seg.pages) * pageSize
+	}
+
+	dropTomb := !l.hasSegmentsBelowLocked(level)
+
+	sources := make([]mergeSource, len(inputs))
+	for i, seg := range inputs {
+		sources[i] = &segSource{pgr: l.pgr, seg: seg}
+	}
+	mi, err := newMergeIter(sources, nil)
+	if err != nil {
+		return engine.MaintReport{}, err
+	}
+
+	outputs, err := l.writeSplitLocked(mi, watermark, dropTomb, bloomBitsForLevel(level, l.levelRatio))
+	if err != nil {
+		return engine.MaintReport{}, err
+	}
+
+	for _, seg := range inputs {
+		if err := l.appendEditLocked(manifestRemove, uint8(level), seg.footer); err != nil {
+			return engine.MaintReport{}, err
+		}
+	}
+	for _, seg := range outputs {
+		if err := l.appendEditLocked(manifestAdd, uint8(level), seg.footer); err != nil {
+			return engine.MaintReport{}, err
+		}
+	}
+
+	l.removeSegmentsLocked(level, setOf(inputs))
+	for _, seg := range outputs {
+		l.addSegmentLocked(level, seg)
 	}
 
 	for _, seg := range inputs {

@@ -70,6 +70,13 @@ type LSM struct {
 	levelRatio     int
 	l1TargetBytes  int64
 	segTargetBytes int
+	// tierFanout is the run count the largest (deepest) level accumulates before it
+	// self-merges. That level is tiered, not leveled: a compaction from above adds its
+	// output as another run rather than merging it into a single sorted run, so the
+	// bottom (where most of the data lives) is rewritten a factor of tierFanout less
+	// often. The smaller levels stay leveled, one run each, where read and space cost
+	// dominate. This is the Dostoevsky lazy-leveling shape (spec 06 §6).
+	tierFanout int
 	// compactCursor[i] is the user key the next level-i compaction starts at or after,
 	// rotating the picked segment across the level so work spreads instead of hammering
 	// one key range.
@@ -98,6 +105,7 @@ func New(pgr *pager.Pager) *LSM {
 		levelRatio:     defaultLevelRatio,
 		l1TargetBytes:  defaultL1TargetBytes,
 		segTargetBytes: defaultSegTargetBytes,
+		tierFanout:     defaultTierFanout,
 		compactCursor:  map[int][]byte{},
 	}
 }
@@ -210,25 +218,30 @@ func (l *LSM) flushLocked() error {
 }
 
 // Maintain implements engine.Engine. It runs at most one compaction per call: the
-// level-aware Fluid policy scores every level against its size target, picks the one
-// most over target, and merges a bounded input set from it into the level below,
-// dropping the versions no reader at or below the watermark can still observe and, at
-// the deepest level, the point tombstones nothing lives under (spec 06 §6). A zero
-// budget, the host's "do nothing" signal, is honored by skipping the work. Running one
-// compaction unit per call, with each output segment cut at segTargetBytes, keeps a
-// single Maintain from monopolizing I/O; the host calls it repeatedly to work a backlog
-// down.
+// lazy-leveling policy scores every level and runs the most urgent action, pushing a run
+// from a leveled level down into the level below, self-merging the tiered bottom when its
+// runs have stacked too deep, or descending the bottom when it has outgrown its target
+// (spec 06 §6). Every merge drops the versions no reader at or below the watermark can
+// still observe, and a self-merge of the bottom also drops the point tombstones nothing
+// lives under. A zero budget, the host's "do nothing" signal, is honored by skipping the
+// work. Running one compaction unit per call, with each output segment cut at
+// segTargetBytes, keeps a single Maintain from monopolizing I/O; the host calls it
+// repeatedly to work a backlog down.
 func (l *LSM) Maintain(ctx context.Context, budget engine.MaintBudget) (engine.MaintReport, error) {
 	if budget.MaxPages <= 0 && budget.MaxBytes <= 0 {
 		return engine.MaintReport{}, nil
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	src, ok := l.pickCompactionLocked()
-	if !ok {
+	c := l.pickCompactionLocked()
+	switch c.kind {
+	case compactPushDown:
+		return l.runCompactionLocked(c.level, budget.Watermark, c.wholeLevel)
+	case compactSelfMerge:
+		return l.runSelfMergeLocked(c.level, budget.Watermark)
+	default:
 		return engine.MaintReport{}, nil
 	}
-	return l.runCompactionLocked(src, budget.Watermark)
 }
 
 // Stats implements engine.Engine, reporting the memtable footprint plus the on-disk

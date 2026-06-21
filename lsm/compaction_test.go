@@ -31,15 +31,26 @@ func drainCompaction(t *testing.T, l *LSM, watermark uint64) {
 	}
 }
 
-// forceCompact merges L0 into L1 regardless of the fan-in trigger, the hook the
-// version-semantics tests use to exercise the drop rule on a small segment set without
-// flushing a trigger's worth of segments first.
+// forceCompact merges L0 into the level below it regardless of the fan-in trigger, the
+// hook the version-semantics tests use to exercise the drop rule on a small segment set
+// without flushing a trigger's worth of segments first.
 func forceCompact(t *testing.T, l *LSM, watermark uint64) {
 	t.Helper()
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if _, err := l.runCompactionLocked(0, watermark); err != nil {
+	if _, err := l.runCompactionLocked(0, watermark, true); err != nil {
 		t.Fatalf("compact: %v", err)
+	}
+}
+
+// forcePushDown pushes one run from a leveled source level down into the level below,
+// bypassing the picker so a test can drive a specific level transition.
+func forcePushDown(t *testing.T, l *LSM, src int, watermark uint64, wholeLevel bool) {
+	t.Helper()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if _, err := l.runCompactionLocked(src, watermark, wholeLevel); err != nil {
+		t.Fatalf("push down level %d: %v", src, err)
 	}
 }
 
@@ -68,11 +79,28 @@ func sameShape(a, b []int) bool {
 	return true
 }
 
-// assertLeveledInvariant confirms every level below L0 is sorted by first key with
-// disjoint ranges, the non-overlapping invariant a leveled compaction must preserve.
+// deepestLevel returns the index of the deepest level that holds a segment, or -1 when
+// the tree is empty. That level is the tiered bottom under lazy-leveling.
+func deepestLevel(l *LSM) int {
+	for i := len(l.levels) - 1; i >= 1; i-- {
+		if len(l.levels[i]) > 0 {
+			return i
+		}
+	}
+	return -1
+}
+
+// assertLeveledInvariant confirms every leveled level is sorted by first key with
+// disjoint ranges, the non-overlapping invariant a leveled compaction must preserve. The
+// tiered bottom is exempt: it holds several runs that may overlap, which is the whole
+// point of tiering it.
 func assertLeveledInvariant(t *testing.T, l *LSM) {
 	t.Helper()
+	bottom := deepestLevel(l)
 	for i := 1; i < len(l.levels); i++ {
+		if i == bottom {
+			continue
+		}
 		segs := l.levels[i]
 		for j := 1; j < len(segs); j++ {
 			if format.CompareUser(segs[j-1].maxKey, segs[j].minKey) >= 0 {
@@ -400,33 +428,46 @@ func TestLeveledFormsDeeperLevels(t *testing.T) {
 	}
 }
 
-// TestLeveledPartialPick confirms a deeper-level compaction touches only the segments
-// its input overlaps, leaving the disjoint neighbours untouched, the property that makes
-// leveled compaction incremental.
+// TestLeveledPartialPick confirms a push-down into a leveled middle level touches only the
+// segments its input overlaps, leaving the disjoint neighbours untouched, the property
+// that makes leveled compaction incremental. The middle level is made leveled by seeding a
+// level below it, since the deepest level is tiered and would add a run rather than merge.
 func TestLeveledPartialPick(t *testing.T) {
 	l := newLSM(t)
 	l.l0Trigger = 1
-	l.segTargetBytes = 1 // one version group per output segment
+	l.segTargetBytes = 1      // one version group per output segment
+	l.l1TargetBytes = 1 << 50 // huge, so no level descends on its own during the test
+	l.tierFanout = 1 << 30    // huge, so the bottom never self-merges during the test
 
-	// One L0 segment of three far-apart keys; compacting it splits L1 into three disjoint
-	// single-key segments.
-	applyBatch(t, l, 1, func(b *engine.WriteBatch) {
+	// Seed an L2 so L1 becomes a leveled middle level: flush a key, add it to L1 as the
+	// (then) tiered bottom, then descend that whole level into L2.
+	applyBatch(t, l, 1, func(b *engine.WriteBatch) { b.Set([]byte("seed"), []byte("0")) })
+	l.flushActive(t)
+	forceCompact(t, l, 0)           // L0 -> L1, tiered add (L1 is the bottom)
+	forcePushDown(t, l, 1, 0, true) // descend the whole L1 into L2; L1 is now empty and leveled
+	if deepestLevel(l) != 2 {
+		t.Fatalf("expected L2 to be the bottom, got shape %v", levelShape(l))
+	}
+
+	// One L0 segment of three far-apart keys; a leveled merge into the empty L1 splits it
+	// into three disjoint single-key segments.
+	applyBatch(t, l, 2, func(b *engine.WriteBatch) {
 		b.Set([]byte("aaa"), []byte("1"))
 		b.Set([]byte("mmm"), []byte("1"))
 		b.Set([]byte("zzz"), []byte("1"))
 	})
 	l.flushActive(t)
-	compact(t, l, 0)
-	if len(l.levels) < 2 || len(l.levels[1]) != 3 {
+	forceCompact(t, l, 0)
+	if len(l.levels[1]) != 3 {
 		t.Fatalf("expected three disjoint L1 segments, got shape %v", levelShape(l))
 	}
 	low, mid, high := l.levels[1][0], l.levels[1][1], l.levels[1][2]
 
-	// A new write to the middle key only; compacting it must rewrite only the middle L1
+	// A new write to the middle key only; the leveled merge must rewrite only the middle L1
 	// segment and leave the low and high segments as the exact same handles.
-	applyBatch(t, l, 2, func(b *engine.WriteBatch) { b.Set([]byte("mmm"), []byte("2")) })
+	applyBatch(t, l, 3, func(b *engine.WriteBatch) { b.Set([]byte("mmm"), []byte("2")) })
 	l.flushActive(t)
-	compact(t, l, 0)
+	forceCompact(t, l, 0)
 
 	if len(l.levels[1]) != 3 || l.levels[1][0] != low || l.levels[1][2] != high {
 		t.Fatalf("partial compaction disturbed the disjoint neighbours, shape %v", levelShape(l))
@@ -444,25 +485,35 @@ func TestLeveledPartialPick(t *testing.T) {
 	}
 }
 
-// TestLeveledBottomTombstoneDrop confirms a point delete compacted into the deepest
-// level is dropped outright, since nothing lives below it for the tombstone to shadow,
-// so the key and its value both vanish.
+// TestLeveledBottomTombstoneDrop confirms a self-merge of the tiered bottom drops a point
+// delete outright, since every run is an input and nothing lives below it for the
+// tombstone to shadow, so the key and its value both vanish. The set and the delete are
+// added as two separate bottom runs, then a self-merge folds them together.
 func TestLeveledBottomTombstoneDrop(t *testing.T) {
 	l := newLSM(t)
-	l.l0Trigger = 2
+	l.l0Trigger = 1
+	l.tierFanout = 2
 
+	// Two separate pushes into the tiered bottom: one run holding the set, one the delete.
 	applyBatch(t, l, 1, func(b *engine.WriteBatch) { b.Set([]byte("k"), []byte("v")) })
 	l.flushActive(t)
+	compact(t, l, 10) // L0 -> L1 tiered add: run with the set
 	applyBatch(t, l, 2, func(b *engine.WriteBatch) { b.Delete([]byte("k")) })
 	l.flushActive(t)
+	compact(t, l, 10) // L0 -> L1 tiered add: run with the delete
+	if got := len(l.levels[1]); got != 2 {
+		t.Fatalf("expected two tiered runs at the bottom, got %d (shape %v)", got, levelShape(l))
+	}
 
+	// The two runs overlap on key k, so a third Maintain self-merges them and drops the
+	// tombstone at the bottom.
 	compact(t, l, 10)
 	total := 0
 	for _, s := range l.allSegmentsLocked() {
 		total += s.numCells
 	}
 	if total != 0 {
-		t.Fatalf("bottom compaction left %d cells, want the tombstone and value both dropped", total)
+		t.Fatalf("bottom self-merge left %d cells, want the tombstone and value both dropped", total)
 	}
 	if _, ok := getAt(t, l, "k", 100); ok {
 		t.Fatalf("Get(k) found a value, want not found after the tombstone drop")

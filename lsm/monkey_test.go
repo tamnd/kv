@@ -71,7 +71,7 @@ func TestMonkeyDeepSegmentsGetFewerBits(t *testing.T) {
 
 	// Move one L1 segment down to L2; the output filter must shrink to the L2 budget.
 	l.mu.Lock()
-	if _, err := l.runCompactionLocked(1, 0); err != nil {
+	if _, err := l.runCompactionLocked(1, 0, false); err != nil {
 		l.mu.Unlock()
 		t.Fatalf("compact L1: %v", err)
 	}
