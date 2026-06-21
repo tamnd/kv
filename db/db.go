@@ -116,6 +116,14 @@ type Options struct {
 	// §3). Zero, the default, disables it, and the read path skips reading the clock
 	// when it is zero or Logger is nil. It has effect only when Logger is set.
 	SlowOpThreshold time.Duration
+	// Tracer arms the tracing surface: when set, kv starts a span around each operation
+	// and its major phases (commit and its durable/apply split, checkpoint, compaction,
+	// point read) so a slow request can be attributed to I/O versus engine versus
+	// compaction (spec 19 §3). Nil, the default, disables tracing: no span is started and
+	// every site is a single nil check, so a build that does not set it pays nothing. The
+	// host adapts the Tracer to OpenTelemetry or any backend, so kv takes no tracing
+	// dependency.
+	Tracer Tracer
 	// EncryptionKey, when non-empty, encrypts the main file's data pages at rest under
 	// AES-256-GCM, the spec default cipher (spec 14). It must be exactly 32 bytes, a
 	// key supplied directly (the KMS-managed path); the passphrase KDF that stretches a
@@ -267,6 +275,10 @@ type DB struct {
 	// operation only when both a logger is set and slowOp is positive.
 	logger *slog.Logger
 	slowOp time.Duration
+	// tracer is the span hook from Options.Tracer (spec 19 §3), nil when tracing is off.
+	// Every site goes through startSpan, which guards on nil, so a disabled build starts
+	// no spans.
+	tracer Tracer
 
 	// now is the wall-clock source, in Unix nanoseconds, that read resolution compares
 	// a TTL set's absolute expiry against (spec 15 §6). It is the real system clock by
@@ -353,7 +365,7 @@ func create(fs vfs.FS, path string, opts Options) (*DB, error) {
 		return nil, err
 	}
 	d := &DB{fs: fs, path: path, pgr: pgr, wal: w, eng: eng, orc: newOracle(0), crypto: enc,
-		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, bufferedInserts: opts.BufferedInserts, compression: opts.Compression, now: opts.clock(), logger: opts.Logger, slowOp: opts.SlowOpThreshold, readReplica: opts.ReadReplica, archive: opts.WALArchive}
+		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, bufferedInserts: opts.BufferedInserts, compression: opts.Compression, now: opts.clock(), logger: opts.Logger, slowOp: opts.SlowOpThreshold, tracer: opts.Tracer, readReplica: opts.ReadReplica, archive: opts.WALArchive}
 	if err := d.openEngine(opts.Merge); err != nil {
 		w.Close()
 		pgr.Close()
@@ -381,7 +393,7 @@ func openExisting(fs vfs.FS, path string, opts Options) (*DB, error) {
 		return nil, err
 	}
 	d := &DB{fs: fs, path: path, pgr: pgr, eng: eng, crypto: enc,
-		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, bufferedInserts: opts.BufferedInserts, compression: opts.Compression, now: opts.clock(), logger: opts.Logger, slowOp: opts.SlowOpThreshold, readReplica: opts.ReadReplica, archive: opts.WALArchive}
+		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, bufferedInserts: opts.BufferedInserts, compression: opts.Compression, now: opts.clock(), logger: opts.Logger, slowOp: opts.SlowOpThreshold, tracer: opts.Tracer, readReplica: opts.ReadReplica, archive: opts.WALArchive}
 	if err := d.openEngine(opts.Merge); err != nil {
 		pgr.Close()
 		return nil, err
@@ -707,27 +719,36 @@ func (d *DB) applyTxn(v uint64, ops []pendingOp) (uint64, error) {
 // and calls oracle.applied after, in version order (spec 07 §1, spec 10 §2).
 func (d *DB) applyCommitted(b *engine.WriteBatch, v uint64) error {
 	encoded := b.Encode()
+	// Trace the whole commit and split it into its durable and apply phases, so a span
+	// backend can attribute commit latency to fsync versus engine cost the same way the
+	// slow-op log does (spec 19 §3). The spans are no-ops when no tracer is set.
+	ctx, commitSpan := d.startSpan(context.Background(), "kv.commit")
+	defer endSpan(commitSpan)
 	// Time the durable-commit sequence (log append plus fsync) for the commit-latency
 	// metric (spec 19 §1.1). time.Now is the right clock here, not d.now: this measures
 	// real fsync cost, independent of the injectable TTL clock, and Go's monotonic
 	// reading makes the delta immune to wall-clock steps.
 	commitStart := time.Now()
+	_, durableSpan := d.startSpan(ctx, "kv.commit.durable")
 	// A failed log append or commit sync is a fatal durability fault (fsyncgate, spec
 	// 07 §6): the kernel may have dropped the un-synced bytes, so the commit must not
 	// be acknowledged and the database is fenced until reopen. Apply runs only after a
 	// durable commit, so a fault here leaves the engine untouched and this version
 	// unapplied, exactly the state recovery reconstructs from the durable log.
 	if err := d.wal.LogBatch(v, encoded); err != nil {
+		endSpan(durableSpan)
 		d.fatal = fmt.Errorf("%w: %v", ErrFatalSync, err)
 		d.logFatal(d.fatal)
 		return d.fatal
 	}
 	commitLSN, err := d.wal.Commit(v)
 	if err != nil {
+		endSpan(durableSpan)
 		d.fatal = fmt.Errorf("%w: %v", ErrFatalSync, err)
 		d.logFatal(d.fatal)
 		return d.fatal
 	}
+	endSpan(durableSpan)
 	// The batch is durable: count it and fold in its latency. Only a successful, durable
 	// commit is tallied, so the average latency is over acknowledged commits, never over
 	// the faults that fenced the database above.
@@ -738,9 +759,12 @@ func (d *DB) applyCommitted(b *engine.WriteBatch, v uint64) error {
 	// applying it, so its durable mark can later report how far a flush has reached.
 	d.noteLSN(commitLSN)
 	applyStart := time.Now()
+	_, applySpan := d.startSpan(ctx, "kv.commit.apply")
 	if err := d.eng.Apply(b, v); err != nil {
+		endSpan(applySpan)
 		return err
 	}
+	endSpan(applySpan)
 	// Slow-op log (spec 19 §3): if the commit ran past the threshold, name it with a
 	// durable/apply phase split so an operator can tell fsync cost from engine cost. The
 	// timing is read only when the slow-op log is armed, so a database with no logger
@@ -780,6 +804,8 @@ func batchKeys(b *engine.WriteBatch) []string {
 // taking the shared read lock so it never observes a page mid-commit. It returns
 // the value and whether the key is present at that snapshot (spec 10 §3).
 func (d *DB) snapshotGet(version uint64, key []byte) ([]byte, bool, error) {
+	_, span := d.startSpan(context.Background(), "kv.get")
+	defer endSpan(span)
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	rd, err := d.eng.NewReader(engine.Snapshot{Version: version, Now: d.now()})
@@ -836,7 +862,13 @@ func (d *DB) Maintain(maxPages int) (engine.MaintReport, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	budget := engine.MaintBudget{MaxPages: maxPages, Watermark: d.orc.readMark(), Now: d.now()}
-	rep, err := d.eng.Maintain(context.Background(), budget)
+	// Trace the maintenance round (compaction, version GC) so a span backend can see how
+	// much of a request's latency is background work serialized behind the writer lock
+	// (spec 19 §3). The span passes its context to the engine, so a tracer-aware engine
+	// could nest its own phases, and is a no-op when no tracer is set.
+	ctx, span := d.startSpan(context.Background(), "kv.compaction")
+	rep, err := d.eng.Maintain(ctx, budget)
+	endSpan(span)
 	if err == nil {
 		d.logMaintain(rep)
 	}
@@ -1126,6 +1158,11 @@ func (d *DB) CheckpointMode(m CheckpointMode) error {
 // out so other writer-lock operations that must fold the WAL first, such as Vacuum,
 // can reuse it without releasing and reacquiring the lock.
 func (d *DB) checkpointLocked() error {
+	// Trace the checkpoint (fold the WAL into the main file, fsync, reset the log) so a
+	// span backend can see checkpoint stalls in a request's timeline (spec 19 §3). It is
+	// a no-op when no tracer is set.
+	_, span := d.startSpan(context.Background(), "kv.checkpoint")
+	defer endSpan(span)
 	// Persist the durable commit version from the oracle, the single source of truth.
 	// A live commit keeps the header's version current through applyCommitted, but a
 	// version reconstructed by redo reaches the engine through eng.Apply directly and
