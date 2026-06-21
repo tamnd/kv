@@ -51,6 +51,24 @@ func (h *Histogram) Record(d time.Duration) {
 // Count is how many samples were recorded.
 func (h *Histogram) Count() int { return len(h.samples) }
 
+// Merge folds another histogram's samples into this one, so a concurrent run's per-worker
+// histograms combine into one distribution before it is summarized. The percentiles of the
+// merged set are the true percentiles across all workers, not an average of per-worker
+// percentiles, which would understate the global tail.
+func (h *Histogram) Merge(other *Histogram) {
+	if other == nil || len(other.samples) == 0 {
+		return
+	}
+	h.samples = append(h.samples, other.samples...)
+	h.sum += other.sum
+	if other.min < h.min {
+		h.min = other.min
+	}
+	if other.max > h.max {
+		h.max = other.max
+	}
+}
+
 // Latency summarizes a histogram. All durations are nanoseconds when marshaled, named in
 // the field tags, so the JSON is unambiguous about units (spec 21 §5).
 type Latency struct {
