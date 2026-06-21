@@ -72,7 +72,7 @@ func TestRunInvariants(t *testing.T) {
 				}
 				// A workload with reads reports a real, non-negative read amplification from
 				// the pager counter; a write-only workload leaves the not-measured sentinel.
-				hasReads := w.ReadFraction > 0 || w.RMW || w.ScanLength > 0
+				hasReads := w.ReadFraction > 0 || w.RMW || w.ScanLength > 0 || w.ReadLatest
 				if hasReads {
 					if amp.Read < 0 {
 						t.Fatalf("read workload should report read amplification, got sentinel %v", amp.Read)

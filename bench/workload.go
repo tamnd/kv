@@ -26,20 +26,32 @@ type Workload struct {
 	// MeasureLoad measures the bulk load instead of a run phase, for the cold-population
 	// workload. When true the run phase is skipped.
 	MeasureLoad bool
+	// ReadLatest drives the YCSB-D pattern: a growing keyspace where inserts append new keys
+	// at the head and reads skew toward the most recently inserted ones. It runs on a single
+	// goroutine (the head is shared mutable state) and uses InsertFraction for its op mix
+	// instead of ReadFraction.
+	ReadLatest bool
+	// InsertFraction is the probability a ReadLatest op inserts a new key; the rest read a
+	// recent one. Ignored unless ReadLatest is set.
+	InsertFraction float64
 }
 
 // scanLenE is the short-scan length YCSB-E uses; 50 keys is the conventional value.
 const scanLenE = 50
 
-// Standard is the canonical workload matrix the suite reports for both engines (spec 21
-// §2). YCSB-D (read-latest) is intentionally absent: it needs a growing keyspace with a
-// recency-biased generator, which is its own slice, and faking it with a fixed keyspace
-// would misreport what it measures.
+// insertFracD is the insert share YCSB-D uses: 5% inserts, 95% read-latest, the conventional
+// mix.
+const insertFracD = 0.05
+
+// Standard is the canonical workload matrix the suite reports for both engines (spec 21 §2):
+// the YCSB core A through F plus the two targeted micro workloads, a cold bulk load and a
+// write-saturated ingest.
 func Standard() []Workload {
 	return []Workload{
 		{Name: "ycsb-a", Dist: Zipfian, ReadFraction: 0.50},
 		{Name: "ycsb-b", Dist: Zipfian, ReadFraction: 0.95},
 		{Name: "ycsb-c", Dist: Zipfian, ReadFraction: 1.00},
+		{Name: "ycsb-d", Dist: Zipfian, ReadLatest: true, InsertFraction: insertFracD},
 		{Name: "ycsb-e", Dist: Zipfian, ReadFraction: 1.00, ScanLength: scanLenE},
 		{Name: "ycsb-f", Dist: Zipfian, ReadFraction: 1.00, RMW: true},
 		{Name: "bulk-load", Dist: Sequential, ReadFraction: 0.0, MeasureLoad: true},

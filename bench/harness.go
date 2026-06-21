@@ -314,44 +314,108 @@ func splitOps(total, workers int) []int {
 // the wall clock across the whole parallel window, so the read amplification, the GC cost, and
 // the throughput all describe the same span the latencies were drawn from, not the load phase.
 func runPhase(db *kv.DB, cfg Config, w Workload) (runResult, error) {
-	workers := concurrencyOf(cfg)
-	per := splitOps(cfg.Ops, workers)
-
 	rr := runResult{reads: NewHistogram(cfg.Ops), writes: NewHistogram(cfg.Ops)}
 	pageReads0 := db.Stats().PageReads
 	gcStart := readGC()
 	start := time.Now()
 
-	if workers == 1 {
-		wr, err := runWorker(db, cfg, w, 0, per[0])
-		if err != nil {
-			return rr, err
-		}
-		mergeWorker(&rr, wr)
+	// One window, two drivers. A read-latest workload runs on a single goroutine because its
+	// head is shared mutable state; everything else fans out across cfg.Concurrency workers.
+	var err error
+	if w.ReadLatest {
+		err = runReadLatestInto(&rr, db, cfg, w)
 	} else {
-		results := make([]workerResult, workers)
-		errs := make([]error, workers)
-		var wg sync.WaitGroup
-		for i := 0; i < workers; i++ {
-			wg.Add(1)
-			go func(i int) {
-				defer wg.Done()
-				results[i], errs[i] = runWorker(db, cfg, w, i, per[i])
-			}(i)
-		}
-		wg.Wait()
-		for i := 0; i < workers; i++ {
-			if errs[i] != nil {
-				return rr, errs[i]
-			}
-			mergeWorker(&rr, results[i])
-		}
+		err = runConcurrentInto(&rr, db, cfg, w)
+	}
+	if err != nil {
+		return rr, err
 	}
 
 	rr.dur = time.Since(start)
 	rr.gc = readGC().diff(gcStart)
 	rr.pageReadDelta = db.Stats().PageReads - pageReads0
 	return rr, nil
+}
+
+// runConcurrentInto drives the standard read/write/scan/RMW workloads, optionally spread across
+// cfg.Concurrency goroutines, and folds every worker's histograms and counts into rr. With one
+// worker it runs inline; with more it fans out and merges under a barrier so the run's
+// percentiles are true global percentiles.
+func runConcurrentInto(rr *runResult, db *kv.DB, cfg Config, w Workload) error {
+	workers := concurrencyOf(cfg)
+	per := splitOps(cfg.Ops, workers)
+
+	if workers == 1 {
+		wr, err := runWorker(db, cfg, w, 0, per[0])
+		if err != nil {
+			return err
+		}
+		mergeWorker(rr, wr)
+		return nil
+	}
+
+	results := make([]workerResult, workers)
+	errs := make([]error, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			results[i], errs[i] = runWorker(db, cfg, w, i, per[i])
+		}(i)
+	}
+	wg.Wait()
+	for i := 0; i < workers; i++ {
+		if errs[i] != nil {
+			return errs[i]
+		}
+		mergeWorker(rr, results[i])
+	}
+	return nil
+}
+
+// runReadLatestInto drives the YCSB-D read-latest pattern against a growing keyspace (spec 21
+// §2). It runs on a single goroutine because the head, the index the next insert takes, is
+// shared mutable state that a concurrent fan-out would race on. An op inserts a fresh key at
+// the head with probability w.InsertFraction, extending the keyspace; otherwise it reads a
+// recent key, drawn by a Zipfian offset back from the head so the most recently inserted keys
+// are the hottest. The offset draws over [0, KeyCount-1] and head starts at KeyCount, so the
+// computed index is always in range and the read window is the KeyCount most recent keys.
+func runReadLatestInto(rr *runResult, db *kv.DB, cfg Config, w Workload) error {
+	wr := workerResult{reads: NewHistogram(cfg.Ops), writes: NewHistogram(cfg.Ops)}
+	// One Zipfian stream serves both the offset draw and the key/value encoding (encoding does
+	// not advance the PRNG), and a separate uniform stream is the insert/read coin.
+	gen := NewGenerator(GenConfig{KeyCount: cfg.KeyCount, KeyLen: cfg.KeyLen, ValLen: cfg.ValLen, Dist: Zipfian, Seed: cfg.Seed})
+	coin := NewGenerator(GenConfig{KeyCount: 1 << 20, KeyLen: minKeyLen, ValLen: minValLen, Dist: Uniform, Seed: cfg.Seed + 1})
+
+	head := uint64(cfg.KeyCount) // the index the next insert will take
+	var kbuf []byte
+	for n := 0; n < cfg.Ops; n++ {
+		coinVal := float64(coin.nextIndex()) / float64(1<<20)
+		if coinVal < w.InsertFraction {
+			// Insert a brand-new key at the head, extending the keyspace by one.
+			kbuf = gen.Key(kbuf, head)
+			if e := writeOp(db, kbuf, gen.Value(head), wr.writes); e != nil {
+				if e == kv.ErrConflict {
+					wr.dropped++
+					continue
+				}
+				return e
+			}
+			head++
+		} else {
+			// Read a recent key: offset 0 is the latest insert, which the Zipfian head favors.
+			idx := head - 1 - gen.nextIndex()
+			kbuf = gen.Key(kbuf, idx)
+			if e := readOp(db, kbuf, wr.reads); e != nil {
+				return e
+			}
+			wr.logicalRead++
+		}
+		wr.ops++
+	}
+	mergeWorker(rr, wr)
+	return nil
 }
 
 // workerResult is one goroutine's slice of the run phase: its own latency histograms and its
