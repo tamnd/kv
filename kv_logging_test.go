@@ -2,8 +2,10 @@ package kv_test
 
 import (
 	"bytes"
+	"context"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -43,4 +45,59 @@ func TestWithLoggerDefaultSilent(t *testing.T) {
 	}
 	// Nothing to assert beyond a clean run: with no logger there is no sink to inspect,
 	// and the db-layer tests cover the nil-guard behavior directly.
+}
+
+// facadeTracer records started span names so a facade test can confirm WithTracer threads
+// the hook through the public API.
+type facadeTracer struct {
+	mu    sync.Mutex
+	names []string
+}
+
+type facadeSpan struct {
+	t    *facadeTracer
+	name string
+}
+
+func (s facadeSpan) End() {}
+
+func (t *facadeTracer) StartSpan(ctx context.Context, name string) (context.Context, kv.Span) {
+	t.mu.Lock()
+	t.names = append(t.names, name)
+	t.mu.Unlock()
+	return ctx, facadeSpan{t: t, name: name}
+}
+
+func (t *facadeTracer) saw(name string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, n := range t.names {
+		if n == name {
+			return true
+		}
+	}
+	return false
+}
+
+// TestWithTracerFacade confirms WithTracer threads a Tracer through the public facade so a
+// commit and a read start spans on the caller's tracer (spec 19 §3).
+func TestWithTracerFacade(t *testing.T) {
+	tr := &facadeTracer{}
+	d := open(t, kv.WithTracer(tr))
+	if err := d.Update(func(txn *kv.Txn) error {
+		return txn.Set([]byte("k"), []byte("v"))
+	}); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	if err := d.View(func(txn *kv.Txn) error {
+		_, err := txn.Get([]byte("k"))
+		return err
+	}); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	for _, name := range []string{"kv.commit", "kv.commit.durable", "kv.commit.apply"} {
+		if !tr.saw(name) {
+			t.Fatalf("missing span %q through facade; saw %v", name, tr.names)
+		}
+	}
 }

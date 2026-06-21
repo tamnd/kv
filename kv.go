@@ -69,6 +69,16 @@ const (
 	Serializable = db.Serializable
 )
 
+// Tracer is the optional span hook kv calls around each operation and its major phases
+// (spec 19 §3). It is the seam a host wires to OpenTelemetry, or any tracer, without kv
+// taking a dependency on it: an implementation returns a Span whose End closes the host's
+// own span. It is off by default and enabled with WithTracer. See Tracer in the db package
+// for the phase names kv emits.
+type Tracer = db.Tracer
+
+// Span is one started trace span; End closes it, called exactly once.
+type Span = db.Span
+
 // IterOptions controls a range scan: bounds, prefix, reverse, key-only (spec 11 §1).
 // It is the same shape the iterator layer consumes, exposed here so callers construct
 // it as kv.IterOptions.
@@ -149,6 +159,16 @@ func WithLogger(logger *slog.Logger) Option {
 // WithLogger is also set, and the read path reads no clock when it is off.
 func WithSlowOpThreshold(d time.Duration) Option {
 	return func(c *config) { c.opts.SlowOpThreshold = d }
+}
+
+// WithTracer arms the tracing surface (open-time, spec 19 §3): kv starts a span around
+// each commit (split into its durable and apply phases), checkpoint, compaction round, and
+// point read, so a slow request can be attributed to I/O versus engine versus compaction.
+// Tracing is off by default; the host passes a Tracer that adapts these calls to its own
+// span backend, so kv takes no tracing dependency. The disabled path is a single nil check
+// per site, so a build that does not set it pays nothing.
+func WithTracer(t Tracer) Option {
+	return func(c *config) { c.opts.Tracer = t }
 }
 
 // WithEncryptionKey encrypts the database at rest under a 32-byte master key (spec 14).
