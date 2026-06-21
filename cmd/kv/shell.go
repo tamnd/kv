@@ -445,6 +445,10 @@ func (sh *shell) dot(toks []string) (quit bool) {
 		if err := enc.Encode(toJSON(sh.db.Stats())); err != nil {
 			fmt.Fprintf(sh.errOut, "kv: %v\n", err)
 		}
+	case ".metrics":
+		if err := sh.db.WriteMetrics(sh.out); err != nil {
+			fmt.Fprintf(sh.errOut, "kv: %v\n", err)
+		}
 	case ".check":
 		sh.doCheck()
 	case ".checkpoint":
@@ -624,6 +628,7 @@ func (sh *shell) help() {
 Meta-commands:
   .info                     print a summary of the database
   .stats                    print space and durability accounting as JSON
+  .metrics                  print observability metrics in Prometheus text format
   .check                    verify structural integrity
   .checkpoint               fold the WAL into the main file
   .vacuum [N]               return up to N trailing free pages to the OS (0 = all)
