@@ -108,6 +108,12 @@ type LSM struct {
 	// that reaches the same false-positive rate in less space on the deep cold levels. It
 	// is read from the options at Open. See ribbon.go.
 	filterKind filterKind
+	// compress turns on heat-tiered block compression of the segment data pages (spec 13):
+	// a flush and a compaction pick a codec by the level they write to, cheap and fast on
+	// the hot shallow levels, higher-ratio on the cold deep ones. It is read from the
+	// options at Open and is off by default, so an unconfigured segment writes raw cell
+	// pages byte-identical to before this knob existed. See codec.go and codecForLevel.
+	compress bool
 	// vlogHeadRecorded is the value-log head the MANIFEST last recorded, so a flush or GC
 	// emits a manifestVLogHead edit only when the head actually moves: a flush moves it off
 	// NoPage when the first value separates, the GC moves it forward when it frees the old
@@ -167,8 +173,28 @@ func (l *LSM) Open(env *engine.Env) error {
 	if env != nil && env.Options.Filter == engine.FilterRibbon {
 		l.filterKind = filterRibbon
 	}
+	if env != nil && env.Options.Compression {
+		l.compress = true
+	}
 	l.durableLSN = l.pgr.CheckpointLSN()
 	return l.loadManifestLocked()
+}
+
+// codecForLevel picks the block codec for a segment written to level, heat-tiering by
+// depth (spec 13 §3.1): with compression off every level writes raw pages, and with it on
+// the hot shallow levels take the fast codec, whose decompress cost is negligible against
+// the I/O it saves on data that is read and rewritten often, while the cold deep levels
+// take the higher-ratio codec, whose extra CPU is paid rarely because those pages are
+// written once and read seldom. The boundary at level 2 keeps L0 and L1, where compaction
+// churns, on the cheap codec.
+func (l *LSM) codecForLevel(level int) codecID {
+	if !l.compress {
+		return codecNone
+	}
+	if level <= 1 {
+		return codecFast
+	}
+	return codecHigh
 }
 
 // Close implements engine.Engine. It drops the in-memory state; the host checkpoints
@@ -237,7 +263,7 @@ func (l *LSM) flushLocked() error {
 	// Separating only at flush, never at compaction, is the WiscKey win: once a value is in
 	// the vLog every later compaction of its key moves the pointer, not the bytes.
 	var sepErr error
-	seg, err := writeSegment(l.pgr, bloomBitsForLevel(0, l.levelRatio), l.filterKind, func(emit func(ik, val []byte) bool) {
+	seg, err := writeSegment(l.pgr, bloomBitsForLevel(0, l.levelRatio), l.filterKind, l.codecForLevel(0), func(emit func(ik, val []byte) bool) {
 		mem.scan(func(ik, val []byte) bool {
 			oik, oval, e := l.separateForFlush(ik, val)
 			if e != nil {

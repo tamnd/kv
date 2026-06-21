@@ -49,10 +49,11 @@ const segDataHeaderSize = format.CommonHeaderSize
 // Flags-byte markers distinguishing the LSM block page roles that share the
 // PageLSMBlock type. A data page carries no flag.
 const (
-	footerFlag   byte = 0x01 // the footer page
-	indexFlag    byte = 0x02 // a block-index page
-	rangeDelFlag byte = 0x04 // a range-delete page
-	filterFlag   byte = 0x08 // a Bloom-filter page
+	footerFlag     byte = 0x01 // the footer page
+	indexFlag      byte = 0x02 // a block-index page
+	rangeDelFlag   byte = 0x04 // a range-delete page
+	filterFlag     byte = 0x08 // a Bloom-filter page
+	compressedFlag byte = 0x10 // a data page whose cells are stored as a compressed frame
 )
 
 // segFilter is the per-segment membership filter seam (spec 06 §5). A point read
@@ -126,12 +127,46 @@ type pendingPage struct {
 // one. A non-positive value falls back to the flat default. kind selects the filter
 // structure: filterBloom is the default, filterRibbon builds the opt-in Ribbon filter,
 // which falls back to Bloom when its construction cannot be seeded.
-func writeSegment(pgr *pager.Pager, bitsPerKey int, kind filterKind, src func(emit func(internalKey, value []byte) bool)) (*segment, error) {
+func writeSegment(pgr *pager.Pager, bitsPerKey int, kind filterKind, cdc codecID, src func(emit func(internalKey, value []byte) bool)) (*segment, error) {
 	usable := pgr.Header().UsablePageSize()
 	// The most a single cell can occupy: two length varints plus the bytes. A page
 	// must hold at least one whole cell, so a cell larger than the usable area minus
 	// the header cannot be stored inline and is rejected until value separation lands.
 	maxCell := usable - segDataHeaderSize
+	// With compression on, a page may hold more raw cell bytes than the usable area as
+	// long as the compressed frame fits; maxRawBlock caps how far the packer lets a page's
+	// raw size run so the read-time decompress buffer and the in-flight candidate copies
+	// stay bounded. Four usable pages is generous headroom for a real compression ratio
+	// without letting one page's raw block grow without limit.
+	maxRawBlock := 4 * usable
+
+	// encodeCell appends one length-prefixed (ik, val) cell onto dst, the on-page cell
+	// shape, so the packer can build a prospective page body to size or compression-test it
+	// before committing the cells to the current page.
+	encodeCell := func(dst, ik, val []byte) []byte {
+		dst = format.AppendUvarint(dst, uint64(len(ik)))
+		dst = append(dst, ik...)
+		dst = format.AppendUvarint(dst, uint64(len(val)))
+		dst = append(dst, val...)
+		return dst
+	}
+
+	// storable reports whether a prospective page body (its reserved header plus cells)
+	// can be stored on one page: directly when it already fits the usable area, or, with
+	// compression on and the raw block within maxRawBlock, when its compressed frame fits
+	// the usable area. A page whose raw cells overrun the usable area is admitted only when
+	// it compresses back under a page, which is where the space win comes from in a
+	// fixed-page store: more raw cell bytes packed into one physical page.
+	storable := func(body []byte) bool {
+		if len(body) <= usable {
+			return true
+		}
+		if cdc == codecNone || len(body) > maxRawBlock {
+			return false
+		}
+		frame := compressBlock(cdc, body[segDataHeaderSize:])
+		return segDataHeaderSize+len(frame) <= usable
+	}
 
 	var (
 		pages      []pendingPage
@@ -157,12 +192,14 @@ func writeSegment(pgr *pager.Pager, bitsPerKey int, kind filterKind, src func(em
 		}
 	}
 	appendCell := func(ik, val []byte) {
-		cur.body = format.AppendUvarint(cur.body, uint64(len(ik)))
-		cur.body = append(cur.body, ik...)
-		cur.body = format.AppendUvarint(cur.body, uint64(len(val)))
-		cur.body = append(cur.body, val...)
+		cur.body = encodeCell(cur.body, ik, val)
 		cur.cells++
 	}
+	// maxCellsPerPage caps a page's cell count below the uint16 the header records, so the
+	// dense packing a compressible block allows never overflows the count field. Without
+	// compression the packer fills a page to the usable area long before this many cells
+	// fit, so the cap only ever binds on a heavily compressed page.
+	const maxCellsPerPage = 60000
 
 	// A version group is buffered whole, then committed onto a page that has room
 	// for all of it, so a group never straddles a page boundary unless it alone
@@ -179,21 +216,47 @@ func writeSegment(pgr *pager.Pager, bitsPerKey int, kind filterKind, src func(em
 		}
 		// One filter entry per distinct user key, recorded as the group commits.
 		filterKeys = append(filterKeys, append([]byte(nil), groupUser...))
-		// Start the group on a fresh page when it will not fit on the current one,
-		// so the whole group stays together.
-		if cur.cells > 0 && len(cur.body)+groupLen > usable {
-			flushPage()
+		// Start the group on a fresh page when it will not fit on the current one, so the
+		// whole group stays together. With compression on, "fit" means the prospective body
+		// either stays within the usable area or compresses back under it, so a page packs
+		// more raw cells before it spills; storable decides both. The cell-count ceiling
+		// forces a spill regardless, so a densely packed page never overruns the count field.
+		if cur.cells > 0 {
+			over := false
+			if cur.cells+len(group) > maxCellsPerPage {
+				over = true
+			} else if len(cur.body)+groupLen > usable {
+				cand := append([]byte(nil), cur.body...)
+				for _, c := range group {
+					cand = encodeCell(cand, c.ik, c.val)
+				}
+				over = !storable(cand)
+			}
+			if over {
+				flushPage()
+			}
 		}
 		if cur.cells == 0 {
 			startPage(groupUser)
 		}
 		for _, c := range group {
 			cellLen := uvarintLen(uint64(len(c.ik))) + len(c.ik) + uvarintLen(uint64(len(c.val))) + len(c.val)
-			// A group larger than a page spills onto continuation pages that repeat
-			// its first user key, the only case a group spans pages.
-			if cur.cells > 0 && len(cur.body)+cellLen > usable {
-				flushPage()
-				startPage(groupUser)
+			// A group larger than a page spills onto continuation pages that repeat its
+			// first user key, the only case a group spans pages. The raw fit test is free
+			// until the body passes the usable area, then storable decides, so a compressible
+			// run keeps packing past usable while an incompressible one spills at usable.
+			if cur.cells > 0 {
+				spill := false
+				if cur.cells >= maxCellsPerPage {
+					spill = true
+				} else if len(cur.body)+cellLen > usable {
+					cand := encodeCell(append([]byte(nil), cur.body...), c.ik, c.val)
+					spill = !storable(cand)
+				}
+				if spill {
+					flushPage()
+					startPage(groupUser)
+				}
 			}
 			appendCell(c.ik, c.val)
 
@@ -276,16 +339,30 @@ func writeSegment(pgr *pager.Pager, bitsPerKey int, kind filterKind, src func(em
 		if i+1 < len(pages) {
 			next = pgnos[i+1]
 		}
+		body := pages[i].body
+		flags := byte(0)
+		// A page whose raw cells overran the usable area was let through only by storable,
+		// which proved its frame fits, so compress it now and mark it. A page within the
+		// usable area is stored raw: compressing it would not shrink the fixed-size page on
+		// disk, so it would only cost decode CPU on every read for no space back.
+		if cdc != codecNone && len(body) > usable {
+			frame := compressBlock(cdc, body[segDataHeaderSize:])
+			out := make([]byte, segDataHeaderSize, segDataHeaderSize+len(frame))
+			out = append(out, frame...)
+			body = out
+			flags = compressedFlag
+		}
 		header := format.CommonHeader{
 			Type:      format.PageLSMBlock,
+			Flags:     flags,
 			CellCount: uint16(pages[i].cells),
 			Overflow:  next,
 		}
-		header.Encode(pages[i].body)
+		header.Encode(body)
 		data := frames[i].Data()
-		copy(data, pages[i].body)
+		copy(data, body)
 		// Zero any tail left from a reused page so the unused area is deterministic.
-		for j := len(pages[i].body); j < len(data); j++ {
+		for j := len(body); j < len(data); j++ {
 			data[j] = 0
 		}
 		pgr.Unpin(frames[i], true)
@@ -725,6 +802,19 @@ func (s *segment) seekPage(userKey []byte) int {
 	return idx - 1 // the group starts mid-page on the page before the first larger separator
 }
 
+// dataPageBody returns the cell bytes of a data page, the slice the readers iterate over.
+// An uncompressed page returns its bytes past the header directly; a compressed page (its
+// header carries compressedFlag) returns the decoded cells, so a reader walks the same cell
+// layout either way and needs no knowledge of which codec, if any, packed the page. The
+// returned slice for a compressed page is a fresh buffer; for an uncompressed page it aliases
+// the pinned page and is valid only while the frame stays pinned.
+func dataPageBody(data []byte, h format.CommonHeader) ([]byte, error) {
+	if h.Flags&compressedFlag == 0 {
+		return data[segDataHeaderSize:], nil
+	}
+	return decompressBlock(data[segDataHeaderSize:])
+}
+
 // getGroup calls fn for every cell of userKey's version group, in ascending
 // internal-key order (newest version first), using the block index to seek the data
 // page that holds the group rather than scanning the run. The cell slices alias the
@@ -749,17 +839,22 @@ func (s *segment) getGroup(pgr *pager.Pager, userKey []byte, fn func(internalKey
 			pgr.Unpin(fr, false)
 			return fmt.Errorf("lsm: page %d in segment chain is not an LSM block", s.index[i].page)
 		}
-		off := segDataHeaderSize
+		body, derr := dataPageBody(data, h)
+		if derr != nil {
+			pgr.Unpin(fr, false)
+			return derr
+		}
+		off := 0
 		stop := false
 		var lastUser []byte
 		for c := 0; c < int(h.CellCount); c++ {
-			klen, m := format.Uvarint(data[off:])
+			klen, m := format.Uvarint(body[off:])
 			off += m
-			ik := data[off : off+int(klen)]
+			ik := body[off : off+int(klen)]
 			off += int(klen)
-			vlen, m := format.Uvarint(data[off:])
+			vlen, m := format.Uvarint(body[off:])
 			off += m
-			val := data[off : off+int(vlen)]
+			val := body[off : off+int(vlen)]
 			off += int(vlen)
 			lastUser = format.UserKey(ik)
 			cmp := format.CompareUser(lastUser, userKey)
@@ -804,16 +899,21 @@ func (s *segment) scan(pgr *pager.Pager, fn func(internalKey, value []byte) bool
 			pgr.Unpin(fr, false)
 			return fmt.Errorf("lsm: page %d in segment chain is not an LSM block", pgno)
 		}
-		off := segDataHeaderSize
+		body, derr := dataPageBody(data, h)
+		if derr != nil {
+			pgr.Unpin(fr, false)
+			return derr
+		}
+		off := 0
 		stop := false
 		for i := 0; i < int(h.CellCount); i++ {
-			klen, n := format.Uvarint(data[off:])
+			klen, n := format.Uvarint(body[off:])
 			off += n
-			key := data[off : off+int(klen)]
+			key := body[off : off+int(klen)]
 			off += int(klen)
-			vlen, n := format.Uvarint(data[off:])
+			vlen, n := format.Uvarint(body[off:])
 			off += n
-			val := data[off : off+int(vlen)]
+			val := body[off : off+int(vlen)]
 			off += int(vlen)
 			if !fn(key, val) {
 				stop = true
