@@ -406,3 +406,25 @@ func (w *WAL) Close() error { return w.file.Close() }
 
 // Path reports the WAL file path.
 func (w *WAL) Path() string { return w.path }
+
+// DurableSize reports the byte length of the log's durable prefix: the header plus
+// every frame appended and synced so far, which is the next append offset. A physical
+// backup copies exactly this many bytes from the front of the -wal file to capture the
+// frames a restore must replay, ignoring any stale bytes a previous larger generation
+// left past the tail (spec 18 §2).
+func (w *WAL) DurableSize() int64 { return w.tailOff }
+
+// DurableImage returns a copy of the log's durable prefix, the bytes from the front of
+// the -wal file up to DurableSize. It is the WAL half of a physical backup: combined
+// with the checkpointed main file it reconstructs the exact state a reader at the backup
+// version would see, since the main file holds everything folded at the last checkpoint
+// and these frames hold everything committed after it (spec 18 §2). For the B-tree core a
+// checkpoint folds the whole log, so the image is a header-only empty log; for the LSM
+// core it carries the frames kept past the engine's durable point.
+func (w *WAL) DurableImage() ([]byte, error) {
+	buf := make([]byte, w.tailOff)
+	if _, err := w.file.ReadAt(buf, 0); err != nil {
+		return nil, err
+	}
+	return buf, nil
+}

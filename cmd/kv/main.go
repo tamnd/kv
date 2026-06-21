@@ -55,6 +55,8 @@ func commands() []command {
 		{"dump", "stream all key/value pairs as JSONL", cmdDump},
 		{"load", "bulk-load key/value pairs from stdin or a file", cmdLoad},
 		{"checkpoint", "fold the WAL into the main file", cmdCheckpoint},
+		{"backup", "stream a consistent physical image to a file or stdout", cmdBackup},
+		{"restore", "rebuild a database from a backup stream", cmdRestore},
 		{"vacuum", "return trailing free pages to the OS; shrink the file", cmdVacuum},
 		{"pragma", "read or set a configuration knob (engine, application_id, ...)", cmdPragma},
 		{"check", "verify structural integrity; exit 4 on any violation", cmdCheck},

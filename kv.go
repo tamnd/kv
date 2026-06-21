@@ -18,6 +18,7 @@ package kv
 
 import (
 	"context"
+	"io"
 	"log/slog"
 	"time"
 
@@ -209,6 +210,16 @@ func Compact(path string, opts ...Option) error {
 	}
 	c.resolveCache()
 	return wrap(db.Compact(vfs.NewOS(), path, c.opts))
+}
+
+// RestoreBackup reconstructs a database at path from a stream produced by DB.Backup, writing
+// the main file and its -wal sidecar so a subsequent Open reads the restored database (spec
+// 18 §2). It refuses to overwrite an existing file at either path: restore creates, it never
+// clobbers. The restored database is byte-faithful to the source at the backup version, same
+// engine and format; an encrypted backup restores to an encrypted database that needs the
+// original key supplied at Open.
+func RestoreBackup(path string, r io.Reader) error {
+	return wrap(db.RestoreBackup(vfs.NewOS(), path, r))
 }
 
 // resolveCache converts a byte cache budget into the frame count the pager wants,
@@ -484,6 +495,19 @@ func (kdb *DB) CheckpointMode(m CheckpointMode) error {
 func (kdb *DB) Vacuum(budget int) (int, error) {
 	freed, err := kdb.d.Vacuum(budget)
 	return freed, wrap(err)
+}
+
+// Backup streams a consistent physical image of the database to w and returns the commit
+// version it captured (spec 18 §2). The image folds the WAL into the main file first, so it
+// is self-contained, and restores with RestoreBackup into a database that opens directly and
+// passes Check. Backup runs under the write lock, so it serializes with the single writer:
+// commits wait while the image is copied, the simple always-correct physical snapshot. If
+// the database is encrypted the image is ciphertext, so the backup is encrypted at rest and
+// a restore needs the same key (spec 18 §7); back the key up separately, or the backup is
+// unrecoverable.
+func (kdb *DB) Backup(w io.Writer) (uint64, error) {
+	v, err := kdb.d.Backup(w)
+	return v, wrap(err)
 }
 
 // ApplicationID returns the application-defined file tag stored in the header (spec 22 §2),
