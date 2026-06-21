@@ -120,6 +120,11 @@ func Run(cfg Config, w Workload) (Result, error) {
 	loadGen := NewGenerator(GenConfig{KeyCount: cfg.KeyCount, KeyLen: cfg.KeyLen, ValLen: cfg.ValLen, Dist: Sequential, Seed: cfg.Seed})
 	ingested := int64(cfg.KeyCount) * int64(loadGen.BytesPerOp())
 
+	// Read-amplification inputs, filled by the run phase (a bulk-load workload leaves them
+	// zero, so its read amplification stays the not-measured sentinel).
+	var readOps int64
+	var pageReadDelta uint64
+
 	if w.MeasureLoad {
 		// The bulk-load workload measures the load itself: time and GC are captured around it.
 		gcStart := readGC()
@@ -143,25 +148,31 @@ func Run(cfg Config, w Workload) (Result, error) {
 		if err := settle(db); err != nil {
 			return Result{}, err
 		}
-		reads, writes, ops, dropped, dur, gc, err := runPhase(db, cfg, w)
+		rr, err := runPhase(db, cfg, w)
 		if err != nil {
 			return Result{}, err
 		}
-		res.Ops = ops
-		res.Dropped = dropped
-		res.Duration = dur
-		res.Reads = reads.Summary()
-		res.Writes = writes.Summary()
-		res.GC = gc
-		res.Throughput = opsPerSec(ops, dur)
+		res.Ops = rr.ops
+		res.Dropped = rr.dropped
+		res.Duration = rr.dur
+		res.Reads = rr.reads.Summary()
+		res.Writes = rr.writes.Summary()
+		res.GC = rr.gc
+		res.Throughput = opsPerSec(rr.ops, rr.dur)
+		readOps = rr.readOps
+		pageReadDelta = rr.pageReadDelta
 	}
 
 	// Settle once more so the file footprint reflects folded, compacted state, then read the
-	// amplification triple.
+	// amplification triple. Read amplification comes from the run phase's own page-read delta
+	// over its logical reads; the space and write factors come from the settled file.
 	if err := settle(db); err != nil {
 		return Result{}, err
 	}
 	res.Amplification = amplification(db, cfg.Dir, ingested)
+	if readOps > 0 {
+		res.Amplification.Read = float64(pageReadDelta) / float64(readOps)
+	}
 	return res, nil
 }
 
@@ -215,18 +226,35 @@ func settle(db *kv.DB) error {
 	return nil
 }
 
+// runResult is the run phase's measured output: the read and write latency histograms, the
+// op and dropped counts, the wall-clock window, the window's GC cost, and the read-side I/O
+// the read amplification ratio needs (logical read ops and the physical page reads the pager
+// issued to serve them).
+type runResult struct {
+	reads, writes *Histogram
+	ops, dropped  int64
+	readOps       int64
+	pageReadDelta uint64
+	dur           time.Duration
+	gc            GCStats
+}
+
 // runPhase performs cfg.Ops operations of workload w against a loaded database, timing each
-// and bucketing its latency into the read or write histogram. It returns the two histograms
-// plus the op count, dropped count, wall-clock window, and the window's GC cost.
-func runPhase(db *kv.DB, cfg Config, w Workload) (reads, writes *Histogram, ops, dropped int64, dur time.Duration, gc GCStats, err error) {
-	reads = NewHistogram(cfg.Ops)
-	writes = NewHistogram(cfg.Ops)
+// and bucketing its latency into the read or write histogram. It samples the pager's
+// physical-read counter across the window so the read amplification denominator (logical
+// reads) and numerator (page reads) come from the same window, not from the load phase.
+func runPhase(db *kv.DB, cfg Config, w Workload) (runResult, error) {
+	rr := runResult{
+		reads:  NewHistogram(cfg.Ops),
+		writes: NewHistogram(cfg.Ops),
+	}
 	// A separate draw stream for keys and for the read/write coin, both seeded, so the op
 	// mix is reproducible. Offsetting the coin's seed keeps it independent of the key draw.
 	keyGen := NewGenerator(GenConfig{KeyCount: cfg.KeyCount, KeyLen: cfg.KeyLen, ValLen: cfg.ValLen, Dist: w.Dist, Seed: cfg.Seed})
 	coin := NewGenerator(GenConfig{KeyCount: 1 << 20, KeyLen: minKeyLen, ValLen: minValLen, Dist: Uniform, Seed: cfg.Seed + 1})
 
 	var kbuf []byte
+	pageReads0 := db.Stats().PageReads
 	gcStart := readGC()
 	start := time.Now()
 	for n := 0; n < cfg.Ops; n++ {
@@ -236,34 +264,31 @@ func runPhase(db *kv.DB, cfg Config, w Workload) (reads, writes *Histogram, ops,
 
 		switch {
 		case w.RMW:
-			if e := rmwOp(db, kbuf, keyGen, idx, reads, writes); e != nil {
-				err = e
-				return
+			if e := rmwOp(db, kbuf, keyGen, idx, rr.reads, rr.writes); e != nil {
+				return rr, e
 			}
-			ops++
+			rr.readOps++ // an RMW reads before it writes
 		case w.ScanLength > 0:
-			if e := scanOp(db, kbuf, w.ScanLength, reads); e != nil {
-				err = e
-				return
+			if e := scanOp(db, kbuf, w.ScanLength, rr.reads); e != nil {
+				return rr, e
 			}
-			ops++
+			rr.readOps++ // a scan is one logical read that touches many keys
 		case w.isWrite(coinVal):
-			if e := writeOp(db, kbuf, keyGen.Value(idx), writes); e != nil {
-				err = e
-				return
+			if e := writeOp(db, kbuf, keyGen.Value(idx), rr.writes); e != nil {
+				return rr, e
 			}
-			ops++
 		default:
-			if e := readOp(db, kbuf, reads); e != nil {
-				err = e
-				return
+			if e := readOp(db, kbuf, rr.reads); e != nil {
+				return rr, e
 			}
-			ops++
+			rr.readOps++
 		}
+		rr.ops++
 	}
-	dur = time.Since(start)
-	gc = readGC().diff(gcStart)
-	return
+	rr.dur = time.Since(start)
+	rr.gc = readGC().diff(gcStart)
+	rr.pageReadDelta = db.Stats().PageReads - pageReads0
+	return rr, nil
 }
 
 // readOp times a single point lookup. A miss is not an error: under a Zipfian draw over a

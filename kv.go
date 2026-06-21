@@ -345,6 +345,12 @@ type Stats struct {
 	WALBacklog uint64
 	// Syncs is how many fsyncs the WAL has performed since open.
 	Syncs uint64
+	// PageReads and CacheHits are the buffer pool's cumulative traffic since open: physical
+	// page reads against the main file, and Gets served from a resident frame. Their ratio
+	// is the cache hit rate, and PageReads over a workload's logical read count is its read
+	// amplification (spec 19, spec 21 §1).
+	PageReads uint64
+	CacheHits uint64
 }
 
 // Stats returns a current space-and-durability snapshot of the database (spec 09 §4).
@@ -364,6 +370,8 @@ func (kdb *DB) Stats() Stats {
 		WALFrames:     s.WALFrames,
 		WALBacklog:    s.WALBacklog,
 		Syncs:         s.Syncs,
+		PageReads:     s.PageReads,
+		CacheHits:     s.CacheHits,
 	}
 }
 

@@ -18,6 +18,7 @@ func (p *Pager) Get(pgno uint32, intent Intent) (*Frame, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if fr, ok := p.index[pgno]; ok {
+		p.cacheHits.Add(1)
 		fr.pins.Add(1)
 		fr.ref = true
 		return fr, nil
@@ -27,7 +28,9 @@ func (p *Pager) Get(pgno uint32, intent Intent) (*Frame, error) {
 		return nil, err
 	}
 	// Read the page from disk if it is within the materialized file; a freshly
-	// allocated page beyond the on-disk size reads as zeroes.
+	// allocated page beyond the on-disk size reads as zeroes. Either way a physical
+	// read was issued, so it counts toward read amplification.
+	p.pageReads.Add(1)
 	off := int64(pgno-1) * int64(p.pageSize)
 	if _, err := p.file.ReadAt(fr.data, off); err != nil {
 		// A short read at the tail of a just-grown file is not an error; zero-fill.
