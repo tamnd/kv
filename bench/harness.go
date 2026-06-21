@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/tamnd/kv"
@@ -35,6 +36,11 @@ type Config struct {
 	// Ops is the number of measured operations in the run phase. Ignored for a bulk-load
 	// workload, whose measured window is the load itself.
 	Ops int
+	// Concurrency is how many goroutines drive the run phase in parallel, each with its own
+	// seeded draw stream. Zero or one runs the phase serially, the default the regression gate
+	// uses for a stable single-threaded number; a higher value measures throughput and tail
+	// latency under contention (spec 21 §3). It does not affect the bulk-load workload.
+	Concurrency int
 	// BatchSize is how many writes share one transaction in the load phase and in
 	// write-heavy run phases; batching is what lets the LSM flush real multi-page segments.
 	BatchSize int
@@ -53,16 +59,17 @@ type Config struct {
 // the LSM flushes real segments. Callers scale KeyCount/Ops up for a real measurement.
 func DefaultConfig(engine kv.EngineKind, dir string) Config {
 	return Config{
-		Engine:    engine,
-		Dir:       dir,
-		PageSize:  4096,
-		Sync:      kv.SyncFull,
-		KeyCount:  20000,
-		KeyLen:    24,
-		ValLen:    64,
-		Ops:       20000,
-		BatchSize: 100,
-		Seed:      1,
+		Engine:      engine,
+		Dir:         dir,
+		PageSize:    4096,
+		Sync:        kv.SyncFull,
+		KeyCount:    20000,
+		KeyLen:      24,
+		ValLen:      64,
+		Ops:         20000,
+		Concurrency: 1,
+		BatchSize:   100,
+		Seed:        1,
 	}
 }
 
@@ -119,6 +126,7 @@ func Run(cfg Config, w Workload) (Result, error) {
 		Seed:         cfg.Seed,
 		Synchronous:  syncName(cfg.Sync),
 		BatchSize:    cfg.BatchSize,
+		Concurrency:  concurrencyOf(cfg),
 	}
 	res := Result{Workload: w.Name, Engine: engineName(cfg.Engine), Setup: setup}
 
@@ -262,56 +270,143 @@ type runResult struct {
 	gc            GCStats
 }
 
-// runPhase performs cfg.Ops operations of workload w against a loaded database, timing each
-// and bucketing its latency into the read or write histogram. It samples the pager's
-// physical-read counter across the window so the read amplification denominator (logical
-// reads) and numerator (page reads) come from the same window, not from the load phase.
-func runPhase(db *kv.DB, cfg Config, w Workload) (runResult, error) {
-	rr := runResult{
-		reads:  NewHistogram(cfg.Ops),
-		writes: NewHistogram(cfg.Ops),
+// concurrencyOf is the effective worker count: at least one.
+func concurrencyOf(cfg Config) int {
+	if cfg.Concurrency < 1 {
+		return 1
 	}
-	// A separate draw stream for keys and for the read/write coin, both seeded, so the op
-	// mix is reproducible. Offsetting the coin's seed keeps it independent of the key draw.
-	keyGen := NewGenerator(GenConfig{KeyCount: cfg.KeyCount, KeyLen: cfg.KeyLen, ValLen: cfg.ValLen, Dist: w.Dist, Seed: cfg.Seed})
-	coin := NewGenerator(GenConfig{KeyCount: 1 << 20, KeyLen: minKeyLen, ValLen: minValLen, Dist: Uniform, Seed: cfg.Seed + 1})
+	return cfg.Concurrency
+}
 
-	var kbuf []byte
+// splitOps divides total ops as evenly as possible across workers, handing the remainder to
+// the first few so the counts sum back to total exactly.
+func splitOps(total, workers int) []int {
+	out := make([]int, workers)
+	base, rem := total/workers, total%workers
+	for i := range out {
+		out[i] = base
+		if i < rem {
+			out[i]++
+		}
+	}
+	return out
+}
+
+// runPhase performs cfg.Ops operations of workload w against a loaded database, optionally
+// spread across cfg.Concurrency goroutines, timing each op and bucketing its latency into the
+// read or write histogram. It samples the pager's physical-read counter, the GC counters, and
+// the wall clock across the whole parallel window, so the read amplification, the GC cost, and
+// the throughput all describe the same span the latencies were drawn from, not the load phase.
+func runPhase(db *kv.DB, cfg Config, w Workload) (runResult, error) {
+	workers := concurrencyOf(cfg)
+	per := splitOps(cfg.Ops, workers)
+
+	rr := runResult{reads: NewHistogram(cfg.Ops), writes: NewHistogram(cfg.Ops)}
 	pageReads0 := db.Stats().PageReads
 	gcStart := readGC()
 	start := time.Now()
-	for n := 0; n < cfg.Ops; n++ {
+
+	if workers == 1 {
+		wr, err := runWorker(db, cfg, w, 0, per[0])
+		if err != nil {
+			return rr, err
+		}
+		mergeWorker(&rr, wr)
+	} else {
+		results := make([]workerResult, workers)
+		errs := make([]error, workers)
+		var wg sync.WaitGroup
+		for i := 0; i < workers; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				results[i], errs[i] = runWorker(db, cfg, w, i, per[i])
+			}(i)
+		}
+		wg.Wait()
+		for i := 0; i < workers; i++ {
+			if errs[i] != nil {
+				return rr, errs[i]
+			}
+			mergeWorker(&rr, results[i])
+		}
+	}
+
+	rr.dur = time.Since(start)
+	rr.gc = readGC().diff(gcStart)
+	rr.pageReadDelta = db.Stats().PageReads - pageReads0
+	return rr, nil
+}
+
+// workerResult is one goroutine's slice of the run phase: its own latency histograms and its
+// own op, dropped, and logical-read counts, all merged into the run's totals afterward.
+type workerResult struct {
+	reads, writes             *Histogram
+	ops, dropped, logicalRead int64
+}
+
+// mergeWorker folds a worker's result into the run total. Histograms merge sample-for-sample
+// so the run's percentiles are the true percentiles across all workers, not an average of
+// per-worker percentiles.
+func mergeWorker(rr *runResult, wr workerResult) {
+	rr.reads.Merge(wr.reads)
+	rr.writes.Merge(wr.writes)
+	rr.ops += wr.ops
+	rr.dropped += wr.dropped
+	rr.readOps += wr.logicalRead
+}
+
+// runWorker drives ops operations of workload w on its own seeded draw streams. Each worker
+// gets a distinct seed so the workers do not all replay the same key sequence in lockstep,
+// while staying reproducible run to run. A write that loses its retry race under contention
+// surfaces as kv.ErrConflict and is counted as a dropped op, not a fatal error.
+func runWorker(db *kv.DB, cfg Config, w Workload, worker, ops int) (workerResult, error) {
+	wr := workerResult{reads: NewHistogram(ops), writes: NewHistogram(ops)}
+	// A separate draw stream for keys and for the read/write coin, both seeded, so the op mix
+	// is reproducible. The per-worker offset keeps each goroutine's stream distinct, and the
+	// coin's offset keeps it independent of the key draw.
+	seed := cfg.Seed + int64(worker)*0x9e3779b1
+	keyGen := NewGenerator(GenConfig{KeyCount: cfg.KeyCount, KeyLen: cfg.KeyLen, ValLen: cfg.ValLen, Dist: w.Dist, Seed: seed})
+	coin := NewGenerator(GenConfig{KeyCount: 1 << 20, KeyLen: minKeyLen, ValLen: minValLen, Dist: Uniform, Seed: seed + 1})
+
+	var kbuf []byte
+	for n := 0; n < ops; n++ {
 		idx := keyGen.nextIndex()
 		kbuf = keyGen.Key(kbuf, idx)
 		coinVal := float64(coin.nextIndex()) / float64(1<<20)
 
 		switch {
 		case w.RMW:
-			if e := rmwOp(db, kbuf, keyGen, idx, rr.reads, rr.writes); e != nil {
-				return rr, e
+			if e := rmwOp(db, kbuf, keyGen, idx, wr.reads, wr.writes); e != nil {
+				if e == kv.ErrConflict {
+					wr.dropped++
+					continue
+				}
+				return wr, e
 			}
-			rr.readOps++ // an RMW reads before it writes
+			wr.logicalRead++ // an RMW reads before it writes
 		case w.ScanLength > 0:
-			if e := scanOp(db, kbuf, w.ScanLength, rr.reads); e != nil {
-				return rr, e
+			if e := scanOp(db, kbuf, w.ScanLength, wr.reads); e != nil {
+				return wr, e
 			}
-			rr.readOps++ // a scan is one logical read that touches many keys
+			wr.logicalRead++ // a scan is one logical read that touches many keys
 		case w.isWrite(coinVal):
-			if e := writeOp(db, kbuf, keyGen.Value(idx), rr.writes); e != nil {
-				return rr, e
+			if e := writeOp(db, kbuf, keyGen.Value(idx), wr.writes); e != nil {
+				if e == kv.ErrConflict {
+					wr.dropped++
+					continue
+				}
+				return wr, e
 			}
 		default:
-			if e := readOp(db, kbuf, rr.reads); e != nil {
-				return rr, e
+			if e := readOp(db, kbuf, wr.reads); e != nil {
+				return wr, e
 			}
-			rr.readOps++
+			wr.logicalRead++
 		}
-		rr.ops++
+		wr.ops++
 	}
-	rr.dur = time.Since(start)
-	rr.gc = readGC().diff(gcStart)
-	rr.pageReadDelta = db.Stats().PageReads - pageReads0
-	return rr, nil
+	return wr, nil
 }
 
 // readOp times a single point lookup. A miss is not an error: under a Zipfian draw over a
@@ -329,10 +424,16 @@ func readOp(db *kv.DB, key []byte, h *Histogram) error {
 	return err
 }
 
-// writeOp times a single committed update of one key.
+// writeOp times a single committed update of one key. Under concurrency Update may still lose
+// a write-write race after exhausting its retry bound; that surfaces as kv.ErrConflict, which
+// the caller counts as a dropped op rather than a fatal error. A dropped write records no
+// latency sample, so the histogram holds only ops that actually committed.
 func writeOp(db *kv.DB, key, val []byte, h *Histogram) error {
 	start := time.Now()
 	err := db.Update(func(txn *kv.Txn) error { return txn.Set(key, val) })
+	if err == kv.ErrConflict {
+		return err
+	}
 	h.Record(time.Since(start))
 	return err
 }
@@ -347,6 +448,9 @@ func rmwOp(db *kv.DB, key []byte, gen *Generator, idx uint64, reads, writes *His
 		}
 		return txn.Set(key, gen.Value(idx))
 	})
+	if err == kv.ErrConflict {
+		return err
+	}
 	d := time.Since(start)
 	// An RMW touches both paths; charge it to both histograms so neither tail is hidden.
 	reads.Record(d)

@@ -139,6 +139,7 @@ type Setup struct {
 	Seed         int64  `json:"seed"`
 	Synchronous  string `json:"synchronous"`
 	BatchSize    int    `json:"batch_size"`
+	Concurrency  int    `json:"concurrency"`
 }
 
 // JSON renders the result as indented, machine-readable JSON for storage and diffing.
