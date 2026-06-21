@@ -605,6 +605,11 @@ func (s *splitter) fill(emit func(ik, val []byte) bool) {
 //     newer version of their own key;
 //   - at the deepest level, drop a point delete that becomes the base, since nothing
 //     lives below it for the tombstone to shadow.
+//
+// A separated set (KindSetSep) is a base exactly like an inline set: its value lives in
+// the value log, but the cell still establishes the version a snapshot resolves to, so it
+// shadows the older versions under it the same way. Compaction carries the pointer cell
+// through verbatim, which is what makes value separation cheap.
 func (s *splitter) keep(ik []byte) bool {
 	kind := format.KindOf(ik)
 	if kind == format.KindRangeBegin {
@@ -614,7 +619,7 @@ func (s *splitter) keep(ik []byte) bool {
 		if s.keptBase {
 			return false
 		}
-		if kind == format.KindSet || kind == format.KindDelete {
+		if kind == format.KindSet || kind == format.KindSetSep || kind == format.KindDelete {
 			s.keptBase = true
 			if s.dropTomb && kind == format.KindDelete {
 				return false

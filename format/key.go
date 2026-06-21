@@ -13,6 +13,7 @@ const (
 	KindRangeBegin Kind = 0x03 // range-delete start
 	KindRangeEnd   Kind = 0x04 // range-delete end
 	KindSetWithTTL Kind = 0x05 // value set with an expiry prefix on the value (spec 15 §6)
+	KindSetSep     Kind = 0x06 // value set whose bytes live in the value log; the cell holds a value pointer (spec 06 §7)
 )
 
 // String renders a Kind for diagnostics.
@@ -30,6 +31,8 @@ func (k Kind) String() string {
 		return "rangeend"
 	case KindSetWithTTL:
 		return "setttl"
+	case KindSetSep:
+		return "setsep"
 	default:
 		return "kind?"
 	}
