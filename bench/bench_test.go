@@ -70,8 +70,15 @@ func TestRunInvariants(t *testing.T) {
 				if amp.Write <= 0 {
 					t.Fatalf("non-positive write factor %v (the file should hold the data)", amp.Write)
 				}
-				if amp.Read != readNotMeasured {
-					t.Fatalf("read amplification should be the not-measured sentinel %v, got %v", readNotMeasured, amp.Read)
+				// A workload with reads reports a real, non-negative read amplification from
+				// the pager counter; a write-only workload leaves the not-measured sentinel.
+				hasReads := w.ReadFraction > 0 || w.RMW || w.ScanLength > 0
+				if hasReads {
+					if amp.Read < 0 {
+						t.Fatalf("read workload should report read amplification, got sentinel %v", amp.Read)
+					}
+				} else if amp.Read != readNotMeasured {
+					t.Fatalf("write-only workload should leave the not-measured sentinel %v, got %v", readNotMeasured, amp.Read)
 				}
 
 				// The result must round-trip through JSON unchanged, since that JSON is the

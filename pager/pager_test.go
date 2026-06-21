@@ -193,6 +193,68 @@ func TestBufferPoolExhaustion(t *testing.T) {
 	}
 }
 
+// TestIOStatsCountsHitsAndReads checks the buffer pool's traffic counters: a Get served
+// from a resident frame is a cache hit and issues no physical read, and a Get for a page
+// evicted out of the pool is a miss that issues exactly one physical read. These are the
+// numbers read amplification and the cache hit ratio rest on (spec 19, spec 21 §1).
+func TestIOStatsCountsHitsAndReads(t *testing.T) {
+	_, p := newTestPager(t, Options{PageSize: 4096, CacheFrames: 8})
+
+	// Allocate a first page; it stays resident and dirty in the pool.
+	pgno, fr, err := p.Allocate()
+	if err != nil {
+		t.Fatalf("allocate: %v", err)
+	}
+	writePattern(fr.Data(), pgno)
+	p.Unpin(fr, true)
+
+	// Two Gets of a resident page are two cache hits and zero physical reads.
+	base := p.IOStats()
+	for i := 0; i < 2; i++ {
+		fr, err := p.Get(pgno, Read)
+		if err != nil {
+			t.Fatalf("get resident: %v", err)
+		}
+		p.Unpin(fr, false)
+	}
+	hit := p.IOStats()
+	if hit.CacheHits != base.CacheHits+2 {
+		t.Fatalf("cache hits = %d, want %d", hit.CacheHits, base.CacheHits+2)
+	}
+	if hit.PageReads != base.PageReads {
+		t.Fatalf("resident gets issued %d physical reads, want 0", hit.PageReads-base.PageReads)
+	}
+
+	// Allocate well past the 8-frame pool so the first page is evicted to the file.
+	for i := 0; i < 24; i++ {
+		_, fr, err := p.Allocate()
+		if err != nil {
+			t.Fatalf("allocate filler %d: %v", i, err)
+		}
+		writePattern(fr.Data(), fr.PageNo())
+		p.Unpin(fr, true)
+	}
+
+	// Getting the now-evicted first page is a miss: exactly one physical read, and the page
+	// comes back intact so the read actually happened.
+	before := p.IOStats()
+	fr, err = p.Get(pgno, Read)
+	if err != nil {
+		t.Fatalf("get evicted: %v", err)
+	}
+	if !checkPattern(fr.Data(), pgno) {
+		t.Fatalf("evicted page %d came back corrupt", pgno)
+	}
+	p.Unpin(fr, false)
+	after := p.IOStats()
+	if after.PageReads != before.PageReads+1 {
+		t.Fatalf("miss issued %d physical reads, want 1", after.PageReads-before.PageReads)
+	}
+	if after.CacheHits != before.CacheHits {
+		t.Fatalf("miss counted %d cache hits, want 0", after.CacheHits-before.CacheHits)
+	}
+}
+
 // TestTruncateTailShrinksFile allocates a run of pages, frees the ones at the very end,
 // and confirms TruncateTail hands them back to the file (the page count and on-disk size
 // both fall), while a free page buried in the middle is left on the freelist (spec 09 §3.1).

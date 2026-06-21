@@ -23,10 +23,11 @@ type Amplification struct {
 	// the public surface today, and it is labeled as such rather than dressed up as the real
 	// write amp.
 	Write float64 `json:"write_factor"`
-	// Read is I/Os per logical read. It is left at -1 ("not measured") in this slice: it
-	// needs a pager I/O counter that does not exist yet, and reporting a fabricated number
-	// would be exactly the dishonesty spec 21 §3 warns against. The follow-on slice that adds
-	// the counter fills this in.
+	// Read is read amplification: physical page reads the pager issued to serve the run
+	// phase over the logical read operations the workload performed (spec 21 §1). It is
+	// measured from the pager's page-read counter sampled across the run window. A workload
+	// with no read operations (a bulk load, a write-only ingest) leaves it at the -1
+	// not-measured sentinel rather than dividing by zero.
 	Read float64 `json:"read_ios_per_op"`
 }
 

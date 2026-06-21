@@ -758,6 +758,12 @@ type Stats struct {
 	WALBacklog uint64
 	// Syncs is how many fsyncs the WAL has performed since open (spec 19).
 	Syncs uint64
+	// PageReads and CacheHits are the buffer pool's cumulative traffic since open: physical
+	// page reads against the main file, and Gets served from a resident frame. Their ratio
+	// is the cache hit rate, and PageReads divided by a workload's logical read count is its
+	// read amplification (spec 19, spec 21 §1).
+	PageReads uint64
+	CacheHits uint64
 }
 
 // Stats gathers a Stats snapshot under a read lock, so it is consistent against a
@@ -780,6 +786,7 @@ func (d *DB) Stats() Stats {
 	if written > folded {
 		backlog = written - folded
 	}
+	io := d.pgr.IOStats()
 	return Stats{
 		Engine:        d.pgr.Header().Engine,
 		PageSize:      d.pgr.PageSize(),
@@ -793,6 +800,8 @@ func (d *DB) Stats() Stats {
 		WALFrames:     written,
 		WALBacklog:    backlog,
 		Syncs:         d.wal.Syncs(),
+		PageReads:     io.PageReads,
+		CacheHits:     io.CacheHits,
 	}
 }
 

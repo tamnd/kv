@@ -80,6 +80,29 @@ type Pager struct {
 
 	dbSize uint32   // page count (high-water mark); pages are 1-based
 	free   []uint32 // in-memory freelist, persisted to trunk pages at checkpoint
+
+	// pageReads and cacheHits count the buffer pool's traffic for the read-amplification
+	// and cache-hit-ratio observability the spec asks for (spec 19, spec 21 §1). pageReads
+	// is the number of physical page reads issued against the main file to satisfy a Get
+	// miss; cacheHits is the number of Gets served from a resident frame. They are atomics
+	// so a Stats reader can sample them without taking the pager mutex off the hot path.
+	pageReads atomic.Uint64
+	cacheHits atomic.Uint64
+}
+
+// IOStats is the buffer pool's cumulative traffic since open. PageReads is physical reads
+// of a page from the main file (cache misses that hit disk); CacheHits is Gets served from
+// a resident frame. Their ratio is the cache hit rate, and PageReads over the number of
+// logical reads a workload issued is its read amplification (spec 21 §1).
+type IOStats struct {
+	PageReads uint64
+	CacheHits uint64
+}
+
+// IOStats samples the pager's cumulative I/O counters. It is lock-free and cheap, safe to
+// poll from a Stats path while the pager serves reads.
+func (p *Pager) IOStats() IOStats {
+	return IOStats{PageReads: p.pageReads.Load(), CacheHits: p.cacheHits.Load()}
 }
 
 // Create initializes a fresh database file and returns an open pager.
