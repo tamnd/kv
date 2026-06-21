@@ -110,6 +110,82 @@ func TestFollowerWriteRefusedFacade(t *testing.T) {
 	}
 }
 
+// TestPITRFacade drives point-in-time recovery through the public surface: a primary
+// archives each WAL generation via WithWALArchive, then a fresh database restored from the
+// base and rolled forward through the archived deltas with ApplyWALUntil lands at exactly
+// the target version.
+func TestPITRFacade(t *testing.T) {
+	dir := t.TempDir()
+	primaryPath := filepath.Join(dir, "primary.kv")
+	recoveredPath := filepath.Join(dir, "recovered.kv")
+
+	var archives [][]byte
+	sink := func(delta []byte) error {
+		archives = append(archives, append([]byte(nil), delta...))
+		return nil
+	}
+	p, err := kv.Open(primaryPath, kv.WithAutoCheckpoint(-1), kv.WithWALArchive(sink))
+	if err != nil {
+		t.Fatalf("open primary: %v", err)
+	}
+	if err := p.Update(func(txn *kv.Txn) error { return txn.Set([]byte("base"), []byte("0")) }); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	var base bytes.Buffer
+	if _, err := p.Backup(&base); err != nil {
+		t.Fatalf("base backup: %v", err)
+	}
+
+	versions := make([]uint64, 4)
+	for i := 0; i < 4; i++ {
+		k := []byte{'k', byte(i)}
+		if err := p.Update(func(txn *kv.Txn) error { return txn.Set(k, []byte{'v', byte(i)}) }); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+		versions[i] = p.Stats().Version
+		if err := p.Checkpoint(); err != nil {
+			t.Fatalf("checkpoint %d: %v", i, err)
+		}
+	}
+	if err := p.Close(); err != nil {
+		t.Fatalf("close primary: %v", err)
+	}
+
+	target := versions[1] // recover to the state right after k1
+	if err := kv.RestoreBackup(recoveredPath, &base); err != nil {
+		t.Fatalf("restore base: %v", err)
+	}
+	r, err := kv.Open(recoveredPath, kv.WithReadReplica())
+	if err != nil {
+		t.Fatalf("open recovered: %v", err)
+	}
+	defer r.Close()
+	for i, delta := range archives {
+		if _, err := r.ApplyWALUntil(bytes.NewReader(delta), target); err != nil {
+			t.Fatalf("replay archive %d: %v", i, err)
+		}
+	}
+	if got := r.Stats().Version; got != target {
+		t.Fatalf("recovered version %d, want %d", got, target)
+	}
+	if err := r.View(func(txn *kv.Txn) error {
+		for i := 0; i <= 1; i++ {
+			v, err := txn.Get([]byte{'k', byte(i)})
+			if err != nil || !bytes.Equal(v, []byte{'v', byte(i)}) {
+				t.Fatalf("recovered k%d = %q,%v, want present", i, v, err)
+			}
+		}
+		for i := 2; i <= 3; i++ {
+			if _, err := txn.Get([]byte{'k', byte(i)}); !errors.Is(err, kv.ErrNotFound) {
+				t.Fatalf("recovered k%d err = %v, want ErrNotFound (past target)", i, err)
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("view recovered: %v", err)
+	}
+}
+
 // TestApplyGarbageFacade confirms the facade surfaces kv.ErrBackupFormat for a stream that
 // is not a ship container.
 func TestApplyGarbageFacade(t *testing.T) {

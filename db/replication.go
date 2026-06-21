@@ -129,6 +129,31 @@ func (d *DB) ShipWAL(w io.Writer) (uint64, error) {
 // shipping onto a writable database with its own commit stream is not a supported
 // topology; a follower should be opened ReadReplica.
 func (d *DB) ApplyWAL(r io.Reader) (uint64, error) {
+	return d.applyWAL(r, ^uint64(0))
+}
+
+// ApplyWALUntil replays a shipped or archived delta but stops after the target version,
+// leaving any later commits in the delta unapplied (spec 18 §6). It is the point-in-time
+// recovery primitive: restore a base backup, then feed the archived generations in order
+// through ApplyWALUntil with the same target, and the database rolls forward to exactly
+// the committed state at that version. Frames at or below the follower's applied version
+// are skipped as already present, and frames past target end the replay, so the roll
+// forward stops precisely at the target commit. A target at or above the delta's last
+// version applies the whole delta, identical to ApplyWAL.
+//
+// Replaying a chain of archived deltas with the same target is monotone: each earlier
+// generation applies fully (its versions are all below the target), and the generation
+// that straddles the target applies its frames up to and including it. Versions are
+// assigned in commit order and logged in LSN order, so stopping at the first frame past
+// the target never skips an earlier commit.
+func (d *DB) ApplyWALUntil(r io.Reader, target uint64) (uint64, error) {
+	return d.applyWAL(r, target)
+}
+
+// applyWAL is the shared body of ApplyWAL and ApplyWALUntil: it recovers the shipped image
+// and replays every committed batch whose version is past the follower's applied version
+// and at or below target, in order. target is ^uint64(0) for the unbounded ApplyWAL.
+func (d *DB) applyWAL(r io.Reader, target uint64) (uint64, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.fatal != nil {
@@ -163,13 +188,18 @@ func (d *DB) ApplyWAL(r io.Reader) (uint64, error) {
 	// Gap check: the lowest committed version in the ship must reach the follower's next
 	// expected version (applied+1) or overlap below it. If it starts higher, the frames in
 	// between were checkpointed away on the primary and are unrecoverable from this stream.
-	if low, ok := lowestVersion(batches); ok && low > applied+1 {
+	// A delta entirely past the recovery target contributes nothing and is not a gap, so the
+	// check only fires on frames the bounded replay would actually apply (version <= target).
+	if low, ok := lowestVersion(batches); ok && low <= target && low > applied+1 {
 		return applied, ErrReplicaGap
 	}
 
 	for _, cb := range batches {
 		if cb.Version <= applied {
 			continue // already applied; idempotent skip
+		}
+		if cb.Version > target {
+			break // bounded replay: stop at the target version (batches are in version order)
 		}
 		if err := d.applyShipped(cb.Version, cb.Encoded); err != nil {
 			return d.orc.lastCommitted(), err

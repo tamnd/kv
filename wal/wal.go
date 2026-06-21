@@ -65,6 +65,11 @@ const (
 	walVersion = 1
 )
 
+// HeaderSize is the fixed -wal header length. A durable image of exactly this many bytes
+// is an empty generation with no committed frames, which the archive path uses to skip
+// shipping a generation that carried no commits (spec 18 §6).
+const HeaderSize = headerSize
+
 // frameHeaderSize is the fixed per-frame header: type(1) + length(4) + LSN(8) +
 // version(8) + salt(8) + checksum(8). The checksum is last so it can cover the
 // preceding header bytes plus the payload plus the previous frame's checksum.

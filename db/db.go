@@ -135,6 +135,16 @@ type Options struct {
 	// slightly behind it (asynchronous replication); promote one to a writable primary
 	// by reopening the file without this flag.
 	ReadReplica bool
+	// WALArchive, when set, receives each WAL generation as a self-describing delta just
+	// before a checkpoint folds and resets it, so the committed history outlives the live
+	// -wal file and supports point-in-time recovery (spec 18 §6). Each delta is the same
+	// container ShipWAL produces, covering the commits since the previously archived
+	// generation, so restoring a base backup and replaying the archived deltas in order
+	// through ApplyWALUntil, stopped at a target version, reconstructs the exact committed
+	// state at that version. The sink is called under the database write lock at checkpoint
+	// time; an error it returns fails the checkpoint rather than reset the log, so a frame
+	// is never lost to a failed archive. A generation with no new commits is not archived.
+	WALArchive func(delta []byte) error
 }
 
 func (o Options) maxRetries() int {
@@ -241,6 +251,11 @@ type DB struct {
 	readReplica bool
 	replicaHigh uint64
 
+	// archive, when set, receives each WAL generation as a replication delta just before a
+	// checkpoint resets the log, so the committed history survives for point-in-time
+	// recovery (spec 18 §6). It is called under d.mu at checkpoint time.
+	archive func(delta []byte) error
+
 	// counters is the cumulative-since-open operation tally surfaced through Stats and
 	// the Prometheus exposition (spec 19 §1.1). Reads bump it on the transaction path,
 	// commits on applyCommitted; it is all atomics, so no lock guards it.
@@ -338,7 +353,7 @@ func create(fs vfs.FS, path string, opts Options) (*DB, error) {
 		return nil, err
 	}
 	d := &DB{fs: fs, path: path, pgr: pgr, wal: w, eng: eng, orc: newOracle(0), crypto: enc,
-		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, bufferedInserts: opts.BufferedInserts, compression: opts.Compression, now: opts.clock(), logger: opts.Logger, slowOp: opts.SlowOpThreshold, readReplica: opts.ReadReplica}
+		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, bufferedInserts: opts.BufferedInserts, compression: opts.Compression, now: opts.clock(), logger: opts.Logger, slowOp: opts.SlowOpThreshold, readReplica: opts.ReadReplica, archive: opts.WALArchive}
 	if err := d.openEngine(opts.Merge); err != nil {
 		w.Close()
 		pgr.Close()
@@ -366,7 +381,7 @@ func openExisting(fs vfs.FS, path string, opts Options) (*DB, error) {
 		return nil, err
 	}
 	d := &DB{fs: fs, path: path, pgr: pgr, eng: eng, crypto: enc,
-		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, bufferedInserts: opts.BufferedInserts, compression: opts.Compression, now: opts.clock(), logger: opts.Logger, slowOp: opts.SlowOpThreshold, readReplica: opts.ReadReplica}
+		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, bufferedInserts: opts.BufferedInserts, compression: opts.Compression, now: opts.clock(), logger: opts.Logger, slowOp: opts.SlowOpThreshold, readReplica: opts.ReadReplica, archive: opts.WALArchive}
 	if err := d.openEngine(opts.Merge); err != nil {
 		pgr.Close()
 		return nil, err
@@ -1137,9 +1152,35 @@ func (d *DB) checkpointLocked() error {
 	}
 	d.logCheckpoint(foldedLSN, d.orc.lastCommitted(), resetWAL)
 	if resetWAL {
+		// Archive the generation about to be folded before the reset discards it, so the
+		// committed history outlives the live -wal file for point-in-time recovery (spec 18
+		// §6). A failed archive fails the checkpoint, so the frames are never lost.
+		if err := d.archiveGeneration(); err != nil {
+			return err
+		}
 		return d.wal.Checkpointed(foldedLSN)
 	}
 	return nil
+}
+
+// archiveGeneration hands the current WAL generation's committed image to the archive
+// sink before a checkpoint resets the log, wrapped in the same container ShipWAL produces
+// so the PITR replay path reads it with ApplyWAL/ApplyWALUntil. It skips a generation with
+// no commits since the last checkpoint, whose durable image is a header-only log with
+// nothing to replay. The caller holds d.mu.
+func (d *DB) archiveGeneration() error {
+	if d.archive == nil {
+		return nil
+	}
+	if d.wal.DurableSize() <= int64(wal.HeaderSize) {
+		return nil // empty generation, nothing committed to archive
+	}
+	img, err := d.wal.DurableImage()
+	if err != nil {
+		return err
+	}
+	hdr := shipHeader{pageSize: uint32(d.pgr.PageSize()), highVersion: d.orc.lastCommitted(), walLen: uint64(len(img))}
+	return d.archive(append(hdr.encode(), img...))
 }
 
 // engineDurableLSN reports the highest WAL LSN whose effects the engine has

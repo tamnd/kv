@@ -228,6 +228,59 @@ func TestCLIShipReplayRoundTrip(t *testing.T) {
 	}
 }
 
+func TestCLIPITRRollForward(t *testing.T) {
+	// Seed and base-backup at version 2, then build two archived generations: k3 at version
+	// 3 and k4 at version 4, each shipped to its own delta and checkpointed away.
+	src := dbPath(t)
+	run([]string{"set", src, "k1", "v1"})
+	run([]string{"set", src, "k2", "v2"})
+
+	baseFile := filepath.Join(t.TempDir(), "base.kvbak")
+	if code := run([]string{"backup", src, "--output", baseFile}); code != exitOK {
+		t.Fatalf("backup: exit %d", code)
+	}
+	follower := filepath.Join(t.TempDir(), "recovered.kv")
+	if code := run([]string{"restore", follower, "--input", baseFile}); code != exitOK {
+		t.Fatalf("restore base: exit %d", code)
+	}
+
+	run([]string{"set", src, "k3", "v3"})
+	delta3 := filepath.Join(t.TempDir(), "g3.kvship")
+	if code := run([]string{"ship", src, "--output", delta3}); code != exitOK {
+		t.Fatalf("ship g3: exit %d", code)
+	}
+	run([]string{"checkpoint", src})
+
+	run([]string{"set", src, "k4", "v4"})
+	delta4 := filepath.Join(t.TempDir(), "g4.kvship")
+	if code := run([]string{"ship", src, "--output", delta4}); code != exitOK {
+		t.Fatalf("ship g4: exit %d", code)
+	}
+	run([]string{"checkpoint", src})
+
+	// Recover to version 3: replay both deltas bounded by 3. The second is entirely past the
+	// target and applies nothing.
+	if code := run([]string{"replay", follower, "--input", delta3, "--until", "3"}); code != exitOK {
+		t.Fatalf("replay g3: exit %d", code)
+	}
+	if code := run([]string{"replay", follower, "--input", delta4, "--until", "3"}); code != exitOK {
+		t.Fatalf("replay g4: exit %d", code)
+	}
+
+	out := capture(t, func() { run([]string{"scan", follower, "-f", "jsonl"}) })
+	var got []string
+	sc := bufio.NewScanner(strings.NewReader(out))
+	for sc.Scan() {
+		var r record
+		json.Unmarshal(sc.Bytes(), &r)
+		got = append(got, r.Key+"="+r.Value)
+	}
+	sort.Strings(got)
+	if strings.Join(got, ",") != "k1=v1,k2=v2,k3=v3" {
+		t.Fatalf("recovered = %v, want [k1=v1 k2=v2 k3=v3]", got)
+	}
+}
+
 func TestCLIDumpLoadRoundTrip(t *testing.T) {
 	src := dbPath(t)
 	run([]string{"set", src, "k1", "v1"})

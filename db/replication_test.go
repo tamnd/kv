@@ -322,3 +322,182 @@ func TestReplicaLagStat(t *testing.T) {
 		t.Fatalf("caught-up follower lag = %d, want 0", lag)
 	}
 }
+
+// TestPITRRollForwardToVersion is the point-in-time-recovery path (spec 18 §6): a primary
+// archives each WAL generation, an operator restores the base backup and replays the
+// archived deltas bounded by a target version, and the recovered database holds exactly the
+// commits at or below that version and none past it.
+func TestPITRRollForwardToVersion(t *testing.T) {
+	fs := vfs.NewMem()
+	var archives [][]byte
+	sink := func(delta []byte) error {
+		archives = append(archives, append([]byte(nil), delta...))
+		return nil
+	}
+	p, err := Open(fs, "primary.kv", Options{PageSize: 4096, AutoCheckpoint: -1, WALArchive: sink})
+	if err != nil {
+		t.Fatalf("open primary: %v", err)
+	}
+
+	// Base: one write, then a base backup. The backup checkpoints, so the seed generation is
+	// archived too; the restore lands the follower at the base version and the overlap is
+	// skipped on replay.
+	if _, err := p.Write(func(b *engine.WriteBatch) { b.Set([]byte("base"), []byte("0")) }); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	var base bytes.Buffer
+	if _, err := p.Backup(&base); err != nil {
+		t.Fatalf("base backup: %v", err)
+	}
+
+	// Six post-base writes, each its own checkpointed generation, so each is archived alone
+	// and the target can land between them.
+	versions := make([]uint64, 6)
+	for i := 0; i < 6; i++ {
+		k := []byte{'k', byte(i)}
+		if _, err := p.Write(func(b *engine.WriteBatch) { b.Set(k, []byte{'v', byte(i)}) }); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+		versions[i] = p.orc.lastCommitted()
+		if err := p.Checkpoint(); err != nil {
+			t.Fatalf("checkpoint %d: %v", i, err)
+		}
+	}
+	if err := p.Close(); err != nil {
+		t.Fatalf("close primary: %v", err)
+	}
+
+	// Recover to the state right after k3: restore the base, replay every archived delta
+	// bounded by versions[3].
+	target := versions[3]
+	if err := RestoreBackup(fs, "recovered.kv", &base); err != nil {
+		t.Fatalf("restore base: %v", err)
+	}
+	r, err := Open(fs, "recovered.kv", Options{ReadReplica: true})
+	if err != nil {
+		t.Fatalf("open recovered: %v", err)
+	}
+	defer r.Close()
+	for i, delta := range archives {
+		if _, err := r.ApplyWALUntil(bytes.NewReader(delta), target); err != nil {
+			t.Fatalf("replay archive %d: %v", i, err)
+		}
+	}
+
+	if got := r.orc.lastCommitted(); got != target {
+		t.Fatalf("recovered version %d, want target %d", got, target)
+	}
+	// k0..k3 are at or below the target and must be present; k4,k5 are past it and must be absent.
+	for i := 0; i <= 3; i++ {
+		got, err := r.Get([]byte{'k', byte(i)})
+		if err != nil || !bytes.Equal(got, []byte{'v', byte(i)}) {
+			t.Fatalf("recovered k%d = %q,%v, want v%d", i, got, err, i)
+		}
+	}
+	for i := 4; i <= 5; i++ {
+		if got, err := r.Get([]byte{'k', byte(i)}); err == nil {
+			t.Fatalf("recovered k%d = %q, want absent (past target)", i, got)
+		}
+	}
+}
+
+// TestArchiveSkipsEmptyGeneration confirms a checkpoint with no new commits since the last
+// one does not call the archive sink: an empty generation has nothing to replay.
+func TestArchiveSkipsEmptyGeneration(t *testing.T) {
+	fs := vfs.NewMem()
+	var count int
+	sink := func(delta []byte) error { count++; return nil }
+	p, err := Open(fs, "primary.kv", Options{PageSize: 4096, AutoCheckpoint: -1, WALArchive: sink})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer p.Close()
+
+	if _, err := p.Write(func(b *engine.WriteBatch) { b.Set([]byte("a"), []byte("1")) }); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := p.Checkpoint(); err != nil {
+		t.Fatalf("checkpoint 1: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("after one write+checkpoint, archive called %d times, want 1", count)
+	}
+	// A second checkpoint with no intervening write archives nothing.
+	if err := p.Checkpoint(); err != nil {
+		t.Fatalf("checkpoint 2: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("empty-generation checkpoint archived %d times, want still 1", count)
+	}
+}
+
+// TestArchiveFailureFailsCheckpoint confirms a sink error fails the checkpoint rather than
+// reset the log, so a frame is never lost to a failed archive.
+func TestArchiveFailureFailsCheckpoint(t *testing.T) {
+	fs := vfs.NewMem()
+	sink := func(delta []byte) error { return errors.New("archive sink down") }
+	p, err := Open(fs, "primary.kv", Options{PageSize: 4096, AutoCheckpoint: -1, WALArchive: sink})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer p.Close()
+
+	if _, err := p.Write(func(b *engine.WriteBatch) { b.Set([]byte("a"), []byte("1")) }); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := p.Checkpoint(); err == nil {
+		t.Fatal("checkpoint succeeded despite archive failure, want error")
+	}
+	// The commit is still readable: the failed checkpoint did not lose it.
+	if got, err := p.Get([]byte("a")); err != nil || !bytes.Equal(got, []byte("1")) {
+		t.Fatalf("after failed checkpoint key a = %q,%v, want 1", got, err)
+	}
+}
+
+// TestApplyWALUntilStopsBeforeTargetBoundary confirms ApplyWALUntil applies a delta's
+// frames up to and including the target and stops, even when the delta carries later
+// commits in the same generation.
+func TestApplyWALUntilStopsBeforeTargetBoundary(t *testing.T) {
+	fs := vfs.NewMem()
+	p, err := Open(fs, "primary.kv", Options{PageSize: 4096, AutoCheckpoint: -1})
+	if err != nil {
+		t.Fatalf("open primary: %v", err)
+	}
+	if _, err := p.Write(func(b *engine.WriteBatch) { b.Set([]byte("seed"), []byte("0")) }); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	f := newFollower(t, p, fs, "follower.kv", Options{})
+	defer f.Close()
+	defer p.Close()
+
+	// Three writes in one generation, captured as a single ship delta.
+	var stop uint64
+	for i := 0; i < 3; i++ {
+		if _, err := p.Write(func(b *engine.WriteBatch) { b.Set([]byte{'k', byte(i)}, []byte{byte(i)}) }); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+		if i == 1 {
+			stop = p.orc.lastCommitted() // stop after the second write
+		}
+	}
+	var buf bytes.Buffer
+	if _, err := p.ShipWAL(&buf); err != nil {
+		t.Fatalf("ship: %v", err)
+	}
+	got, err := f.ApplyWALUntil(bytes.NewReader(buf.Bytes()), stop)
+	if err != nil {
+		t.Fatalf("apply until: %v", err)
+	}
+	if got != stop {
+		t.Fatalf("applied to %d, want %d", got, stop)
+	}
+	if v, err := f.Get([]byte{'k', 0}); err != nil || !bytes.Equal(v, []byte{0}) {
+		t.Fatalf("k0 = %q,%v, want present", v, err)
+	}
+	if v, err := f.Get([]byte{'k', 1}); err != nil || !bytes.Equal(v, []byte{1}) {
+		t.Fatalf("k1 = %q,%v, want present", v, err)
+	}
+	if v, err := f.Get([]byte{'k', 2}); err == nil {
+		t.Fatalf("k2 = %q, want absent (past target)", v)
+	}
+}
