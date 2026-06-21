@@ -221,6 +221,12 @@ func (w *WAL) headerChecksum() uint64 {
 	return walChecksum.Sum(h[:24])
 }
 
+// SetScheme swaps the encryption scheme new frames are sealed under, the WAL half of a key
+// rotation (spec 14 §5). Frames already in the log keep the epoch they recorded, so recovery
+// still decrypts them; only frames written after the swap use the new epoch. The caller holds
+// the database write lock, so no frame is being appended concurrently.
+func (w *WAL) SetScheme(s *crypto.Scheme) { w.crypto = s }
+
 // LSN reports the next LSN that will be assigned.
 func (w *WAL) LSN() uint64 { return w.lsn }
 

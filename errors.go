@@ -50,6 +50,9 @@ var (
 	// ErrKeyOnPlaintext means WithEncryptionKey was supplied for a file that was created
 	// unencrypted, so the key does not belong to it (spec 14).
 	ErrKeyOnPlaintext = db.ErrKeyOnPlaintext
+	// ErrNotEncrypted means a key rotation was requested on a database that was not created
+	// with an encryption key, so there is no key to rotate (spec 14 §5).
+	ErrNotEncrypted = db.ErrNotEncrypted
 )
 
 // wrap maps the internal db/engine sentinels onto the public ones so callers match the

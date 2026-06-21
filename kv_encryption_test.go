@@ -111,6 +111,68 @@ func TestWithEncryptionKeyOnPlaintext(t *testing.T) {
 	}
 }
 
+// TestRotateEncryptionKeyRoundTrip drives a key rotation through the public surface: write,
+// rotate, write again, reopen with the same key, and read both generations. The key the
+// caller holds does not change; the rotation bumps the internal epoch off the same master.
+func TestRotateEncryptionKeyRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "data.kv")
+
+	d, err := kv.Open(path, kv.WithEncryptionKey(encKey))
+	if err != nil {
+		t.Fatalf("open encrypted: %v", err)
+	}
+	if err := d.Update(func(txn *kv.Txn) error {
+		return txn.Set([]byte("old"), []byte("before-rotate"))
+	}); err != nil {
+		t.Fatalf("pre-rotate update: %v", err)
+	}
+	if err := d.RotateEncryptionKey(); err != nil {
+		t.Fatalf("rotate: %v", err)
+	}
+	if err := d.Update(func(txn *kv.Txn) error {
+		return txn.Set([]byte("new"), []byte("after-rotate"))
+	}); err != nil {
+		t.Fatalf("post-rotate update: %v", err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	d2, err := kv.Open(path, kv.WithEncryptionKey(encKey))
+	if err != nil {
+		t.Fatalf("reopen with key: %v", err)
+	}
+	defer d2.Close()
+	if err := d2.View(func(txn *kv.Txn) error {
+		old, err := txn.Get([]byte("old"))
+		if err != nil || string(old) != "before-rotate" {
+			t.Fatalf("old = %q,%v, want before-rotate", old, err)
+		}
+		nw, err := txn.Get([]byte("new"))
+		if err != nil || string(nw) != "after-rotate" {
+			t.Fatalf("new = %q,%v, want after-rotate", nw, err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("view: %v", err)
+	}
+}
+
+// TestRotateEncryptionKeyOnPlaintext checks a rotation on a database created without a key is
+// refused with kv.ErrNotEncrypted, so the call fails loudly rather than appearing to succeed.
+func TestRotateEncryptionKeyOnPlaintext(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "data.kv")
+
+	d, err := kv.Open(path)
+	if err != nil {
+		t.Fatalf("open plain: %v", err)
+	}
+	defer d.Close()
+	if err := d.RotateEncryptionKey(); !errors.Is(err, kv.ErrNotEncrypted) {
+		t.Fatalf("rotate on plaintext = %v, want kv.ErrNotEncrypted", err)
+	}
+}
+
 // TestWithEncryptionKeyCiphertextOnDisk checks a value written through the public surface to
 // an encrypted database is not present in the clear in the on-disk file after a checkpoint.
 func TestWithEncryptionKeyCiphertextOnDisk(t *testing.T) {

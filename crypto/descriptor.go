@@ -10,7 +10,10 @@ import (
 var descMagic = [4]byte{'K', 'V', 'E', 'N'}
 
 // descVersion is the descriptor layout version, bumped if the encoding below changes.
-const descVersion = 1
+// Version 2 introduced the per-page key epoch in the envelope trailer (the lazy-rotation
+// format), so a version-1 file, whose envelopes are 4 bytes narrower, is rejected here at
+// open rather than mis-decrypted.
+const descVersion = 2
 
 // verifyConst is the fixed plaintext sealed into a descriptor's verification tag. Opening
 // the tag with the right key recovers exactly these bytes; the wrong key fails to

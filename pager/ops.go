@@ -332,6 +332,46 @@ func (p *Pager) flushHeaderLocked() error {
 	return nil
 }
 
+// Rekey swaps the encryption scheme new and rewritten pages are sealed under and rewrites
+// the cleartext descriptor on page 1 to record the new epoch, the main-file half of a key
+// rotation (spec 14 §5). It does not re-encrypt the pages already on disk: those keep the
+// epoch their envelopes record and stay readable under the new scheme, which derives any
+// earlier epoch's key from the same master. The new descriptor is written and fsynced before
+// the scheme pointer is swapped, so a crash mid-rekey leaves either the old descriptor with
+// old-epoch pages or the new descriptor with the same old-epoch pages, both of which open.
+// The caller holds no pager lock; Rekey takes p.mu itself.
+func (p *Pager) Rekey(newScheme *crypto.Scheme, newDescriptor []byte) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.crypto == nil {
+		return ErrNotEncrypted
+	}
+	if format.HeaderSize+len(newDescriptor) > p.pageSize-p.header.Checksum.ChecksumSize() {
+		return fmt.Errorf("pager: rotated encryption descriptor does not fit on page 1")
+	}
+	page1 := make([]byte, p.pageSize)
+	if fr, ok := p.index[1]; ok {
+		copy(page1, fr.data)
+	} else {
+		_, _ = p.file.ReadAt(page1, 0)
+	}
+	p.header.Encode(page1)
+	copy(page1[format.HeaderSize:], newDescriptor)
+	format.StampPageChecksum(page1, p.header.Checksum)
+	if fr, ok := p.index[1]; ok {
+		copy(fr.data, page1)
+		fr.dirty = false
+	}
+	if _, err := p.file.WriteAt(page1, 0); err != nil {
+		return err
+	}
+	if err := p.file.Sync(vfs.SyncFull); err != nil {
+		return err
+	}
+	p.crypto = newScheme
+	return nil
+}
+
 // TruncateTail returns trailing free pages to the operating system by shrinking the
 // file (spec 09 §3.1, incremental vacuum). It reclaims the maximal contiguous run of
 // free pages at the very end of the file: as long as the highest page number is on

@@ -311,6 +311,159 @@ func TestEncryptionWALCiphertextOnDisk(t *testing.T) {
 	_ = p.Close()
 }
 
+// TestRotateEncryptionKeyLazyCoexistence confirms a lazy rotation: data written and
+// checkpointed before the rotation is sealed under the old epoch and stays on disk under it,
+// data written after is sealed under the new epoch, and a reopen reads both. This is the
+// coexistence property spec 14 §5 promises, where a rotation does not re-encrypt the file.
+func TestRotateEncryptionKeyLazyCoexistence(t *testing.T) {
+	fs := vfs.NewMem()
+	d, err := Open(fs, "test.kv", Options{PageSize: 4096, EncryptionKey: encKey})
+	if err != nil {
+		t.Fatalf("create encrypted: %v", err)
+	}
+	// Pre-rotation data, folded to the main file under epoch 0.
+	for i := 0; i < 30; i++ {
+		k := []byte{'o', byte(i)}
+		v := []byte{'a', byte(i), byte(i)}
+		if _, err := d.Write(func(b *engine.WriteBatch) { b.Set(k, v) }); err != nil {
+			t.Fatalf("pre-write %d: %v", i, err)
+		}
+	}
+	if err := d.Checkpoint(); err != nil {
+		t.Fatalf("checkpoint before rotate: %v", err)
+	}
+
+	if err := d.RotateEncryptionKey(); err != nil {
+		t.Fatalf("rotate: %v", err)
+	}
+
+	// Post-rotation data, sealed under the new epoch.
+	for i := 0; i < 30; i++ {
+		k := []byte{'n', byte(i)}
+		v := []byte{'b', byte(i), byte(i)}
+		if _, err := d.Write(func(b *engine.WriteBatch) { b.Set(k, v) }); err != nil {
+			t.Fatalf("post-write %d: %v", i, err)
+		}
+	}
+	if err := d.Checkpoint(); err != nil {
+		t.Fatalf("checkpoint after rotate: %v", err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// The on-disk descriptor now records the new epoch.
+	desc, err := pager.ReadDescriptor(fs, "test.kv")
+	if err != nil {
+		t.Fatalf("read descriptor: %v", err)
+	}
+	if desc.Epoch != 1 {
+		t.Fatalf("descriptor epoch = %d, want 1 after one rotation", desc.Epoch)
+	}
+
+	// Reopen with the same key and read both generations: old-epoch and new-epoch pages
+	// coexist and both decrypt.
+	d2, err := Open(fs, "test.kv", Options{EncryptionKey: encKey})
+	if err != nil {
+		t.Fatalf("reopen after rotate: %v", err)
+	}
+	defer d2.Close()
+	for i := 0; i < 30; i++ {
+		ok, owant := []byte{'o', byte(i)}, []byte{'a', byte(i), byte(i)}
+		got, err := d2.Get(ok)
+		if err != nil || !bytes.Equal(got, owant) {
+			t.Fatalf("old key %d = %q,%v, want %q", i, got, err, owant)
+		}
+		nk, nwant := []byte{'n', byte(i)}, []byte{'b', byte(i), byte(i)}
+		got, err = d2.Get(nk)
+		if err != nil || !bytes.Equal(got, nwant) {
+			t.Fatalf("new key %d = %q,%v, want %q", i, got, err, nwant)
+		}
+	}
+}
+
+// TestRotateEncryptionKeySurvivesCrash confirms data written under the new epoch but only
+// logged to the WAL (not checkpointed) recovers across a crash, so the rotation reaches the
+// log as well as the main file.
+func TestRotateEncryptionKeySurvivesCrash(t *testing.T) {
+	fs := vfs.NewMem()
+	d, err := Open(fs, "test.kv", Options{PageSize: 4096, Sync: wal.SyncFull, AutoCheckpoint: -1, EncryptionKey: encKey})
+	if err != nil {
+		t.Fatalf("create encrypted: %v", err)
+	}
+	if _, err := d.Write(func(b *engine.WriteBatch) { b.Set([]byte("before"), []byte("0")) }); err != nil {
+		t.Fatalf("pre-write: %v", err)
+	}
+	if err := d.RotateEncryptionKey(); err != nil {
+		t.Fatalf("rotate: %v", err)
+	}
+	// Written after the rotation, lives only in the WAL under the new epoch.
+	for i := 0; i < 20; i++ {
+		k := []byte{'p', byte(i)}
+		v := []byte{'q', byte(i)}
+		if _, err := d.Write(func(b *engine.WriteBatch) { b.Set(k, v) }); err != nil {
+			t.Fatalf("post-write %d: %v", i, err)
+		}
+	}
+	fs.Crash()
+
+	d2, err := Open(fs, "test.kv", Options{Sync: wal.SyncFull, AutoCheckpoint: -1, EncryptionKey: encKey})
+	if err != nil {
+		t.Fatalf("reopen after crash: %v", err)
+	}
+	defer d2.Close()
+	if got, err := d2.Get([]byte("before")); err != nil || !bytes.Equal(got, []byte("0")) {
+		t.Fatalf("pre-rotation key = %q,%v, want 0", got, err)
+	}
+	for i := 0; i < 20; i++ {
+		k := []byte{'p', byte(i)}
+		want := []byte{'q', byte(i)}
+		got, err := d2.Get(k)
+		if err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("post-rotation key %d = %q,%v, want %q", i, got, err, want)
+		}
+	}
+}
+
+// TestRotateEncryptionKeyRejectsPlaintext confirms a rotation on an unencrypted database is
+// refused with ErrNotEncrypted rather than silently doing nothing.
+func TestRotateEncryptionKeyRejectsPlaintext(t *testing.T) {
+	fs := vfs.NewMem()
+	d, err := Open(fs, "test.kv", Options{PageSize: 4096})
+	if err != nil {
+		t.Fatalf("create plain: %v", err)
+	}
+	defer d.Close()
+	if err := d.RotateEncryptionKey(); !errors.Is(err, ErrNotEncrypted) {
+		t.Fatalf("rotate on plaintext = %v, want ErrNotEncrypted", err)
+	}
+}
+
+// TestRotateEncryptionKeyWrongKeyAfterReopen confirms a rotated database still rejects the
+// wrong key cleanly: the verification tag is re-sealed under the new epoch, so a wrong key
+// fails the descriptor check on reopen.
+func TestRotateEncryptionKeyWrongKeyAfterReopen(t *testing.T) {
+	fs := vfs.NewMem()
+	d, err := Open(fs, "test.kv", Options{PageSize: 4096, EncryptionKey: encKey})
+	if err != nil {
+		t.Fatalf("create encrypted: %v", err)
+	}
+	if _, err := d.Write(func(b *engine.WriteBatch) { b.Set([]byte("k"), []byte("v")) }); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := d.RotateEncryptionKey(); err != nil {
+		t.Fatalf("rotate: %v", err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	wrong := bytes.Repeat([]byte{0x11}, 32)
+	if _, err := Open(fs, "test.kv", Options{EncryptionKey: wrong}); !errors.Is(err, crypto.ErrWrongKey) {
+		t.Fatalf("reopen rotated with wrong key = %v, want crypto.ErrWrongKey", err)
+	}
+}
+
 // TestEncryptionShortKeyRejected confirms a key that is not 32 bytes is refused at create.
 func TestEncryptionShortKeyRejected(t *testing.T) {
 	fs := vfs.NewMem()
