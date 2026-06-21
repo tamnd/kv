@@ -184,6 +184,18 @@ func WithReadReplica() Option {
 	return func(c *config) { c.opts.ReadReplica = true }
 }
 
+// WithWALArchive registers a sink that receives each WAL generation as a replication delta
+// just before a checkpoint folds and resets it, so the committed history survives for
+// point-in-time recovery (spec 18 §6). Each delta is the same container ShipWAL produces;
+// persist them in order (to files, an object store, anywhere) and a restored base backup
+// rolled forward through them with ApplyWALUntil reconstructs any committed version in
+// between. The sink runs under the database write lock at checkpoint time, so it should be
+// quick and must not call back into the database; an error it returns fails the checkpoint
+// rather than lose a frame. A generation with no new commits is not handed to the sink.
+func WithWALArchive(sink func(delta []byte) error) Option {
+	return func(c *config) { c.opts.WALArchive = sink }
+}
+
 // DB is an open database over one file, safe for concurrent use by many goroutines
 // (spec 15 §1). It is obtained from Open and must be Closed.
 type DB struct {
@@ -551,6 +563,17 @@ func (kdb *DB) ShipWAL(w io.Writer) (uint64, error) {
 // Call it on a database opened WithReadReplica.
 func (kdb *DB) ApplyWAL(r io.Reader) (uint64, error) {
 	v, err := kdb.d.ApplyWAL(r)
+	return v, wrap(err)
+}
+
+// ApplyWALUntil replays a shipped or archived delta from r but stops after the target
+// version, leaving later commits in the delta unapplied (spec 18 §6). It is the
+// point-in-time-recovery primitive: restore a base backup into a fresh file opened
+// WithReadReplica, then feed the archived generations in order through ApplyWALUntil with
+// the same target, and the database rolls forward to exactly the committed state at that
+// version. A target at or above the delta's last version applies it whole, like ApplyWAL.
+func (kdb *DB) ApplyWALUntil(r io.Reader, target uint64) (uint64, error) {
+	v, err := kdb.d.ApplyWALUntil(r, target)
 	return v, wrap(err)
 }
 

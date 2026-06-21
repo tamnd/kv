@@ -55,15 +55,19 @@ func cmdShip(args []string) int {
 // file or stdin (spec 18 §4). It opens the follower read-only and replays the shipped
 // frames through the redo path, advancing it to the primary's version. A gap (the primary
 // checkpointed away frames the follower never saw) is reported and the follower must be
-// re-seeded from a full restore. The new applied version is printed to stderr.
+// re-seeded from a full restore. With --until V it stops after version V, leaving later
+// commits unapplied: restore a base, then replay archived deltas with the same --until to
+// roll forward to an exact point in time (spec 18 §6). The new applied version is printed
+// to stderr.
 func cmdReplay(args []string) int {
 	fs := flag.NewFlagSet("replay", flag.ContinueOnError)
 	input := fs.String("input", "-", "read the WAL delta from this file (- for stdin)")
+	until := fs.Uint64("until", 0, "stop after this commit version (0 replays the whole delta)")
 	if err := parseArgs(fs, args); err != nil {
 		return exitUsage
 	}
 	if fs.NArg() != 1 {
-		return usageErr("usage: kv replay <db> [--input F]")
+		return usageErr("usage: kv replay <db> [--input F] [--until V]")
 	}
 	d, code := openDB(fs.Arg(0), kv.WithReadReplica())
 	if code != exitOK {
@@ -80,7 +84,11 @@ func cmdReplay(args []string) int {
 		defer f.Close()
 		in = f
 	}
-	version, err := d.ApplyWAL(bufio.NewReader(in))
+	target := *until
+	if target == 0 {
+		target = ^uint64(0) // unbounded: replay the whole delta
+	}
+	version, err := d.ApplyWALUntil(bufio.NewReader(in), target)
 	if err != nil {
 		return fail(err)
 	}
