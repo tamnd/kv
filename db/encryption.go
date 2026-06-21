@@ -16,6 +16,10 @@ var ErrEncryptedNoKey = errors.New("kv: database is encrypted, an encryption key
 // that was not created encrypted: the key does not belong to this file.
 var ErrKeyOnPlaintext = errors.New("kv: encryption key supplied for an unencrypted database")
 
+// ErrNotEncrypted is returned when a key-rotation is requested on a database that is not
+// encrypted: there is no scheme to rotate.
+var ErrNotEncrypted = errors.New("kv: database is not encrypted")
+
 // newEncryptionForCreate builds the encryption scheme and the cleartext descriptor for a
 // fresh database when Options.EncryptionKey is set (spec 14). It returns nil, nil, nil
 // when encryption is off, the default, so the create path stays byte-for-byte unchanged

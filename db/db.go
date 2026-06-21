@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/tamnd/kv/btree"
+	"github.com/tamnd/kv/crypto"
 	"github.com/tamnd/kv/engine"
 	"github.com/tamnd/kv/format"
 	"github.com/tamnd/kv/lsm"
@@ -210,6 +211,11 @@ type DB struct {
 	eng engine.Engine
 	orc *oracle
 
+	// crypto is the encryption scheme this database seals pages and WAL frames under, nil
+	// for an unencrypted file (spec 14). It is the handle a key rotation advances: RotateEncryptionKey
+	// derives the next epoch from it and swaps the pager's and WAL's schemes.
+	crypto *crypto.Scheme
+
 	merge           func(existing, operand []byte) []byte
 	maxRetries      int
 	syncMode        wal.Sync
@@ -316,7 +322,7 @@ func create(fs vfs.FS, path string, opts Options) (*DB, error) {
 		pgr.Close()
 		return nil, err
 	}
-	d := &DB{fs: fs, path: path, pgr: pgr, wal: w, eng: eng, orc: newOracle(0),
+	d := &DB{fs: fs, path: path, pgr: pgr, wal: w, eng: eng, orc: newOracle(0), crypto: enc,
 		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, bufferedInserts: opts.BufferedInserts, compression: opts.Compression, now: opts.clock(), logger: opts.Logger, slowOp: opts.SlowOpThreshold}
 	if err := d.openEngine(opts.Merge); err != nil {
 		w.Close()
@@ -344,7 +350,7 @@ func openExisting(fs vfs.FS, path string, opts Options) (*DB, error) {
 		pgr.Close()
 		return nil, err
 	}
-	d := &DB{fs: fs, path: path, pgr: pgr, eng: eng,
+	d := &DB{fs: fs, path: path, pgr: pgr, eng: eng, crypto: enc,
 		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, bufferedInserts: opts.BufferedInserts, compression: opts.Compression, now: opts.clock(), logger: opts.Logger, slowOp: opts.SlowOpThreshold}
 	if err := d.openEngine(opts.Merge); err != nil {
 		pgr.Close()
@@ -1172,6 +1178,44 @@ func (d *DB) SetUserVersion(v uint32) error {
 	defer d.mu.Unlock()
 	d.pgr.Header().UserVersion = v
 	return d.checkpointLocked()
+}
+
+// RotateEncryptionKey performs a lazy DEK rotation (spec 14 §5): it bumps the key epoch,
+// derives a new data-encryption key from the same master key, and from then on seals new and
+// rewritten pages and WAL frames under the new epoch, while pages already on disk keep the
+// epoch their envelopes record and stay readable. It is the cheap, incremental rotation the
+// envelope-encryption model gives: the master key is unchanged, so it does not re-derive from
+// a passphrase, and it does not re-encrypt the whole file. A full re-encryption that leaves no
+// page under a superseded epoch is available separately by compacting the database, which
+// rebuilds it from scratch and reseals every page.
+//
+// It first folds the WAL into the main file with a checkpoint so the log starts empty in the
+// new epoch and the rotation has a clean boundary, then persists the new descriptor durably on
+// page 1 before swapping the live schemes, so a crash at any point leaves a file that opens.
+// The database must have been created with an encryption key; otherwise it returns
+// ErrNotEncrypted.
+func (d *DB) RotateEncryptionKey() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.crypto == nil {
+		return ErrNotEncrypted
+	}
+	// Fold the WAL so every committed page lands in the main file under the current epoch and
+	// the log is empty before the new epoch begins.
+	if err := d.checkpointLocked(); err != nil {
+		return err
+	}
+	next := d.crypto.Rotate(d.crypto.Epoch() + 1)
+	desc, err := crypto.NewDescriptor(next, crypto.KDFRaw, nil, 0, 0, 0)
+	if err != nil {
+		return err
+	}
+	if err := d.pgr.Rekey(next, desc.Encode()); err != nil {
+		return err
+	}
+	d.wal.SetScheme(next)
+	d.crypto = next
+	return nil
 }
 
 // Close releases the database without an implicit checkpoint: committed data is

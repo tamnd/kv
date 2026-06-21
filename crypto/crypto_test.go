@@ -71,15 +71,51 @@ func TestOpenWrongPageNo(t *testing.T) {
 	}
 }
 
-// TestOpenWrongEpoch confirms the epoch is bound as AAD: an envelope sealed under one
-// epoch does not authenticate under another, even with the same master key.
-func TestOpenWrongEpoch(t *testing.T) {
+// TestRotationOpensOldEpoch confirms lazy rotation: a page sealed under epoch 0 still opens
+// after the scheme rotates to epoch 1, because the envelope records the epoch that sealed it
+// and the rotated scheme derives that epoch's key from the same master (spec 14 §5).
+func TestRotationOpensOldEpoch(t *testing.T) {
 	e0, _ := NewScheme(testKey, CipherAESGCM, 0)
-	env, _ := e0.SealPage(nil, []byte("epoch zero"), 2)
-	e1, _ := NewScheme(testKey, CipherAESGCM, 1)
-	if _, err := e1.OpenPage(nil, env, 2); !errors.Is(err, ErrWrongKey) {
-		t.Errorf("cross-epoch open error = %v, want ErrWrongKey", err)
+	old := []byte("sealed under epoch zero")
+	env0, _ := e0.SealPage(nil, old, 2)
+
+	e1 := e0.Rotate(1)
+	if got := e1.Epoch(); got != 1 {
+		t.Fatalf("rotated epoch = %d, want 1", got)
 	}
+	// The old-epoch page opens under the rotated scheme.
+	pt, err := e1.OpenPage(nil, env0, 2)
+	if err != nil {
+		t.Fatalf("open epoch-0 page under epoch-1 scheme: %v", err)
+	}
+	if !bytes.Equal(pt, old) {
+		t.Fatalf("decrypted = %q, want %q", pt, old)
+	}
+	// A page sealed after the rotation carries the new epoch and also opens.
+	fresh := []byte("sealed under epoch one")
+	env1, _ := e1.SealPage(nil, fresh, 2)
+	if got := readEpoch(env1); got != 1 {
+		t.Fatalf("fresh envelope epoch = %d, want 1", got)
+	}
+	pt1, err := e1.OpenPage(nil, env1, 2)
+	if err != nil || !bytes.Equal(pt1, fresh) {
+		t.Fatalf("open epoch-1 page = %q, %v, want %q", pt1, err, fresh)
+	}
+}
+
+// TestEnvelopeRecordsEpoch confirms the cleartext epoch trailer carries the sealing epoch.
+func TestEnvelopeRecordsEpoch(t *testing.T) {
+	e5, _ := NewScheme(testKey, CipherAESGCM, 5)
+	env, _ := e5.SealPage(nil, []byte("five"), 9)
+	if got := readEpoch(env); got != 5 {
+		t.Fatalf("envelope epoch = %d, want 5", got)
+	}
+}
+
+// readEpoch reads the 4-byte epoch trailer a sealed envelope ends with.
+func readEpoch(env []byte) uint32 {
+	_, epoch := splitEpoch(env)
+	return epoch
 }
 
 // TestOpenTamperedEnvelope confirms a single flipped bit anywhere in the envelope fails

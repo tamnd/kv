@@ -553,6 +553,19 @@ func (kdb *DB) Check() (*CheckReport, error) {
 	return out, nil
 }
 
+// RotateEncryptionKey rotates the database's data-encryption key in place (spec 14 §5). It
+// advances the key epoch and seals every new and rewritten page and WAL frame under a fresh
+// key derived from the same master key, while the pages already on disk keep the epoch they
+// were sealed under and stay readable: a lazy, incremental rotation that does not re-encrypt
+// the whole file and does not change the master key supplied through WithEncryptionKey. It
+// folds the WAL and persists the new key epoch durably before returning. To force a full
+// re-encryption that leaves no page under the old epoch, run Compact, which rebuilds the file
+// and reseals every page. It returns ErrNotEncrypted if the database was not created with an
+// encryption key.
+func (kdb *DB) RotateEncryptionKey() error {
+	return wrap(kdb.d.RotateEncryptionKey())
+}
+
 // Close flushes, runs a final checkpoint, and releases the file (spec 15 §1).
 func (kdb *DB) Close() error {
 	return wrap(kdb.d.Close())
