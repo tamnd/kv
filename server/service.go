@@ -99,16 +99,32 @@ type TxnResult struct {
 var ErrAssertFailed = errors.New("kv: transaction assertion failed")
 
 // Service is the transport-agnostic operation surface over a single database. It holds the
-// open *kv.DB and nothing else; every method is a thin, concurrency-safe mapping onto a
-// library call, so many adapter goroutines call one Service in parallel exactly as many
-// callers share one *kv.DB.
+// open *kv.DB and the registry of open interactive transactions; every method is a thin,
+// concurrency-safe mapping onto a library call, so many adapter goroutines call one Service in
+// parallel exactly as many callers share one *kv.DB.
 type Service struct {
-	db *kv.DB
+	db   *kv.DB
+	txns *txnRegistry
 }
 
 // NewService wraps an open database in a Service. The caller owns the database's lifetime;
-// the Service never closes it.
-func NewService(db *kv.DB) *Service { return &Service{db: db} }
+// the Service never closes it. The interactive transaction registry it starts must be stopped
+// with Close so its reaper goroutine does not outlive the Service.
+func NewService(db *kv.DB) *Service {
+	return &Service{db: db, txns: newTxnRegistry(defaultMaxOpenTxns, defaultTxnIdleTTL)}
+}
+
+// newServiceWithLimits builds a Service with explicit interactive-transaction bounds. It exists
+// for tests that need a tiny cap or a short idle window without poking the registry's fields
+// after its reaper has started, which would race the reaper's reads.
+func newServiceWithLimits(db *kv.DB, maxOpen int, idleTTL time.Duration) *Service {
+	return &Service{db: db, txns: newTxnRegistry(maxOpen, idleTTL)}
+}
+
+// Close stops the interactive transaction registry, force-discarding any still-open
+// transactions and ending the reaper goroutine. It does not close the database, which the
+// caller owns. The Server calls it during Shutdown.
+func (s *Service) Close() { s.txns.close() }
 
 // DB returns the underlying database, for adapters that need a surface Service does not wrap
 // directly (the streaming Scan and Watch, the ops endpoints).

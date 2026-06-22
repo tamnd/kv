@@ -400,6 +400,229 @@ func TestBinaryWatch(t *testing.T) {
 	}
 }
 
+func TestBinaryInteractiveTxnReadModifyWrite(t *testing.T) {
+	cl := newBinaryServer(t)
+	if _, err := cl.Set([]byte("bal"), []byte("100"), 0); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	// Begin a writable transaction, read the balance, write a new one based on it, commit.
+	txn, err := cl.BeginTxn(true)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	v, found, err := txn.Get([]byte("bal"))
+	if err != nil || !found || string(v) != "100" {
+		t.Fatalf("txn get = %q found=%v err=%v", v, found, err)
+	}
+	if err := txn.Set([]byte("bal"), []byte("150"), 0); err != nil {
+		t.Fatalf("txn set: %v", err)
+	}
+	// The write is not visible outside the transaction until commit.
+	if outside, _, _ := cl.Get([]byte("bal")); string(outside) != "100" {
+		t.Fatalf("uncommitted write leaked: %q", outside)
+	}
+	version, err := txn.Commit()
+	if err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if version == 0 {
+		t.Fatalf("commit returned zero version")
+	}
+	if after, _, _ := cl.Get([]byte("bal")); string(after) != "150" {
+		t.Fatalf("after commit = %q, want 150", after)
+	}
+}
+
+func TestBinaryInteractiveTxnSeesOwnWrites(t *testing.T) {
+	cl := newBinaryServer(t)
+	txn, err := cl.BeginTxn(true)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer txn.Discard()
+	if err := txn.Set([]byte("k"), []byte("v"), 0); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	v, found, err := txn.Get([]byte("k"))
+	if err != nil || !found || string(v) != "v" {
+		t.Fatalf("read own write = %q found=%v err=%v", v, found, err)
+	}
+	ok, err := txn.Exists([]byte("k"))
+	if err != nil || !ok {
+		t.Fatalf("exists own write = %v err=%v", ok, err)
+	}
+}
+
+func TestBinaryInteractiveTxnDiscard(t *testing.T) {
+	cl := newBinaryServer(t)
+	txn, err := cl.BeginTxn(true)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if err := txn.Set([]byte("k"), []byte("v"), 0); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	if err := txn.Discard(); err != nil {
+		t.Fatalf("discard: %v", err)
+	}
+	// The discarded write never landed.
+	if _, found, _ := cl.Get([]byte("k")); found {
+		t.Fatalf("discarded write is visible")
+	}
+	// Operations on a discarded transaction report it is gone.
+	if _, _, err := txn.Get([]byte("k")); !errors.Is(err, ErrNoSuchTxn) {
+		t.Fatalf("get on discarded txn err = %v, want ErrNoSuchTxn", err)
+	}
+}
+
+func TestBinaryInteractiveTxnUnknownID(t *testing.T) {
+	cl := newBinaryServer(t)
+	// A handle with an id the server never issued is unknown.
+	bogus := &TxnHandle{c: cl, id: 999999}
+	if _, _, err := bogus.Get([]byte("k")); !errors.Is(err, ErrNoSuchTxn) {
+		t.Fatalf("get on bogus id err = %v, want ErrNoSuchTxn", err)
+	}
+}
+
+func TestBinaryInteractiveTxnRangeAndMerge(t *testing.T) {
+	cl := newBinaryServer(t)
+	for _, k := range []string{"a", "b", "c"} {
+		cl.Set([]byte(k), []byte("v"), 0)
+	}
+	txn, err := cl.BeginTxn(true)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if err := txn.DeleteRange([]byte("a"), []byte("c")); err != nil {
+		t.Fatalf("delete range: %v", err)
+	}
+	if err := txn.Merge([]byte("counter"), []byte("1")); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if _, err := txn.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	// a and b removed by the range delete, c survives.
+	if _, found, _ := cl.Get([]byte("a")); found {
+		t.Fatalf("a should be deleted")
+	}
+	if _, found, _ := cl.Get([]byte("c")); !found {
+		t.Fatalf("c should survive")
+	}
+	if _, found, _ := cl.Get([]byte("counter")); !found {
+		t.Fatalf("counter should exist after merge")
+	}
+}
+
+// newTestDB opens a fresh temp database and closes it on cleanup, for Service-level tests that
+// drive the registry directly without a socket in between.
+func newTestDB(t *testing.T) *kv.DB {
+	t.Helper()
+	db, err := kv.Open(t.TempDir() + "/test.kv")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	return db
+}
+
+func TestBinaryInteractiveTxnConflict(t *testing.T) {
+	cl := newBinaryServer(t)
+	if _, err := cl.Set([]byte("k"), []byte("0"), 0); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	// Two writable transactions both read the key, then both try to write it. The first to
+	// commit wins; the second conflicts because its snapshot is now stale.
+	t1, err := cl.BeginTxn(true)
+	if err != nil {
+		t.Fatalf("begin t1: %v", err)
+	}
+	t2, err := cl.BeginTxn(true)
+	if err != nil {
+		t.Fatalf("begin t2: %v", err)
+	}
+	if _, _, err := t1.Get([]byte("k")); err != nil {
+		t.Fatalf("t1 get: %v", err)
+	}
+	if _, _, err := t2.Get([]byte("k")); err != nil {
+		t.Fatalf("t2 get: %v", err)
+	}
+	if err := t1.Set([]byte("k"), []byte("1"), 0); err != nil {
+		t.Fatalf("t1 set: %v", err)
+	}
+	if err := t2.Set([]byte("k"), []byte("2"), 0); err != nil {
+		t.Fatalf("t2 set: %v", err)
+	}
+	if _, err := t1.Commit(); err != nil {
+		t.Fatalf("t1 commit: %v", err)
+	}
+	if _, err := t2.Commit(); !errors.Is(err, kv.ErrConflict) {
+		t.Fatalf("t2 commit err = %v, want ErrConflict", err)
+	}
+}
+
+func TestServiceInteractiveTxnCap(t *testing.T) {
+	db := newTestDB(t)
+	svc := newServiceWithLimits(db, 2, defaultTxnIdleTTL)
+	defer svc.Close()
+
+	if _, err := svc.BeginTxn(false); err != nil {
+		t.Fatalf("begin 1: %v", err)
+	}
+	if _, err := svc.BeginTxn(false); err != nil {
+		t.Fatalf("begin 2: %v", err)
+	}
+	if _, err := svc.BeginTxn(false); !errors.Is(err, ErrTooManyTxns) {
+		t.Fatalf("begin 3 err = %v, want ErrTooManyTxns", err)
+	}
+}
+
+func TestServiceInteractiveTxnReaper(t *testing.T) {
+	db := newTestDB(t)
+	// Drive the idle clock hard so the reaper fires within the test.
+	svc := newServiceWithLimits(db, defaultMaxOpenTxns, 20*time.Millisecond)
+	defer svc.Close()
+
+	id, err := svc.BeginTxn(true)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	// Leave the session untouched so its lastUsed stays put: any use refreshes it and would
+	// keep it alive. After several idle windows the reaper has force-discarded it, and the next
+	// reference reports it gone.
+	time.Sleep(300 * time.Millisecond)
+	if _, err := svc.TxnExists(id, []byte("k")); !errors.Is(err, ErrNoSuchTxn) {
+		t.Fatalf("reaper did not discard idle txn, err = %v", err)
+	}
+}
+
+func TestServiceInteractiveTxnCloseDiscards(t *testing.T) {
+	db := newTestDB(t)
+	svc := NewService(db)
+	id, err := svc.BeginTxn(true)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if err := svc.TxnSet(id, []byte("k"), []byte("v"), 0); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	svc.Close()
+	// Every open session is gone after Close, and the uncommitted write never landed.
+	if _, err := svc.TxnExists(id, []byte("k")); !errors.Is(err, ErrNoSuchTxn) {
+		t.Fatalf("after close err = %v, want ErrNoSuchTxn", err)
+	}
+	var found bool
+	db.View(func(txn *kv.Txn) error {
+		found, _ = txn.Exists([]byte("k"))
+		return nil
+	})
+	if found {
+		t.Fatalf("uncommitted write survived Close")
+	}
+}
+
 func TestBinaryReuseConnection(t *testing.T) {
 	cl := newBinaryServer(t)
 	// Many ops on one connection exercise the per-connection request/response loop reusing one

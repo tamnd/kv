@@ -81,6 +81,10 @@ func (t *Txn) NewIterator(opts IterOptions) (*Iterator, error) {
 // ErrConflict if it lost a write-write or SSI race (spec 15 §2.2).
 func (t *Txn) Commit() error { return wrap(t.t.Commit()) }
 
+// CommitVersion returns the version this transaction committed at, valid only after a
+// successful Commit. It is zero before commit and for a read-only or empty transaction.
+func (t *Txn) CommitVersion() uint64 { return t.t.CommitVersion() }
+
 // Discard releases the transaction's snapshot without applying its writes. It is a
 // no-op after Commit and must always be called (deferred) to free the snapshot's
 // readMark registration (spec 15 §2.2).

@@ -321,6 +321,123 @@ func boolByte(b bool) byte {
 	return 0
 }
 
+// TxnHandle is a client-side reference to an interactive transaction open on the server. It
+// carries the transaction id the server assigned and the client it rides; its methods send
+// transaction-scoped operations the server applies to the held transaction. A handle is valid
+// from BeginTxn until Commit or Discard, or until the server's idle reaper discards it, after
+// which its operations return an error built from the not-found status. Like the unary calls, a
+// handle's operations serialize on the client's connection lock; a transaction is not meant to
+// be driven from several goroutines at once.
+type TxnHandle struct {
+	c  *Client
+	id uint64
+}
+
+// BeginTxn opens an interactive transaction and returns a handle to it. A writable transaction
+// can read and write; a read-only one reads at a fixed snapshot. The caller must end it with
+// Commit or Discard; a handle left open is reclaimed by the server's idle timeout.
+func (c *Client) BeginTxn(writable bool) (*TxnHandle, error) {
+	e := encoder{buf: []byte{byte(opBeginTxn)}}
+	e.byte(boolByte(writable))
+	id, err := c.versionCall(e.buf)
+	if err != nil {
+		return nil, err
+	}
+	return &TxnHandle{c: c, id: id}, nil
+}
+
+// Get reads a key inside the transaction, seeing its own uncommitted writes.
+func (h *TxnHandle) Get(key []byte) (value []byte, found bool, err error) {
+	e := encoder{buf: []byte{byte(opTxnGet)}}
+	e.uint64(h.id)
+	e.bytes(key)
+	resp, err := h.c.roundTrip(e.buf)
+	if err != nil {
+		return nil, false, err
+	}
+	return decodeReadResponse(resp)
+}
+
+// Exists reports whether a key is present inside the transaction.
+func (h *TxnHandle) Exists(key []byte) (bool, error) {
+	e := encoder{buf: []byte{byte(opTxnExists)}}
+	e.uint64(h.id)
+	e.bytes(key)
+	resp, err := h.c.roundTrip(e.buf)
+	if err != nil {
+		return false, err
+	}
+	_, found, err := decodeReadResponse(resp)
+	return found, err
+}
+
+// Set buffers a set inside the transaction; it is durable only after Commit.
+func (h *TxnHandle) Set(key, value []byte, ttl time.Duration) error {
+	e := encoder{buf: []byte{byte(opTxnSet)}}
+	e.uint64(h.id)
+	e.bytes(key)
+	e.bytes(value)
+	e.uint64(uint64(ttl / time.Millisecond))
+	return h.statusCall(e.buf)
+}
+
+// Delete buffers a delete inside the transaction.
+func (h *TxnHandle) Delete(key []byte) error {
+	e := encoder{buf: []byte{byte(opTxnDelete)}}
+	e.uint64(h.id)
+	e.bytes(key)
+	return h.statusCall(e.buf)
+}
+
+// DeleteRange buffers a range delete inside the transaction.
+func (h *TxnHandle) DeleteRange(lo, hi []byte) error {
+	e := encoder{buf: []byte{byte(opTxnDeleteRange)}}
+	e.uint64(h.id)
+	e.bytes(lo)
+	e.bytes(hi)
+	return h.statusCall(e.buf)
+}
+
+// Merge buffers a merge inside the transaction.
+func (h *TxnHandle) Merge(key, operand []byte) error {
+	e := encoder{buf: []byte{byte(opTxnMerge)}}
+	e.uint64(h.id)
+	e.bytes(key)
+	e.bytes(operand)
+	return h.statusCall(e.buf)
+}
+
+// Commit commits the transaction and returns its commit version, which is zero for a read-only
+// or empty transaction. A conflict or other failure ends the transaction; the caller begins a
+// fresh one to retry. The handle is spent after Commit either way.
+func (h *TxnHandle) Commit() (uint64, error) {
+	e := encoder{buf: []byte{byte(opTxnCommit)}}
+	e.uint64(h.id)
+	return h.c.versionCall(e.buf)
+}
+
+// Discard ends the transaction without applying its writes. It is the explicit rollback; the
+// handle is spent afterward.
+func (h *TxnHandle) Discard() error {
+	e := encoder{buf: []byte{byte(opTxnDiscard)}}
+	e.uint64(h.id)
+	return h.statusCall(e.buf)
+}
+
+// statusCall performs a request whose success response is a bare status byte, the shape the
+// buffered transaction writes and the discard share.
+func (h *TxnHandle) statusCall(body []byte) error {
+	resp, err := h.c.roundTrip(body)
+	if err != nil {
+		return err
+	}
+	d := newDecoder(resp)
+	if st := status(d.byte()); st != statusOK {
+		return decodeError(d, st)
+	}
+	return nil
+}
+
 // encodeOpList encodes a count-prefixed op list, the client mirror of decodeOpList.
 func encodeOpList(e *encoder, ops []Op) {
 	e.uint64(uint64(len(ops)))
