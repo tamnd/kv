@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"net/http"
+	"time"
 
 	"github.com/tamnd/kv"
 )
@@ -28,13 +29,31 @@ type Server struct {
 
 // Options configures a Server. Addr is the listen address for the HTTP surface (for example
 // ":8480" or "127.0.0.1:0" to pick a free port in a test); an empty Addr defaults to the
-// standard kv port. The zero value is usable: New fills the defaults.
+// standard kv port. Limits, when non-nil, replaces the default request limits (spec 17 §6); a
+// nil Limits keeps the Service's defaults, which is why it is a pointer rather than a value that
+// could not tell "all limits off" from "unset". The two timeouts bound a slow client without
+// touching a streaming response: ReadHeaderTimeout caps how long a client may dawdle sending its
+// request headers, and IdleTimeout caps how long a kept-alive connection may sit between
+// requests; neither limits the duration of a scan or a watch, which by design run as long as
+// their data does. The zero value of Options is usable: New fills every default.
 type Options struct {
-	Addr string
+	Addr              string
+	Limits            *Limits
+	ReadHeaderTimeout time.Duration
+	IdleTimeout       time.Duration
 }
 
 // defaultAddr is kv's registered-by-convention HTTP port, used when Options.Addr is empty.
 const defaultAddr = ":8480"
+
+// The default HTTP timeouts bound a slow or idle client. They are deliberately the two timeouts
+// that do not interfere with a long streaming response: a header-read deadline and a keep-alive
+// idle deadline. A blanket read or write deadline is omitted on purpose, since it would cut a
+// healthy scan or watch off mid-stream.
+const (
+	defaultReadHeaderTimeout = 10 * time.Second
+	defaultIdleTimeout       = 120 * time.Second
+)
 
 // New builds a Server over an already-open database. It wires the Service and the HTTP mux
 // but binds no socket; call ListenAndServe or Serve to start accepting. The database must
@@ -45,8 +64,25 @@ func New(db *kv.DB, opts Options) *Server {
 		addr = defaultAddr
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	srv := &Server{svc: NewService(db), baseCtx: ctx, cancel: cancel}
-	srv.http = &http.Server{Addr: addr, Handler: srv.httpHandler()}
+	svc := NewService(db)
+	if opts.Limits != nil {
+		svc.SetLimits(*opts.Limits)
+	}
+	readHeaderTimeout := opts.ReadHeaderTimeout
+	if readHeaderTimeout == 0 {
+		readHeaderTimeout = defaultReadHeaderTimeout
+	}
+	idleTimeout := opts.IdleTimeout
+	if idleTimeout == 0 {
+		idleTimeout = defaultIdleTimeout
+	}
+	srv := &Server{svc: svc, baseCtx: ctx, cancel: cancel}
+	srv.http = &http.Server{
+		Addr:              addr,
+		Handler:           srv.httpHandler(),
+		ReadHeaderTimeout: readHeaderTimeout,
+		IdleTimeout:       idleTimeout,
+	}
 	return srv
 }
 

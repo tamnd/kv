@@ -369,6 +369,8 @@ func writeServiceErr(w http.ResponseWriter, err error) {
 		http.Error(w, err.Error(), http.StatusConflict)
 	case errors.Is(err, kv.ErrReadOnly):
 		http.Error(w, err.Error(), http.StatusMethodNotAllowed)
+	case errors.Is(err, ErrLimitExceeded):
+		http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
 	case errors.Is(err, kv.ErrNeedsRecovery), errors.Is(err, kv.ErrCorrupt), errors.Is(err, kv.ErrClosed):
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 	default:
