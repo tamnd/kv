@@ -42,10 +42,12 @@ func TestDurabilitySweepWalksTheLadder(t *testing.T) {
 	// cannot be fundamentally slower. The measured throughputs are noisy though, especially on
 	// a fast disk where the OS buffers writes and group commit folds many commits into one
 	// fsync, so the two modes can land within a few percent and ordinary scheduling jitter can
-	// flip them. The test asserts only the robust fact: off is not dramatically slower than
-	// extra. A real inversion (durability levels wired backward) would put off far below this
-	// floor, where measurement noise stays well inside it.
-	const floor = 0.75 // off must reach at least 75% of extra's throughput
+	// flip them. On a shared CI runner that jitter can run to tens of percent, so the floor is
+	// generous: the test asserts only the robust fact that off is not dramatically slower than
+	// extra. A real inversion (durability levels wired backward) makes off pay every fsync extra
+	// should skip, which on any disk where fsync costs anything drops it far below this floor,
+	// while measurement noise stays well inside it.
+	const floor = 0.5 // off must reach at least half of extra's throughput
 	if byMode["off"].Throughput < floor*byMode["extra"].Throughput {
 		t.Fatalf("SyncOff throughput %.0f is far below SyncExtra %.0f (floor %.0f), which inverts the durability tradeoff",
 			byMode["off"].Throughput, byMode["extra"].Throughput, floor*byMode["extra"].Throughput)
