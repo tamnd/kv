@@ -104,6 +104,14 @@ type WAL struct {
 	batchN  uint32 // frames appended in the open (uncommitted) batch
 	syncs   uint64 // count of fsyncs performed, for observability
 
+	// Reusable append-path scratch (perf/02 Finding 6). The WAL is single-writer by
+	// contract (the db serializes every append through the single-flight committer, the
+	// same contract that lets lsn/lastSum/tailOff be plain fields), so one frame buffer and
+	// one checksum buffer can be reused across frames instead of a make per frame in the
+	// commit critical section. They grow to the largest frame seen and stay.
+	frameScratch []byte
+	chainScratch []byte
+
 	crypto *crypto.Scheme // encrypts kv-batch payloads when set; nil for a cleartext log
 }
 
@@ -265,7 +273,11 @@ func (w *WAL) Syncs() uint64 { return w.syncs }
 // appendFrame encodes one frame, appends it to the file, and advances the chain.
 // It does not sync; callers batch the sync at the commit boundary.
 func (w *WAL) appendFrame(ft FrameType, version uint64, payload []byte) error {
-	frame := make([]byte, frameHeaderSize+len(payload))
+	need := frameHeaderSize + len(payload)
+	if cap(w.frameScratch) < need {
+		w.frameScratch = make([]byte, need)
+	}
+	frame := w.frameScratch[:need]
 	frame[0] = byte(ft)
 	binary.BigEndian.PutUint32(frame[1:5], uint32(len(payload)))
 	binary.BigEndian.PutUint64(frame[5:13], w.lsn)
@@ -276,9 +288,11 @@ func (w *WAL) appendFrame(ft FrameType, version uint64, payload []byte) error {
 	// The chained checksum covers the previous frame's checksum, this frame's
 	// header (sans its own checksum slot), and the payload. The first frame chains
 	// from the header checksum seeded at Create/Open.
-	sum := chain(w.lastSum, frame[0:29], payload)
+	sum := w.chainSum(w.lastSum, frame[0:29], payload)
 	binary.BigEndian.PutUint64(frame[29:37], sum)
 
+	// WriteAt copies frame into the file's own storage (both the os and mem backends do),
+	// so reusing w.frameScratch on the next frame is safe.
 	if _, err := w.file.WriteAt(frame, w.tailOff); err != nil {
 		return err
 	}
@@ -289,8 +303,25 @@ func (w *WAL) appendFrame(ft FrameType, version uint64, payload []byte) error {
 	return nil
 }
 
+// chainSum is the allocation-free form of chain for the append hot path: it reuses
+// w.chainScratch instead of allocating the concatenation buffer per frame, since
+// appendFrame runs in the commit critical section under the db's single-flight commit.
+func (w *WAL) chainSum(prev uint64, headerSansSum, payload []byte) uint64 {
+	need := 8 + len(headerSansSum) + len(payload)
+	if cap(w.chainScratch) < need {
+		w.chainScratch = make([]byte, need)
+	}
+	buf := w.chainScratch[:need]
+	binary.BigEndian.PutUint64(buf[0:8], prev)
+	copy(buf[8:], headerSansSum)
+	copy(buf[8+len(headerSansSum):], payload)
+	return walChecksum.Sum(buf)
+}
+
 // chain computes the cumulative frame checksum: xxh64 over the previous checksum
-// (8 bytes, big-endian), the frame header sans checksum, and the payload.
+// (8 bytes, big-endian), the frame header sans checksum, and the payload. It is the
+// allocating form the recovery reader uses, where the per-frame buffer does not matter;
+// the append hot path uses w.chainSum, which reuses a scratch buffer instead.
 func chain(prev uint64, headerSansSum, payload []byte) uint64 {
 	buf := make([]byte, 8+len(headerSansSum)+len(payload))
 	binary.BigEndian.PutUint64(buf[0:8], prev)
