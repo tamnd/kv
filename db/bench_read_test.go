@@ -58,3 +58,39 @@ func BenchmarkConcurrentGet(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkGetLargeValue measures a cache-resident point read of a large value. The read
+// path copies the chosen version out of the decoded node before handing it to the caller;
+// at large value sizes that memcpy and its allocation dominate, so this is the workload that
+// shows the value-copy reductions on the read path (spec 01 Finding 2) where the small-value
+// BenchmarkConcurrentGet, dominated by descent and lock costs, cannot.
+func BenchmarkGetLargeValue(b *testing.B) {
+	for _, size := range []int{256, 4096, 65536} {
+		b.Run(fmt.Sprintf("size=%d", size), func(b *testing.B) {
+			fs := vfs.NewMem()
+			d, err := Open(fs, "bench.kv", Options{PageSize: 65536, Sync: wal.SyncOff})
+			if err != nil {
+				b.Fatalf("open: %v", err)
+			}
+			defer d.Close()
+			val := make([]byte, size)
+			for i := range val {
+				val[i] = byte(i)
+			}
+			key := []byte("big")
+			if _, err := d.Write(func(wb *engine.WriteBatch) {
+				wb.Set(key, val)
+			}); err != nil {
+				b.Fatalf("seed: %v", err)
+			}
+			b.SetBytes(int64(size))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				if _, err := d.Get(key); err != nil {
+					b.Fatalf("get: %v", err)
+				}
+			}
+		})
+	}
+}
