@@ -139,14 +139,17 @@ func writeAllSteps(t *testing.T, d *DB) {
 // crashEquivOptions is the workload's open options: the LSM core, a memtable small enough
 // that the steps flush many segments, SyncFull so every commit is its own fsync boundary,
 // and no auto-checkpoint so the only checkpoints are the deterministic ones the workload
-// drives and no background goroutine writes after the freeze.
+// drives and no background goroutine writes after the freeze. Auto-compaction is off for the
+// same reason: the test drives compaction by hand through Maintain so the crash window lands
+// over a known tree shape, not whatever a background compactor happened to leave.
 func crashEquivOptions() Options {
 	return Options{
-		PageSize:       4096,
-		Engine:         format.EngineLSM,
-		MemtableSize:   64,
-		Sync:           wal.SyncFull,
-		AutoCheckpoint: -1,
+		PageSize:              4096,
+		Engine:                format.EngineLSM,
+		MemtableSize:          64,
+		Sync:                  wal.SyncFull,
+		AutoCheckpoint:        -1,
+		disableAutoCompaction: true,
 	}
 }
 

@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tamnd/kv/btree"
@@ -105,6 +106,11 @@ type Options struct {
 	// space-bound or write-heavy workloads on storage slower than the CPU. The B-tree core
 	// ignores it.
 	Compression bool
+	// disableAutoCompaction turns off the LSM core's background compaction scheduler so
+	// compaction runs only on an explicit Maintain. It is unexported: production always
+	// self-schedules compaction, and only an in-package test that drives compaction by hand
+	// to observe a precise segment shape or a deterministic crash window sets it.
+	disableAutoCompaction bool
 	// Logger is the structured-logging sink for database lifecycle, recovery,
 	// checkpoint, maintenance, the fatal durability fault, and slow operations (spec
 	// 19 §3). Nil, the default, disables logging entirely: no event is formatted and
@@ -237,6 +243,12 @@ type DB struct {
 	wal *wal.WAL
 	eng engine.Engine
 	orc *oracle
+	// orcPub publishes the oracle to the engine's background workers (the LSM
+	// flusher's compaction watermark) race-free. orc itself is assigned once on the
+	// Open goroutine, but a background compaction can read it concurrently during
+	// recovery, before that assignment; the atomic load returns nil until then, which
+	// the watermark adapter reads as "GC nothing yet."
+	orcPub atomic.Pointer[oracle]
 
 	// crypto is the encryption scheme this database seals pages and WAL frames under, nil
 	// for an unencrypted file (spec 14). It is the handle a key rotation advances: RotateEncryptionKey
@@ -252,6 +264,7 @@ type DB struct {
 	filter          engine.FilterKind
 	bufferedInserts bool
 	compression     bool
+	noAutoCompact   bool
 
 	// readReplica makes this a read-only follower (spec 18 §4): user writes are refused
 	// and state advances only through ApplyWAL replaying shipped frames. replicaHigh is
@@ -378,7 +391,7 @@ func create(fs vfs.FS, path string, opts Options) (*DB, error) {
 		return nil, err
 	}
 	d := &DB{fs: fs, path: path, pgr: pgr, wal: w, eng: eng, orc: newOracle(0), crypto: enc,
-		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, bufferedInserts: opts.BufferedInserts, compression: opts.Compression, now: opts.clock(), logger: opts.Logger, slowOp: opts.SlowOpThreshold, tracer: opts.Tracer, readReplica: opts.ReadReplica, archive: opts.WALArchive}
+		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, bufferedInserts: opts.BufferedInserts, compression: opts.Compression, noAutoCompact: opts.disableAutoCompaction, now: opts.clock(), logger: opts.Logger, slowOp: opts.SlowOpThreshold, tracer: opts.Tracer, readReplica: opts.ReadReplica, archive: opts.WALArchive}
 	d.ccond = sync.NewCond(&d.cmu)
 	if err := d.openEngine(opts.Merge); err != nil {
 		w.Close()
@@ -407,7 +420,7 @@ func openExisting(fs vfs.FS, path string, opts Options) (*DB, error) {
 		return nil, err
 	}
 	d := &DB{fs: fs, path: path, pgr: pgr, eng: eng, crypto: enc,
-		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, bufferedInserts: opts.BufferedInserts, compression: opts.Compression, now: opts.clock(), logger: opts.Logger, slowOp: opts.SlowOpThreshold, tracer: opts.Tracer, readReplica: opts.ReadReplica, archive: opts.WALArchive}
+		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, bufferedInserts: opts.BufferedInserts, compression: opts.Compression, noAutoCompact: opts.disableAutoCompaction, now: opts.clock(), logger: opts.Logger, slowOp: opts.SlowOpThreshold, tracer: opts.Tracer, readReplica: opts.ReadReplica, archive: opts.WALArchive}
 	d.ccond = sync.NewCond(&d.cmu)
 	if err := d.openEngine(opts.Merge); err != nil {
 		pgr.Close()
@@ -466,15 +479,33 @@ func openExisting(fs vfs.FS, path string, opts Options) (*DB, error) {
 		last = maxVer
 	}
 	d.orc = newOracle(last)
+	d.orcPub.Store(d.orc)
 	d.startCheckpointer(opts.autoCheckpoint())
 	d.logOpened(last)
 	return d, nil
+}
+
+// engineWatermark feeds a core's background work the version-GC horizon (spec 10 §6):
+// the oldest version any live reader can still observe, below which a superseded version
+// is collectible. The LSM core reads it when its background compaction merges away dead
+// versions. The oracle is built after the engine opens, so this loads it atomically and
+// reports 0 (collect nothing) until it exists, which is only during recovery before the
+// database is live and no reader can yet hold a version back.
+type engineWatermark struct{ d *DB }
+
+func (w engineWatermark) OldestReadable() uint64 {
+	o := w.d.orcPub.Load()
+	if o == nil {
+		return 0
+	}
+	return o.readMark()
 }
 
 // openEngine wires the engine to its substrate and installs the merge resolver.
 func (d *DB) openEngine(merge func(existing, operand []byte) []byte) error {
 	env := &engine.Env{
 		Pager: d.pgr,
+		Clock: engineWatermark{d},
 		Options: engine.EngineOptions{
 			PageSize:        d.pgr.PageSize(),
 			MemtableSize:    d.memtableSize,
@@ -482,6 +513,8 @@ func (d *DB) openEngine(merge func(existing, operand []byte) []byte) error {
 			Filter:          d.filter,
 			BufferedInserts: d.bufferedInserts,
 			Compression:     d.compression,
+
+			DisableAutoCompaction: d.noAutoCompact,
 		},
 	}
 	if err := d.eng.Open(env); err != nil {

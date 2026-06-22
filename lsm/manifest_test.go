@@ -45,6 +45,9 @@ func reopenPager(t *testing.T, fs vfs.FS, pgr *pager.Pager) *pager.Pager {
 func openLSM(t *testing.T, pgr *pager.Pager) *LSM {
 	t.Helper()
 	l := New(pgr)
+	// Manual-compaction tests drive Maintain by hand against a known segment shape, so the
+	// background compactor is off here (it is covered by the auto-compaction tests).
+	l.autoCompact = false
 	if err := l.Open(&engine.Env{Pager: pgr, Options: engine.EngineOptions{PageSize: pgr.PageSize()}}); err != nil {
 		t.Fatalf("open lsm: %v", err)
 	}

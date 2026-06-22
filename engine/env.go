@@ -118,4 +118,11 @@ type EngineOptions struct {
 	RangeIndex        bool       // build the REMIX ordered index for scan-heavy workloads
 	Filter            FilterKind // per-segment membership filter: Bloom (default) or Ribbon
 	Compression       bool       // heat-tiered block compression on the LSM data pages (spec 13)
+
+	// DisableAutoCompaction turns off the LSM core's background compaction scheduler, so
+	// compaction runs only when the host calls Maintain. Off by default (the engine
+	// self-schedules compaction to keep read fan-out and space amp bounded under sustained
+	// writes); a test that drives compaction by hand to observe a precise segment shape
+	// sets it. The B-tree core ignores it.
+	DisableAutoCompaction bool
 }
