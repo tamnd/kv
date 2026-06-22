@@ -36,6 +36,10 @@ type ScanOptions struct {
 // not retain key or value past the call: they are the iterator's own buffers, valid only for
 // the duration of the call, which is what lets a long scan stay at one item of memory.
 func (s *Service) Scan(opts ScanOptions, yield func(key, value []byte) error) error {
+	// Clamp the requested limit to the scan ceiling so an unbounded or oversized scan returns at
+	// most the configured maximum, the same guardrail on either protocol. A client that wanted
+	// more resumes from the last key it saw, the normal paginated-scan pattern.
+	opts.Limit = s.limits.clampScan(opts.Limit)
 	return s.db.View(func(txn *kv.Txn) error {
 		it, err := txn.NewIterator(kv.IterOptions{
 			Lower:    opts.Lower,

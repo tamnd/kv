@@ -103,22 +103,28 @@ var ErrAssertFailed = errors.New("kv: transaction assertion failed")
 // concurrency-safe mapping onto a library call, so many adapter goroutines call one Service in
 // parallel exactly as many callers share one *kv.DB.
 type Service struct {
-	db   *kv.DB
-	txns *txnRegistry
+	db     *kv.DB
+	txns   *txnRegistry
+	limits Limits
 }
 
-// NewService wraps an open database in a Service. The caller owns the database's lifetime;
-// the Service never closes it. The interactive transaction registry it starts must be stopped
-// with Close so its reaper goroutine does not outlive the Service.
+// NewService wraps an open database in a Service with the default request limits. The caller owns
+// the database's lifetime; the Service never closes it. The interactive transaction registry it
+// starts must be stopped with Close so its reaper goroutine does not outlive the Service.
 func NewService(db *kv.DB) *Service {
-	return &Service{db: db, txns: newTxnRegistry(defaultMaxOpenTxns, defaultTxnIdleTTL)}
+	return &Service{db: db, txns: newTxnRegistry(defaultMaxOpenTxns, defaultTxnIdleTTL), limits: DefaultLimits()}
 }
 
-// newServiceWithLimits builds a Service with explicit interactive-transaction bounds. It exists
-// for tests that need a tiny cap or a short idle window without poking the registry's fields
-// after its reaper has started, which would race the reaper's reads.
-func newServiceWithLimits(db *kv.DB, maxOpen int, idleTTL time.Duration) *Service {
-	return &Service{db: db, txns: newTxnRegistry(maxOpen, idleTTL)}
+// SetLimits replaces the request limits the Service enforces. It is meant to be called once at
+// startup before the Service serves any request, the way Options.Limits flows through New; it
+// is not safe to call concurrently with in-flight requests.
+func (s *Service) SetLimits(l Limits) { s.limits = l }
+
+// newServiceWithTxnBounds builds a Service with explicit interactive-transaction bounds and the
+// default request limits. It exists for tests that need a tiny cap or a short idle window without
+// poking the registry's fields after its reaper has started, which would race the reaper's reads.
+func newServiceWithTxnBounds(db *kv.DB, maxOpen int, idleTTL time.Duration) *Service {
+	return &Service{db: db, txns: newTxnRegistry(maxOpen, idleTTL), limits: DefaultLimits()}
 }
 
 // Close stops the interactive transaction registry, force-discarding any still-open
@@ -157,8 +163,15 @@ func (s *Service) Exists(key []byte) (bool, error) {
 	return found, err
 }
 
-// Set upserts a key, with an optional TTL, and returns the commit version.
+// Set upserts a key, with an optional TTL, and returns the commit version. An over-limit key or
+// value is refused before the transaction opens.
 func (s *Service) Set(key, value []byte, ttl time.Duration) (uint64, error) {
+	if err := s.limits.checkKey(key); err != nil {
+		return 0, err
+	}
+	if err := s.limits.checkValue(value); err != nil {
+		return 0, err
+	}
 	return s.db.UpdateVersion(func(txn *kv.Txn) error {
 		if ttl > 0 {
 			return txn.SetWithTTL(key, value, ttl)
@@ -169,16 +182,31 @@ func (s *Service) Set(key, value []byte, ttl time.Duration) (uint64, error) {
 
 // Delete removes one key and returns the commit version.
 func (s *Service) Delete(key []byte) (uint64, error) {
+	if err := s.limits.checkKey(key); err != nil {
+		return 0, err
+	}
 	return s.db.UpdateVersion(func(txn *kv.Txn) error { return txn.Delete(key) })
 }
 
 // DeleteRange removes every key in [lo, hi) and returns the commit version.
 func (s *Service) DeleteRange(lo, hi []byte) (uint64, error) {
+	if err := s.limits.checkKey(lo); err != nil {
+		return 0, err
+	}
+	if err := s.limits.checkKey(hi); err != nil {
+		return 0, err
+	}
 	return s.db.UpdateVersion(func(txn *kv.Txn) error { return txn.DeleteRange(lo, hi) })
 }
 
 // Merge applies the registered merge operator to a key and returns the commit version.
 func (s *Service) Merge(key, operand []byte) (uint64, error) {
+	if err := s.limits.checkKey(key); err != nil {
+		return 0, err
+	}
+	if err := s.limits.checkValue(operand); err != nil {
+		return 0, err
+	}
 	return s.db.UpdateVersion(func(txn *kv.Txn) error { return txn.Merge(key, operand) })
 }
 
@@ -188,6 +216,19 @@ func (s *Service) Merge(key, operand []byte) (uint64, error) {
 // whole thing retries on conflict like any Update, so the asserts are re-checked against the
 // fresh snapshot each attempt, giving a correct compare-and-swap over the wire.
 func (s *Service) Txn(req TxnRequest) (TxnResult, error) {
+	if err := s.limits.checkBatch(len(req.Ops)); err != nil {
+		return TxnResult{}, err
+	}
+	for _, a := range req.Asserts {
+		if err := s.limits.checkAssert(a); err != nil {
+			return TxnResult{}, err
+		}
+	}
+	for _, op := range req.Ops {
+		if err := s.limits.checkOp(op); err != nil {
+			return TxnResult{}, err
+		}
+	}
 	var reads []ReadResult
 	version, err := s.db.UpdateVersion(func(txn *kv.Txn) error {
 		reads = reads[:0]
@@ -229,6 +270,14 @@ func (s *Service) Txn(req TxnRequest) (TxnResult, error) {
 // Batch applies a set of write ops atomically and returns the commit version (spec 17 §3). It
 // is Txn without reads or asserts, the bulk-write path: a single Update over the ops.
 func (s *Service) Batch(ops []Op) (uint64, error) {
+	if err := s.limits.checkBatch(len(ops)); err != nil {
+		return 0, err
+	}
+	for _, op := range ops {
+		if err := s.limits.checkOp(op); err != nil {
+			return 0, err
+		}
+	}
 	version, err := s.db.UpdateVersion(func(txn *kv.Txn) error {
 		for _, op := range ops {
 			if e := applyOp(txn, op, nil); e != nil {

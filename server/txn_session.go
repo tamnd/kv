@@ -281,8 +281,16 @@ func (s *Service) TxnExists(id uint64, key []byte) (bool, error) {
 	return found, err
 }
 
-// TxnSet buffers a set inside an open transaction. The write is not durable until CommitTxn.
+// TxnSet buffers a set inside an open transaction. The write is not durable until CommitTxn. The
+// size limits apply here exactly as they do to a single-shot set, so an interactive transaction is
+// not a way around them.
 func (s *Service) TxnSet(id uint64, key, value []byte, ttl time.Duration) error {
+	if err := s.limits.checkKey(key); err != nil {
+		return err
+	}
+	if err := s.limits.checkValue(value); err != nil {
+		return err
+	}
 	return s.txns.with(id, func(txn *kv.Txn) error {
 		if ttl > 0 {
 			return txn.SetWithTTL(key, value, ttl)
@@ -293,16 +301,31 @@ func (s *Service) TxnSet(id uint64, key, value []byte, ttl time.Duration) error 
 
 // TxnDelete buffers a delete inside an open transaction.
 func (s *Service) TxnDelete(id uint64, key []byte) error {
+	if err := s.limits.checkKey(key); err != nil {
+		return err
+	}
 	return s.txns.with(id, func(txn *kv.Txn) error { return txn.Delete(key) })
 }
 
 // TxnDeleteRange buffers a range delete inside an open transaction.
 func (s *Service) TxnDeleteRange(id uint64, lo, hi []byte) error {
+	if err := s.limits.checkKey(lo); err != nil {
+		return err
+	}
+	if err := s.limits.checkKey(hi); err != nil {
+		return err
+	}
 	return s.txns.with(id, func(txn *kv.Txn) error { return txn.DeleteRange(lo, hi) })
 }
 
 // TxnMerge buffers a merge inside an open transaction.
 func (s *Service) TxnMerge(id uint64, key, operand []byte) error {
+	if err := s.limits.checkKey(key); err != nil {
+		return err
+	}
+	if err := s.limits.checkValue(operand); err != nil {
+		return err
+	}
 	return s.txns.with(id, func(txn *kv.Txn) error { return txn.Merge(key, operand) })
 }
 

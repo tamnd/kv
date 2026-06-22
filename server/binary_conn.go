@@ -486,6 +486,8 @@ func errBinaryStatus(s status, msg string) error {
 		return wrapBinary(kv.ErrNeedsRecovery, msg)
 	case statusNoTxn:
 		return wrapBinary(ErrNoSuchTxn, msg)
+	case statusTooLarge:
+		return wrapBinary(ErrLimitExceeded, msg)
 	default:
 		return errors.New(msg)
 	}

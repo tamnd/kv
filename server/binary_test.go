@@ -565,7 +565,7 @@ func TestBinaryInteractiveTxnConflict(t *testing.T) {
 
 func TestServiceInteractiveTxnCap(t *testing.T) {
 	db := newTestDB(t)
-	svc := newServiceWithLimits(db, 2, defaultTxnIdleTTL)
+	svc := newServiceWithTxnBounds(db, 2, defaultTxnIdleTTL)
 	defer svc.Close()
 
 	if _, err := svc.BeginTxn(false); err != nil {
@@ -582,7 +582,7 @@ func TestServiceInteractiveTxnCap(t *testing.T) {
 func TestServiceInteractiveTxnReaper(t *testing.T) {
 	db := newTestDB(t)
 	// Drive the idle clock hard so the reaper fires within the test.
-	svc := newServiceWithLimits(db, defaultMaxOpenTxns, 20*time.Millisecond)
+	svc := newServiceWithTxnBounds(db, defaultMaxOpenTxns, 20*time.Millisecond)
 	defer svc.Close()
 
 	id, err := svc.BeginTxn(true)

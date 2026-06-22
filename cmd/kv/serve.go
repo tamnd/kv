@@ -22,11 +22,25 @@ func cmdServe(args []string) int {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	addr := fs.String("addr", ":8480", "listen address for the HTTP surface")
 	binaryAddr := fs.String("binary-addr", "", "listen address for the binary protocol (empty disables it)")
+	// Request limits (spec 17 §6). The defaults come from the server; a flag overrides one
+	// dimension, and a zero value disables that one limit. They guard the single process against a
+	// request large enough to spike its memory or stall its writer.
+	defaults := server.DefaultLimits()
+	maxKeySize := fs.Int("max-key-size", defaults.MaxKeySize, "largest key in bytes (0 disables)")
+	maxValueSize := fs.Int("max-value-size", defaults.MaxValueSize, "largest value in bytes (0 disables)")
+	maxBatchOps := fs.Int("max-batch-ops", defaults.MaxBatchOps, "most ops in a batch or transaction (0 disables)")
+	maxScanLimit := fs.Int("max-scan-limit", defaults.MaxScanLimit, "most pairs one scan returns (0 disables)")
 	if err := parseArgs(fs, args); err != nil {
 		return exitUsage
 	}
 	if fs.NArg() != 1 {
-		return usageErr("usage: kv serve <db> [-addr host:port] [-binary-addr host:port]")
+		return usageErr("usage: kv serve <db> [-addr host:port] [-binary-addr host:port] [limit flags]")
+	}
+	limits := server.Limits{
+		MaxKeySize:   *maxKeySize,
+		MaxValueSize: *maxValueSize,
+		MaxBatchOps:  *maxBatchOps,
+		MaxScanLimit: *maxScanLimit,
 	}
 
 	d, code := openDB(fs.Arg(0))
@@ -42,7 +56,7 @@ func cmdServe(args []string) int {
 	if err != nil {
 		return fail(err)
 	}
-	srv := server.New(d, server.Options{Addr: ln.Addr().String()})
+	srv := server.New(d, server.Options{Addr: ln.Addr().String(), Limits: &limits})
 
 	errc := make(chan error, 1)
 	go func() { errc <- srv.Serve(ln) }()
