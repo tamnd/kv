@@ -59,7 +59,7 @@ func (t *BTree) BulkLoad(next func() (ik, value []byte, ok bool)) error {
 		}
 		cur.keys = append(cur.keys, append([]byte(nil), ik...))
 		cur.vals = append(cur.vals, append([]byte(nil), value...))
-		if len(marshalLeaf(cur)) <= t.usable {
+		if leafEncodedSize(cur) <= t.usable {
 			continue
 		}
 

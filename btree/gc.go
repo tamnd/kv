@@ -70,7 +70,7 @@ func (t *BTree) gcVersions(w, sweepNow uint64, maxPages int) (engine.MaintReport
 		next := l.next
 		nl, changed, swept := gcCollapseLeaf(l, w, sweepNow, t.rangeDels, t.merge)
 		if changed {
-			report.BytesReclaimed += int64(len(marshalLeaf(l)) - len(marshalLeaf(nl)))
+			report.BytesReclaimed += int64(leafEncodedSize(l) - leafEncodedSize(nl))
 			report.ExpiredSwept += swept
 			if err := t.storeLeaf(pgno, nl); err != nil {
 				return report, err
@@ -229,7 +229,7 @@ func (t *BTree) dropDeadMarkers(w uint64) (int64, error) {
 			nl.vals = append(nl.vals, l.vals[idx])
 		}
 		if dropped {
-			reclaimed += int64(len(marshalLeaf(l)) - len(marshalLeaf(nl)))
+			reclaimed += int64(leafEncodedSize(l) - leafEncodedSize(nl))
 			if err := t.storeLeaf(pgno, nl); err != nil {
 				return 0, err
 			}
