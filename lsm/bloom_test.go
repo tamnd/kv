@@ -43,6 +43,26 @@ func TestBloomFalsePositiveRate(t *testing.T) {
 	}
 }
 
+// TestBloomLegacyNonPow2 confirms a filter whose bit array is not a power of two long,
+// the layout a segment written before the mask change carries, still reads correctly:
+// add and mayContain must agree on the bit positions, which means both must take the
+// division fallback rather than masking against a non-power-of-two length. A filter
+// built by hand at a non-power-of-two byte count stands in for the on-disk legacy one.
+func TestBloomLegacyNonPow2(t *testing.T) {
+	f := &bloomFilter{bits: make([]byte, 625), k: bloomK(bloomBitsPerKey)} // 5000 bits, not a power of two
+	if n := f.nbits(); n&(n-1) == 0 {
+		t.Fatalf("test wants a non-power-of-two length, got %d", n)
+	}
+	for i := 0; i < 500; i++ {
+		f.add([]byte(fmt.Sprintf("legacy%06d", i)))
+	}
+	for i := 0; i < 500; i++ {
+		if !f.mayContain([]byte(fmt.Sprintf("legacy%06d", i))) {
+			t.Fatalf("false negative for legacy%06d: the modulo fallback disagrees with add", i)
+		}
+	}
+}
+
 // TestBloomNilIsConservative confirms a nil filter, the state a segment written
 // before this slice or one with no keys carries, passes every key so the segment is
 // always read rather than wrongly skipped.
@@ -55,6 +75,30 @@ func TestBloomNilIsConservative(t *testing.T) {
 	if !empty.mayContain([]byte("anything")) {
 		t.Fatal("empty filter must pass every key so the segment is always read")
 	}
+}
+
+// BenchmarkBloomMayContain measures the cost the point read pays per segment it touches:
+// k probe positions reduced against the bit-array length. The mask path (power-of-two
+// length, every filter newBloom builds) replaces the k divisions of the modulo path with
+// k bitwise ands, so this is the microbenchmark the R4 change moves. Half the probed keys
+// are present and half absent, the mix a real point read sees against a filter.
+func BenchmarkBloomMayContain(b *testing.B) {
+	const n = 10000
+	f := newBloom(n, bloomBitsPerKey)
+	for i := 0; i < n; i++ {
+		f.add([]byte(fmt.Sprintf("present%06d", i)))
+	}
+	keys := make([][]byte, 2*n)
+	for i := 0; i < n; i++ {
+		keys[2*i] = []byte(fmt.Sprintf("present%06d", i))
+		keys[2*i+1] = []byte(fmt.Sprintf("absent%06d", i))
+	}
+	b.ResetTimer()
+	var sink bool
+	for i := 0; i < b.N; i++ {
+		sink = f.mayContain(keys[i%len(keys)])
+	}
+	_ = sink
 }
 
 // TestSegmentBloomBuiltAndProbed flushes keys into a segment and confirms the segment
