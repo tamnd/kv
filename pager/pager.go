@@ -5,9 +5,15 @@
 // above the pager touches bytes on disk; nothing in the pager knows what a page
 // means (interior vs leaf vs segment block is the core's concern).
 //
-// Concurrency in this milestone is single-mutex: correctness first. The
-// lock-free sharded read path and per-frame hybrid latch the spec describes
-// (spec 03 §6) are a later optimization that does not change this contract.
+// Concurrency: the buffer pool is sharded by page number into independent
+// shards, each with its own mutex, CLOCK hand, and resident-frame index (spec
+// 03 §6, perf/05 F1). A Get or Unpin contends only with other access to the
+// same shard, so reads of different pages run on different cores without
+// serializing on one global lock. Page allocation (the freelist and the
+// high-water mark) and the file header sit under a separate metaMu, which is a
+// leaf lock: code paths acquire shards first (in ascending index order) and
+// metaMu last, and nothing acquires a shard while holding metaMu, so the order
+// is total and the pool cannot deadlock.
 package pager
 
 import (
@@ -75,39 +81,73 @@ type Options struct {
 
 const defaultCacheFrames = 2000
 
+// Buffer-pool sharding parameters. maxShards caps the shard count so the per-shard
+// bookkeeping stays small; minFramesPerShard is the floor on frames each shard owns,
+// chosen comfortably above the most pages any one operation pins simultaneously in a
+// single shard (a tree-height descent plus a cursor stack), so a shard never starves an
+// admission while the rest of the pool sits idle. A pool below the floor collapses to a
+// single shard and behaves exactly like the old global pool, which keeps the tiny-pool
+// regime (the streaming-flush tests) working.
+const (
+	maxShards         = 64
+	minFramesPerShard = 16
+)
+
+// shard is one independent slice of the buffer pool: the frames whose page numbers hash
+// to it, a CLOCK hand over just those frames, and the index that finds a resident page
+// among them. Every field is guarded by mu. A page number maps to exactly one shard for
+// the pool's lifetime, so a frame in this shard only ever caches pages that belong here.
+type shard struct {
+	mu      sync.Mutex
+	index   map[uint32]*Frame // resident frames by page number, this shard only
+	frames  []*Frame          // frames owned by this shard, pinned or free
+	hand    int               // CLOCK hand into frames
+	scratch []byte            // pageSize crypto staging buffer, lazily allocated
+}
+
 // Pager owns the buffer pool and the main file.
 type Pager struct {
 	fs   vfs.FS
 	file vfs.File
 	path string
 
-	mu       sync.Mutex
 	pageSize int
-	header   *format.Header
 
-	// crypto, when set, encrypts data pages on the way to disk and decrypts them on
-	// the way back (spec 14). It is nil for an unencrypted file, the default. encScratch
-	// is a single pageSize staging buffer the encrypted read and write paths reuse; both
-	// run under mu, so one buffer is enough.
-	crypto     *crypto.Scheme
-	encScratch []byte
+	// metaMu guards the page-allocation state (free, dbSize) and the mutable header
+	// fields written at checkpoint and truncate. It is the leaf of the lock order: a
+	// caller may hold one or more shard locks and then take metaMu, never the reverse.
+	metaMu sync.Mutex
+	header *format.Header
 
-	index map[uint32]*Frame // resident frames by page number
-	pool  []*Frame          // all frames, pooled or free
-	arena []byte
-	hand  int // CLOCK hand
+	// crypto, when set, encrypts data pages on the way to disk and decrypts them on the
+	// way back (spec 14). It is nil for an unencrypted file, the default. It is an atomic
+	// pointer because the sharded read and write paths load it without a global lock while
+	// Rekey may swap it live (spec 14 §5); each shard keeps its own scratch buffer so the
+	// encrypted paths never share staging memory across cores.
+	crypto atomic.Pointer[crypto.Scheme]
 
-	dbSize uint32   // page count (high-water mark); pages are 1-based
-	free   []uint32 // in-memory freelist, persisted to trunk pages at checkpoint
+	shards    []*shard
+	shardMask uint32 // len(shards)-1; len(shards) is always a power of two
+	arena     []byte
+
+	dbSize uint32   // page count (high-water mark); pages are 1-based; under metaMu
+	free   []uint32 // in-memory freelist, persisted to trunk pages at checkpoint; under metaMu
 
 	// pageReads and cacheHits count the buffer pool's traffic for the read-amplification
 	// and cache-hit-ratio observability the spec asks for (spec 19, spec 21 §1). pageReads
 	// is the number of physical page reads issued against the main file to satisfy a Get
 	// miss; cacheHits is the number of Gets served from a resident frame. They are atomics
-	// so a Stats reader can sample them without taking the pager mutex off the hot path.
+	// so a Stats reader can sample them without taking a pager lock off the hot path.
 	pageReads atomic.Uint64
 	cacheHits atomic.Uint64
 }
+
+// shardFor returns the shard that owns pgno. The mapping is a fixed mask over the page
+// number, so a page lives in the same shard for the pool's lifetime.
+func (p *Pager) shardFor(pgno uint32) *shard { return p.shards[pgno&p.shardMask] }
+
+// cryptoScheme loads the live encryption scheme, or nil for an unencrypted file.
+func (p *Pager) cryptoScheme() *crypto.Scheme { return p.crypto.Load() }
 
 // IOStats is the buffer pool's cumulative traffic since open. PageReads is physical reads
 // of a page from the main file (cache misses that hit disk); CacheHits is Gets served from
@@ -153,7 +193,7 @@ func Create(fs vfs.FS, path string, opts Options) (*Pager, error) {
 		// encryption flag so a reader knows to expect a descriptor and a key.
 		h.ReservedPerPage += byte(crypto.Overhead)
 		h.Flags |= format.FlagEncryption
-		p.crypto = opts.Encryption
+		p.crypto.Store(opts.Encryption)
 		if format.HeaderSize+len(opts.Descriptor) > ps-checksum.ChecksumSize() {
 			f.Close()
 			return nil, fmt.Errorf("pager: encryption descriptor does not fit on page 1")
@@ -227,7 +267,7 @@ func Open(fs vfs.FS, path string, opts Options) (*Pager, error) {
 			f.Close()
 			return nil, ErrKeyRequired
 		}
-		p.crypto = opts.Encryption
+		p.crypto.Store(opts.Encryption)
 	}
 	p.dbSize = uint32(size / int64(ps))
 	if p.dbSize == 0 {
@@ -281,21 +321,51 @@ func newPager(fs vfs.FS, f vfs.File, path string, pageSize, cacheFrames int) *Pa
 	if cacheFrames <= 0 {
 		cacheFrames = defaultCacheFrames
 	}
+	nShards := shardCount(cacheFrames)
 	p := &Pager{
-		fs:       fs,
-		file:     f,
-		path:     path,
-		pageSize: pageSize,
-		index:    make(map[uint32]*Frame, cacheFrames),
-		pool:     make([]*Frame, 0, cacheFrames),
-		arena:    make([]byte, cacheFrames*pageSize),
+		fs:        fs,
+		file:      f,
+		path:      path,
+		pageSize:  pageSize,
+		arena:     make([]byte, cacheFrames*pageSize),
+		shards:    make([]*shard, nShards),
+		shardMask: uint32(nShards - 1),
 	}
-	// Carve frames out of the arena up front; data slices are stable for life.
-	for i := 0; i < cacheFrames; i++ {
-		fr := &Frame{slot: i, data: p.arena[i*pageSize : (i+1)*pageSize : (i+1)*pageSize]}
-		p.pool = append(p.pool, fr)
+	// Carve frames out of the arena up front; data slices are stable for life. Frames are
+	// handed to shards in contiguous runs, with the first (cacheFrames mod nShards) shards
+	// getting one extra, so every shard owns at least cacheFrames/nShards frames. A frame's
+	// data window is fixed by its global slot regardless of which shard owns it.
+	base, extra := cacheFrames/nShards, cacheFrames%nShards
+	slot := 0
+	for s := 0; s < nShards; s++ {
+		n := base
+		if s < extra {
+			n++
+		}
+		sh := &shard{
+			index:  make(map[uint32]*Frame, n),
+			frames: make([]*Frame, 0, n),
+		}
+		for i := 0; i < n; i++ {
+			fr := &Frame{slot: slot, data: p.arena[slot*pageSize : (slot+1)*pageSize : (slot+1)*pageSize]}
+			sh.frames = append(sh.frames, fr)
+			slot++
+		}
+		p.shards[s] = sh
 	}
 	return p
+}
+
+// shardCount picks the number of pool shards: the largest power of two no greater than
+// maxShards that still leaves every shard at least minFramesPerShard frames, and at least
+// one. A pool below the floor uses a single shard, restoring the old global-pool behavior
+// (which the tiny-pool streaming-flush regime relies on).
+func shardCount(cacheFrames int) int {
+	n := 1
+	for n*2 <= maxShards && cacheFrames/(n*2) >= minFramesPerShard {
+		n *= 2
+	}
+	return n
 }
 
 // PageSize reports the full on-disk page size in bytes.
@@ -334,16 +404,16 @@ func (p *Pager) Header() *format.Header { return p.header }
 
 // DBSize reports the current page count (high-water mark).
 func (p *Pager) DBSize() uint32 {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.metaMu.Lock()
+	defer p.metaMu.Unlock()
 	return p.dbSize
 }
 
 // FreeCount reports how many pages are currently on the in-memory freelist,
 // available for reallocation before the file grows (spec 09 §2, §4).
 func (p *Pager) FreeCount() int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.metaMu.Lock()
+	defer p.metaMu.Unlock()
 	return len(p.free)
 }
 
@@ -352,7 +422,7 @@ func (p *Pager) FreeCount() int {
 // free and reachable from the tree, and that the freelist, reachable, and metadata
 // pages account for the whole file.
 func (p *Pager) FreePages() []uint32 {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.metaMu.Lock()
+	defer p.metaMu.Unlock()
 	return append([]uint32(nil), p.free...)
 }
