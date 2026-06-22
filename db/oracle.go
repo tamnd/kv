@@ -2,6 +2,7 @@ package db
 
 import (
 	"sync"
+	"sync/atomic"
 
 	"github.com/tamnd/kv/format"
 )
@@ -44,6 +45,14 @@ type oracle struct {
 	nextVersion    uint64
 	appliedVersion uint64
 
+	// appliedPub mirrors appliedVersion for the lock-free read path. It is published
+	// (stored) under mu every time appliedVersion advances, and read with a plain atomic
+	// load by lastCommitted, so a non-transactional Get takes its read snapshot without
+	// touching the oracle mutex (spec 07 §MVCC: non-transactional reads skip the lock and
+	// the read-set registry entirely). It only ever moves forward, in lockstep with
+	// appliedVersion, so a lock-free reader sees a monotonic, already-durable version.
+	appliedPub atomic.Uint64
+
 	// readers counts live read snapshots by version. The minimum live version is
 	// the readMark: no reader can ever again observe anything older, so older
 	// versions and tombstones are reclaimable (spec 10 §6) and stale commit records
@@ -77,12 +86,14 @@ type commitRecord struct {
 // newOracle starts the oracle past the last durable commit: a fresh write gets
 // lastCommitted+1, and a fresh reader sees lastCommitted (spec 10 §1).
 func newOracle(lastCommitted uint64) *oracle {
-	return &oracle{
+	o := &oracle{
 		nextVersion:    lastCommitted + 1,
 		appliedVersion: lastCommitted,
 		readers:        make(map[uint64]int),
 		readerSince:    make(map[uint64]uint64),
 	}
+	o.appliedPub.Store(lastCommitted)
+	return o
 }
 
 // readTs registers a new read snapshot at the latest applied version and returns
@@ -129,11 +140,14 @@ func (o *oracle) oldestReaderSince() uint64 {
 	return oldest
 }
 
-// lastCommitted reports the newest applied version, the default read snapshot.
+// lastCommitted reports the newest applied version, the default read snapshot. It is
+// the lock-free read fast path: it loads the published applied version with a single
+// atomic load and never takes the oracle mutex, so concurrent non-transactional reads do
+// not serialize on it (spec 07 §MVCC). The value is monotonic and only ever names an
+// already-durable version, since appliedPub is stored under mu in lockstep with
+// appliedVersion right after engine.Apply.
 func (o *oracle) lastCommitted() uint64 {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	return o.appliedVersion
+	return o.appliedPub.Load()
 }
 
 // peekNext reports the version the next commit will receive without reserving it.
@@ -251,6 +265,7 @@ func (o *oracle) applied(v uint64) {
 	defer o.mu.Unlock()
 	if v > o.appliedVersion {
 		o.appliedVersion = v
+		o.appliedPub.Store(v)
 	}
 }
 
@@ -268,6 +283,7 @@ func (o *oracle) advanceTo(v uint64) {
 	}
 	if v > o.appliedVersion {
 		o.appliedVersion = v
+		o.appliedPub.Store(v)
 	}
 }
 
