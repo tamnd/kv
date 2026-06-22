@@ -27,6 +27,25 @@ func (l *LSM) flushActive(t *testing.T) {
 	}
 }
 
+// drainSegments waits for the already-sealed memtables to finish flushing, then reports how
+// many segments the tree holds. Unlike flushActive it does not seal the active memtable, so a
+// test that wants to assert the low cap flushed earlier batches on its own sees exactly the
+// segments auto-flush produced, with no segment forced by the drain. It reads the count under
+// l.mu, the lock the background flusher publishes versions under, so the read never races the
+// install.
+func (l *LSM) drainSegments(t *testing.T) int {
+	t.Helper()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for len(l.imm) > 0 && l.flushErr == nil {
+		l.flushCond.Wait()
+	}
+	if l.flushErr != nil {
+		t.Fatalf("flush: %v", l.flushErr)
+	}
+	return len(l.allSegmentsLocked())
+}
+
 // TestLSMFlushConformanceBasic runs the shared oracle suite with the memtable cap set
 // so low that every batch after the first flushes the previous one to a segment, so
 // the reads resolve across a mix of segments and the live memtable.
@@ -55,7 +74,7 @@ func TestLSMFlushConformanceBasic(t *testing.T) {
 	if err := engine.CheckEngine(l, batches, concatMerge); err != nil {
 		t.Fatalf("conformance: %v", err)
 	}
-	if len(l.allSegmentsLocked()) == 0 {
+	if l.drainSegments(t) == 0 {
 		t.Fatal("expected the low cap to have produced segments")
 	}
 }

@@ -64,44 +64,10 @@ const (
 // paths fold (resolution depends on the version in each key, not the level a segment
 // sits at, so a read need not care about levels). The caller holds l.mu.
 func (l *LSM) allSegmentsLocked() []*segment {
-	var segs []*segment
-	for _, lvl := range l.levels {
-		segs = append(segs, lvl...)
-	}
-	return segs
+	return flattenSegments(l.levelsLocked())
 }
 
-// addSegmentLocked inserts seg into the given level, growing the level slice as needed
-// and keeping every level below L0 sorted by first key so the non-overlapping run reads
-// in order. The caller holds l.mu.
-func (l *LSM) addSegmentLocked(level int, seg *segment) {
-	for len(l.levels) <= level {
-		l.levels = append(l.levels, nil)
-	}
-	l.levels[level] = append(l.levels[level], seg)
-	if level >= 1 {
-		sort.Slice(l.levels[level], func(i, j int) bool {
-			return format.CompareUser(l.levels[level][i].minKey, l.levels[level][j].minKey) < 0
-		})
-	}
-}
-
-// removeSegmentsLocked drops every segment in set from the given level. The caller holds
-// l.mu.
-func (l *LSM) removeSegmentsLocked(level int, set map[*segment]bool) {
-	if level >= len(l.levels) || len(set) == 0 {
-		return
-	}
-	kept := l.levels[level][:0]
-	for _, s := range l.levels[level] {
-		if !set[s] {
-			kept = append(kept, s)
-		}
-	}
-	l.levels[level] = kept
-}
-
-// setOf collects segments into a membership set for removeSegmentsLocked.
+// setOf collects segments into a membership set for removeSegments.
 func setOf(segs []*segment) map[*segment]bool {
 	m := make(map[*segment]bool, len(segs))
 	for _, s := range segs {
@@ -112,12 +78,12 @@ func setOf(segs []*segment) map[*segment]bool {
 
 // levelBytesLocked reports the on-disk byte footprint of a level. The caller holds l.mu.
 func (l *LSM) levelBytesLocked(i int) int64 {
-	if i < 0 || i >= len(l.levels) {
+	if i < 0 || i >= len(l.levelsLocked()) {
 		return 0
 	}
 	pageSize := int64(l.pgr.PageSize())
 	var b int64
-	for _, s := range l.levels[i] {
+	for _, s := range l.levelsLocked()[i] {
 		b += int64(s.pages) * pageSize
 	}
 	return b
@@ -141,8 +107,8 @@ func (l *LSM) levelTargetBytesLocked(i int) int64 {
 // segment, the test for whether a compaction output is at the bottom of the tree and may
 // therefore drop tombstones. The caller holds l.mu.
 func (l *LSM) hasSegmentsBelowLocked(level int) bool {
-	for i := level + 1; i < len(l.levels); i++ {
-		if len(l.levels[i]) > 0 {
+	for i := level + 1; i < len(l.levelsLocked()); i++ {
+		if len(l.levelsLocked()[i]) > 0 {
 			return true
 		}
 	}
@@ -153,7 +119,7 @@ func (l *LSM) hasSegmentsBelowLocked(level int) bool {
 // still holds a segment. That level accumulates runs instead of merging into one, while
 // every level above it stays leveled. The caller holds l.mu.
 func (l *LSM) isTieredLocked(level int) bool {
-	if level < 1 || level >= len(l.levels) || len(l.levels[level]) == 0 {
+	if level < 1 || level >= len(l.levelsLocked()) || len(l.levelsLocked()[level]) == 0 {
 		return false
 	}
 	return !l.hasSegmentsBelowLocked(level)
@@ -166,10 +132,10 @@ func (l *LSM) isTieredLocked(level int) bool {
 // closed key ranges, which already live in their footers, so it needs no extra state and
 // recomputes correctly after a reopen. The caller holds l.mu.
 func (l *LSM) maxOverlapLocked(level int) int {
-	if level < 0 || level >= len(l.levels) {
+	if level < 0 || level >= len(l.levelsLocked()) {
 		return 0
 	}
-	segs := l.levels[level]
+	segs := l.levelsLocked()[level]
 	if len(segs) < 2 {
 		return len(segs)
 	}
@@ -209,11 +175,11 @@ func (l *LSM) maxOverlapLocked(level int) int {
 // overlappingLocked returns the segments in a level whose key range intersects the
 // half-closed user-key span [lo, hi]. The caller holds l.mu.
 func (l *LSM) overlappingLocked(level int, lo, hi []byte) []*segment {
-	if level < 0 || level >= len(l.levels) {
+	if level < 0 || level >= len(l.levelsLocked()) {
 		return nil
 	}
 	var out []*segment
-	for _, s := range l.levels[level] {
+	for _, s := range l.levelsLocked()[level] {
 		if s.minKey == nil {
 			continue
 		}
@@ -228,7 +194,7 @@ func (l *LSM) overlappingLocked(level int, lo, hi []byte) []*segment {
 // per-level cursor across the level so successive compactions spread over the key space
 // instead of repeatedly rewriting the same low range. The caller holds l.mu.
 func (l *LSM) pickSegmentLocked(level int) *segment {
-	segs := l.levels[level]
+	segs := l.levelsLocked()[level]
 	if len(segs) == 0 {
 		return nil
 	}
@@ -285,12 +251,12 @@ func (l *LSM) pickCompactionLocked() (compaction, float64) {
 			best, bestScore = c, score
 		}
 	}
-	if len(l.levels) > 0 && len(l.levels[0]) >= l.l0Trigger {
+	if len(l.levelsLocked()) > 0 && len(l.levelsLocked()[0]) >= l.l0Trigger {
 		consider(compaction{kind: compactPushDown, level: 0, wholeLevel: true},
-			float64(len(l.levels[0]))/float64(l.l0Trigger))
+			float64(len(l.levelsLocked()[0]))/float64(l.l0Trigger))
 	}
-	for i := 1; i < len(l.levels); i++ {
-		if len(l.levels[i]) == 0 {
+	for i := 1; i < len(l.levelsLocked()); i++ {
+		if len(l.levelsLocked()[i]) == 0 {
 			continue
 		}
 		if l.isTieredLocked(i) {
@@ -396,12 +362,12 @@ func (l *LSM) planCompactionLocked() (*compactionPlan, bool) {
 // version under it. The caller holds l.mu.
 func (l *LSM) planPushDownLocked(c compaction) (*compactionPlan, bool) {
 	src := c.level
-	if src < 0 || src >= len(l.levels) || len(l.levels[src]) == 0 {
+	if src < 0 || src >= len(l.levelsLocked()) || len(l.levelsLocked()[src]) == 0 {
 		return nil, false
 	}
 	var in0 []*segment
 	if c.wholeLevel {
-		in0 = append(in0, l.levels[src]...)
+		in0 = append(in0, l.levelsLocked()[src]...)
 	} else {
 		seg := l.pickSegmentLocked(src)
 		if seg == nil {
@@ -428,10 +394,10 @@ func (l *LSM) planPushDownLocked(c compaction) (*compactionPlan, bool) {
 // that becomes the base. The caller holds l.mu.
 func (l *LSM) planSelfMergeLocked(c compaction) (*compactionPlan, bool) {
 	level := c.level
-	if level < 1 || level >= len(l.levels) || len(l.levels[level]) < 2 {
+	if level < 1 || level >= len(l.levelsLocked()) || len(l.levelsLocked()[level]) < 2 {
 		return nil, false
 	}
-	inputs := append([]*segment(nil), l.levels[level]...)
+	inputs := append([]*segment(nil), l.levelsLocked()[level]...)
 	p := &compactionPlan{
 		srcLevel: level,
 		outLevel: level,
@@ -465,11 +431,14 @@ func (l *LSM) buildCompaction(p *compactionPlan, watermark uint64) ([]*segment, 
 }
 
 // installCompactionLocked publishes a built compaction: it records every input removal and
-// output addition in the MANIFEST, swaps the live set, and frees the inputs' pages, all in
-// one l.mu critical section so a reader folds either the inputs or the outputs but never
-// both (the outputs are the MVCC merge of the inputs, so the two views resolve identically).
-// The edits are recorded before the live set is swapped, the LSM's atomic version install.
-// The caller holds l.mu and flushMu. It returns the work report.
+// output addition in the MANIFEST and swaps the current version to one without the inputs and
+// with the outputs, in one l.mu critical section so a reader folds either the inputs or the
+// outputs but never both (the outputs are the MVCC merge of the inputs, so the two views
+// resolve identically). The edits are recorded before the version is swapped, the LSM's atomic
+// version install. The inputs' pages are not freed here: a reader that loaded the prior version
+// before the swap may still be folding those segments with l.mu released, so publishVersionLocked
+// defers each input's free to when the last version naming it is released (version.go, perf/03
+// R3). The caller holds l.mu and flushMu. It returns the work report.
 func (l *LSM) installCompactionLocked(p *compactionPlan, outputs []*segment) (engine.MaintReport, error) {
 	for _, seg := range p.in0 {
 		if err := l.appendEditLocked(manifestRemove, uint8(p.srcLevel), seg.footer); err != nil {
@@ -487,24 +456,15 @@ func (l *LSM) installCompactionLocked(p *compactionPlan, outputs []*segment) (en
 		}
 	}
 
-	l.removeSegmentsLocked(p.srcLevel, setOf(p.in0))
+	nl := l.cloneLevelsLocked()
+	removeSegments(nl, p.srcLevel, setOf(p.in0))
 	if len(p.in1) > 0 {
-		l.removeSegmentsLocked(p.outLevel, setOf(p.in1))
+		removeSegments(nl, p.outLevel, setOf(p.in1))
 	}
 	for _, seg := range outputs {
-		l.addSegmentLocked(p.outLevel, seg)
+		nl = addSegment(nl, p.outLevel, seg)
 	}
-
-	for _, seg := range p.in0 {
-		if err := l.freeSegmentPages(seg); err != nil {
-			return engine.MaintReport{}, err
-		}
-	}
-	for _, seg := range p.in1 {
-		if err := l.freeSegmentPages(seg); err != nil {
-			return engine.MaintReport{}, err
-		}
-	}
+	l.publishVersionLocked(nl)
 
 	pageSize := int64(l.pgr.PageSize())
 	var after int64

@@ -105,6 +105,13 @@ type segment struct {
 	index     []indexEntry      // one separator per data page, ascending by user key
 	rangeDels []format.RangeDel // the segment's range-delete intervals
 	filter    segFilter         // membership filter over the segment's user keys, or nil
+
+	// vrefs counts how many live versions name this segment (version.go, perf/03 R3). A
+	// publish that includes the segment increments it, a version drop that named it
+	// decrements it, and the segment's pages are freed when it reaches zero, so a segment a
+	// compaction removed from the current version survives until the last reader holding an
+	// older version that still names it lets go. Guarded by l.mu.
+	vrefs int
 }
 
 // pendingPage is one data page's cells, accumulated before the pages are allocated

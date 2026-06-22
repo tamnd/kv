@@ -77,7 +77,7 @@ func (l *LSM) runVLogGCLocked(budget engine.MaintBudget) (engine.MaintReport, er
 	live[len(chain)-1] = true // the tail is the append cursor, never freed
 
 	var scanErr error
-	for _, seg := range l.allSegmentsLocked() {
+	for _, seg := range l.allLiveSegmentsLocked() {
 		err := seg.scan(l.pgr, func(ik, val []byte) bool {
 			if format.KindOf(ik) != format.KindSetSep {
 				return true

@@ -48,8 +48,8 @@ func BenchmarkAutoCompactionReadFanout(b *testing.B) {
 
 			l.mu.Lock()
 			l0 := 0
-			if len(l.levels) > 0 {
-				l0 = len(l.levels[0])
+			if len(l.levelsLocked()) > 0 {
+				l0 = len(l.levelsLocked()[0])
 			}
 			l.mu.Unlock()
 
@@ -84,6 +84,82 @@ func BenchmarkAutoCompactionReadFanout(b *testing.B) {
 			b.ReportMetric(float64(l0), "L0-depth")
 		})
 	}
+}
+
+// BenchmarkReadUnderCompaction measures what R3 (the immutable segment-list snapshot) buys: a
+// point read takes the engine lock only briefly to reference the current version, then probes
+// that version's segments with no lock held, so a continuously running background compactor no
+// longer serializes against readers on l.mu. The benchmark runs parallel readers against a tree
+// a writer goroutine keeps churning, so flushes and compactions install new versions throughout
+// the read phase, the exact moment the old RLock-across read path would have stalled behind a
+// compaction's install. It reports read throughput and the p99 read latency; run with
+// -mutexprofile to confirm l.mu contention from the read path is gone.
+func BenchmarkReadUnderCompaction(b *testing.B) {
+	l := newAutoLSMBench(b, true)
+	l.memtableCap = 1
+
+	const total = 4000
+	version := uint64(1)
+	for s := 0; s < 200; s++ {
+		batch := engine.NewWriteBatch(version)
+		for i := 0; i < 20; i++ {
+			key := fmt.Sprintf("key%05d", (s*20+i)%total)
+			batch.Set([]byte(key), []byte(fmt.Sprintf("v%d", version)))
+		}
+		if err := l.Apply(batch, version); err != nil {
+			b.Fatalf("apply batch %d: %v", s, err)
+		}
+		version++
+	}
+	l.settleAutoBench(b)
+
+	// A writer that keeps applying so the compactor stays busy installing new versions for the
+	// whole read phase. It stops when the readers finish.
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		v := version
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			batch := engine.NewWriteBatch(v)
+			for i := 0; i < 20; i++ {
+				key := fmt.Sprintf("key%05d", int(v*20+uint64(i))%total)
+				batch.Set([]byte(key), []byte(fmt.Sprintf("v%d", v)))
+			}
+			if err := l.Apply(batch, v); err != nil {
+				return
+			}
+			v++
+		}
+	}()
+
+	snap := engine.Snapshot{Version: version}
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		rd, err := l.NewReader(snap)
+		if err != nil {
+			b.Errorf("reader: %v", err)
+			return
+		}
+		defer rd.Close()
+		i := 0
+		for pb.Next() {
+			key := []byte(fmt.Sprintf("key%05d", i%total))
+			if _, err := rd.Get(key); err != nil {
+				b.Errorf("get: %v", err)
+				return
+			}
+			i++
+		}
+	})
+	b.StopTimer()
+	close(stop)
+	<-done
 }
 
 // newAutoLSMBench is newAutoLSM for a benchmark, with the compactor toggle exposed so the

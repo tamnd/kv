@@ -136,25 +136,25 @@ func (l *LSM) rangeSourcesLocked() []mergeSource {
 		}
 		return sources
 	}
-	if len(l.levels) > 0 {
-		for _, seg := range l.levels[0] {
+	if len(l.levelsLocked()) > 0 {
+		for _, seg := range l.levelsLocked()[0] {
 			sources = append(sources, &segSource{pgr: l.pgr, seg: seg})
 		}
 	}
-	for i := 1; i < len(l.levels); i++ {
-		if len(l.levels[i]) == 0 {
+	for i := 1; i < len(l.levelsLocked()); i++ {
+		if len(l.levelsLocked()[i]) == 0 {
 			continue
 		}
 		// Only a leveled level is one disjoint sorted run a single cursor can walk. The
 		// tiered bottom accumulates overlapping runs (spec 06 §6), so like L0 its segments
 		// must stay separate sources for the heap to merge.
 		if l.isTieredLocked(i) {
-			for _, seg := range l.levels[i] {
+			for _, seg := range l.levelsLocked()[i] {
 				sources = append(sources, &segSource{pgr: l.pgr, seg: seg})
 			}
 			continue
 		}
-		sources = append(sources, &levelSource{pgr: l.pgr, segs: l.levels[i]})
+		sources = append(sources, &levelSource{pgr: l.pgr, segs: l.levelsLocked()[i]})
 	}
 	return sources
 }
