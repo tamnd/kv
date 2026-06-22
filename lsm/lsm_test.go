@@ -24,6 +24,10 @@ func newLSM(t *testing.T) *LSM {
 		t.Fatalf("create pager: %v", err)
 	}
 	l := New(p)
+	// These tests build a known segment shape with their own flushes and then drive one
+	// compaction by hand, so the background compactor is off; it is exercised separately in
+	// the auto-compaction tests. Setting it before Open means the flusher never sees it on.
+	l.autoCompact = false
 	if err := l.Open(&engine.Env{}); err != nil {
 		t.Fatalf("open lsm: %v", err)
 	}

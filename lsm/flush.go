@@ -79,15 +79,20 @@ func (l *LSM) sealForFlushLocked() error {
 	return nil
 }
 
-// flushLoop is the background flusher. It waits for a sealed memtable, flushes it, and
-// repeats until Close. It owns no state across iterations: each sealed memtable is handled
-// start to finish by flushOne, so a failure stops the queue without corrupting a partial
-// one.
+// flushLoop is the background flusher and the automatic compactor (perf/03 W3/W4). It wakes
+// for a sealed memtable or a due compaction, does one unit of whichever, and repeats until
+// Close. Flushing has priority: it always drains the sealed queue before it compacts, so a
+// write burst is turned into segments promptly and compaction runs in the gaps. It owns no
+// state across iterations: a flush is handled start to finish by flushOne and a compaction by
+// compactOnce, so a failure stops the work without corrupting a partial one. A compaction
+// becomes due only as a result of a flush this same goroutine just installed, so re-checking
+// the picker after each unit is enough; no separate wakeup is needed beyond the seal that
+// already broadcasts.
 func (l *LSM) flushLoop() {
 	defer close(l.flusherDone)
 	for {
 		l.mu.Lock()
-		for len(l.imm) == 0 && !l.closing {
+		for len(l.imm) == 0 && !l.compactionDueLocked() && !l.closing {
 			l.flushCond.Wait()
 		}
 		if l.closing {
@@ -98,10 +103,72 @@ func (l *LSM) flushLoop() {
 			l.mu.Unlock()
 			return
 		}
-		ent := l.imm[0]
+		if len(l.imm) > 0 {
+			ent := l.imm[0]
+			l.mu.Unlock()
+			l.flushOne(ent)
+			continue
+		}
+		// The queue is drained and a compaction is due: pay down read fan-out and space amp
+		// off the foreground path.
 		l.mu.Unlock()
-		l.flushOne(ent)
+		l.compactOnce()
 	}
+}
+
+// compactionDueLocked reports whether the picker has an action to run, the predicate that
+// wakes the flusher to compact once the sealed queue is empty. The caller holds l.mu.
+func (l *LSM) compactionDueLocked() bool {
+	if !l.autoCompact {
+		return false
+	}
+	c, _ := l.pickCompactionLocked()
+	return c.kind != compactNone
+}
+
+// compactOnce runs one automatic compaction unit off the foreground path (perf/03 W4), the
+// structural analog of flushOne: it bounds L0's read fan-out and merges away the versions no
+// reader can still see, so the tree does not degrade under sustained writes without a host
+// Maintain call. The picker chooses the most urgent action under l.mu; the merge that turns
+// its inputs into outputs runs with l.mu released, so foreground writers keep inserting while
+// it serializes; the install swaps the live set under l.mu in one step, so a reader folds
+// either the inputs or the outputs but never both. flushMu serializes the segment and
+// value-log page writes against the flusher and the vLog GC, and the pager's external-write
+// gate holds a checkpoint off the frames the build fills, exactly as flushOne does.
+func (l *LSM) compactOnce() {
+	l.pgr.BeginExternalWrite()
+	defer l.pgr.EndExternalWrite()
+	l.flushMu.Lock()
+	defer l.flushMu.Unlock()
+
+	l.mu.Lock()
+	if l.closing {
+		l.mu.Unlock()
+		return
+	}
+	p, ok := l.planCompactionLocked()
+	l.mu.Unlock()
+	if !ok {
+		return
+	}
+
+	// Read the watermark with no lock held, so the host's oracle lock and l.mu stay
+	// independent, then merge the immutable inputs into new segments off l.mu.
+	watermark := l.compactionWatermark()
+	outputs, buildErr := l.buildCompaction(p, watermark)
+
+	l.mu.Lock()
+	err := buildErr
+	if err == nil {
+		_, err = l.installCompactionLocked(p, outputs)
+	}
+	if err != nil {
+		// A compaction failure is sticky like a flush failure: the next Apply surfaces it
+		// rather than the engine spinning on the same broken merge.
+		l.flushErr = err
+	}
+	l.flushCond.Broadcast()
+	l.mu.Unlock()
 }
 
 // flushOne builds one sealed memtable into a segment and installs it. The build runs under

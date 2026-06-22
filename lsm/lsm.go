@@ -146,6 +146,13 @@ type LSM struct {
 	flusherDone chan struct{}
 	maxImm      int
 	flushMu     sync.Mutex
+	// autoCompact lets the background flusher drive compaction automatically once a flush
+	// pushes L0 past its trigger or a level past its size target (flush.go, perf/03 W4), so
+	// read fan-out and space amp stay bounded under sustained writes without a host Maintain
+	// call. It is on by default; a unit test that wants to observe the intermediate segment
+	// shape its own flushes build, then drive one compaction by hand, turns it off before
+	// Open so the flusher only ever drains the seal queue.
+	autoCompact bool
 
 	merge func(existing, operand []byte) []byte
 	env   *engine.Env
@@ -165,6 +172,7 @@ func New(pgr *pager.Pager) *LSM {
 		tierFanout:     defaultTierFanout,
 		compactCursor:  map[int][]byte{},
 		vlog:           newVLog(pgr),
+		autoCompact:    true,
 	}
 }
 
@@ -194,6 +202,9 @@ func (l *LSM) Open(env *engine.Env) error {
 	}
 	if env != nil && env.Options.Compression {
 		l.compress = true
+	}
+	if env != nil && env.Options.DisableAutoCompaction {
+		l.autoCompact = false
 	}
 	l.durableLSN = l.pgr.CheckpointLSN()
 	if err := l.loadManifestLocked(); err != nil {
@@ -467,6 +478,20 @@ func (l *LSM) Maintain(ctx context.Context, budget engine.MaintBudget) (engine.M
 		// space instead, the vLog's analog of compaction (spec 06 §7).
 		return l.runVLogGCLocked(budget)
 	}
+}
+
+// compactionWatermark reports the version-GC horizon for a background compaction: the
+// oldest version any live reader can still observe, below which a superseded version is
+// collectible (spec 10 §6). The host supplies it through env.Clock; when no clock is wired
+// (a bare engine test) it is zero, which keeps every version and lets a background
+// compaction still bound read fan-out structurally without dropping any data. It is read
+// with no lock held, so it must not be called while holding l.mu would invert a lock order;
+// the clock's own lock is independent of l.mu.
+func (l *LSM) compactionWatermark() uint64 {
+	if l.env != nil && l.env.Clock != nil {
+		return l.env.Clock.OldestReadable()
+	}
+	return 0
 }
 
 // Stats implements engine.Engine, reporting the memtable footprint plus the on-disk

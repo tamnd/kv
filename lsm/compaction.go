@@ -335,199 +335,231 @@ func keyRangeOf(segs []*segment) (lo, hi []byte) {
 	return lo, hi
 }
 
-// runCompactionLocked merges a run from the source level into the level below it,
-// installs the result through the MANIFEST, and frees the inputs. The caller holds l.mu.
-// It returns a report of the work done, or a zero report when there was nothing to merge.
-//
-// The input is all of src when wholeLevel is set (L0, whose segments overlap and compact
-// as a unit, or the tiered bottom descending a level), otherwise one picked segment of a
-// leveled level. When the output level is the deepest, the merge is a tiered add: the
-// output joins the bottom's other runs and no lower-level segment is rewritten, which is
-// the lazy-leveling saving. When the output level is a middle leveled level, every
-// segment the input overlaps there is also an input, so the output and the segments left
-// behind stay disjoint, preserving the leveled invariant. The merge is the shared
-// streaming k-way merge, so the output arrives in internal-key order; the splitter
-// applies version GC and cuts the output into size-bounded segments. A point tombstone is
-// never dropped here, since the bottom's other runs (a tiered add) or a deeper level (a
-// leveled push-down) may hold an older version it still shadows; only a self-merge of the
-// whole bottom drops one.
-func (l *LSM) runCompactionLocked(src int, watermark uint64, wholeLevel bool) (engine.MaintReport, error) {
-	if src < 0 || src >= len(l.levels) || len(l.levels[src]) == 0 {
-		return engine.MaintReport{}, nil
-	}
+// A compaction runs in three phases so the expensive middle one need not hold l.mu, the
+// same split the background flush uses (flush.go, perf/03 W3/W4). planCompactionLocked picks
+// the most urgent action and snapshots its inputs under l.mu; buildCompaction merges those
+// immutable inputs into new output segments with l.mu released, so foreground writers keep
+// inserting while the merge serializes; installCompactionLocked swaps the live set under
+// l.mu in one step. The host's Maintain path runs all three under l.mu (it already holds it
+// and wants the simplest contract); the background compactor (compactOnce in flush.go) holds
+// l.mu only for the plan and the install. Both take flushMu around the whole thing so only
+// one compaction, flush build, or vLog GC writes the value-log and segment pages at a time.
 
+// compactionPlan is one compaction unit's inputs and shape, chosen under l.mu so the merge
+// that turns the inputs into outputs can then run with l.mu released. in0 is the source-level
+// run (all of a wholeLevel push or one picked segment); in1 the lower-level segments a
+// leveled push-down overlaps, empty for a tiered add or a self-merge. For a self-merge
+// srcLevel == outLevel and in0 holds every run at the level. before is the inputs' on-disk
+// byte size, captured at plan time for the work report.
+type compactionPlan struct {
+	srcLevel int
+	outLevel int
+	in0      []*segment
+	in1      []*segment
+	dropTomb bool
+	before   int64
+}
+
+// inputBytes is the on-disk byte footprint of a segment set. The caller holds l.mu (it reads
+// each segment's page count and the pager's page size).
+func (l *LSM) inputBytes(segs []*segment) int64 {
+	pageSize := int64(l.pgr.PageSize())
+	var b int64
+	for _, seg := range segs {
+		b += int64(seg.pages) * pageSize
+	}
+	return b
+}
+
+// planCompactionLocked picks the most urgent compaction and snapshots its inputs, or reports
+// false when nothing is due. The caller holds l.mu.
+func (l *LSM) planCompactionLocked() (*compactionPlan, bool) {
+	c, _ := l.pickCompactionLocked()
+	switch c.kind {
+	case compactPushDown:
+		return l.planPushDownLocked(c)
+	case compactSelfMerge:
+		return l.planSelfMergeLocked(c)
+	default:
+		return nil, false
+	}
+}
+
+// planPushDownLocked snapshots a push-down's inputs: the source run plus, for a leveled
+// output, the lower-level segments it overlaps. The input is all of src when wholeLevel is
+// set (L0, whose segments overlap and compact as a unit, or the tiered bottom descending a
+// level), otherwise one picked segment of a leveled level. When the output is the deepest
+// level the merge is a tiered add, so no lower-level segment is rewritten (the lazy-leveling
+// saving); when it is a middle leveled level every segment the input overlaps there joins the
+// merge, so the output and the segments left behind stay disjoint. A point tombstone is never
+// dropped here, since the bottom's other runs or a deeper level may still hold an older
+// version under it. The caller holds l.mu.
+func (l *LSM) planPushDownLocked(c compaction) (*compactionPlan, bool) {
+	src := c.level
+	if src < 0 || src >= len(l.levels) || len(l.levels[src]) == 0 {
+		return nil, false
+	}
 	var in0 []*segment
-	if wholeLevel {
+	if c.wholeLevel {
 		in0 = append(in0, l.levels[src]...)
 	} else {
 		seg := l.pickSegmentLocked(src)
 		if seg == nil {
-			return engine.MaintReport{}, nil
+			return nil, false
 		}
 		in0 = append(in0, seg)
 	}
-
 	lo, hi := keyRangeOf(in0)
 	out := src + 1
-	// A tiered add when the output is the deepest level: the run joins the bottom beside
-	// the runs already there, so nothing there is rewritten. Otherwise a leveled merge,
-	// which pulls in the overlapping segments of the lower level.
-	tieredOut := !l.hasSegmentsBelowLocked(out)
 	var in1 []*segment
-	if !tieredOut {
+	if !l.hasSegmentsBelowLocked(out) {
+		// A tiered add: the run joins the deepest level beside the runs already there.
+	} else {
 		in1 = l.overlappingLocked(out, lo, hi)
 	}
-
-	inputs := make([]*segment, 0, len(in0)+len(in1))
-	inputs = append(inputs, in0...)
-	inputs = append(inputs, in1...)
-
-	pageSize := int64(l.pgr.PageSize())
-	var before int64
-	for _, seg := range inputs {
-		before += int64(seg.pages) * pageSize
-	}
-
-	const dropTomb = false
-
-	sources := make([]mergeSource, len(inputs))
-	for i, seg := range inputs {
-		sources[i] = &segSource{pgr: l.pgr, seg: seg}
-	}
-	mi, err := newMergeIter(sources, nil)
-	if err != nil {
-		return engine.MaintReport{}, err
-	}
-
-	outputs, err := l.writeSplitLocked(mi, watermark, dropTomb, bloomBitsForLevel(out, l.levelRatio), l.codecForLevel(out))
-	if err != nil {
-		return engine.MaintReport{}, err
-	}
-
-	// Install the new view through the MANIFEST: remove every input at its level, then
-	// add every output at the lower level, so a replay drops the inputs and keeps the
-	// outputs. The edits are recorded before the live set is swapped, the LSM's atomic
-	// version install.
-	for _, seg := range in0 {
-		if err := l.appendEditLocked(manifestRemove, uint8(src), seg.footer); err != nil {
-			return engine.MaintReport{}, err
-		}
-	}
-	for _, seg := range in1 {
-		if err := l.appendEditLocked(manifestRemove, uint8(out), seg.footer); err != nil {
-			return engine.MaintReport{}, err
-		}
-	}
-	for _, seg := range outputs {
-		if err := l.appendEditLocked(manifestAdd, uint8(out), seg.footer); err != nil {
-			return engine.MaintReport{}, err
-		}
-	}
-
-	l.removeSegmentsLocked(src, setOf(in0))
-	l.removeSegmentsLocked(out, setOf(in1))
-	for _, seg := range outputs {
-		l.addSegmentLocked(out, seg)
-	}
-
-	for _, seg := range inputs {
-		if err := l.freeSegmentPages(seg); err != nil {
-			return engine.MaintReport{}, err
-		}
-	}
-
-	var after int64
-	for _, seg := range outputs {
-		after += int64(seg.pages) * pageSize
-	}
-	reclaimed := before - after
-	if reclaimed < 0 {
-		reclaimed = 0
-	}
-	return engine.MaintReport{
-		PagesCompacted: len(inputs),
-		BytesWritten:   after,
-		BytesReclaimed: reclaimed,
-	}, nil
+	p := &compactionPlan{srcLevel: src, outLevel: out, in0: in0, in1: in1, dropTomb: false}
+	p.before = l.inputBytes(in0) + l.inputBytes(in1)
+	return p, true
 }
 
-// runSelfMergeLocked folds every run at a tiered level back into one disjoint run, cut at
-// segTargetBytes, and installs it in place through the MANIFEST. It is what the bottom
-// pays for accumulating runs instead of merging on every push: it runs once per tierFanout
-// pushes rather than on each one. Because every run at the level is an input and nothing
-// lives below, this is the one merge that may drop a point tombstone that becomes the
-// base. The caller holds l.mu.
-func (l *LSM) runSelfMergeLocked(level int, watermark uint64) (engine.MaintReport, error) {
+// planSelfMergeLocked snapshots a self-merge's inputs: every run at the tiered level, folded
+// back into one disjoint run in place. Because every run is an input and (when nothing lives
+// below) nothing shadows them, this is the one compaction that may drop a point tombstone
+// that becomes the base. The caller holds l.mu.
+func (l *LSM) planSelfMergeLocked(c compaction) (*compactionPlan, bool) {
+	level := c.level
 	if level < 1 || level >= len(l.levels) || len(l.levels[level]) < 2 {
-		return engine.MaintReport{}, nil
+		return nil, false
 	}
 	inputs := append([]*segment(nil), l.levels[level]...)
-
-	pageSize := int64(l.pgr.PageSize())
-	var before int64
-	for _, seg := range inputs {
-		before += int64(seg.pages) * pageSize
+	p := &compactionPlan{
+		srcLevel: level,
+		outLevel: level,
+		in0:      inputs,
+		dropTomb: !l.hasSegmentsBelowLocked(level),
 	}
+	p.before = l.inputBytes(inputs)
+	return p, true
+}
 
-	dropTomb := !l.hasSegmentsBelowLocked(level)
-
-	sources := make([]mergeSource, len(inputs))
-	for i, seg := range inputs {
-		sources[i] = &segSource{pgr: l.pgr, seg: seg}
+// buildCompaction runs the plan's inputs through the shared streaming k-way merge and the
+// splitter, producing the size-bounded output segments (in internal-key order, version GC
+// applied at the watermark). It reads only the input segments, which are immutable once
+// published, and the open-time-immutable split knobs, so it is safe with l.mu released:
+// background compaction runs it that way so foreground writers keep inserting while the
+// merge serializes. The caller holds flushMu, so no flush build or other compaction writes
+// the same pages at once.
+func (l *LSM) buildCompaction(p *compactionPlan, watermark uint64) ([]*segment, error) {
+	sources := make([]mergeSource, 0, len(p.in0)+len(p.in1))
+	for _, seg := range p.in0 {
+		sources = append(sources, &segSource{pgr: l.pgr, seg: seg})
+	}
+	for _, seg := range p.in1 {
+		sources = append(sources, &segSource{pgr: l.pgr, seg: seg})
 	}
 	mi, err := newMergeIter(sources, nil)
 	if err != nil {
-		return engine.MaintReport{}, err
+		return nil, err
 	}
+	return l.writeSplit(mi, watermark, p.dropTomb, bloomBitsForLevel(p.outLevel, l.levelRatio), l.codecForLevel(p.outLevel))
+}
 
-	outputs, err := l.writeSplitLocked(mi, watermark, dropTomb, bloomBitsForLevel(level, l.levelRatio), l.codecForLevel(level))
-	if err != nil {
-		return engine.MaintReport{}, err
+// installCompactionLocked publishes a built compaction: it records every input removal and
+// output addition in the MANIFEST, swaps the live set, and frees the inputs' pages, all in
+// one l.mu critical section so a reader folds either the inputs or the outputs but never
+// both (the outputs are the MVCC merge of the inputs, so the two views resolve identically).
+// The edits are recorded before the live set is swapped, the LSM's atomic version install.
+// The caller holds l.mu and flushMu. It returns the work report.
+func (l *LSM) installCompactionLocked(p *compactionPlan, outputs []*segment) (engine.MaintReport, error) {
+	for _, seg := range p.in0 {
+		if err := l.appendEditLocked(manifestRemove, uint8(p.srcLevel), seg.footer); err != nil {
+			return engine.MaintReport{}, err
+		}
 	}
-
-	for _, seg := range inputs {
-		if err := l.appendEditLocked(manifestRemove, uint8(level), seg.footer); err != nil {
+	for _, seg := range p.in1 {
+		if err := l.appendEditLocked(manifestRemove, uint8(p.outLevel), seg.footer); err != nil {
 			return engine.MaintReport{}, err
 		}
 	}
 	for _, seg := range outputs {
-		if err := l.appendEditLocked(manifestAdd, uint8(level), seg.footer); err != nil {
+		if err := l.appendEditLocked(manifestAdd, uint8(p.outLevel), seg.footer); err != nil {
 			return engine.MaintReport{}, err
 		}
 	}
 
-	l.removeSegmentsLocked(level, setOf(inputs))
+	l.removeSegmentsLocked(p.srcLevel, setOf(p.in0))
+	if len(p.in1) > 0 {
+		l.removeSegmentsLocked(p.outLevel, setOf(p.in1))
+	}
 	for _, seg := range outputs {
-		l.addSegmentLocked(level, seg)
+		l.addSegmentLocked(p.outLevel, seg)
 	}
 
-	for _, seg := range inputs {
+	for _, seg := range p.in0 {
+		if err := l.freeSegmentPages(seg); err != nil {
+			return engine.MaintReport{}, err
+		}
+	}
+	for _, seg := range p.in1 {
 		if err := l.freeSegmentPages(seg); err != nil {
 			return engine.MaintReport{}, err
 		}
 	}
 
+	pageSize := int64(l.pgr.PageSize())
 	var after int64
 	for _, seg := range outputs {
 		after += int64(seg.pages) * pageSize
 	}
-	reclaimed := before - after
+	reclaimed := p.before - after
 	if reclaimed < 0 {
 		reclaimed = 0
 	}
 	return engine.MaintReport{
-		PagesCompacted: len(inputs),
+		PagesCompacted: len(p.in0) + len(p.in1),
 		BytesWritten:   after,
 		BytesReclaimed: reclaimed,
 	}, nil
 }
 
-// writeSplitLocked drives the merge through a splitter, writing the kept cells into one
-// or more size-bounded output segments, each filter sized for the output level by the
-// Monkey budget bitsPerKey. The caller holds l.mu. An empty trailing segment (when the
-// final pull dropped every cell) is reclaimed rather than published, so a compaction
-// whose tail is all dead versions leaks no pages.
-func (l *LSM) writeSplitLocked(mi *mergeIter, watermark uint64, dropTomb bool, bitsPerKey int, cdc codecID) ([]*segment, error) {
+// runCompactionLocked merges a run from the source level into the level below it through the
+// three compaction phases, all under l.mu (the host Maintain path holds it). It returns a
+// report of the work done, or a zero report when there was nothing to merge.
+func (l *LSM) runCompactionLocked(src int, watermark uint64, wholeLevel bool) (engine.MaintReport, error) {
+	p, ok := l.planPushDownLocked(compaction{kind: compactPushDown, level: src, wholeLevel: wholeLevel})
+	if !ok {
+		return engine.MaintReport{}, nil
+	}
+	outputs, err := l.buildCompaction(p, watermark)
+	if err != nil {
+		return engine.MaintReport{}, err
+	}
+	return l.installCompactionLocked(p, outputs)
+}
+
+// runSelfMergeLocked folds every run at a tiered level back into one disjoint run through the
+// three compaction phases, all under l.mu. It is what the bottom pays for accumulating runs
+// instead of merging on every push: it runs once per tierFanout pushes rather than on each
+// one. The caller holds l.mu.
+func (l *LSM) runSelfMergeLocked(level int, watermark uint64) (engine.MaintReport, error) {
+	p, ok := l.planSelfMergeLocked(compaction{kind: compactSelfMerge, level: level})
+	if !ok {
+		return engine.MaintReport{}, nil
+	}
+	outputs, err := l.buildCompaction(p, watermark)
+	if err != nil {
+		return engine.MaintReport{}, err
+	}
+	return l.installCompactionLocked(p, outputs)
+}
+
+// writeSplit drives the merge through a splitter, writing the kept cells into one or more
+// size-bounded output segments, each filter sized for the output level by the Monkey budget
+// bitsPerKey. It reads only the open-time-immutable split knobs and writes fresh pages, so it
+// is safe with l.mu released (the caller holds flushMu, the page-write serializer). An empty
+// trailing segment (when the final pull dropped every cell) is reclaimed rather than
+// published, so a compaction whose tail is all dead versions leaks no pages.
+func (l *LSM) writeSplit(mi *mergeIter, watermark uint64, dropTomb bool, bitsPerKey int, cdc codecID) ([]*segment, error) {
 	target := l.segTargetBytes
 	if target < 1 {
 		target = 1
