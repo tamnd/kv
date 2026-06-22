@@ -73,7 +73,21 @@ type oracle struct {
 	// below the readMark, because no live or future transaction reads from before
 	// the readMark, so none can still conflict with it.
 	commits []commitRecord
+
+	// freeSets recycles the conflict-tracking maps that trimLocked retires. A commit
+	// allocates one map for its write set; when no live reader pins an older version the
+	// record is trimmed on the very next commit, so without recycling every commit churns a
+	// map. Returning the trimmed map (cleared, buckets intact) here and reusing it on the next
+	// commit turns that per-commit allocation into a steady-state reuse (spec 07, commit-side
+	// cost). The pool is bounded so a burst of commits under a held-open reader cannot pin an
+	// unbounded number of empty maps. Touched only under mu, by takeWriteSet/retireWriteSet.
+	freeSets []map[string]struct{}
 }
+
+// maxFreeSets bounds the recycled-map pool. A handful covers the steady state (add then trim
+// one record per commit); beyond that the maps are let go so a long-held reader, which keeps
+// many records live and untrimmed, does not also hoard empty maps.
+const maxFreeSets = 8
 
 // commitRecord is the set of user keys a committed transaction wrote, tagged with
 // its commit version. Conflict detection intersects a committing transaction's
@@ -176,13 +190,38 @@ func (o *oracle) commit(writes []string) uint64 {
 func (o *oracle) recordCommitLocked(writes []string) uint64 {
 	v := o.nextVersion
 	o.nextVersion++
-	set := make(map[string]struct{}, len(writes))
+	set := o.takeWriteSet(len(writes))
 	for _, k := range writes {
 		set[k] = struct{}{}
 	}
 	o.commits = append(o.commits, commitRecord{version: v, writes: set})
 	o.trimLocked()
 	return v
+}
+
+// takeWriteSet returns an empty map for a new commit record's write set, reusing one the pool
+// holds when available and allocating a hint-sized map otherwise. A pooled map was cleared on
+// retirement, so it is ready to fill. The caller holds o.mu.
+func (o *oracle) takeWriteSet(hint int) map[string]struct{} {
+	if n := len(o.freeSets); n > 0 {
+		m := o.freeSets[n-1]
+		o.freeSets[n-1] = nil
+		o.freeSets = o.freeSets[:n-1]
+		return m
+	}
+	return make(map[string]struct{}, hint)
+}
+
+// retireWriteSet clears a trimmed record's write set and returns it to the recycle pool, up to
+// the pool bound. clear empties the map but keeps its allocated buckets, which is exactly the
+// reuse the next takeWriteSet exploits. The caller holds o.mu, and the map is internal to the
+// oracle (no commitRecord escapes), so the recycled map can never alias a live reference.
+func (o *oracle) retireWriteSet(m map[string]struct{}) {
+	if len(o.freeSets) >= maxFreeSets {
+		return
+	}
+	clear(m)
+	o.freeSets = append(o.freeSets, m)
 }
 
 // newCommitTs runs write-write conflict detection for a transaction that read at
@@ -319,6 +358,8 @@ func (o *oracle) trimLocked() {
 	for _, c := range o.commits {
 		if c.version > mark {
 			keep = append(keep, c)
+		} else {
+			o.retireWriteSet(c.writes)
 		}
 	}
 	o.commits = keep

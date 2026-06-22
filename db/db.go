@@ -721,10 +721,32 @@ func (d *DB) buildOpsBatch(v uint64, ops []pendingOp) *engine.WriteBatch {
 
 // batchKeys returns the unique user keys a blind batch wrote, so a Write
 // participates in conflict detection against concurrent transactions.
+//
+// A blind write is usually a handful of keys, so for a small batch the dedup is a linear scan
+// of the result, which keeps the whole call to one slice allocation; the map, which costs an
+// allocation of its own on every commit, is reserved for the rare large batch where the
+// quadratic scan would actually matter (spec 07, commit-side cost).
 func batchKeys(b *engine.WriteBatch) []string {
-	seen := make(map[string]struct{})
-	var keys []string
-	for _, e := range b.Entries() {
+	entries := b.Entries()
+	keys := make([]string, 0, len(entries))
+	if len(entries) <= batchKeysLinearMax {
+		for _, e := range entries {
+			k := string(format.UserKey(e.InternalKey))
+			dup := false
+			for _, existing := range keys {
+				if existing == k {
+					dup = true
+					break
+				}
+			}
+			if !dup {
+				keys = append(keys, k)
+			}
+		}
+		return keys
+	}
+	seen := make(map[string]struct{}, len(entries))
+	for _, e := range entries {
 		k := string(format.UserKey(e.InternalKey))
 		if _, ok := seen[k]; ok {
 			continue
@@ -734,6 +756,10 @@ func batchKeys(b *engine.WriteBatch) []string {
 	}
 	return keys
 }
+
+// batchKeysLinearMax is the batch size below which batchKeys dedups by linear scan instead of a
+// map. Set where the quadratic scan is still cheaper than allocating and populating a map.
+const batchKeysLinearMax = 16
 
 // snapshotGet reads key at a fixed version through a short-lived engine reader,
 // taking the shared read lock so it never observes a page mid-commit. It returns
