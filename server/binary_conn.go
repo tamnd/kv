@@ -22,6 +22,9 @@ import (
 // is the binary analog of the HTTP Serve: a host that wants the efficient protocol runs this on
 // a second listener alongside the HTTP one. It returns when accepting stops.
 func (srv *Server) ServeBinary(ln net.Listener) error {
+	// Wrap the listener in TLS when configured, so the binary face gets the same transport security
+	// as HTTP and an accepted connection is a *tls.Conn the rest of the loop treats transparently.
+	ln = srv.wrapTLS(ln)
 	// Close the listener when the server shuts down so a blocked Accept returns and this loop
 	// exits, the same way http.Server.Shutdown unblocks its own Accept.
 	stop := context.AfterFunc(srv.baseCtx, func() { ln.Close() })
@@ -55,10 +58,15 @@ func (srv *Server) serveBinaryConn(conn net.Conn) {
 
 	r := bufio.NewReader(conn)
 	w := bufio.NewWriter(conn)
-	// One session per connection holds the identity an opAuth handshake binds, so a token is
-	// presented once and every later operation on the connection is authorized against it. It
-	// stays nil on an open server, where authorizeBinary allows everything.
+	// One session per connection holds the identity, so a credential is presented once and every
+	// later operation on the connection is authorized against it. A connection that arrives over
+	// mTLS with a verified client certificate authenticates by it up front, before the first
+	// request; otherwise the identity stays nil until an opAuth token handshake binds it, or for the
+	// whole connection on an open server, where authorizeBinary allows everything.
 	sess := &binarySession{}
+	if id, ok := srv.peerIdentity(conn); ok {
+		sess.ident = id
+	}
 	for {
 		body, err := readFrame(r)
 		if err != nil {
@@ -102,7 +110,7 @@ type binarySession struct {
 // connection never authenticated. It calls the same Identity grant methods the HTTP path does, so
 // a token authorizes the same operations on either wire.
 func (srv *Server) authorizeBinary(sess *binarySession, allowed func(*Identity) bool) error {
-	if srv.auth == nil {
+	if !srv.authEnabled() {
 		return nil
 	}
 	if sess.ident == nil {

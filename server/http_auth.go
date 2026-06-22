@@ -57,11 +57,11 @@ func isAuthExempt(path string) bool {
 // after this middleware is therefore guaranteed an identity in context whenever auth is on.
 func (srv *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if srv.auth == nil || isAuthExempt(r.URL.Path) {
+		if !srv.authEnabled() || isAuthExempt(r.URL.Path) {
 			next.ServeHTTP(w, r)
 			return
 		}
-		id, ok := srv.auth.Authenticate(bearerToken(r))
+		id, ok := srv.authenticateRequest(r)
 		if !ok {
 			// Advertise bearer auth so a well-behaved client knows how to retry, then refuse. The
 			// body names the failure without leaking which credential was tried.
@@ -71,6 +71,23 @@ func (srv *Server) authMiddleware(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r.WithContext(withIdentity(r.Context(), id)))
 	})
+}
+
+// authenticateRequest resolves a request's identity, trying mTLS first and a bearer token second.
+// A verified client certificate (when mTLS is configured and one was presented) names the caller
+// without a token, which is the point of mTLS; absent that, the bearer token is consulted. Trying
+// the certificate first lets a connection that already proved its identity at the TLS layer skip
+// the token, while still allowing a token on a TLS connection that carried no client certificate.
+func (srv *Server) authenticateRequest(r *http.Request) (*Identity, bool) {
+	if srv.peerAuth != nil && r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
+		if id, ok := srv.peerAuth.AuthenticatePeer(r.TLS.PeerCertificates[0]); ok {
+			return id, true
+		}
+	}
+	if srv.auth != nil {
+		return srv.auth.Authenticate(bearerToken(r))
+	}
+	return nil, false
 }
 
 // bearerToken extracts the credential a request carries: an Authorization: Bearer <token> header,
@@ -93,7 +110,7 @@ func bearerToken(r *http.Request) string {
 // predicate naming exactly the access the request needs, for example read of one key or write of a
 // range, so authorization is expressed where the keys are known.
 func (srv *Server) authorize(r *http.Request, allowed func(*Identity) bool) error {
-	if srv.auth == nil {
+	if !srv.authEnabled() {
 		return nil
 	}
 	id := identityFrom(r.Context())

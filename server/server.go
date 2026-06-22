@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
 	"net"
 	"net/http"
 	"time"
@@ -18,10 +19,18 @@ import (
 type Server struct {
 	svc  *Service
 	http *http.Server
-	// auth resolves a request's credential to an Identity and is nil when the server runs open.
-	// The HTTP middleware and, in a later slice, the binary connection loop consult it; a nil
-	// auth means every request is allowed, the default for a database served on a trusted socket.
+	// auth resolves a request's credential to an Identity and is nil when no token authentication
+	// is configured. The HTTP middleware and the binary connection loop consult it; with both auth
+	// and peerAuth nil every request is allowed, the default for a database served on a trusted
+	// socket.
 	auth Authenticator
+	// peerAuth resolves a verified TLS client certificate to an Identity (mTLS), and is nil when
+	// client-certificate authentication is off. When set, a connection that presents a verified
+	// certificate authenticates by it without a token; the same per-prefix ACL then applies.
+	peerAuth PeerAuthenticator
+	// tlsConfig, when set, wraps both the HTTP and the binary listeners in TLS so traffic on the
+	// wire is encrypted. It is nil for a plaintext server, which the spec permits only on loopback.
+	tlsConfig *tls.Config
 	// baseCtx is cancelled by Shutdown before the HTTP server drains, so long-lived
 	// streaming handlers (watch) that are idle on a blocking Subscribe observe the shutdown
 	// and return instead of pinning the drain open forever. Each watch derives its context
@@ -45,11 +54,21 @@ type Options struct {
 	Limits            *Limits
 	ReadHeaderTimeout time.Duration
 	IdleTimeout       time.Duration
-	// Auth, when non-nil, turns on authentication and per-prefix authorization (spec 17 §6):
+	// Auth, when non-nil, turns on token authentication and per-prefix authorization (spec 17 §6):
 	// every request outside the operational health and metrics routes must carry a credential the
 	// Authenticator resolves to an Identity, and each operation is checked against that identity's
-	// grants. A nil Auth leaves the server open, the default, for a database on a trusted socket.
+	// grants. A nil Auth leaves token authentication off.
 	Auth Authenticator
+	// PeerAuth, when non-nil, turns on mTLS client-certificate authentication: a connection that
+	// presents a certificate the configured client CA verifies is authenticated by it, and PeerAuth
+	// maps that certificate to an Identity whose grants are then enforced exactly as a token's are.
+	// It composes with Auth: a request may authenticate by certificate or by token. With both Auth
+	// and PeerAuth nil the server is open.
+	PeerAuth PeerAuthenticator
+	// TLSConfig, when non-nil, wraps both listeners in TLS. For mTLS, set its ClientAuth and
+	// ClientCAs so the stack verifies client certificates before PeerAuth ever sees them. A nil
+	// TLSConfig serves in the clear, which NonLoopbackRequiresTLS refuses for an off-host bind.
+	TLSConfig *tls.Config
 }
 
 // defaultAddr is kv's registered-by-convention HTTP port, used when Options.Addr is empty.
@@ -85,7 +104,7 @@ func New(db *kv.DB, opts Options) *Server {
 	if idleTimeout == 0 {
 		idleTimeout = defaultIdleTimeout
 	}
-	srv := &Server{svc: svc, baseCtx: ctx, cancel: cancel, auth: opts.Auth}
+	srv := &Server{svc: svc, baseCtx: ctx, cancel: cancel, auth: opts.Auth, peerAuth: opts.PeerAuth, tlsConfig: opts.TLSConfig}
 	srv.http = &http.Server{
 		Addr:              addr,
 		Handler:           srv.httpHandler(),
@@ -94,6 +113,12 @@ func New(db *kv.DB, opts Options) *Server {
 	}
 	return srv
 }
+
+// authEnabled reports whether the server enforces access control, which it does when either token
+// or client-certificate authentication is configured. With neither, the server is open and both
+// the HTTP middleware and the binary gate pass everything through, the default for a trusted
+// socket.
+func (srv *Server) authEnabled() bool { return srv.auth != nil || srv.peerAuth != nil }
 
 // Service returns the transport-agnostic core, for a host that wants to drive operations in
 // process alongside the served surface, or to mount the handler itself.
@@ -107,15 +132,23 @@ func (srv *Server) Handler() http.Handler { return srv.http.Handler }
 func (srv *Server) Addr() string { return srv.http.Addr }
 
 // ListenAndServe binds the HTTP listener and serves until the server is shut down or the
-// listener fails, the one-call path `kv serve` takes. It returns http.ErrServerClosed on a
-// clean Shutdown, which the caller treats as success.
+// listener fails, the one-call path a host takes when it has no listener of its own. It returns
+// http.ErrServerClosed on a clean Shutdown, which the caller treats as success. When a TLS config
+// is set, the bound listener is wrapped in TLS, so this one call serves HTTPS.
 func (srv *Server) ListenAndServe() error {
-	return srv.http.ListenAndServe()
+	ln, err := net.Listen("tcp", srv.http.Addr)
+	if err != nil {
+		return err
+	}
+	return srv.Serve(ln)
 }
 
-// Serve serves HTTP on an already-bound listener, the path a test takes after opening a
-// listener on port zero so it knows the real address before traffic starts.
+// Serve serves HTTP on an already-bound listener, the path `kv serve` and the tests take after
+// opening a listener on port zero so they know the real address before traffic starts. When a TLS
+// config is set the listener is wrapped in TLS, so a connection accepted from it is encrypted; the
+// handlers are unchanged either way, since the TLS termination is transparent to them.
 func (srv *Server) Serve(ln net.Listener) error {
+	ln = srv.wrapTLS(ln)
 	srv.http.Addr = ln.Addr().String()
 	return srv.http.Serve(ln)
 }
