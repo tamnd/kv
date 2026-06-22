@@ -16,6 +16,15 @@ import (
 // the file folds.
 func newBinaryServer(t *testing.T) *Client {
 	t.Helper()
+	addr := newBinaryServerAddr(t)
+	return dialClient(t, addr)
+}
+
+// newBinaryServerAddr opens a fresh temp database, serves the binary protocol on a free port,
+// and returns its address. The cleanup shuts the server down and closes the database. A test
+// that needs several connections to one server dials each itself.
+func newBinaryServerAddr(t *testing.T) string {
+	t.Helper()
 	path := t.TempDir() + "/test.kv"
 	db, err := kv.Open(path)
 	if err != nil {
@@ -27,16 +36,21 @@ func newBinaryServer(t *testing.T) *Client {
 	}
 	srv := New(db, Options{})
 	go srv.ServeBinary(ln)
-
-	cl, err := Dial(ln.Addr().String())
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
 	t.Cleanup(func() {
-		cl.Close()
 		srv.Shutdown(context.Background())
 		db.Close()
 	})
+	return ln.Addr().String()
+}
+
+// dialClient dials a client to addr and closes it on cleanup.
+func dialClient(t *testing.T, addr string) *Client {
+	t.Helper()
+	cl, err := Dial(addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { cl.Close() })
 	return cl
 }
 
@@ -247,6 +261,142 @@ func TestBinaryTTL(t *testing.T) {
 	_, found, err := cl.Get([]byte("eph"))
 	if err != nil || !found {
 		t.Fatalf("get within ttl: found=%v err=%v", found, err)
+	}
+}
+
+func TestBinaryScan(t *testing.T) {
+	cl := newBinaryServer(t)
+	for _, k := range []string{"a", "b", "c", "d", "e"} {
+		if _, err := cl.Set([]byte(k), []byte("v-"+k), 0); err != nil {
+			t.Fatalf("set %s: %v", k, err)
+		}
+	}
+
+	// A full forward scan yields every pair in key order with its value.
+	var got []string
+	err := cl.Scan(ScanOptions{}, func(key, value []byte) error {
+		got = append(got, string(key)+"="+string(value))
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	want := []string{"a=v-a", "b=v-b", "c=v-c", "d=v-d", "e=v-e"}
+	if len(got) != len(want) {
+		t.Fatalf("scan got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("scan[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestBinaryScanBoundsAndLimit(t *testing.T) {
+	cl := newBinaryServer(t)
+	for _, k := range []string{"a", "b", "c", "d", "e"} {
+		cl.Set([]byte(k), []byte("v"), 0)
+	}
+
+	// A bounded scan [b, e) yields b, c, d.
+	var keys []string
+	cl.Scan(ScanOptions{Lower: []byte("b"), Upper: []byte("e")}, func(key, _ []byte) error {
+		keys = append(keys, string(key))
+		return nil
+	})
+	if len(keys) != 3 || keys[0] != "b" || keys[2] != "d" {
+		t.Fatalf("bounded scan = %v, want [b c d]", keys)
+	}
+
+	// A limit caps the count.
+	keys = nil
+	cl.Scan(ScanOptions{Limit: 2}, func(key, _ []byte) error {
+		keys = append(keys, string(key))
+		return nil
+	})
+	if len(keys) != 2 {
+		t.Fatalf("limited scan = %v, want 2 keys", keys)
+	}
+}
+
+func TestBinaryScanKeysOnly(t *testing.T) {
+	cl := newBinaryServer(t)
+	cl.Set([]byte("k"), []byte("value"), 0)
+	err := cl.Scan(ScanOptions{KeysOnly: true}, func(key, value []byte) error {
+		if string(key) != "k" {
+			t.Fatalf("key = %q, want k", key)
+		}
+		if value != nil {
+			t.Fatalf("keys-only value = %q, want nil", value)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("scan keys-only: %v", err)
+	}
+}
+
+func TestBinaryScanReverse(t *testing.T) {
+	cl := newBinaryServer(t)
+	for _, k := range []string{"a", "b", "c"} {
+		cl.Set([]byte(k), []byte("v"), 0)
+	}
+	var keys []string
+	cl.Scan(ScanOptions{Reverse: true}, func(key, _ []byte) error {
+		keys = append(keys, string(key))
+		return nil
+	})
+	if len(keys) != 3 || keys[0] != "c" || keys[2] != "a" {
+		t.Fatalf("reverse scan = %v, want [c b a]", keys)
+	}
+}
+
+func TestBinaryWatch(t *testing.T) {
+	// A dedicated client drives the watch, since a watch takes over its connection; a second
+	// client on the same server does the write.
+	addr := newBinaryServerAddr(t)
+	watcher := dialClient(t, addr)
+	writer := dialClient(t, addr)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	got := make(chan kv.Change, 8)
+	done := make(chan error, 1)
+	go func() {
+		done <- watcher.Watch(ctx, nil, 0, func(c kv.Change) error {
+			got <- c
+			return nil
+		})
+	}()
+
+	// Give the watch a moment to subscribe before the write, so the change is not missed.
+	time.Sleep(50 * time.Millisecond)
+	if _, err := writer.Set([]byte("wk"), []byte("wv"), 0); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+
+	select {
+	case c := <-got:
+		if string(c.Key) != "wk" || string(c.Value) != "wv" {
+			t.Fatalf("change = %+v, want wk=wv", c)
+		}
+		if c.Kind != kv.ChangeSet {
+			t.Fatalf("kind = %v, want set", c.Kind)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("watch did not deliver the change")
+	}
+
+	// Cancelling ends the watch with the context error.
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("watch end err = %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("watch did not end after cancel")
 	}
 }
 
