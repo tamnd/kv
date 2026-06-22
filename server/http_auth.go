@@ -112,17 +112,7 @@ func (srv *Server) authorize(r *http.Request, allowed func(*Identity) bool) erro
 // from committing the part it was allowed, which would violate the atomicity the request promises.
 func (srv *Server) authorizeOps(r *http.Request, asserts []Assert, ops []Op) error {
 	return srv.authorize(r, func(id *Identity) bool {
-		for _, a := range asserts {
-			if !id.canRead(a.Key) {
-				return false
-			}
-		}
-		for _, op := range ops {
-			if !id.canDoOp(op) {
-				return false
-			}
-		}
-		return true
+		return id.canDoTxn(asserts, ops)
 	})
 }
 

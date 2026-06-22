@@ -154,6 +154,26 @@ func (id *Identity) canDoOp(op Op) bool {
 	}
 }
 
+// canDoTxn reports whether the identity may perform a whole transaction or batch: every assert
+// is a read of its key and every op is checked by its kind, so the set is allowed only when the
+// identity may do all of it. Both protocol adapters check the entire set before applying any of
+// it, so a partially-authorized request never commits the part it was allowed, which would break
+// the atomicity the request promises. The grant logic lives here, not in either adapter, so a
+// token authorizes the same transaction on either wire.
+func (id *Identity) canDoTxn(asserts []Assert, ops []Op) bool {
+	for _, a := range asserts {
+		if !id.canRead(a.Key) {
+			return false
+		}
+	}
+	for _, op := range ops {
+		if !id.canDoOp(op) {
+			return false
+		}
+	}
+	return true
+}
+
 // prefixUpperBound returns the smallest key that is greater than every key having the given
 // prefix, or nil if the prefix has no upper bound (it is empty or all 0xff), meaning it covers
 // keys without limit. It is the standard prefix-to-range-end transform: drop trailing 0xff bytes,
