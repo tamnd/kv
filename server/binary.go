@@ -76,6 +76,9 @@ const (
 
 	statusUnauthenticated status = 9  // a missing or unrecognized credential
 	statusForbidden       status = 10 // a recognized identity without a grant for the key
+
+	statusOverloaded  status = 11 // the server is at its in-flight request limit
+	statusRateLimited status = 12 // the caller exceeded its configured request rate
 )
 
 // maxFrameSize caps a single message body so a corrupt or hostile length prefix cannot make
@@ -226,6 +229,10 @@ func statusForError(err error) status {
 		return statusUnauthenticated
 	case errors.Is(err, ErrForbidden):
 		return statusForbidden
+	case errors.Is(err, ErrOverloaded):
+		return statusOverloaded
+	case errors.Is(err, ErrRateLimited):
+		return statusRateLimited
 	case errors.Is(err, ErrTooManyTxns), errors.Is(err, kv.ErrNeedsRecovery), errors.Is(err, kv.ErrCorrupt), errors.Is(err, kv.ErrClosed):
 		return statusUnavail
 	default:

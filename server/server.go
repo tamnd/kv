@@ -31,6 +31,18 @@ type Server struct {
 	// tlsConfig, when set, wraps both the HTTP and the binary listeners in TLS so traffic on the
 	// wire is encrypted. It is nil for a plaintext server, which the spec permits only on loopback.
 	tlsConfig *tls.Config
+	// connLimit caps the simultaneously open connections on each listener; zero is unlimited. It
+	// wraps the listener beneath TLS, so it counts TCP connections on either wire.
+	connLimit int
+	// inflight caps concurrent in-progress requests across both wires and is nil when unlimited; an
+	// excess request is shed with ErrOverloaded rather than queued.
+	inflight *inFlight
+	// rate limits the request rate per caller (per identity, or per remote address when open) and is
+	// nil when unlimited; an over-rate request is shed with ErrRateLimited.
+	rate *rateLimiter
+	// checkpointOnShutdown folds the WAL into the main file during graceful shutdown, so a redeploy
+	// leaves the file needing no recovery on the next open (spec 17 §6).
+	checkpointOnShutdown bool
 	// baseCtx is cancelled by Shutdown before the HTTP server drains, so long-lived
 	// streaming handlers (watch) that are idle on a blocking Subscribe observe the shutdown
 	// and return instead of pinning the drain open forever. Each watch derives its context
@@ -69,6 +81,23 @@ type Options struct {
 	// ClientCAs so the stack verifies client certificates before PeerAuth ever sees them. A nil
 	// TLSConfig serves in the clear, which NonLoopbackRequiresTLS refuses for an off-host bind.
 	TLSConfig *tls.Config
+	// MaxConns caps the simultaneously open connections on each listener (spec 17 §4); zero leaves
+	// connections unbounded. The cap is backpressure on the accept loop: a connection past the cap
+	// waits in the kernel's accept queue rather than being served.
+	MaxConns int
+	// MaxInFlight caps concurrent in-progress requests across both wires (spec 17 §6); zero leaves
+	// them unbounded. A request past the cap is shed with a retryable overload error rather than
+	// queued, so a request's latency stays bounded under a flood.
+	MaxInFlight int
+	// RatePerSecond and RateBurst configure a per-caller request rate (spec 17 §6): RatePerSecond is
+	// the sustained requests per second a caller may make and RateBurst is how many may arrive at
+	// once before the steady rate applies. A zero RatePerSecond leaves the rate unlimited. The limit
+	// is keyed per identity when auth is on and per remote address when the server runs open.
+	RatePerSecond float64
+	RateBurst     int
+	// CheckpointOnShutdown folds the WAL into the main file as the last step of a graceful shutdown
+	// (spec 17 §6), so a redeploy does not leave the file needing recovery on its next open.
+	CheckpointOnShutdown bool
 }
 
 // defaultAddr is kv's registered-by-convention HTTP port, used when Options.Addr is empty.
@@ -104,7 +133,18 @@ func New(db *kv.DB, opts Options) *Server {
 	if idleTimeout == 0 {
 		idleTimeout = defaultIdleTimeout
 	}
-	srv := &Server{svc: svc, baseCtx: ctx, cancel: cancel, auth: opts.Auth, peerAuth: opts.PeerAuth, tlsConfig: opts.TLSConfig}
+	srv := &Server{
+		svc:                  svc,
+		baseCtx:              ctx,
+		cancel:               cancel,
+		auth:                 opts.Auth,
+		peerAuth:             opts.PeerAuth,
+		tlsConfig:            opts.TLSConfig,
+		connLimit:            opts.MaxConns,
+		inflight:             newInFlight(opts.MaxInFlight),
+		rate:                 newRateLimiter(opts.RatePerSecond, opts.RateBurst),
+		checkpointOnShutdown: opts.CheckpointOnShutdown,
+	}
 	srv.http = &http.Server{
 		Addr:              addr,
 		Handler:           srv.httpHandler(),
@@ -148,22 +188,38 @@ func (srv *Server) ListenAndServe() error {
 // config is set the listener is wrapped in TLS, so a connection accepted from it is encrypted; the
 // handlers are unchanged either way, since the TLS termination is transparent to them.
 func (srv *Server) Serve(ln net.Listener) error {
-	ln = srv.wrapTLS(ln)
+	ln = srv.wrapListener(ln)
 	srv.http.Addr = ln.Addr().String()
 	return srv.http.Serve(ln)
 }
 
+// wrapListener applies the connection cap and then TLS to a raw listener, the shared wrap both
+// faces take. The connection limit is innermost so it counts TCP connections regardless of TLS, and
+// TLS is outermost so a connection accepted from the result is already encrypted; either wrap is a
+// no-op when its feature is off.
+func (srv *Server) wrapListener(ln net.Listener) net.Listener {
+	return srv.wrapTLS(newLimitListener(ln, srv.connLimit))
+}
+
 // Shutdown stops accepting new connections and waits for in-flight requests to finish, or
 // for ctx to expire, then returns. It does not close the database: the caller owns that, and
-// closing it after Shutdown returns drains served work first. Later slices fold transaction
-// draining and a final checkpoint into this path.
+// closing it after Shutdown returns drains served work first.
+//
+// The order is deliberate (spec 17 §6): cancel the base context so streaming handlers and parked
+// binary connections observe the shutdown, drain the HTTP server, force-discard any open
+// interactive transactions so no snapshot is pinned, and finally, when configured, fold the WAL into
+// the main file with a checkpoint so a redeploy leaves the file needing no recovery on its next
+// open. The transaction discard runs after the HTTP drain so a request committing during the drain
+// still finds its session; the checkpoint runs after the discard so no open snapshot holds back the
+// fold. Releasing the file lock is the caller's Close, since the caller owns the database.
 func (srv *Server) Shutdown(ctx context.Context) error {
 	srv.cancel()
 	err := srv.http.Shutdown(ctx)
-	// Force-discard any open interactive transactions and stop their reaper, releasing the
-	// snapshots they pin before the caller closes the database (spec 17 §6). This runs after the
-	// HTTP drain so a request committing an interactive transaction during the drain still finds
-	// its session; anything still open after the drain belongs to a gone client and is discarded.
 	srv.svc.Close()
+	if srv.checkpointOnShutdown {
+		if cerr := srv.svc.Checkpoint(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}
 	return err
 }
