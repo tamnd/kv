@@ -145,6 +145,9 @@ func (srv *Server) httpHandler() http.Handler {
 		writeJSON(w, http.StatusOK, versionResponse{Version: version})
 	})
 
+	mux.HandleFunc("GET /v1/scan", srv.handleScan)
+	mux.HandleFunc("GET /v1/watch", srv.handleWatch)
+
 	mux.HandleFunc("GET /v1/stats", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, s.Stats())
 	})

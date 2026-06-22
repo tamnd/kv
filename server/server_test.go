@@ -26,8 +26,12 @@ func newTestServer(t *testing.T) (*httptest.Server, *kv.DB) {
 	srv := New(db, Options{})
 	hs := httptest.NewServer(srv.Handler())
 	t.Cleanup(func() {
-		hs.Close()
+		// Close the database before the HTTP server: a closed database releases any idle
+		// watch handler (Subscribe returns ErrClosed), so the server's drain has nothing to
+		// wait on. The reverse order would deadlock, since hs.Close blocks on an in-flight
+		// watch that only the database close can wake.
 		db.Close()
+		hs.Close()
 	})
 	return hs, db
 }
