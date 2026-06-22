@@ -11,20 +11,22 @@ import (
 // Get returns the frame for pgno, pinned, reading it from the main file if it is
 // not already resident. The caller must Unpin exactly once. intent is advisory in
 // this milestone (it documents read vs write at the call site); dirtiness is
-// declared at Unpin.
+// declared at Unpin. Get contends only on the shard that owns pgno, so reads of
+// pages in different shards proceed in parallel.
 func (p *Pager) Get(pgno uint32, intent Intent) (*Frame, error) {
 	if pgno == 0 {
 		return nil, fmt.Errorf("pager: page 0 is the null page")
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if fr, ok := p.index[pgno]; ok {
+	sh := p.shardFor(pgno)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	if fr, ok := sh.index[pgno]; ok {
 		p.cacheHits.Add(1)
 		fr.pins.Add(1)
 		fr.ref = true
 		return fr, nil
 	}
-	fr, err := p.admit(pgno)
+	fr, err := p.admit(sh, pgno)
 	if err != nil {
 		return nil, err
 	}
@@ -33,11 +35,11 @@ func (p *Pager) Get(pgno uint32, intent Intent) (*Frame, error) {
 	// read was issued, so it counts toward read amplification.
 	p.pageReads.Add(1)
 	off := int64(pgno-1) * int64(p.pageSize)
-	if p.crypto != nil && pgno != 1 {
-		// Encrypted data page: read the ciphertext envelope into the staging buffer,
-		// verify its checksum, and decrypt into the frame, which holds plaintext.
-		if err := p.readEncrypted(fr, pgno, off); err != nil {
-			delete(p.index, pgno)
+	if sc := p.cryptoScheme(); sc != nil && pgno != 1 {
+		// Encrypted data page: read the ciphertext envelope into the shard's staging
+		// buffer, verify its checksum, and decrypt into the frame, which holds plaintext.
+		if err := p.readEncrypted(sh, sc, fr, pgno, off); err != nil {
+			delete(sh.index, pgno)
 			fr.pgno = 0
 			fr.dirty = false
 			return nil, err
@@ -51,7 +53,7 @@ func (p *Pager) Get(pgno uint32, intent Intent) (*Frame, error) {
 		// The page read whole but failed its checksum: a torn write or bit rot. Drop
 		// the frame so a retry re-reads rather than trusting the cached bad bytes, and
 		// surface ErrCorrupt to the caller (spec 02 §3.2).
-		delete(p.index, pgno)
+		delete(sh.index, pgno)
 		fr.pgno = 0
 		fr.dirty = false
 		return nil, fmt.Errorf("pager: page %d: %w", pgno, err)
@@ -62,46 +64,48 @@ func (p *Pager) Get(pgno uint32, intent Intent) (*Frame, error) {
 }
 
 // Unpin releases one pin. If dirty, the frame is marked for write-back at the
-// next checkpoint.
+// next checkpoint. The caller still holds a pin when calling, so the frame cannot
+// be evicted underneath this and fr.pgno still names its shard.
 func (p *Pager) Unpin(fr *Frame, dirty bool) {
-	p.mu.Lock()
+	sh := p.shardFor(fr.pgno)
+	sh.mu.Lock()
 	if dirty {
 		fr.dirty = true
 	}
 	fr.pins.Add(-1)
-	p.mu.Unlock()
+	sh.mu.Unlock()
 }
 
-// admit finds a free or evictable frame, binds it to pgno, and indexes it. The
-// caller must hold p.mu. The returned frame is not yet pinned.
-func (p *Pager) admit(pgno uint32) (*Frame, error) {
-	fr := p.evict()
+// admit finds a free or evictable frame in sh, binds it to pgno, and indexes it.
+// The caller must hold sh.mu. The returned frame is not yet pinned.
+func (p *Pager) admit(sh *shard, pgno uint32) (*Frame, error) {
+	fr := p.evict(sh)
 	if fr == nil {
 		return nil, fmt.Errorf("pager: buffer pool exhausted (all frames pinned)")
 	}
 	fr.pgno = pgno
 	fr.dirty = false
 	fr.ref = false
-	p.index[pgno] = fr
+	sh.index[pgno] = fr
 	return fr, nil
 }
 
-// evict returns a reusable frame via CLOCK: sweep, clearing reference bits, and
-// take the first unpinned frame whose bit is already clear. A dirty victim is
-// written back to the main file first (its describing WAL batch is already
-// durable by the time any page is dirtied, so this respects the WAL rule). The
-// caller must hold p.mu.
-func (p *Pager) evict() *Frame {
+// evict returns a reusable frame from sh via CLOCK: sweep its frames, clearing
+// reference bits, and take the first unpinned frame whose bit is already clear. A
+// dirty victim is written back to the main file first (its describing WAL batch is
+// already durable by the time any page is dirtied, so this respects the WAL rule).
+// The caller must hold sh.mu.
+func (p *Pager) evict(sh *shard) *Frame {
 	// Fast path: an unbound frame is immediately reusable.
-	for _, fr := range p.pool {
+	for _, fr := range sh.frames {
 		if fr.pgno == 0 && fr.pins.Load() == 0 {
 			return fr
 		}
 	}
-	n := len(p.pool)
+	n := len(sh.frames)
 	for i := 0; i < 2*n; i++ {
-		fr := p.pool[p.hand]
-		p.hand = (p.hand + 1) % n
+		fr := sh.frames[sh.hand]
+		sh.hand = (sh.hand + 1) % n
 		if fr.pins.Load() != 0 {
 			continue
 		}
@@ -111,12 +115,12 @@ func (p *Pager) evict() *Frame {
 		}
 		// Victim found.
 		if fr.dirty {
-			if err := p.writeBack(fr); err != nil {
+			if err := p.writeBack(sh, fr); err != nil {
 				// If write-back fails, skip this victim and try another.
 				continue
 			}
 		}
-		delete(p.index, fr.pgno)
+		delete(sh.index, fr.pgno)
 		fr.pgno = 0
 		fr.dirty = false
 		return fr
@@ -128,10 +132,10 @@ func (p *Pager) evict() *Frame {
 // into the reserved trailer first, so every page reaches disk self-describing and a
 // later read can detect a torn write or bit rot (spec 02 §3.2). The stamp lands in
 // the trailer the engine never uses, so it does not disturb the cached node body.
-// The caller must hold p.mu.
-func (p *Pager) writeBack(fr *Frame) error {
-	if p.crypto != nil && fr.pgno != 1 {
-		return p.writeBackEncrypted(fr)
+// The caller must hold sh.mu (sh owns fr).
+func (p *Pager) writeBack(sh *shard, fr *Frame) error {
+	if sc := p.cryptoScheme(); sc != nil && fr.pgno != 1 {
+		return p.writeBackEncrypted(sh, sc, fr)
 	}
 	format.StampPageChecksum(fr.data, p.header.Checksum)
 	off := int64(fr.pgno-1) * int64(p.pageSize)
@@ -142,25 +146,25 @@ func (p *Pager) writeBack(fr *Frame) error {
 	return nil
 }
 
-// encScratchBuf returns the shared pageSize staging buffer the encrypted read and write
-// paths use, allocating it on first use. The caller must hold p.mu; both paths run under
-// the lock and use the buffer for the span of a single page operation, so one buffer
-// serves all of them without contention.
-func (p *Pager) encScratchBuf() []byte {
-	if cap(p.encScratch) < p.pageSize {
-		p.encScratch = make([]byte, p.pageSize)
+// scratchBuf returns the shard's pageSize crypto staging buffer, allocating it on first
+// use. The caller must hold the shard's mu; the encrypted read and write paths run under
+// it and use the buffer for the span of a single page operation, so one buffer per shard
+// serves all of that shard's encrypted traffic without sharing memory across cores.
+func (sh *shard) scratchBuf(pageSize int) []byte {
+	if cap(sh.scratch) < pageSize {
+		sh.scratch = make([]byte, pageSize)
 	}
-	return p.encScratch[:p.pageSize]
+	return sh.scratch[:pageSize]
 }
 
 // readEncrypted reads an encrypted data page into a frame: it loads the on-disk envelope
-// into the staging buffer, verifies the page checksum, and decrypts the envelope into the
-// frame's plaintext window, zeroing the reserved tail. An all-zero page (a freshly grown
-// hole never written) or a short read at the file tail yields a zero plaintext frame, the
-// same as the cleartext path. A checksum mismatch or a failed decrypt is corruption and is
-// returned as an error. The caller must hold p.mu.
-func (p *Pager) readEncrypted(fr *Frame, pgno uint32, off int64) error {
-	buf := p.encScratchBuf()
+// into the shard's staging buffer, verifies the page checksum, and decrypts the envelope
+// into the frame's plaintext window, zeroing the reserved tail. An all-zero page (a freshly
+// grown hole never written) or a short read at the file tail yields a zero plaintext frame,
+// the same as the cleartext path. A checksum mismatch or a failed decrypt is corruption and
+// is returned as an error. The caller must hold sh.mu.
+func (p *Pager) readEncrypted(sh *shard, sc *crypto.Scheme, fr *Frame, pgno uint32, off int64) error {
+	buf := sh.scratchBuf(p.pageSize)
 	if _, err := p.file.ReadAt(buf, off); err != nil {
 		for i := range fr.data {
 			fr.data[i] = 0
@@ -177,7 +181,7 @@ func (p *Pager) readEncrypted(fr *Frame, pgno uint32, off int64) error {
 		return fmt.Errorf("pager: page %d: %w", pgno, err)
 	}
 	env := buf[:p.header.UsablePageSize()+crypto.Overhead]
-	pt, err := p.crypto.OpenPage(fr.data[:0], env, pgno)
+	pt, err := sc.OpenPage(fr.data[:0], env, pgno)
 	if err != nil {
 		return fmt.Errorf("pager: page %d: decrypt: %w", pgno, err)
 	}
@@ -190,13 +194,13 @@ func (p *Pager) readEncrypted(fr *Frame, pgno uint32, off int64) error {
 }
 
 // writeBackEncrypted flushes a dirty data page as ciphertext: it seals the frame's
-// plaintext window into the staging buffer, stamps the page checksum over the envelope,
-// and writes the whole page. The plaintext usable area, the AEAD tag and nonce, and the
-// checksum exactly fill the page, since the reserved trailer was widened to crypto.Overhead
-// plus the checksum size at Create (spec 14 §3). The caller must hold p.mu.
-func (p *Pager) writeBackEncrypted(fr *Frame) error {
-	buf := p.encScratchBuf()
-	env, err := p.crypto.SealPage(buf[:0], fr.data[:p.header.UsablePageSize()], fr.pgno)
+// plaintext window into the shard's staging buffer, stamps the page checksum over the
+// envelope, and writes the whole page. The plaintext usable area, the AEAD tag and nonce,
+// and the checksum exactly fill the page, since the reserved trailer was widened to
+// crypto.Overhead plus the checksum size at Create (spec 14 §3). The caller must hold sh.mu.
+func (p *Pager) writeBackEncrypted(sh *shard, sc *crypto.Scheme, fr *Frame) error {
+	buf := sh.scratchBuf(p.pageSize)
+	env, err := sc.SealPage(buf[:0], fr.data[:p.header.UsablePageSize()], fr.pgno)
 	if err != nil {
 		return err
 	}
@@ -237,12 +241,12 @@ func allZero(b []byte) bool {
 
 // Allocate returns a fresh page, pinned with Write intent and zeroed. It reuses a
 // page from the freelist if one is available, otherwise it grows the file by one
-// page (high-water mark).
+// page (high-water mark). The number is reserved under metaMu and the frame is bound
+// under the owning shard, two separate locks taken in sequence; the reserved number
+// is already off the freelist so nothing else can claim it in between.
 func (p *Pager) Allocate() (uint32, *Frame, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	pgno := p.allocateNumberLocked()
-	fr, err := p.getAllocatedLocked(pgno)
+	pgno := p.AllocateNumber()
+	fr, err := p.GetAllocated(pgno)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -258,13 +262,13 @@ func (p *Pager) Allocate() (uint32, *Frame, error) {
 // what keeps a segment flush from pinning the entire segment's worth of frames at once
 // and exhausting a pool smaller than the segment (perf/05 F2).
 func (p *Pager) AllocateNumber() uint32 {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.metaMu.Lock()
+	defer p.metaMu.Unlock()
 	return p.allocateNumberLocked()
 }
 
 // allocateNumberLocked pops the freelist or bumps the high-water mark and returns the
-// reserved page number. The caller must hold p.mu.
+// reserved page number. The caller must hold metaMu.
 func (p *Pager) allocateNumberLocked() uint32 {
 	if n := len(p.free); n > 0 {
 		pgno := p.free[n-1]
@@ -282,15 +286,10 @@ func (p *Pager) allocateNumberLocked() uint32 {
 // exactly once, as with Allocate; this is simply Allocate's second half, split out so a
 // bulk writer can materialize reserved pages one at a time.
 func (p *Pager) GetAllocated(pgno uint32) (*Frame, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.getAllocatedLocked(pgno)
-}
-
-// getAllocatedLocked binds a zeroed, pinned, dirty frame to an already-reserved page
-// number without reading the page from disk. The caller must hold p.mu.
-func (p *Pager) getAllocatedLocked(pgno uint32) (*Frame, error) {
-	fr, err := p.admit(pgno)
+	sh := p.shardFor(pgno)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	fr, err := p.admit(sh, pgno)
 	if err != nil {
 		return nil, err
 	}
@@ -303,17 +302,38 @@ func (p *Pager) getAllocatedLocked(pgno uint32) (*Frame, error) {
 	return fr, nil
 }
 
-// Free returns a page to the freelist. The page must not be pinned.
+// Free returns a page to the freelist. The page must not be pinned. It drops any cached
+// frame under the owning shard, then appends to the freelist under metaMu (shard before
+// meta, the global lock order).
 func (p *Pager) Free(pgno uint32) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if fr, ok := p.index[pgno]; ok {
-		delete(p.index, pgno)
+	sh := p.shardFor(pgno)
+	sh.mu.Lock()
+	if fr, ok := sh.index[pgno]; ok {
+		delete(sh.index, pgno)
 		fr.pgno = 0
 		fr.dirty = false
 		fr.ref = false
 	}
+	sh.mu.Unlock()
+	p.metaMu.Lock()
 	p.free = append(p.free, pgno)
+	p.metaMu.Unlock()
+}
+
+// lockAllShards takes every shard lock in ascending index order and returns a function
+// that releases them in reverse. Heavy, infrequent operations (checkpoint, truncate,
+// close) use it to make the whole pool exclusive; the hot paths take a single shard lock
+// and so simply wait their turn rather than deadlock, because the order is always
+// shards-ascending then metaMu.
+func (p *Pager) lockAllShards() func() {
+	for _, sh := range p.shards {
+		sh.mu.Lock()
+	}
+	return func() {
+		for i := len(p.shards) - 1; i >= 0; i-- {
+			p.shards[i].mu.Unlock()
+		}
+	}
 }
 
 // Checkpoint writes every dirty frame to the main file, persists the freelist and
@@ -321,14 +341,18 @@ func (p *Pager) Free(pgno uint32) {
 // all committed work and contains no torn pages. checkpointLSN is recorded in the
 // header so recovery knows which WAL frames precede this checkpoint.
 func (p *Pager) Checkpoint(checkpointLSN uint64) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	unlock := p.lockAllShards()
+	defer unlock()
+	p.metaMu.Lock()
+	defer p.metaMu.Unlock()
 
-	// Flush dirty data frames.
-	for _, fr := range p.pool {
-		if fr.pgno != 0 && fr.dirty {
-			if err := p.writeBack(fr); err != nil {
-				return err
+	// Flush dirty data frames across every shard.
+	for _, sh := range p.shards {
+		for _, fr := range sh.frames {
+			if fr.pgno != 0 && fr.dirty {
+				if err := p.writeBack(sh, fr); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -350,19 +374,21 @@ func (p *Pager) Checkpoint(checkpointLSN uint64) error {
 // flushHeaderLocked encodes the live header onto page 1 and writes it to the file,
 // preserving any non-header bytes already on the page and keeping the resident
 // frame, if any, in sync. It does not fsync; the caller decides when to make the
-// write durable. The caller must hold p.mu.
+// write durable. The caller must hold the shard that owns page 1 (and, for the
+// checkpoint/truncate paths that also touch the freelist and header, metaMu).
 func (p *Pager) flushHeaderLocked() error {
+	sh := p.shardFor(1)
 	page1 := make([]byte, p.pageSize)
 	// Preserve any non-header bytes already on page 1 by reading the resident
 	// frame if present, else the file.
-	if fr, ok := p.index[1]; ok {
+	if fr, ok := sh.index[1]; ok {
 		copy(page1, fr.data)
 	} else {
 		_, _ = p.file.ReadAt(page1, 0)
 	}
 	p.header.Encode(page1)
 	format.StampPageChecksum(page1, p.header.Checksum)
-	if fr, ok := p.index[1]; ok {
+	if fr, ok := sh.index[1]; ok {
 		copy(fr.data, page1)
 		fr.dirty = false
 	}
@@ -379,18 +405,21 @@ func (p *Pager) flushHeaderLocked() error {
 // earlier epoch's key from the same master. The new descriptor is written and fsynced before
 // the scheme pointer is swapped, so a crash mid-rekey leaves either the old descriptor with
 // old-epoch pages or the new descriptor with the same old-epoch pages, both of which open.
-// The caller holds no pager lock; Rekey takes p.mu itself.
+// The caller holds no pager lock; Rekey takes the page-1 shard then metaMu itself.
 func (p *Pager) Rekey(newScheme *crypto.Scheme, newDescriptor []byte) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.crypto == nil {
+	sh := p.shardFor(1)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	p.metaMu.Lock()
+	defer p.metaMu.Unlock()
+	if p.cryptoScheme() == nil {
 		return ErrNotEncrypted
 	}
 	if format.HeaderSize+len(newDescriptor) > p.pageSize-p.header.Checksum.ChecksumSize() {
 		return fmt.Errorf("pager: rotated encryption descriptor does not fit on page 1")
 	}
 	page1 := make([]byte, p.pageSize)
-	if fr, ok := p.index[1]; ok {
+	if fr, ok := sh.index[1]; ok {
 		copy(page1, fr.data)
 	} else {
 		_, _ = p.file.ReadAt(page1, 0)
@@ -398,7 +427,7 @@ func (p *Pager) Rekey(newScheme *crypto.Scheme, newDescriptor []byte) error {
 	p.header.Encode(page1)
 	copy(page1[format.HeaderSize:], newDescriptor)
 	format.StampPageChecksum(page1, p.header.Checksum)
-	if fr, ok := p.index[1]; ok {
+	if fr, ok := sh.index[1]; ok {
 		copy(fr.data, page1)
 		fr.dirty = false
 	}
@@ -408,7 +437,7 @@ func (p *Pager) Rekey(newScheme *crypto.Scheme, newDescriptor []byte) error {
 	if err := p.file.Sync(vfs.SyncFull); err != nil {
 		return err
 	}
-	p.crypto = newScheme
+	p.crypto.Store(newScheme)
 	return nil
 }
 
@@ -426,8 +455,10 @@ func (p *Pager) Rekey(newScheme *crypto.Scheme, newDescriptor []byte) error {
 // caller is expected to have folded the WAL with a checkpoint first so the freelist
 // reflects all committed frees.
 func (p *Pager) TruncateTail(budget int) (int, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	unlock := p.lockAllShards()
+	defer unlock()
+	p.metaMu.Lock()
+	defer p.metaMu.Unlock()
 
 	// Index the freelist for O(1) tail membership tests.
 	freeset := make(map[uint32]struct{}, len(p.free))
@@ -444,8 +475,9 @@ func (p *Pager) TruncateTail(budget int) (int, error) {
 		}
 		delete(freeset, p.dbSize)
 		// Drop any cached frame for the page being reclaimed.
-		if fr, ok := p.index[p.dbSize]; ok {
-			delete(p.index, p.dbSize)
+		sh := p.shardFor(p.dbSize)
+		if fr, ok := sh.index[p.dbSize]; ok {
+			delete(sh.index, p.dbSize)
 			fr.pgno = 0
 			fr.dirty = false
 			fr.ref = false
@@ -492,20 +524,22 @@ func (p *Pager) TruncateTail(budget int) (int, error) {
 // Close flushes nothing implicitly; it just releases the file. Callers checkpoint
 // first for a clean shutdown.
 func (p *Pager) Close() error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	unlock := p.lockAllShards()
+	defer unlock()
+	p.metaMu.Lock()
+	defer p.metaMu.Unlock()
 	return p.file.Close()
 }
 
 // CheckpointLSN reports the WAL LSN recorded by the last checkpoint.
 func (p *Pager) CheckpointLSN() uint64 {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.metaMu.Lock()
+	defer p.metaMu.Unlock()
 	return p.header.CheckpointLSN
 }
 
 // loadFreelist reads the freelist trunk chain into memory. The caller need not
-// hold p.mu (called during Open before the pager is shared).
+// hold any lock (called during Open before the pager is shared).
 func (p *Pager) loadFreelist() error {
 	trunk := p.header.FreelistTrunk
 	usable := p.header.UsablePageSize()
@@ -528,7 +562,7 @@ func (p *Pager) loadFreelist() error {
 }
 
 // persistFreelistLocked writes the in-memory freelist back as a trunk chain. The
-// caller must hold p.mu. For simplicity this milestone packs the whole freelist
+// caller must hold metaMu. For simplicity this milestone packs the whole freelist
 // into a single trunk chain rebuilt from scratch each checkpoint.
 func (p *Pager) persistFreelistLocked() error {
 	usable := p.header.UsablePageSize()
