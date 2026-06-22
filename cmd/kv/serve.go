@@ -30,17 +30,32 @@ func cmdServe(args []string) int {
 	maxValueSize := fs.Int("max-value-size", defaults.MaxValueSize, "largest value in bytes (0 disables)")
 	maxBatchOps := fs.Int("max-batch-ops", defaults.MaxBatchOps, "most ops in a batch or transaction (0 disables)")
 	maxScanLimit := fs.Int("max-scan-limit", defaults.MaxScanLimit, "most pairs one scan returns (0 disables)")
+	// Authentication is opt-in (spec 17 §6): -auth-file names a token table, and an empty value
+	// leaves the server open for a database on a trusted socket. The file maps each token to an
+	// identity and its per-prefix grants; see server.ParseTokenAuth for the format.
+	authFile := fs.String("auth-file", "", "path to a token table to require authentication (empty serves open)")
 	if err := parseArgs(fs, args); err != nil {
 		return exitUsage
 	}
 	if fs.NArg() != 1 {
-		return usageErr("usage: kv serve <db> [-addr host:port] [-binary-addr host:port] [limit flags]")
+		return usageErr("usage: kv serve <db> [-addr host:port] [-binary-addr host:port] [-auth-file path] [limit flags]")
 	}
 	limits := server.Limits{
 		MaxKeySize:   *maxKeySize,
 		MaxValueSize: *maxValueSize,
 		MaxBatchOps:  *maxBatchOps,
 		MaxScanLimit: *maxScanLimit,
+	}
+
+	// Load the token table before opening the database so a malformed auth file fails before the
+	// file is touched. A nil authenticator leaves the server open.
+	var auth server.Authenticator
+	if *authFile != "" {
+		a, err := loadAuthFile(*authFile)
+		if err != nil {
+			return fail(err)
+		}
+		auth = a
 	}
 
 	d, code := openDB(fs.Arg(0))
@@ -56,7 +71,7 @@ func cmdServe(args []string) int {
 	if err != nil {
 		return fail(err)
 	}
-	srv := server.New(d, server.Options{Addr: ln.Addr().String(), Limits: &limits})
+	srv := server.New(d, server.Options{Addr: ln.Addr().String(), Limits: &limits, Auth: auth})
 
 	errc := make(chan error, 1)
 	go func() { errc <- srv.Serve(ln) }()
@@ -91,4 +106,16 @@ func cmdServe(args []string) int {
 		}
 		return exitOK
 	}
+}
+
+// loadAuthFile opens a token table file and parses it into an authenticator. It closes the file
+// before returning, so a parse failure does not leak a handle. The parse error already names the
+// offending line, so the caller's fail wraps a message an operator can act on.
+func loadAuthFile(path string) (server.Authenticator, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return server.ParseTokenAuth(f)
 }

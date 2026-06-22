@@ -34,6 +34,10 @@ func (srv *Server) httpHandler() http.Handler {
 			writeErr(w, http.StatusBadRequest, err)
 			return
 		}
+		if err := srv.authorize(r, func(id *Identity) bool { return id.canRead(key) }); err != nil {
+			writeServiceErr(w, err)
+			return
+		}
 		v, found, err := s.Get(key)
 		if err != nil {
 			writeServiceErr(w, err)
@@ -51,6 +55,10 @@ func (srv *Server) httpHandler() http.Handler {
 		key, err := decodeKey(r)
 		if err != nil {
 			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
+		if err := srv.authorize(r, func(id *Identity) bool { return id.canWrite(key) }); err != nil {
+			writeServiceErr(w, err)
 			return
 		}
 		value, err := io.ReadAll(r.Body)
@@ -77,6 +85,10 @@ func (srv *Server) httpHandler() http.Handler {
 			writeErr(w, http.StatusBadRequest, err)
 			return
 		}
+		if err := srv.authorize(r, func(id *Identity) bool { return id.canWrite(key) }); err != nil {
+			writeServiceErr(w, err)
+			return
+		}
 		version, err := s.Delete(key)
 		if err != nil {
 			writeServiceErr(w, err)
@@ -99,6 +111,10 @@ func (srv *Server) httpHandler() http.Handler {
 			writeErr(w, http.StatusBadRequest, err)
 			return
 		}
+		if err := srv.authorize(r, func(id *Identity) bool { return id.canWriteRange(lo, hi) }); err != nil {
+			writeServiceErr(w, err)
+			return
+		}
 		version, err := s.DeleteRange(lo, hi)
 		if err != nil {
 			writeServiceErr(w, err)
@@ -116,6 +132,10 @@ func (srv *Server) httpHandler() http.Handler {
 		decoded, err := req.decode()
 		if err != nil {
 			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
+		if err := srv.authorizeOps(r, decoded.Asserts, decoded.Ops); err != nil {
+			writeServiceErr(w, err)
 			return
 		}
 		res, err := s.Txn(decoded)
@@ -137,6 +157,10 @@ func (srv *Server) httpHandler() http.Handler {
 			writeErr(w, http.StatusBadRequest, err)
 			return
 		}
+		if err := srv.authorizeOps(r, nil, ops); err != nil {
+			writeServiceErr(w, err)
+			return
+		}
 		version, err := s.Batch(ops)
 		if err != nil {
 			writeServiceErr(w, err)
@@ -149,13 +173,25 @@ func (srv *Server) httpHandler() http.Handler {
 	mux.HandleFunc("GET /v1/watch", srv.handleWatch)
 
 	mux.HandleFunc("GET /v1/stats", func(w http.ResponseWriter, r *http.Request) {
+		if err := srv.authorize(r, isAdmin); err != nil {
+			writeServiceErr(w, err)
+			return
+		}
 		writeJSON(w, http.StatusOK, s.Stats())
 	})
 	mux.HandleFunc("GET /v1/info", func(w http.ResponseWriter, r *http.Request) {
+		if err := srv.authorize(r, isAdmin); err != nil {
+			writeServiceErr(w, err)
+			return
+		}
 		writeJSON(w, http.StatusOK, s.Stats())
 	})
 
 	mux.HandleFunc("POST /v1/checkpoint", func(w http.ResponseWriter, r *http.Request) {
+		if err := srv.authorize(r, isAdmin); err != nil {
+			writeServiceErr(w, err)
+			return
+		}
 		if err := s.Checkpoint(); err != nil {
 			writeServiceErr(w, err)
 			return
@@ -163,6 +199,10 @@ func (srv *Server) httpHandler() http.Handler {
 		writeJSON(w, http.StatusOK, okResponse{OK: true})
 	})
 	mux.HandleFunc("POST /v1/compact", func(w http.ResponseWriter, r *http.Request) {
+		if err := srv.authorize(r, isAdmin); err != nil {
+			writeServiceErr(w, err)
+			return
+		}
 		budget := 0
 		if b := r.URL.Query().Get("budget"); b != "" {
 			n, err := strconv.Atoi(b)
@@ -193,7 +233,10 @@ func (srv *Server) httpHandler() http.Handler {
 		}
 	})
 
-	return mux
+	// Authentication wraps the whole router: with an authenticator configured every non-exempt
+	// request must carry a valid credential before it reaches a handler, and with none the wrap is
+	// a pass-through. Authorization happens inside each handler, where the keys are known.
+	return srv.authMiddleware(mux)
 }
 
 // decodeKey reads the {key} path segment and decodes it under the request's ?encoding
@@ -363,6 +406,11 @@ func writeErr(w http.ResponseWriter, status int, err error) {
 // codes so the same typed error gives the same signal on every surface.
 func writeServiceErr(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, ErrUnauthenticated):
+		w.Header().Set("WWW-Authenticate", "Bearer")
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+	case errors.Is(err, ErrForbidden):
+		http.Error(w, err.Error(), http.StatusForbidden)
 	case errors.Is(err, kv.ErrNotFound):
 		http.Error(w, err.Error(), http.StatusNotFound)
 	case errors.Is(err, kv.ErrConflict), errors.Is(err, ErrAssertFailed):
