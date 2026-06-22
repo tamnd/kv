@@ -143,24 +143,34 @@ func (d *DB) View(fn func(txn *Txn) error) error {
 // discarding on an error. On a write-write conflict it retries fn against a fresh
 // snapshot, up to the configured bound (spec 15 §2.1), so fn must be re-runnable.
 func (d *DB) Update(fn func(txn *Txn) error) error {
+	_, err := d.UpdateVersion(fn)
+	return err
+}
+
+// UpdateVersion is Update that also returns the commit version the transaction was
+// assigned (spec 17 §3.1): the server reports it so a networked caller can resume a watch
+// or read its own write. It is zero for a read-only or empty transaction, which committed
+// nothing; the caller falls back to the latest committed version in that case. The retry
+// and conflict semantics are exactly Update's.
+func (d *DB) UpdateVersion(fn func(txn *Txn) error) (uint64, error) {
 	var lastErr error
 	for attempt := 0; attempt <= d.maxRetries; attempt++ {
 		txn := d.Begin(true)
 		err := fn(txn)
 		if err != nil {
 			txn.Discard()
-			return err
+			return 0, err
 		}
 		if err := txn.Commit(); err != nil {
 			if errors.Is(err, ErrConflict) {
 				lastErr = err
 				continue // re-run the closure against a newer snapshot
 			}
-			return err
+			return 0, err
 		}
-		return nil
+		return txn.commitTs, nil
 	}
-	return lastErr
+	return 0, lastErr
 }
 
 // Begin starts an explicit transaction at a fresh snapshot. The caller must call

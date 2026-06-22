@@ -292,6 +292,15 @@ func (kdb *DB) Update(fn func(txn *Txn) error) error {
 	return wrap(kdb.d.Update(func(t *db.Txn) error { return fn(&Txn{t: t}) }))
 }
 
+// UpdateVersion is Update that also returns the commit version the transaction was assigned
+// (spec 17 §3.1). It is zero for a transaction that committed no writes; a caller wanting a
+// monotonic marker in that case reads Stats().Version. The server uses it to return a
+// write's version so a client can resume a watch from just after its own write.
+func (kdb *DB) UpdateVersion(fn func(txn *Txn) error) (uint64, error) {
+	v, err := kdb.d.UpdateVersion(func(t *db.Txn) error { return fn(&Txn{t: t}) })
+	return v, wrap(err)
+}
+
 // Begin starts an explicit transaction at a fresh snapshot (spec 15 §2.2). The caller
 // must Discard it (deferred) to release the snapshot, and Commit a writable one to
 // apply its writes.
