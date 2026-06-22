@@ -45,7 +45,32 @@ var (
 // empty input yields an authenticator that authenticates nothing, which a caller can detect and
 // treat as "auth requested but no tokens", though it is usually a sign the file was wrong.
 func ParseTokenAuth(r io.Reader) (*StaticTokenAuthenticator, error) {
-	tokens := map[string]*Identity{}
+	table, err := parseIdentityTable(r)
+	if err != nil {
+		return nil, err
+	}
+	return NewStaticTokenAuthenticator(table), nil
+}
+
+// ParsePeerAuth reads the same table from r but interprets each line's first field as a
+// certificate subject Common Name rather than a token, returning a CommonNameAuthenticator for
+// mTLS (spec 17 §6). The grammar is identical, so an operator who already knows the token format
+// writes a peer table the same way: the CN a client certificate carries, then the identity name
+// and its grants. Sharing the grammar keeps one thing to learn and one parser to trust.
+func ParsePeerAuth(r io.Reader) (*CommonNameAuthenticator, error) {
+	table, err := parseIdentityTable(r)
+	if err != nil {
+		return nil, err
+	}
+	return NewCommonNameAuthenticator(table), nil
+}
+
+// parseIdentityTable reads the line-oriented identity table shared by the token and the peer
+// authenticators, returning a map from each line's first field (a token or a CN) to its identity.
+// It enforces uniqueness of the first field and names the offending line on any failure, so a
+// misconfigured file fails loudly at startup whichever authenticator consumes it.
+func parseIdentityTable(r io.Reader) (map[string]*Identity, error) {
+	table := map[string]*Identity{}
 	sc := bufio.NewScanner(r)
 	line := 0
 	for sc.Scan() {
@@ -54,19 +79,19 @@ func ParseTokenAuth(r io.Reader) (*StaticTokenAuthenticator, error) {
 		if text == "" || strings.HasPrefix(text, "#") {
 			continue
 		}
-		id, token, err := parseTokenLine(text)
+		id, key, err := parseTokenLine(text)
 		if err != nil {
 			return nil, lineError(line, err)
 		}
-		if _, dup := tokens[token]; dup {
+		if _, dup := table[key]; dup {
 			return nil, lineError(line, errDupToken)
 		}
-		tokens[token] = id
+		table[key] = id
 	}
 	if err := sc.Err(); err != nil {
 		return nil, err
 	}
-	return NewStaticTokenAuthenticator(tokens), nil
+	return table, nil
 }
 
 // parseTokenLine parses one non-comment line into its token and identity.
