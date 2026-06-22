@@ -102,8 +102,9 @@ func (d *DB) processGroup(group []*commitReq) {
 			r.succeed(v)
 			continue
 		}
-		encoded := b.Encode()
-		if err := d.wal.LogBatch(v, encoded); err != nil {
+		// Serialize the batch straight into the WAL frame buffer rather than into a
+		// throwaway buffer that LogBatch would copy in again (perf/02 Finding 4).
+		if err := d.wal.LogBatchAppend(v, b.AppendEncoded); err != nil {
 			d.fenceGroup(append(appended, group[i:]...), err)
 			return
 		}
