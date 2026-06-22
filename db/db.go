@@ -210,8 +210,10 @@ func (o Options) clock() func() uint64 {
 }
 
 func (o Options) sync() wal.Sync {
-	// SyncFull is the iota-zero value of wal.Sync's predecessor SyncOff, so the zero
-	// Options must map to SyncFull explicitly rather than relying on the zero value.
+	// The zero value of wal.Sync is the reserved "unset" sentinel, not a real level, so
+	// an unconfigured Options maps to SyncFull, the safe default. Any explicit choice,
+	// including SyncOff, is non-zero and passes through untouched, which is what lets a
+	// caller actually turn fsync off (perf/06 F1).
 	if o.Sync == 0 {
 		return wal.SyncFull
 	}
