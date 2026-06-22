@@ -42,9 +42,10 @@ type Iterator struct {
 // forwardScanner is the optional capability an engine reader exposes when it can
 // serve a forward streaming scan without materializing the range. The db Iterator
 // type-asserts it and, when present and streamable, drives it one entry at a time
-// under the engine read lock instead of copying the whole range up front. Readers
-// that cannot stream (the LSM core today, or a buffered B-tree) do not satisfy it
-// or return StreamForward false, and the Iterator materializes.
+// under the engine read lock instead of copying the whole range up front. Both the
+// unbuffered B-tree and the LSM core satisfy it; a buffered B-tree (whose interior
+// messages a single-leaf gather would miss) returns StreamForward false, and the
+// Iterator materializes that case and every reverse or write-transaction scan.
 type forwardScanner interface {
 	StreamForward() bool
 	ScanForward(after, lower, upper []byte, keysOnly bool) (key, val []byte, ok bool, err error)

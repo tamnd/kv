@@ -679,6 +679,123 @@ func (r *reader) NewIter(opts engine.IterOptions) (engine.Cursor, error) {
 
 func (r *reader) Close() error { return nil }
 
+// StreamForward reports that the LSM reader can serve the db layer's forward
+// streaming scan (spec 04). The sources (memtable plus segments) keep every visible
+// version in the merge order, so gathering one user-key group at a time off a fresh
+// merge heap yields the same view foldRange would, without materializing the range.
+func (r *reader) StreamForward() bool { return true }
+
+// ScanForward returns the next visible user key strictly greater than after (or the
+// first key >= lower when after is nil) within [lower, upper) at the reader's snapshot,
+// or ok=false at end of range. It mirrors the B-tree reader's primitive: it holds no
+// merge state across calls. Each call builds a fresh merge heap seeked to the start
+// group and pulls forward only until the first visible group resolves, so the db layer
+// can drop and retake l.mu between steps the way it does for a point Get. A flush or
+// compaction between two calls is invisible: the next call re-seeks the new sources,
+// and the fixed snapshot version keeps the sequence consistent.
+//
+// Re-seeking per call costs an O(log) heap build and source seek each step instead of
+// O(1) off a held heap, but a bounded scan takes ScanLen steps, so the work is
+// O(ScanLen log sources) rather than the O(keyspace) the materialized foldRange paid.
+func (r *reader) ScanForward(after, lower, upper []byte, keysOnly bool) (uk, val []byte, ok bool, err error) {
+	l := r.l
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	rangeDels := l.liveRangeDels()
+	sources := l.rangeSourcesLocked()
+
+	// Seek the merge to the start of the group at after (which is then skipped, after is
+	// exclusive) or at lower. MaxVersion gives the smallest internal key in the group, so
+	// the seek lands at the group's first cell and skips none of it.
+	var seekKey []byte
+	switch {
+	case after != nil:
+		seekKey = after
+	case lower != nil:
+		seekKey = lower
+	}
+	var target []byte
+	if seekKey != nil {
+		target = format.EncodeInternalKey(seekKey, format.MaxVersion, format.KindDelete)
+	}
+	mi, err := newMergeIter(sources, target)
+	if err != nil {
+		return nil, nil, false, err
+	}
+
+	var ops []format.Op
+	var groupKey []byte
+	resolve := func() ([]byte, []byte, bool) {
+		rd := format.NewestCoveringRangeDel(rangeDels, groupKey, r.snap.Version)
+		v, vok := format.Fold(ops, r.snap.Version, rd, l.merge)
+		if !vok {
+			return nil, nil, false
+		}
+		out := append([]byte(nil), v...)
+		if keysOnly {
+			out = nil
+		}
+		return append([]byte(nil), groupKey...), out, true
+	}
+	for mi.valid() {
+		ik := mi.key()
+		guk := format.UserKey(ik)
+		if upper != nil && bytes.Compare(guk, upper) >= 0 {
+			break
+		}
+		// Skip the leading cells the seek over-reaches: after's own group (exclusive) and
+		// anything below lower. Once past them, accumulate one group at a time.
+		if after != nil && bytes.Compare(guk, after) <= 0 {
+			if err := mi.next(); err != nil {
+				return nil, nil, false, err
+			}
+			continue
+		}
+		if lower != nil && bytes.Compare(guk, lower) < 0 {
+			if err := mi.next(); err != nil {
+				return nil, nil, false, err
+			}
+			continue
+		}
+		if groupKey != nil && !bytes.Equal(guk, groupKey) {
+			// A group boundary: the accumulated group is complete. Return it if visible,
+			// otherwise drop it (a folded-absent tombstone) and accumulate the next.
+			if ruk, rval, rok := resolve(); rok {
+				return ruk, rval, true, nil
+			}
+			ops = ops[:0]
+			groupKey = nil
+		}
+		if groupKey == nil {
+			groupKey = append([]byte(nil), guk...)
+		}
+		// materializeOp owns the value bytes it returns (it copies the borrowed source value
+		// and dereferences a separated value fresh from the vLog), so nothing kept here
+		// aliases mi.value(), which dies on the next advance.
+		op, opok, err := l.materializeOp(ik, mi.value(), r.snap.Now, keysOnly)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		if opok {
+			ops = append(ops, op)
+		}
+		if err := mi.next(); err != nil {
+			return nil, nil, false, err
+		}
+	}
+	if mi.err != nil {
+		return nil, nil, false, mi.err
+	}
+	// The last group has no successor cell to trigger the boundary flush above.
+	if groupKey != nil {
+		if ruk, rval, rok := resolve(); rok {
+			return ruk, rval, true, nil
+		}
+	}
+	return nil, nil, false, nil
+}
+
 // cursor walks a pre-resolved snapshot view; bounds and prefix are already applied,
 // and reverse flips the direction of First/Last/Next/Prev.
 type cursor struct {
