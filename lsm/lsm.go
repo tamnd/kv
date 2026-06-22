@@ -59,12 +59,13 @@ type LSM struct {
 
 	mu  sync.RWMutex
 	mem *memtable
-	// levels is the on-disk tree: levels[0] is L0, the overlapping run of flushed
-	// memtables, and levels[i>=1] hold key-range-disjoint segments sorted by minKey,
-	// the classic leveled invariant. A read folds every segment regardless of level;
-	// the level structure exists so compaction can bound read fan-in and reclaim the
-	// space shadowed versions waste.
-	levels      [][]*segment
+	// cur is the current immutable segment-tree snapshot and live the set of every version
+	// still referenced (the current one plus any a slow reader holds). A read loads cur under
+	// a brief l.mu, references it, and then probes its segments with no lock held; a flush or
+	// compaction publishes a new cur by copy-on-write and frees a retired version's segments
+	// only once the last reader of it lets go (perf/03 R3). See version.go.
+	cur         *version
+	live        []*version
 	memtableCap int
 
 	// Compaction policy knobs (spec 06 §6). l0Trigger is the L0 segment count that
@@ -161,7 +162,7 @@ type LSM struct {
 // New returns an LSM core bound to a pager. The pager is the durable substrate
 // flushes write segments to and that this core reads them back from.
 func New(pgr *pager.Pager) *LSM {
-	return &LSM{
+	l := &LSM{
 		pgr:            pgr,
 		mem:            newMemtable(defaultArenaCap),
 		memtableCap:    defaultMemtableCap,
@@ -174,6 +175,13 @@ func New(pgr *pager.Pager) *LSM {
 		vlog:           newVLog(pgr),
 		autoCompact:    true,
 	}
+	// The engine starts on an empty current version, so a read before recovery loads a tree
+	// it can fold (no segments) and recovery publishes the loaded tree over it.
+	v0 := &version{}
+	v0.refs.Store(1)
+	l.cur = v0
+	l.live = []*version{v0}
+	return l
 }
 
 // Kind implements engine.Engine.
@@ -357,7 +365,7 @@ func (l *LSM) installSegmentLocked(seg *segment, sealedLSN uint64) error {
 		if err := l.appendEditLocked(manifestAdd, 0, seg.footer); err != nil {
 			return err
 		}
-		l.addSegmentLocked(0, seg)
+		l.publishVersionLocked(addSegment(l.cloneLevelsLocked(), 0, seg))
 	}
 	if sealedLSN > l.durableLSN {
 		l.durableLSN = sealedLSN
@@ -511,13 +519,14 @@ func (l *LSM) Stats() engine.EngineStats {
 	// level, youngest first, each carrying its segment count and on-disk bytes. The same
 	// walk that sums physical bytes fills it, so the metric costs no extra pass.
 	var levels []engine.LevelStats
-	for i := range l.levels {
+	cur := l.levelsLocked()
+	for i := range cur {
 		var bytes int64
-		for _, seg := range l.levels[i] {
+		for _, seg := range cur[i] {
 			bytes += int64(seg.pages) * pageSize
 		}
 		physical += bytes
-		levels = append(levels, engine.LevelStats{Segments: len(l.levels[i]), Bytes: bytes})
+		levels = append(levels, engine.LevelStats{Segments: len(cur[i]), Bytes: bytes})
 	}
 	// The most-pending compaction's urgency, read without acting on it: a climbing
 	// score is compaction losing to writes (spec 19 §1.5).
@@ -596,7 +605,7 @@ func (l *LSM) foldRange(snap engine.Snapshot, lower, upper []byte, keysOnly bool
 
 	// The deletes that may cover a key in the range live in the memtable's live set and
 	// each segment's persisted list, the same union the point path folds against.
-	rangeDels := l.liveRangeDels()
+	rangeDels := l.liveRangeDels(l.allSegmentsLocked())
 
 	sources := l.rangeSourcesLocked()
 	var target []byte
@@ -674,16 +683,10 @@ type reader struct {
 // snapshot until the streaming heap-merge lands.
 func (r *reader) Get(userKey []byte) ([]byte, error) {
 	l := r.l
-	l.mu.RLock()
-	defer l.mu.RUnlock()
-
-	// The deletes that may cover the key live in the memtable's live set and in each
-	// segment's persisted range-delete list, all already in memory, so the covering
-	// marker is known before any segment page is touched.
-	rd := format.NewestCoveringRangeDel(l.liveRangeDels(), userKey, r.snap.Version)
 
 	var ops []format.Op
 	var matErr error
+	var rd uint64
 	collect := func(ik, val []byte) bool {
 		// A point Get always wants the value, so keysOnly is false: a separated value is
 		// dereferenced through the vLog here.
@@ -720,22 +723,37 @@ func (r *reader) Get(userKey []byte) ([]byte, error) {
 		return false
 	}
 
+	// The active and sealed memtables are not lock-free against a concurrent Apply, so they,
+	// the current version's reference, the covering range-delete mark, and the merge resolver
+	// are all captured under one brief l.mu.RLock, a single consistent snapshot. The lock is
+	// then released and the on-disk segments, the slow part, are probed with no lock held: a
+	// flush or compaction may swap the current version meanwhile, but the referenced version
+	// keeps its segments' pages off the freelist until the deferred release below, so the
+	// probe reads only stable, still-allocated pages (version.go, perf/03 R3).
+	l.mu.RLock()
+	v := l.acquireVersionLocked()
+	rd = format.NewestCoveringRangeDel(l.liveRangeDels(flattenSegments(v.levels)), userKey, r.snap.Version)
+	mergeFn := l.merge
 	l.mem.getGroup(userKey, collect)
+	// Fold the sealed memtables awaiting flush between the active memtable and the on-disk
+	// levels: each is older than the active one but newer than any segment, and a sealed
+	// memtable becomes a segment only in the one critical section that also pops it, so a key
+	// is folded from exactly one of the two and a merge never applies its operand twice.
+	// Newest-first means the most recently sealed (the tail of the queue) folds first.
+	for i := len(l.imm) - 1; matErr == nil && i >= 0; i-- {
+		l.imm[i].mem.getGroup(userKey, collect)
+	}
+	// resolved() also sorts ops newest-first, the order the final Fold expects, so it is
+	// evaluated before the lock drops whenever the memtables alone might already fix the key.
+	done := matErr == nil && resolved()
+	l.mu.RUnlock()
+	defer l.releaseVersion(v)
+
 	if matErr != nil {
 		return nil, matErr
 	}
-	// Fold the sealed memtables awaiting flush between the active memtable and the on-disk
-	// levels: each is older than the active one but newer than any segment, and a sealed
-	// memtable becomes a segment only in the one critical section that also pops it, so a
-	// key is folded from exactly one of the two and a merge never applies its operand twice.
-	// Newest-first means the most recently sealed (the tail of the queue) folds first.
-	for i := len(l.imm) - 1; i >= 0; i-- {
-		l.imm[i].mem.getGroup(userKey, collect)
-		if matErr != nil {
-			return nil, matErr
-		}
-	}
-	if !resolved() {
+
+	if !done {
 		// Probe the on-disk levels shallowest first and stop at the first level that
 		// supplies a base: a key's newest version always sits in the shallowest level
 		// that holds it (a new write enters at the memtable and only ever migrates down),
@@ -743,10 +761,12 @@ func (r *reader) Get(userKey []byte) ([]byte, error) {
 		// level is gathered before the check because a level may hold overlapping runs
 		// (L0, and a tiered bottom kept in minKey order) whose relative age is not encoded
 		// by their position, so a partial read of such a level could miss the newest
-		// version; a level boundary is the coarsest unit at which newest-first holds.
-		for lvl := 0; lvl < len(l.levels); lvl++ {
+		// version; a level boundary is the coarsest unit at which newest-first holds. This
+		// runs with l.mu released, reading only the referenced version's immutable segments
+		// and the value log their separated pointers name.
+		for lvl := 0; lvl < len(v.levels); lvl++ {
 			touched := false
-			for _, seg := range l.levels[lvl] {
+			for _, seg := range v.levels[lvl] {
 				// The membership filter answers a miss definitively, so a segment it
 				// rejects holds no version of the key and its block index need never be
 				// touched. A segment without a filter has a nil one, so the read proceeds.
@@ -769,7 +789,7 @@ func (r *reader) Get(userKey []byte) ([]byte, error) {
 
 	// ops is sorted newest-first by the final resolved() call, the order Fold expects;
 	// the covering range delete folds in as a synthetic delete at rd.
-	val, ok := format.Fold(ops, r.snap.Version, rd, l.merge)
+	val, ok := format.Fold(ops, r.snap.Version, rd, mergeFn)
 	if !ok {
 		return nil, engine.ErrNotFound
 	}
@@ -777,15 +797,20 @@ func (r *reader) Get(userKey []byte) ([]byte, error) {
 }
 
 // liveRangeDels gathers every range-delete interval the engine holds, from the
-// memtable's live set and each segment's persisted list, the set the fold filters to
-// the markers that cover a key. The caller holds l.mu.
-func (l *LSM) liveRangeDels() []format.RangeDel {
+// memtable's live set, every sealed memtable, and the given segments' persisted lists, the
+// set the fold filters to the markers that cover a key. The segments come from the caller's
+// chosen version: a scan passes the current version's flat set under l.mu, while a point read
+// passes the version it referenced so the deletes it folds match the segments it will probe.
+// The caller holds l.mu when reading the memtables (the segment range-delete lists are loaded
+// once at open and never change, so they are safe to read from a referenced version with the
+// lock dropped).
+func (l *LSM) liveRangeDels(segs []*segment) []format.RangeDel {
 	dels := make([]format.RangeDel, 0, len(l.mem.rangeDels))
 	dels = append(dels, l.mem.rangeDels...)
 	for _, e := range l.imm {
 		dels = append(dels, e.mem.rangeDels...)
 	}
-	for _, seg := range l.allSegmentsLocked() {
+	for _, seg := range segs {
 		dels = append(dels, seg.rangeDels...)
 	}
 	return dels
@@ -832,7 +857,7 @@ func (r *reader) ScanForward(after, lower, upper []byte, keysOnly bool) (uk, val
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 
-	rangeDels := l.liveRangeDels()
+	rangeDels := l.liveRangeDels(l.allSegmentsLocked())
 	sources := l.rangeSourcesLocked()
 
 	// Seek the merge to the start of the group at after (which is then skipped, after is

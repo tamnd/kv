@@ -58,7 +58,7 @@ func forcePushDown(t *testing.T, l *LSM, src int, watermark uint64, wholeLevel b
 // fingerprint the reopen test compares.
 func levelShape(l *LSM) []int {
 	var s []int
-	for _, lvl := range l.levels {
+	for _, lvl := range l.levelsLocked() {
 		s = append(s, len(lvl))
 	}
 	for len(s) > 0 && s[len(s)-1] == 0 {
@@ -82,8 +82,8 @@ func sameShape(a, b []int) bool {
 // deepestLevel returns the index of the deepest level that holds a segment, or -1 when
 // the tree is empty. That level is the tiered bottom under lazy-leveling.
 func deepestLevel(l *LSM) int {
-	for i := len(l.levels) - 1; i >= 1; i-- {
-		if len(l.levels[i]) > 0 {
+	for i := len(l.levelsLocked()) - 1; i >= 1; i-- {
+		if len(l.levelsLocked()[i]) > 0 {
 			return i
 		}
 	}
@@ -97,11 +97,11 @@ func deepestLevel(l *LSM) int {
 func assertLeveledInvariant(t *testing.T, l *LSM) {
 	t.Helper()
 	bottom := deepestLevel(l)
-	for i := 1; i < len(l.levels); i++ {
+	for i := 1; i < len(l.levelsLocked()); i++ {
 		if i == bottom {
 			continue
 		}
-		segs := l.levels[i]
+		segs := l.levelsLocked()[i]
 		for j := 1; j < len(segs); j++ {
 			if format.CompareUser(segs[j-1].maxKey, segs[j].minKey) >= 0 {
 				t.Fatalf("level %d not disjoint: seg %d [%s..%s] overlaps seg %d [%s..%s]",
@@ -395,7 +395,7 @@ func TestLeveledFormsDeeperLevels(t *testing.T) {
 
 	drainCompaction(t, l, 0)
 	assertLeveledInvariant(t, l)
-	if len(l.levels) < 3 {
+	if len(l.levelsLocked()) < 3 {
 		t.Fatalf("expected a multi-level tree, got shape %v", levelShape(l))
 	}
 
@@ -458,10 +458,10 @@ func TestLeveledPartialPick(t *testing.T) {
 	})
 	l.flushActive(t)
 	forceCompact(t, l, 0)
-	if len(l.levels[1]) != 3 {
+	if len(l.levelsLocked()[1]) != 3 {
 		t.Fatalf("expected three disjoint L1 segments, got shape %v", levelShape(l))
 	}
-	low, mid, high := l.levels[1][0], l.levels[1][1], l.levels[1][2]
+	low, mid, high := l.levelsLocked()[1][0], l.levelsLocked()[1][1], l.levelsLocked()[1][2]
 
 	// A new write to the middle key only; the leveled merge must rewrite only the middle L1
 	// segment and leave the low and high segments as the exact same handles.
@@ -469,10 +469,10 @@ func TestLeveledPartialPick(t *testing.T) {
 	l.flushActive(t)
 	forceCompact(t, l, 0)
 
-	if len(l.levels[1]) != 3 || l.levels[1][0] != low || l.levels[1][2] != high {
+	if len(l.levelsLocked()[1]) != 3 || l.levelsLocked()[1][0] != low || l.levelsLocked()[1][2] != high {
 		t.Fatalf("partial compaction disturbed the disjoint neighbours, shape %v", levelShape(l))
 	}
-	if l.levels[1][1] == mid {
+	if l.levelsLocked()[1][1] == mid {
 		t.Fatalf("the overlapped middle segment was not replaced")
 	}
 	if v, ok := getAt(t, l, "mmm", 5); !ok || string(v) != "2" {
@@ -501,7 +501,7 @@ func TestLeveledBottomTombstoneDrop(t *testing.T) {
 	applyBatch(t, l, 2, func(b *engine.WriteBatch) { b.Delete([]byte("k")) })
 	l.flushActive(t)
 	compact(t, l, 10) // L0 -> L1 tiered add: run with the delete
-	if got := len(l.levels[1]); got != 2 {
+	if got := len(l.levelsLocked()[1]); got != 2 {
 		t.Fatalf("expected two tiered runs at the bottom, got %d (shape %v)", got, levelShape(l))
 	}
 
@@ -546,7 +546,7 @@ func TestLeveledReopenRestoresLevels(t *testing.T) {
 	}
 	drainCompaction(t, l, 0)
 	assertLeveledInvariant(t, l)
-	if len(l.levels) < 3 {
+	if len(l.levelsLocked()) < 3 {
 		t.Fatalf("expected a multi-level tree, got shape %v", levelShape(l))
 	}
 	shapeBefore := levelShape(l)

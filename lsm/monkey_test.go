@@ -59,11 +59,11 @@ func TestMonkeyDeepSegmentsGetFewerBits(t *testing.T) {
 	})
 	l.flushActive(t)
 	compact(t, l, 0)
-	if len(l.levels) < 2 || len(l.levels[1]) != 3 {
+	if len(l.levelsLocked()) < 2 || len(l.levelsLocked()[1]) != 3 {
 		t.Fatalf("expected three L1 segments, got shape %v", levelShape(l))
 	}
 	topK := bloomK(bloomBitsForLevel(1, l.levelRatio))
-	for _, s := range l.levels[1] {
+	for _, s := range l.levelsLocked()[1] {
 		if k, ok := bloomProbes(s.filter); !ok || k != topK {
 			t.Fatalf("L1 segment carries %v probes, want the top budget %d", s.filter, topK)
 		}
@@ -76,14 +76,14 @@ func TestMonkeyDeepSegmentsGetFewerBits(t *testing.T) {
 		t.Fatalf("compact L1: %v", err)
 	}
 	l.mu.Unlock()
-	if len(l.levels) < 3 || len(l.levels[2]) == 0 {
+	if len(l.levelsLocked()) < 3 || len(l.levelsLocked()[2]) == 0 {
 		t.Fatalf("expected an L2 segment, got shape %v", levelShape(l))
 	}
 	deepK := bloomK(bloomBitsForLevel(2, l.levelRatio))
 	if deepK >= topK {
 		t.Fatalf("test setup: the L2 budget (%d probes) does not undercut L1 (%d)", deepK, topK)
 	}
-	for _, s := range l.levels[2] {
+	for _, s := range l.levelsLocked()[2] {
 		if k, ok := bloomProbes(s.filter); !ok || k != deepK {
 			t.Fatalf("L2 segment carries %v probes, want the reduced budget %d", s.filter, deepK)
 		}
@@ -109,10 +109,10 @@ func TestMonkeyDeepSegmentsGetFewerBits(t *testing.T) {
 	}
 	pgr2 := reopenPager(t, fs, pgr)
 	l2 := openLSM(t, pgr2)
-	if len(l2.levels) < 3 || len(l2.levels[2]) == 0 {
+	if len(l2.levelsLocked()) < 3 || len(l2.levelsLocked()[2]) == 0 {
 		t.Fatalf("reopen lost L2, got shape %v", levelShape(l2))
 	}
-	for _, s := range l2.levels[2] {
+	for _, s := range l2.levelsLocked()[2] {
 		if k, ok := bloomProbes(s.filter); ok && k != deepK {
 			t.Fatalf("after reopen the L2 segment carries %d probes, want %d", k, deepK)
 		}

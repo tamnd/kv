@@ -74,10 +74,10 @@ func TestAutoCompactionBoundsL0(t *testing.T) {
 
 	l.mu.Lock()
 	l0 := 0
-	if len(l.levels) > 0 {
-		l0 = len(l.levels[0])
+	if len(l.levelsLocked()) > 0 {
+		l0 = len(l.levelsLocked()[0])
 	}
-	deeper := len(l.levels) > 1
+	deeper := len(l.levelsLocked()) > 1
 	l.mu.Unlock()
 
 	if l0 >= l.l0Trigger {

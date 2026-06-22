@@ -70,8 +70,8 @@ func buildLeveledTree(t *testing.T) (*LSM, []string) {
 func hasDisjointLevel(l *LSM, minSegs int) bool {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
-	for i := 1; i < len(l.levels); i++ {
-		if !l.isTieredLocked(i) && len(l.levels[i]) >= minSegs {
+	for i := 1; i < len(l.levelsLocked()); i++ {
+		if !l.isTieredLocked(i) && len(l.levelsLocked()[i]) >= minSegs {
 			return true
 		}
 	}
@@ -124,9 +124,9 @@ func TestRangeIndexMatchesPlainMerge(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			l.rangeIndex = false
-			plain := scanRange(t, l, tc.opts, version(want))
+			plain := scanRange(t, l, tc.opts, snapVersion(want))
 			l.rangeIndex = true
-			remix := scanRange(t, l, tc.opts, version(want))
+			remix := scanRange(t, l, tc.opts, snapVersion(want))
 			l.rangeIndex = false
 
 			if len(plain) != len(remix) {
@@ -143,7 +143,7 @@ func TestRangeIndexMatchesPlainMerge(t *testing.T) {
 
 // version returns a snapshot version above every write in the test tree, so a scan sees
 // the newest version of each key.
-func version(_ []string) uint64 { return 1 << 20 }
+func snapVersion(_ []string) uint64 { return 1 << 20 }
 
 // TestRangeIndexFullScanIsComplete checks the REMIX scan against the independent truth,
 // not just against the plain merge, so a bug shared by both paths cannot hide: a full
@@ -151,7 +151,7 @@ func version(_ []string) uint64 { return 1 << 20 }
 func TestRangeIndexFullScanIsComplete(t *testing.T) {
 	l, want := buildLeveledTree(t)
 	l.rangeIndex = true
-	got := keysOf(scanRange(t, l, engine.IterOptions{}, version(want)))
+	got := keysOf(scanRange(t, l, engine.IterOptions{}, snapVersion(want)))
 	if !equalStrings(got, want) {
 		t.Fatalf("REMIX full scan returned %d keys, want %d; first mismatch reveals the gap", len(got), len(want))
 	}
@@ -167,9 +167,9 @@ func TestLevelSourceWalksDisjointSegments(t *testing.T) {
 	defer l.mu.RUnlock()
 
 	var segs []*segment
-	for i := 1; i < len(l.levels); i++ {
-		if !l.isTieredLocked(i) && len(l.levels[i]) >= 2 {
-			segs = l.levels[i]
+	for i := 1; i < len(l.levelsLocked()); i++ {
+		if !l.isTieredLocked(i) && len(l.levelsLocked()[i]) >= 2 {
+			segs = l.levelsLocked()[i]
 			break
 		}
 	}

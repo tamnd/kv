@@ -102,7 +102,7 @@ func (l *LSM) appendEditLocked(tag byte, level uint8, footer format.PageNo) erro
 }
 
 // loadManifestLocked walks the MANIFEST chain from the engine root, applies every edit
-// in chronological order, and opens each surviving segment into its level in l.levels.
+// in chronological order, and opens each surviving segment into its level in the loaded tree.
 // It runs at Open, before any redo, so the level structure the last checkpoint recorded
 // is in place before the WAL tail replays the batches committed after it. The caller
 // holds l.mu.
@@ -172,6 +172,7 @@ func (l *LSM) loadManifestLocked() error {
 		}
 	}
 
+	var levels [][]*segment
 	for _, footer := range order {
 		if footer == format.NoPage {
 			continue
@@ -180,8 +181,12 @@ func (l *LSM) loadManifestLocked() error {
 		if err != nil {
 			return err
 		}
-		l.addSegmentLocked(int(level[footer]), seg)
+		levels = addSegment(levels, int(level[footer]), seg)
 	}
+	// Publish the loaded tree as the current version, retiring the empty version Open started
+	// on. Recovery runs under l.mu with no reader yet, so the publish frees nothing and simply
+	// installs the segment set every later read folds (version.go).
+	l.publishVersionLocked(levels)
 
 	// Rebuild the value-log append cursor from the recorded head, so a reopen keeps
 	// appending into the existing chain and the GC can walk it. A NoPage head means no

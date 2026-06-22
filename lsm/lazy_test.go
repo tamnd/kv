@@ -19,20 +19,20 @@ func TestTieredBottomAddsRuns(t *testing.T) {
 	applyBatch(t, l, 1, func(b *engine.WriteBatch) { b.Set([]byte("k"), []byte("v1")) })
 	l.flushActive(t)
 	compact(t, l, 0)
-	if len(l.levels[1]) != 1 {
+	if len(l.levelsLocked()[1]) != 1 {
 		t.Fatalf("expected one bottom run, got shape %v", levelShape(l))
 	}
-	run1 := l.levels[1][0]
+	run1 := l.levelsLocked()[1][0]
 
 	applyBatch(t, l, 2, func(b *engine.WriteBatch) { b.Set([]byte("k"), []byte("v2")) })
 	l.flushActive(t)
 	compact(t, l, 0)
 
-	if len(l.levels[1]) != 2 {
+	if len(l.levelsLocked()[1]) != 2 {
 		t.Fatalf("tiered add merged instead of adding a run, got shape %v", levelShape(l))
 	}
 	present := false
-	for _, s := range l.levels[1] {
+	for _, s := range l.levelsLocked()[1] {
 		if s == run1 {
 			present = true
 		}
@@ -71,7 +71,7 @@ func TestMaxOverlapCountsRunsNotPieces(t *testing.T) {
 	})
 	l.flushActive(t)
 	compact(t, l, 0)
-	if got := len(l.levels[1]); got != 3 {
+	if got := len(l.levelsLocked()[1]); got != 3 {
 		t.Fatalf("expected three pieces of one run, got %d (shape %v)", got, levelShape(l))
 	}
 	if ov := l.maxOverlapLocked(1); ov != 1 {
@@ -85,7 +85,7 @@ func TestMaxOverlapCountsRunsNotPieces(t *testing.T) {
 	})
 	l.flushActive(t)
 	compact(t, l, 0)
-	if got := len(l.levels[1]); got != 6 {
+	if got := len(l.levelsLocked()[1]); got != 6 {
 		t.Fatalf("expected six pieces across two runs, got %d (shape %v)", got, levelShape(l))
 	}
 	if ov := l.maxOverlapLocked(1); ov != 2 {
@@ -106,7 +106,7 @@ func TestTieredSelfMergeAtFanout(t *testing.T) {
 		l.flushActive(t)
 		compact(t, l, 0) // tiered add, one run per push
 	}
-	if got := len(l.levels[1]); got != 3 {
+	if got := len(l.levelsLocked()[1]); got != 3 {
 		t.Fatalf("expected three tiered runs, got %d (shape %v)", got, levelShape(l))
 	}
 	if ov := l.maxOverlapLocked(1); ov != 3 {
@@ -116,13 +116,13 @@ func TestTieredSelfMergeAtFanout(t *testing.T) {
 	// The overlap has reached the fanout, so the next Maintain self-merges. At a watermark
 	// above every version the history collapses to the newest.
 	compact(t, l, 100)
-	if got := len(l.levels[1]); got != 1 {
+	if got := len(l.levelsLocked()[1]); got != 1 {
 		t.Fatalf("self-merge left %d runs, want one disjoint run (shape %v)", got, levelShape(l))
 	}
 	if ov := l.maxOverlapLocked(1); ov != 1 {
 		t.Fatalf("after self-merge overlap is %d, want 1", ov)
 	}
-	if got := l.levels[1][0].numCells; got != 1 {
+	if got := l.levelsLocked()[1][0].numCells; got != 1 {
 		t.Fatalf("self-merge kept %d cells, want 1 (newest version only)", got)
 	}
 	if v, ok := getAt(t, l, "k", 100); !ok || string(v) != "v3" {

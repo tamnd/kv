@@ -165,7 +165,7 @@ func TestCompactionCarriesPointers(t *testing.T) {
 	l.flushActive(t)
 	compact(t, l, 0) // push L0 down into the bottom
 
-	bottom := l.levels[1]
+	bottom := l.levelsLocked()[1]
 	if len(bottom) != 1 {
 		t.Fatalf("expected one bottom run after compaction, shape %v", levelShape(l))
 	}
