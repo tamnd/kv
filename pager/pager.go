@@ -43,8 +43,8 @@ type Frame struct {
 	data    []byte
 	pins    atomic.Int32
 	dirty   bool
-	ref     bool // CLOCK reference bit
-	slot    int  // index into the pool, -1 if not pooled
+	ref     atomic.Bool // CLOCK reference bit
+	slot    int         // index into the pool, -1 if not pooled
 	decoded atomic.Pointer[decodedNode]
 }
 
@@ -131,7 +131,7 @@ const (
 // among them. Every field is guarded by mu. A page number maps to exactly one shard for
 // the pool's lifetime, so a frame in this shard only ever caches pages that belong here.
 type shard struct {
-	mu      sync.Mutex
+	mu      sync.RWMutex
 	index   map[uint32]*Frame // resident frames by page number, this shard only
 	frames  []*Frame          // frames owned by this shard, pinned or free
 	hand    int               // CLOCK hand into frames
