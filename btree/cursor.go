@@ -56,7 +56,7 @@ func (t *BTree) gatherPoint(userKey []byte) ([]entry, error) {
 			return nil, err
 		}
 		if typ == format.PageBTreeLeaf {
-			l, err := t.loadLeaf(pgno)
+			l, err := t.viewLeaf(pgno)
 			if err != nil {
 				return nil, err
 			}
@@ -76,7 +76,7 @@ func (t *BTree) gatherPoint(userKey []byte) ([]entry, error) {
 			}
 			break
 		}
-		in, err := t.loadInterior(pgno)
+		in, err := t.viewInterior(pgno)
 		if err != nil {
 			return nil, err
 		}
@@ -174,7 +174,7 @@ func (t *BTree) leafCovering(userKey []byte) (format.PageNo, error) {
 		if typ == format.PageBTreeLeaf {
 			return pgno, nil
 		}
-		in, err := t.loadInterior(pgno)
+		in, err := t.viewInterior(pgno)
 		if err != nil {
 			return 0, err
 		}
@@ -193,7 +193,7 @@ func (t *BTree) leftmostLeaf() (format.PageNo, error) {
 		if typ == format.PageBTreeLeaf {
 			return pgno, nil
 		}
-		in, err := t.loadInterior(pgno)
+		in, err := t.viewInterior(pgno)
 		if err != nil {
 			return 0, err
 		}
@@ -220,7 +220,7 @@ func (t *BTree) collectRange(lower, upper []byte) ([]entry, error) {
 	var out []entry
 	pgno := start
 	for pgno != format.NoPage {
-		l, err := t.loadLeaf(pgno)
+		l, err := t.viewLeaf(pgno)
 		if err != nil {
 			return nil, err
 		}
@@ -278,7 +278,7 @@ func (t *BTree) collectBufferedRange(lower, upper []byte) ([]entry, error) {
 		if typ == format.PageBTreeLeaf {
 			return nil
 		}
-		in, err := t.loadInterior(pgno)
+		in, err := t.viewInterior(pgno)
 		if err != nil {
 			return err
 		}

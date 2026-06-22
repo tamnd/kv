@@ -297,6 +297,61 @@ func (t *BTree) loadInterior(pgno format.PageNo) (*interior, error) {
 	return in, err
 }
 
+// viewLeaf returns the decoded leaf for a read-only caller. It reuses the decoded
+// node cached on the pager frame when the page is resident and unchanged since the
+// last read, decoding the bytes only on a miss and caching the result for the next
+// read (spec 01 Finding 1: stop re-decoding a node that is already in the buffer
+// pool). The returned *leaf is shared and immutable: read callers only ever read its
+// keys and values and copy out before returning, and the mutating path uses loadLeaf,
+// which decodes a private copy, so no caller mutates the cached instance. The pager
+// invalidates the cached view before any write-intent pin or frame rebind, so a hit
+// always describes the page's current bytes.
+func (t *BTree) viewLeaf(pgno format.PageNo) (*leaf, error) {
+	fr, err := t.pgr.Get(pgno, pager.Read)
+	if err != nil {
+		return nil, err
+	}
+	if l, ok := fr.Decoded().(*leaf); ok {
+		t.pgr.Unpin(fr, false)
+		return l, nil
+	}
+	data := fr.Data()
+	if len(data) < format.CommonHeaderSize || format.DecodeCommonHeader(data).Type != format.PageBTreeLeaf {
+		t.pgr.Unpin(fr, false)
+		return nil, format.ErrCorrupt
+	}
+	l, err := unmarshalLeaf(data)
+	if err == nil {
+		fr.SetDecoded(l)
+	}
+	t.pgr.Unpin(fr, false)
+	return l, err
+}
+
+// viewInterior is viewLeaf for an interior node: same shared-immutable contract and
+// same frame-cached decode (spec 01 Finding 1).
+func (t *BTree) viewInterior(pgno format.PageNo) (*interior, error) {
+	fr, err := t.pgr.Get(pgno, pager.Read)
+	if err != nil {
+		return nil, err
+	}
+	if in, ok := fr.Decoded().(*interior); ok {
+		t.pgr.Unpin(fr, false)
+		return in, nil
+	}
+	data := fr.Data()
+	if len(data) < format.CommonHeaderSize || format.DecodeCommonHeader(data).Type != format.PageBTreeInterior {
+		t.pgr.Unpin(fr, false)
+		return nil, format.ErrCorrupt
+	}
+	in, err := unmarshalInterior(data)
+	if err == nil {
+		fr.SetDecoded(in)
+	}
+	t.pgr.Unpin(fr, false)
+	return in, err
+}
+
 func (t *BTree) storeLeaf(pgno format.PageNo, l *leaf) error {
 	return t.writePage(pgno, marshalLeaf(l))
 }
