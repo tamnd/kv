@@ -107,7 +107,16 @@ func (b *WriteBatch) DeleteRange(lo, hi []byte) {
 // value bytes. Lengths are varints because keys and values are small and the
 // common case packs into one byte each.
 func (b *WriteBatch) Encode() []byte {
-	dst := make([]byte, 0, 16+b.size+2*len(b.entries))
+	return b.AppendEncoded(make([]byte, 0, 16+b.size+2*len(b.entries)))
+}
+
+// AppendEncoded appends the batch's wire form to dst and returns the extended slice.
+// It is the body of Encode pulled out so the commit path can serialize the batch
+// straight into the WAL's reusable frame buffer (perf/02 Finding 4) instead of into a
+// throwaway buffer that is then copied into the frame: pass b.AppendEncoded to
+// wal.LogBatchAppend and every value is copied into the bytes that get written exactly
+// once. The layout is identical to Encode, so the two are interchangeable on the wire.
+func (b *WriteBatch) AppendEncoded(dst []byte) []byte {
 	dst = format.AppendUvarint(dst, b.version)
 	dst = format.AppendUvarint(dst, uint64(len(b.entries)))
 	for _, e := range b.entries {

@@ -111,6 +111,7 @@ type WAL struct {
 	// commit critical section. They grow to the largest frame seen and stay.
 	frameScratch []byte
 	chainScratch []byte
+	plainScratch []byte // reusable batch-encode buffer for the encrypted append path
 
 	crypto *crypto.Scheme // encrypts kv-batch payloads when set; nil for a cleartext log
 }
@@ -303,6 +304,37 @@ func (w *WAL) appendFrame(ft FrameType, version uint64, payload []byte) error {
 	return nil
 }
 
+// appendFrameAppend is appendFrame for the case where the payload is not yet
+// materialized: encode appends the payload directly after the frame header in the
+// reusable frame buffer, so the batch is serialized once into the bytes that are
+// written rather than into a separate buffer that is then copied in (perf/02 Finding 4).
+// encode must append exactly the frame payload to its argument and return the extended
+// slice; the buffer it grows is retained as the next frame's scratch. Single-writer like
+// appendFrame.
+func (w *WAL) appendFrameAppend(ft FrameType, version uint64, encode func(dst []byte) []byte) error {
+	if cap(w.frameScratch) < frameHeaderSize {
+		w.frameScratch = make([]byte, frameHeaderSize)
+	}
+	frame := encode(w.frameScratch[:frameHeaderSize])
+	w.frameScratch = frame[:cap(frame)]
+	payload := frame[frameHeaderSize:]
+	frame[0] = byte(ft)
+	binary.BigEndian.PutUint32(frame[1:5], uint32(len(payload)))
+	binary.BigEndian.PutUint64(frame[5:13], w.lsn)
+	binary.BigEndian.PutUint64(frame[13:21], version)
+	binary.BigEndian.PutUint64(frame[21:29], w.salt)
+	sum := w.chainSum(w.lastSum, frame[0:29], payload)
+	binary.BigEndian.PutUint64(frame[29:37], sum)
+	if _, err := w.file.WriteAt(frame, w.tailOff); err != nil {
+		return err
+	}
+	w.tailOff += int64(len(frame))
+	w.lastSum = sum
+	w.lsn++
+	w.grew = true
+	return nil
+}
+
 // chainSum is the allocation-free form of chain for the append hot path: it reuses
 // w.chainScratch instead of allocating the concatenation buffer per frame, since
 // appendFrame runs in the commit critical section under the db's single-flight commit.
@@ -344,6 +376,26 @@ func (w *WAL) LogBatch(version uint64, encoded []byte) error {
 		encoded = sealed
 	}
 	if err := w.appendFrame(FrameKVBatch, version, encoded); err != nil {
+		return err
+	}
+	w.batchN++
+	return nil
+}
+
+// LogBatchAppend is LogBatch for a batch that has not been serialized yet: encode
+// appends the batch's wire form straight into the WAL frame buffer, so each value is
+// copied once into the bytes that get written instead of into a throwaway buffer that
+// is then copied into the frame (perf/02 Finding 4). It is the commit hot path's entry
+// point; pass engine.WriteBatch.AppendEncoded as encode. When the log is encrypted the
+// payload must be sealed from a contiguous plaintext, so the in-place fuse does not
+// apply: the batch is encoded into a reusable plaintext scratch and sealed through the
+// ordinary LogBatch path, which still drops the per-commit encode allocation.
+func (w *WAL) LogBatchAppend(version uint64, encode func(dst []byte) []byte) error {
+	if w.crypto != nil {
+		w.plainScratch = encode(w.plainScratch[:0])
+		return w.LogBatch(version, w.plainScratch)
+	}
+	if err := w.appendFrameAppend(FrameKVBatch, version, encode); err != nil {
 		return err
 	}
 	w.batchN++
