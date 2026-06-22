@@ -111,6 +111,18 @@ func (p *Pager) Unpin(fr *Frame, dirty bool) {
 	sh.mu.RUnlock()
 }
 
+// BeginExternalWrite marks the start of a page-producing section that runs outside the
+// host's single write lock, and EndExternalWrite marks its end. The LSM core's background
+// flusher brackets its segment build and install with the pair so a checkpoint waits for
+// the build to finish rather than reading a half-written frame. Producers share the gate, so
+// two background writers never block each other; only a checkpoint, which holds it
+// exclusively, waits. The matching EndExternalWrite must run on every path, so callers defer
+// it.
+func (p *Pager) BeginExternalWrite() { p.ckptGate.RLock() }
+
+// EndExternalWrite ends a section opened by BeginExternalWrite.
+func (p *Pager) EndExternalWrite() { p.ckptGate.RUnlock() }
+
 // admit finds a free or evictable frame in sh, binds it to pgno, and indexes it.
 // The caller must hold sh.mu. The returned frame is not yet pinned.
 func (p *Pager) admit(sh *shard, pgno uint32) (*Frame, error) {
@@ -380,6 +392,11 @@ func (p *Pager) lockAllShards() func() {
 // all committed work and contains no torn pages. checkpointLSN is recorded in the
 // header so recovery knows which WAL frames precede this checkpoint.
 func (p *Pager) Checkpoint(checkpointLSN uint64) error {
+	// Exclude any external page producer (the LSM background flusher) for the duration: it
+	// writes frame buffers without the host write lock a checkpoint relies on, so without
+	// this gate the writeBack below could read a frame the flusher is still filling.
+	p.ckptGate.Lock()
+	defer p.ckptGate.Unlock()
 	unlock := p.lockAllShards()
 	defer unlock()
 	p.metaMu.Lock()

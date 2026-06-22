@@ -49,6 +49,7 @@ func openLSM(t *testing.T, pgr *pager.Pager) *LSM {
 		t.Fatalf("open lsm: %v", err)
 	}
 	l.SetMergeFunc(concatMerge)
+	t.Cleanup(func() { l.Close() })
 	return l
 }
 

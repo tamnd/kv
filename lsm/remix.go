@@ -124,6 +124,12 @@ func (ls *levelSource) next() error {
 // carries one entry per level rather than one per segment. The caller holds l.mu.
 func (l *LSM) rangeSourcesLocked() []mergeSource {
 	sources := []mergeSource{&memSource{sl: l.mem.sl}}
+	// Sealed memtables awaiting flush sit between the active memtable and the segments: each
+	// is older than the active one but newer than any segment. The most recently sealed (the
+	// tail of the queue) is the newer source, so it comes first.
+	for i := len(l.imm) - 1; i >= 0; i-- {
+		sources = append(sources, &memSource{sl: l.imm[i].mem.sl})
+	}
 	if !l.rangeIndex {
 		for _, seg := range l.allSegmentsLocked() {
 			sources = append(sources, &segSource{pgr: l.pgr, seg: seg})
