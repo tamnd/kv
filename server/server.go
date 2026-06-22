@@ -17,6 +17,13 @@ import (
 type Server struct {
 	svc  *Service
 	http *http.Server
+	// baseCtx is cancelled by Shutdown before the HTTP server drains, so long-lived
+	// streaming handlers (watch) that are idle on a blocking Subscribe observe the shutdown
+	// and return instead of pinning the drain open forever. Each watch derives its context
+	// from both the request and this, so it ends on either a client disconnect or a server
+	// shutdown.
+	baseCtx context.Context
+	cancel  context.CancelFunc
 }
 
 // Options configures a Server. Addr is the listen address for the HTTP surface (for example
@@ -37,7 +44,8 @@ func New(db *kv.DB, opts Options) *Server {
 	if addr == "" {
 		addr = defaultAddr
 	}
-	srv := &Server{svc: NewService(db)}
+	ctx, cancel := context.WithCancel(context.Background())
+	srv := &Server{svc: NewService(db), baseCtx: ctx, cancel: cancel}
 	srv.http = &http.Server{Addr: addr, Handler: srv.httpHandler()}
 	return srv
 }
@@ -72,5 +80,6 @@ func (srv *Server) Serve(ln net.Listener) error {
 // closing it after Shutdown returns drains served work first. Later slices fold transaction
 // draining and a final checkpoint into this path.
 func (srv *Server) Shutdown(ctx context.Context) error {
+	srv.cancel()
 	return srv.http.Shutdown(ctx)
 }
