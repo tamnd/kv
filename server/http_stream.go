@@ -68,6 +68,16 @@ func (srv *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 		}
 		limit = n
 	}
+	// A scan may return any key in its selected region, so it needs a read grant covering that
+	// region: the explicit prefix, or the bound the from/to range shares. Authorizing before the
+	// header is written lets a denial be a clean 403 rather than a torn stream.
+	if err := srv.authorize(r, func(id *Identity) bool {
+		return id.canReadScan(scanAuthPrefix(prefix, lower, upper))
+	}); err != nil {
+		writeServiceErr(w, err)
+		return
+	}
+
 	opts := ScanOptions{
 		Lower:    nilIfEmpty(lower),
 		Upper:    nilIfEmpty(upper),
@@ -134,6 +144,13 @@ func (srv *Server) handleWatch(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		since = n
+	}
+
+	// A watch delivers every committed change under its prefix, so it needs a read grant covering
+	// that prefix; an empty prefix watches the whole keyspace and needs a global read grant.
+	if err := srv.authorize(r, func(id *Identity) bool { return id.canReadScan(prefix) }); err != nil {
+		writeServiceErr(w, err)
+		return
 	}
 
 	w.Header().Set("Content-Type", "text/event-stream")

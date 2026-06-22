@@ -18,6 +18,10 @@ import (
 type Server struct {
 	svc  *Service
 	http *http.Server
+	// auth resolves a request's credential to an Identity and is nil when the server runs open.
+	// The HTTP middleware and, in a later slice, the binary connection loop consult it; a nil
+	// auth means every request is allowed, the default for a database served on a trusted socket.
+	auth Authenticator
 	// baseCtx is cancelled by Shutdown before the HTTP server drains, so long-lived
 	// streaming handlers (watch) that are idle on a blocking Subscribe observe the shutdown
 	// and return instead of pinning the drain open forever. Each watch derives its context
@@ -41,6 +45,11 @@ type Options struct {
 	Limits            *Limits
 	ReadHeaderTimeout time.Duration
 	IdleTimeout       time.Duration
+	// Auth, when non-nil, turns on authentication and per-prefix authorization (spec 17 §6):
+	// every request outside the operational health and metrics routes must carry a credential the
+	// Authenticator resolves to an Identity, and each operation is checked against that identity's
+	// grants. A nil Auth leaves the server open, the default, for a database on a trusted socket.
+	Auth Authenticator
 }
 
 // defaultAddr is kv's registered-by-convention HTTP port, used when Options.Addr is empty.
@@ -76,7 +85,7 @@ func New(db *kv.DB, opts Options) *Server {
 	if idleTimeout == 0 {
 		idleTimeout = defaultIdleTimeout
 	}
-	srv := &Server{svc: svc, baseCtx: ctx, cancel: cancel}
+	srv := &Server{svc: svc, baseCtx: ctx, cancel: cancel, auth: opts.Auth}
 	srv.http = &http.Server{
 		Addr:              addr,
 		Handler:           srv.httpHandler(),
