@@ -240,18 +240,59 @@ func allZero(b []byte) bool {
 // page (high-water mark).
 func (p *Pager) Allocate() (uint32, *Frame, error) {
 	p.mu.Lock()
-	var pgno uint32
-	if n := len(p.free); n > 0 {
-		pgno = p.free[n-1]
-		p.free = p.free[:n-1]
-	} else {
-		p.dbSize++
-		pgno = p.dbSize
+	defer p.mu.Unlock()
+	pgno := p.allocateNumberLocked()
+	fr, err := p.getAllocatedLocked(pgno)
+	if err != nil {
+		return 0, nil, err
 	}
+	return pgno, fr, nil
+}
+
+// AllocateNumber reserves a fresh page number without binding a frame to it: it pops
+// the freelist or grows the high-water mark and returns the number, unpinned and
+// unread. The reservation is immediate, so the number is already off the freelist and
+// will not be handed out twice. The caller pairs it with GetAllocated when it is ready
+// to write that page, which lets a bulk writer reserve a whole run of page numbers (to
+// chain their next-pointers) while holding at most one frame pinned at a time. That is
+// what keeps a segment flush from pinning the entire segment's worth of frames at once
+// and exhausting a pool smaller than the segment (perf/05 F2).
+func (p *Pager) AllocateNumber() uint32 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.allocateNumberLocked()
+}
+
+// allocateNumberLocked pops the freelist or bumps the high-water mark and returns the
+// reserved page number. The caller must hold p.mu.
+func (p *Pager) allocateNumberLocked() uint32 {
+	if n := len(p.free); n > 0 {
+		pgno := p.free[n-1]
+		p.free = p.free[:n-1]
+		return pgno
+	}
+	p.dbSize++
+	return p.dbSize
+}
+
+// GetAllocated returns the frame for a page number that came from AllocateNumber,
+// pinned with Write intent and zeroed, WITHOUT reading the old on-disk bytes. The page
+// is about to be written in full, so its prior content (a hole past the high-water mark
+// or a stale freed page) is dead and a read would be wasted I/O. The caller Unpins
+// exactly once, as with Allocate; this is simply Allocate's second half, split out so a
+// bulk writer can materialize reserved pages one at a time.
+func (p *Pager) GetAllocated(pgno uint32) (*Frame, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.getAllocatedLocked(pgno)
+}
+
+// getAllocatedLocked binds a zeroed, pinned, dirty frame to an already-reserved page
+// number without reading the page from disk. The caller must hold p.mu.
+func (p *Pager) getAllocatedLocked(pgno uint32) (*Frame, error) {
 	fr, err := p.admit(pgno)
 	if err != nil {
-		p.mu.Unlock()
-		return 0, nil, err
+		return nil, err
 	}
 	for i := range fr.data {
 		fr.data[i] = 0
@@ -259,8 +300,7 @@ func (p *Pager) Allocate() (uint32, *Frame, error) {
 	fr.dirty = true
 	fr.pins.Add(1)
 	fr.ref = true
-	p.mu.Unlock()
-	return pgno, fr, nil
+	return fr, nil
 }
 
 // Free returns a page to the freelist. The page must not be pinned.

@@ -322,17 +322,15 @@ func writeSegment(pgr *pager.Pager, bitsPerKey int, kind filterKind, cdc codecID
 		seg.maxKey = nil
 	}
 
-	// Allocate every data page up front so each page's next-pointer can name its
-	// successor before any page is written.
+	// Reserve every data page number up front so each page's next-pointer can name its
+	// successor before any page is written, then materialize the pages one at a time.
+	// Reserving the numbers without pinning a frame bounds the in-flight pin count to a
+	// single page, so a segment larger than the buffer pool flushes without exhausting
+	// it (perf/05 F2). GetAllocated hands back a zeroed frame, so the unused tail past
+	// the body is already deterministic without a separate clearing pass.
 	pgnos := make([]format.PageNo, len(pages))
-	frames := make([]*pager.Frame, len(pages))
 	for i := range pages {
-		pgno, fr, err := pgr.Allocate()
-		if err != nil {
-			return nil, err
-		}
-		pgnos[i] = pgno
-		frames[i] = fr
+		pgnos[i] = pgr.AllocateNumber()
 	}
 	for i := range pages {
 		next := format.NoPage
@@ -359,13 +357,12 @@ func writeSegment(pgr *pager.Pager, bitsPerKey int, kind filterKind, cdc codecID
 			Overflow:  next,
 		}
 		header.Encode(body)
-		data := frames[i].Data()
-		copy(data, body)
-		// Zero any tail left from a reused page so the unused area is deterministic.
-		for j := len(body); j < len(data); j++ {
-			data[j] = 0
+		fr, err := pgr.GetAllocated(pgnos[i])
+		if err != nil {
+			return nil, err
 		}
-		pgr.Unpin(frames[i], true)
+		copy(fr.Data(), body)
+		pgr.Unpin(fr, true)
 	}
 	if len(pgnos) > 0 {
 		seg.head = pgnos[0]
@@ -471,15 +468,12 @@ func writeRecordPages(pgr *pager.Pager, flag byte, records [][]byte) (format.Pag
 		flush()
 	}
 
+	// Reserve every page number first, then write one page at a time so at most one frame
+	// is pinned at once and the chain fits any pool (perf/05 F2). GetAllocated returns a
+	// zeroed frame, so the tail past the body needs no separate clearing.
 	pgnos := make([]format.PageNo, len(bodies))
-	frames := make([]*pager.Frame, len(bodies))
 	for i := range bodies {
-		pgno, fr, err := pgr.Allocate()
-		if err != nil {
-			return 0, 0, err
-		}
-		pgnos[i] = pgno
-		frames[i] = fr
+		pgnos[i] = pgr.AllocateNumber()
 	}
 	for i := range bodies {
 		next := format.NoPage
@@ -487,12 +481,12 @@ func writeRecordPages(pgr *pager.Pager, flag byte, records [][]byte) (format.Pag
 			next = pgnos[i+1]
 		}
 		format.CommonHeader{Type: format.PageLSMBlock, Flags: flag, CellCount: uint16(counts[i]), Overflow: next}.Encode(bodies[i])
-		data := frames[i].Data()
-		copy(data, bodies[i])
-		for j := len(bodies[i]); j < len(data); j++ {
-			data[j] = 0
+		fr, err := pgr.GetAllocated(pgnos[i])
+		if err != nil {
+			return 0, 0, err
 		}
-		pgr.Unpin(frames[i], true)
+		copy(fr.Data(), bodies[i])
+		pgr.Unpin(fr, true)
 	}
 	return pgnos[0], len(bodies), nil
 }
@@ -520,15 +514,12 @@ func writeBlobPages(pgr *pager.Pager, flag byte, blob []byte) (format.PageNo, in
 		chunks = append(chunks, blob[off:end])
 	}
 
+	// Reserve every page number first, then materialize one page at a time so the blob
+	// chain pins a single frame at a time and fits any pool (perf/05 F2). GetAllocated
+	// zeroes the frame, so the unused tail is already clear.
 	pgnos := make([]format.PageNo, len(chunks))
-	frames := make([]*pager.Frame, len(chunks))
 	for i := range chunks {
-		pgno, fr, err := pgr.Allocate()
-		if err != nil {
-			return 0, 0, err
-		}
-		pgnos[i] = pgno
-		frames[i] = fr
+		pgnos[i] = pgr.AllocateNumber()
 	}
 	for i := range chunks {
 		next := format.NoPage
@@ -538,12 +529,12 @@ func writeBlobPages(pgr *pager.Pager, flag byte, blob []byte) (format.PageNo, in
 		body := make([]byte, segDataHeaderSize, usable)
 		body = append(body, chunks[i]...)
 		format.CommonHeader{Type: format.PageLSMBlock, Flags: flag, CellCount: uint16(len(chunks[i])), Overflow: next}.Encode(body)
-		data := frames[i].Data()
-		copy(data, body)
-		for j := len(body); j < len(data); j++ {
-			data[j] = 0
+		fr, err := pgr.GetAllocated(pgnos[i])
+		if err != nil {
+			return 0, 0, err
 		}
-		pgr.Unpin(frames[i], true)
+		copy(fr.Data(), body)
+		pgr.Unpin(fr, true)
 	}
 	return pgnos[0], len(chunks), nil
 }
