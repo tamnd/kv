@@ -270,9 +270,16 @@ func (t *BTree) loadLeaf(pgno format.PageNo) (*leaf, error) {
 	if err != nil {
 		return nil, err
 	}
-	l := unmarshalLeaf(fr.Data())
+	data := fr.Data()
+	// Guard against type confusion: a checksum-valid page reached as a leaf must actually be one, or a
+	// corrupt root pointer would have us decode an interior (or any other page) with the leaf decoder.
+	if len(data) < format.CommonHeaderSize || format.DecodeCommonHeader(data).Type != format.PageBTreeLeaf {
+		t.pgr.Unpin(fr, false)
+		return nil, format.ErrCorrupt
+	}
+	l, err := unmarshalLeaf(data)
 	t.pgr.Unpin(fr, false)
-	return l, nil
+	return l, err
 }
 
 func (t *BTree) loadInterior(pgno format.PageNo) (*interior, error) {
@@ -280,9 +287,14 @@ func (t *BTree) loadInterior(pgno format.PageNo) (*interior, error) {
 	if err != nil {
 		return nil, err
 	}
-	in := unmarshalInterior(fr.Data())
+	data := fr.Data()
+	if len(data) < format.CommonHeaderSize || format.DecodeCommonHeader(data).Type != format.PageBTreeInterior {
+		t.pgr.Unpin(fr, false)
+		return nil, format.ErrCorrupt
+	}
+	in, err := unmarshalInterior(data)
 	t.pgr.Unpin(fr, false)
-	return in, nil
+	return in, err
 }
 
 func (t *BTree) storeLeaf(pgno format.PageNo, l *leaf) error {

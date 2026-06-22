@@ -56,24 +56,80 @@ func marshalLeaf(l *leaf) []byte {
 	return out
 }
 
-// unmarshalLeaf decodes a leaf page.
-func unmarshalLeaf(p []byte) *leaf {
+// nodeReader is a bounds-checked cursor over a node page. Every read advances the offset and reports
+// an error rather than panicking when the page is shorter than the structure it claims to hold, so a
+// corrupt or type-confused page that reaches a decoder is rejected with format.ErrCorrupt instead of
+// crashing the process (spec 23 §5: a malformed input must never panic or over-read). The pager's
+// checksum is the first guard against corruption; this is the defense in depth for the case a
+// checksum-valid page is still structurally wrong, which type confusion (a leaf reached as an
+// interior) produces without ever flipping a byte.
+type nodeReader struct {
+	p   []byte
+	off int
+}
+
+func (r *nodeReader) uint32() (uint32, error) {
+	if r.off < 0 || r.off+4 > len(r.p) {
+		return 0, format.ErrCorrupt
+	}
+	v := binary.BigEndian.Uint32(r.p[r.off:])
+	r.off += 4
+	return v, nil
+}
+
+func (r *nodeReader) uvarint() (uint64, error) {
+	if r.off < 0 || r.off > len(r.p) {
+		return 0, format.ErrCorrupt
+	}
+	v, n := format.Uvarint(r.p[r.off:])
+	if n <= 0 {
+		return 0, format.ErrCorrupt
+	}
+	r.off += n
+	return v, nil
+}
+
+// bytes copies the next n bytes. It checks n against the whole page length before the addition, so a
+// length large enough to overflow int when added to the offset cannot slip past the bound.
+func (r *nodeReader) bytes(n uint64) ([]byte, error) {
+	if r.off < 0 || n > uint64(len(r.p)) || r.off+int(n) > len(r.p) {
+		return nil, format.ErrCorrupt
+	}
+	b := append([]byte(nil), r.p[r.off:r.off+int(n)]...)
+	r.off += int(n)
+	return b, nil
+}
+
+// unmarshalLeaf decodes a leaf page, returning format.ErrCorrupt when the bytes do not describe a
+// well-formed leaf rather than panicking on an out-of-range read.
+func unmarshalLeaf(p []byte) (*leaf, error) {
+	if len(p) < nodeHeaderSize {
+		return nil, format.ErrCorrupt
+	}
 	h := format.DecodeCommonHeader(p)
 	l := &leaf{next: binary.BigEndian.Uint32(p[format.CommonHeaderSize:nodeHeaderSize])}
-	off := nodeHeaderSize
+	r := &nodeReader{p: p, off: nodeHeaderSize}
 	for i := 0; i < int(h.CellCount); i++ {
-		klen, n := format.Uvarint(p[off:])
-		off += n
-		key := append([]byte(nil), p[off:off+int(klen)]...)
-		off += int(klen)
-		vlen, n := format.Uvarint(p[off:])
-		off += n
-		val := append([]byte(nil), p[off:off+int(vlen)]...)
-		off += int(vlen)
+		klen, err := r.uvarint()
+		if err != nil {
+			return nil, err
+		}
+		key, err := r.bytes(klen)
+		if err != nil {
+			return nil, err
+		}
+		vlen, err := r.uvarint()
+		if err != nil {
+			return nil, err
+		}
+		val, err := r.bytes(vlen)
+		if err != nil {
+			return nil, err
+		}
 		l.keys = append(l.keys, key)
 		l.vals = append(l.vals, val)
 	}
-	return l
+	return l, nil
 }
 
 // marshalInterior encodes an interior node: header (with rightmost child in the
@@ -107,41 +163,63 @@ func marshalInterior(in *interior) []byte {
 	return out
 }
 
-// unmarshalInterior decodes an interior page.
-func unmarshalInterior(p []byte) *interior {
+// unmarshalInterior decodes an interior page, returning format.ErrCorrupt when the bytes do not
+// describe a well-formed interior node rather than panicking on an out-of-range read. The garbage
+// cell count a type-confused page presents is exactly what made the old unchecked loop over-read; the
+// bounds-checked reader turns that into a clean rejection.
+func unmarshalInterior(p []byte) (*interior, error) {
+	if len(p) < nodeHeaderSize {
+		return nil, format.ErrCorrupt
+	}
 	h := format.DecodeCommonHeader(p)
 	in := &interior{}
-	off := nodeHeaderSize
+	r := &nodeReader{p: p, off: nodeHeaderSize}
 	for i := 0; i < int(h.CellCount); i++ {
-		child := binary.BigEndian.Uint32(p[off:])
-		off += 4
-		slen, n := format.Uvarint(p[off:])
-		off += n
-		sep := append([]byte(nil), p[off:off+int(slen)]...)
-		off += int(slen)
+		child, err := r.uint32()
+		if err != nil {
+			return nil, err
+		}
+		slen, err := r.uvarint()
+		if err != nil {
+			return nil, err
+		}
+		sep, err := r.bytes(slen)
+		if err != nil {
+			return nil, err
+		}
 		in.children = append(in.children, child)
 		in.seps = append(in.seps, sep)
 	}
 	in.children = append(in.children, binary.BigEndian.Uint32(p[format.CommonHeaderSize:nodeHeaderSize]))
-	// The Bε message buffer follows the pivot cells. An unbuffered interior wrote no
-	// buffer section, so the count reads back as zero from the page's zero padding.
-	if off < len(p) {
-		mcount, n := format.Uvarint(p[off:])
-		off += n
+	// The Bε message buffer follows the pivot cells. An unbuffered interior wrote no buffer section, so
+	// the count reads back as zero from the page's zero padding.
+	if r.off < len(p) {
+		mcount, err := r.uvarint()
+		if err != nil {
+			return nil, err
+		}
 		for i := 0; i < int(mcount); i++ {
-			klen, n := format.Uvarint(p[off:])
-			off += n
-			key := append([]byte(nil), p[off:off+int(klen)]...)
-			off += int(klen)
-			vlen, n := format.Uvarint(p[off:])
-			off += n
-			val := append([]byte(nil), p[off:off+int(vlen)]...)
-			off += int(vlen)
+			klen, err := r.uvarint()
+			if err != nil {
+				return nil, err
+			}
+			key, err := r.bytes(klen)
+			if err != nil {
+				return nil, err
+			}
+			vlen, err := r.uvarint()
+			if err != nil {
+				return nil, err
+			}
+			val, err := r.bytes(vlen)
+			if err != nil {
+				return nil, err
+			}
 			in.msgKeys = append(in.msgKeys, key)
 			in.msgVals = append(in.msgVals, val)
 		}
 	}
-	return in
+	return in, nil
 }
 
 // bufferInsert parks (internalKey, value) in the interior's message buffer in sorted
