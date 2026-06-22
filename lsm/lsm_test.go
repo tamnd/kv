@@ -27,6 +27,7 @@ func newLSM(t *testing.T) *LSM {
 	if err := l.Open(&engine.Env{}); err != nil {
 		t.Fatalf("open lsm: %v", err)
 	}
+	t.Cleanup(func() { l.Close() })
 	return l
 }
 

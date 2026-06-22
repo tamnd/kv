@@ -7,8 +7,10 @@ import (
 	"github.com/tamnd/kv/engine"
 )
 
-// flushActive seals and flushes the active memtable to a segment, the deterministic
-// hook the tests use to force the boundary Apply crosses on its own at the cap.
+// flushActive seals the active memtable and waits for the background flusher to drain it
+// into a segment, the deterministic hook the tests use to force the boundary Apply crosses
+// on its own at the cap. It blocks until the sealed memtable has become a segment, so a
+// test that calls it can read the segment immediately after.
 func (l *LSM) flushActive(t *testing.T) {
 	t.Helper()
 	l.mu.Lock()
@@ -16,8 +18,12 @@ func (l *LSM) flushActive(t *testing.T) {
 	if l.mem.count() == 0 {
 		return
 	}
-	if err := l.flushLocked(); err != nil {
-		t.Fatalf("flush: %v", err)
+	l.sealActiveLocked()
+	for len(l.imm) > 0 && l.flushErr == nil {
+		l.flushCond.Wait()
+	}
+	if l.flushErr != nil {
+		t.Fatalf("flush: %v", l.flushErr)
 	}
 }
 

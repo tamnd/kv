@@ -1335,6 +1335,12 @@ func (d *DB) Close() error {
 			firstErr = err
 		}
 	}
+	// Close the engine before the pager: an engine may run background workers (the LSM
+	// core's flusher) that touch pager pages, so the worker must be joined while the pager
+	// is still live.
+	if err := d.eng.Close(); err != nil && firstErr == nil {
+		firstErr = err
+	}
 	if err := d.pgr.Close(); err != nil && firstErr == nil {
 		firstErr = err
 	}

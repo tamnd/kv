@@ -152,6 +152,17 @@ type Pager struct {
 	metaMu sync.Mutex
 	header *format.Header
 
+	// ckptGate keeps a checkpoint from running while a page producer that is not under the
+	// host's single write lock is mid-write. Almost every page write the pager sees is
+	// serialized behind that lock, which a checkpoint also takes, so the dirty-flag and
+	// frame-buffer writers never overlap (see Unpin). The LSM core's background flusher is
+	// the one exception: it turns a sealed memtable into segment pages off the foreground
+	// path, so it holds this gate in shared mode (BeginExternalWrite) while it writes, and
+	// Checkpoint holds it exclusively. Shared among producers, exclusive against the
+	// checkpoint, so concurrent producers still proceed but a checkpoint waits for the gap
+	// between them.
+	ckptGate sync.RWMutex
+
 	// crypto, when set, encrypts data pages on the way to disk and decrypts them on the
 	// way back (spec 14). It is nil for an unencrypted file, the default. It is an atomic
 	// pointer because the sharded read and write paths load it without a global lock while

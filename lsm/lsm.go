@@ -128,6 +128,25 @@ type LSM struct {
 	memMaxLSN  uint64
 	durableLSN uint64
 
+	// Background flush (flush.go, perf/03 W3). imm is the queue of sealed memtables
+	// awaiting flush, oldest first: Apply seals the full active memtable into it and opens
+	// a fresh one so a writer never waits for a segment write, and a reader folds these
+	// between the active memtable and L0 since a sealed memtable is newer than any flushed
+	// segment. flushCond, built over l.mu, coordinates the flusher, a backpressured Apply,
+	// and the flushActive test waiter; closing and flusherDone drive shutdown; flushErr is
+	// a sticky build failure surfaced to the next Apply; maxImm bounds the queue. flushMu
+	// serializes a flush build (which appends separated values to the vLog) against the
+	// value-log GC, the only other writer of the vLog chain, and is always taken before
+	// l.mu when both are held.
+	imm         []*immMem
+	flushCond   *sync.Cond
+	flusherUp   bool
+	closing     bool
+	flushErr    error
+	flusherDone chan struct{}
+	maxImm      int
+	flushMu     sync.Mutex
+
 	merge func(existing, operand []byte) []byte
 	env   *engine.Env
 }
@@ -177,7 +196,13 @@ func (l *LSM) Open(env *engine.Env) error {
 		l.compress = true
 	}
 	l.durableLSN = l.pgr.CheckpointLSN()
-	return l.loadManifestLocked()
+	if err := l.loadManifestLocked(); err != nil {
+		return err
+	}
+	// Start the background flusher last, once the segment set and durable mark are in
+	// place, so the first seal it ever sees lands on a fully built engine.
+	l.startFlusherLocked()
+	return nil
 }
 
 // codecForLevel picks the block codec for a segment written to level, heat-tiering by
@@ -197,11 +222,26 @@ func (l *LSM) codecForLevel(level int) codecID {
 	return codecHigh
 }
 
-// Close implements engine.Engine. It drops the in-memory state; the host checkpoints
-// before close, folding the segment and MANIFEST pages a flush wrote, so the next open
-// rebuilds the segment set from the MANIFEST and replays only the WAL tail past the
-// checkpoint into a fresh memtable.
-func (l *LSM) Close() error { return nil }
+// Close implements engine.Engine. It stops the background flusher and waits for any
+// in-flight build to finish, so no goroutine outlives the engine and none touches the
+// pager after the host closes it. It drops the in-memory state, including any still-sealed
+// memtables; the host checkpoints before close, folding the segment and MANIFEST pages a
+// flush wrote, so the next open rebuilds the segment set from the MANIFEST and replays only
+// the WAL tail past the checkpoint into a fresh memtable.
+func (l *LSM) Close() error {
+	l.mu.Lock()
+	if !l.flusherUp {
+		l.mu.Unlock()
+		return nil
+	}
+	l.closing = true
+	l.flushCond.Broadcast()
+	done := l.flusherDone
+	l.flusherUp = false
+	l.mu.Unlock()
+	<-done
+	return nil
+}
 
 // SetMergeFunc installs the merge resolver used during read-time version
 // resolution, the same hook the B-tree core and the oracle expose.
@@ -213,15 +253,19 @@ func (l *LSM) SetMergeFunc(f func(existing, operand []byte) []byte) {
 
 // Apply implements engine.Engine: it inserts every entry into the active memtable.
 // The batch is already durable in the WAL, so the insert is pure in-memory work.
-// When the memtable grows past its cap the engine flushes it to an on-disk segment
-// and starts a fresh one, so the resident set stays bounded (spec 06 §2). The flush
-// runs synchronously under the write lock; the sealed-queue and background flush
-// that hide its latency are a later optimization.
+// When the memtable grows past its cap the engine seals it into the flush queue and
+// opens a fresh one, so the resident set stays bounded (spec 06 §2) without the writer
+// waiting for the segment write: the background flusher (flush.go) drains the queue.
+// The seal blocks only when the queue is already full, the backpressure that keeps a
+// write burst that outruns the flusher from growing memory without bound.
 func (l *LSM) Apply(batch *engine.WriteBatch, commitVersion uint64) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.flushErr != nil {
+		return l.flushErr
+	}
 	if l.mem.count() > 0 && l.mem.size() >= l.memtableCap {
-		if err := l.flushLocked(); err != nil {
+		if err := l.sealForFlushLocked(); err != nil {
 			return err
 		}
 	}
@@ -248,20 +292,20 @@ func (l *LSM) NoteLSN(lsn uint64) {
 	l.mu.Unlock()
 }
 
-// flushLocked writes the active memtable to a new on-disk segment, appends the
-// segment to the live set, and swaps in an empty memtable. The caller holds l.mu.
-// The segment's pages are dirtied through the pager and folded by the next
-// checkpoint, the same path every engine write takes; until the MANIFEST records
-// the segment (a later slice) the live set is in-memory only and the WAL remains
-// the sole cross-restart record, so durability is unchanged.
-func (l *LSM) flushLocked() error {
-	mem := l.mem
-	sealedLSN := l.memMaxLSN
-	// A flush is the one place values separate. Each cell the memtable yields is passed
-	// through separateForFlush, which writes a large value into the vLog and rewrites the
-	// cell as a KindSetSep pointer; small values and non-set kinds pass through untouched.
-	// Separating only at flush, never at compaction, is the WiscKey win: once a value is in
-	// the vLog every later compaction of its key moves the pointer, not the bytes.
+// buildSegmentFromMem serializes a sealed memtable to a new on-disk segment, separating
+// large values into the value log as it goes, and syncs the vLog tail so every pointer the
+// segment carries resolves to durable bytes the moment a reader can see it. It runs under
+// flushMu but not l.mu (flush.go), so the foreground keeps inserting into the fresh active
+// memtable while this serializes; it reads only the sealed memtable, which is write-frozen,
+// and the open-time-immutable level and codec knobs. The returned segment is not yet
+// visible: installSegmentLocked publishes it.
+//
+// A flush is the one place values separate. Each cell the memtable yields is passed through
+// separateForFlush, which writes a large value into the vLog and rewrites the cell as a
+// KindSetSep pointer; small values and non-set kinds pass through untouched. Separating only
+// at flush, never at compaction, is the WiscKey win: once a value is in the vLog every later
+// compaction of its key moves the pointer, not the bytes.
+func (l *LSM) buildSegmentFromMem(mem *memtable) (*segment, error) {
 	var sepErr error
 	seg, err := writeSegment(l.pgr, bloomBitsForLevel(0, l.levelRatio), l.filterKind, l.codecForLevel(0), func(emit func(ik, val []byte) bool) {
 		mem.scan(func(ik, val []byte) bool {
@@ -274,40 +318,39 @@ func (l *LSM) flushLocked() error {
 		})
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if sepErr != nil {
-		return sepErr
+		return nil, sepErr
 	}
-	// Persist the vLog tail before the segment becomes visible, so every pointer the
-	// segment carries resolves to durable bytes the moment a reader can see it.
 	if err := l.vlog.sync(); err != nil {
-		return err
+		return nil, err
 	}
-	// Record the value-log head in the MANIFEST the first time a flush separates a value,
-	// so a reopen can walk the chain from it. The edit is emitted only when the head moved.
+	return seg, nil
+}
+
+// installSegmentLocked publishes a built segment: it records the value-log head in the
+// MANIFEST if a separated value moved it, records the segment, adds it to L0, and advances
+// the durable mark to the sealed memtable's largest LSN. The caller holds l.mu and flushMu.
+// Recording in the MANIFEST before adding to the live set keeps a segment a reader can see
+// always one the catalog will name after a restart.
+//
+// The durable advance is safe even though the segment pages are not yet on disk: the
+// checkpoint folds them before the WAL resets, so a crash before the fold simply loses this
+// in-memory advance and the kept WAL replays the batches again.
+func (l *LSM) installSegmentLocked(seg *segment, sealedLSN uint64) error {
 	if err := l.persistVLogHeadLocked(); err != nil {
 		return err
 	}
 	if seg.numCells > 0 {
-		// Record the segment in the MANIFEST before publishing it to the live set, so a
-		// segment a reader can see is always one the catalog will name after a restart. A
-		// flushed segment enters L0, the overlapping level that receives memtables.
 		if err := l.appendEditLocked(manifestAdd, 0, seg.footer); err != nil {
 			return err
 		}
 		l.addSegmentLocked(0, seg)
 	}
-	// Every batch in the sealed memtable now lives in the segment, so the host may
-	// reclaim the WAL up to its largest LSN once the checkpoint folds these pages. The
-	// fold happens before the WAL resets, so advancing the mark here is safe even though
-	// the pages are not yet on disk; a crash before the fold simply loses this in-memory
-	// advance and the kept WAL replays the batches again.
 	if sealedLSN > l.durableLSN {
 		l.durableLSN = sealedLSN
 	}
-	l.mem = newMemtable(defaultArenaCap)
-	l.memMaxLSN = 0
 	return nil
 }
 
@@ -406,6 +449,11 @@ func (l *LSM) Maintain(ctx context.Context, budget engine.MaintBudget) (engine.M
 	if budget.MaxPages <= 0 && budget.MaxBytes <= 0 {
 		return engine.MaintReport{}, nil
 	}
+	// flushMu before l.mu, the same order the flusher takes them (flush.go): vLog GC and a
+	// flush build are the two writers of the value-log chain, so they must not run at once,
+	// and taking flushMu here serializes this maintenance pass against an in-flight flush.
+	l.flushMu.Lock()
+	defer l.flushMu.Unlock()
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	c, _ := l.pickCompactionLocked()
@@ -429,6 +477,11 @@ func (l *LSM) Stats() engine.EngineStats {
 	defer l.mu.RUnlock()
 	pageSize := int64(l.pgr.PageSize())
 	physical := int64(l.mem.size())
+	// Sealed memtables awaiting flush still hold their batches in memory, so count them
+	// in the resident footprint until the flusher turns them into segment pages.
+	for _, e := range l.imm {
+		physical += int64(e.mem.size())
+	}
 	// Per-level shape for the compaction-backlog view (spec 19 §1.5): one entry per
 	// level, youngest first, each carrying its segment count and on-disk bytes. The same
 	// walk that sums physical bytes fills it, so the metric costs no extra pass.
@@ -646,6 +699,17 @@ func (r *reader) Get(userKey []byte) ([]byte, error) {
 	if matErr != nil {
 		return nil, matErr
 	}
+	// Fold the sealed memtables awaiting flush between the active memtable and the on-disk
+	// levels: each is older than the active one but newer than any segment, and a sealed
+	// memtable becomes a segment only in the one critical section that also pops it, so a
+	// key is folded from exactly one of the two and a merge never applies its operand twice.
+	// Newest-first means the most recently sealed (the tail of the queue) folds first.
+	for i := len(l.imm) - 1; i >= 0; i-- {
+		l.imm[i].mem.getGroup(userKey, collect)
+		if matErr != nil {
+			return nil, matErr
+		}
+	}
 	if !resolved() {
 		// Probe the on-disk levels shallowest first and stop at the first level that
 		// supplies a base: a key's newest version always sits in the shallowest level
@@ -693,6 +757,9 @@ func (r *reader) Get(userKey []byte) ([]byte, error) {
 func (l *LSM) liveRangeDels() []format.RangeDel {
 	dels := make([]format.RangeDel, 0, len(l.mem.rangeDels))
 	dels = append(dels, l.mem.rangeDels...)
+	for _, e := range l.imm {
+		dels = append(dels, e.mem.rangeDels...)
+	}
 	for _, seg := range l.allSegmentsLocked() {
 		dels = append(dels, seg.rangeDels...)
 	}
