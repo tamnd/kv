@@ -21,11 +21,12 @@ import (
 func cmdServe(args []string) int {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	addr := fs.String("addr", ":8480", "listen address for the HTTP surface")
+	binaryAddr := fs.String("binary-addr", "", "listen address for the binary protocol (empty disables it)")
 	if err := parseArgs(fs, args); err != nil {
 		return exitUsage
 	}
 	if fs.NArg() != 1 {
-		return usageErr("usage: kv serve <db> [-addr host:port]")
+		return usageErr("usage: kv serve <db> [-addr host:port] [-binary-addr host:port]")
 	}
 
 	d, code := openDB(fs.Arg(0))
@@ -46,6 +47,18 @@ func cmdServe(args []string) int {
 	errc := make(chan error, 1)
 	go func() { errc <- srv.Serve(ln) }()
 	fmt.Fprintf(os.Stderr, "kv: serving %s on http://%s\n", fs.Arg(0), ln.Addr().String())
+
+	// The binary protocol is opt-in: when -binary-addr is set, bind a second listener and serve
+	// the efficient wire on it alongside HTTP. The same Service backs both, so the two faces
+	// agree on every operation. A closed listener on shutdown ends ServeBinary without error.
+	if *binaryAddr != "" {
+		bln, err := net.Listen("tcp", *binaryAddr)
+		if err != nil {
+			return fail(err)
+		}
+		go func() { errc <- srv.ServeBinary(bln) }()
+		fmt.Fprintf(os.Stderr, "kv: serving %s binary on kv://%s\n", fs.Arg(0), bln.Addr().String())
+	}
 
 	// Run until the listener fails or an interrupt/terminate signal arrives, then drain
 	// in-flight requests with a bounded shutdown before the deferred Close folds the file.
