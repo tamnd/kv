@@ -51,15 +51,11 @@ func (t *BTree) gatherPoint(userKey []byte) ([]entry, error) {
 	var group []entry
 	pgno := t.root()
 	for {
-		typ, err := t.typeOf(pgno)
+		typ, l, in, err := t.viewNode(pgno)
 		if err != nil {
 			return nil, err
 		}
 		if typ == format.PageBTreeLeaf {
-			l, err := t.viewLeaf(pgno)
-			if err != nil {
-				return nil, err
-			}
 			// A user key's versions are contiguous in the leaf (cells sort by user
 			// key first), so binary-search to the lower bound of the group and walk
 			// forward while the user key matches, instead of scanning the whole leaf
@@ -75,10 +71,6 @@ func (t *BTree) gatherPoint(userKey []byte) ([]entry, error) {
 				group = append(group, entry{ik: l.keys[i], val: l.vals[i]})
 			}
 			break
-		}
-		in, err := t.viewInterior(pgno)
-		if err != nil {
-			return nil, err
 		}
 		for i := range in.msgKeys {
 			if format.CompareUser(format.UserKey(in.msgKeys[i]), userKey) == 0 {
@@ -167,16 +159,12 @@ func resolveStream(entries []entry, snap engine.Snapshot, merge func(existing, o
 func (t *BTree) leafCovering(userKey []byte) (format.PageNo, error) {
 	pgno := t.root()
 	for {
-		typ, err := t.typeOf(pgno)
+		typ, _, in, err := t.viewNode(pgno)
 		if err != nil {
 			return 0, err
 		}
 		if typ == format.PageBTreeLeaf {
 			return pgno, nil
-		}
-		in, err := t.viewInterior(pgno)
-		if err != nil {
-			return 0, err
 		}
 		pgno = in.children[in.childFor(userKey)]
 	}
@@ -186,16 +174,12 @@ func (t *BTree) leafCovering(userKey []byte) (format.PageNo, error) {
 func (t *BTree) leftmostLeaf() (format.PageNo, error) {
 	pgno := t.root()
 	for {
-		typ, err := t.typeOf(pgno)
+		typ, _, in, err := t.viewNode(pgno)
 		if err != nil {
 			return 0, err
 		}
 		if typ == format.PageBTreeLeaf {
 			return pgno, nil
-		}
-		in, err := t.viewInterior(pgno)
-		if err != nil {
-			return 0, err
 		}
 		pgno = in.children[0]
 	}
@@ -271,16 +255,12 @@ func (t *BTree) collectBufferedRange(lower, upper []byte) ([]entry, error) {
 	var out []entry
 	var walk func(pgno format.PageNo) error
 	walk = func(pgno format.PageNo) error {
-		typ, err := t.typeOf(pgno)
+		typ, _, in, err := t.viewNode(pgno)
 		if err != nil {
 			return err
 		}
 		if typ == format.PageBTreeLeaf {
 			return nil
-		}
-		in, err := t.viewInterior(pgno)
-		if err != nil {
-			return err
 		}
 		for i := range in.msgKeys {
 			uk := format.UserKey(in.msgKeys[i])

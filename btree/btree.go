@@ -328,28 +328,52 @@ func (t *BTree) viewLeaf(pgno format.PageNo) (*leaf, error) {
 	return l, err
 }
 
-// viewInterior is viewLeaf for an interior node: same shared-immutable contract and
-// same frame-cached decode (spec 01 Finding 1).
-func (t *BTree) viewInterior(pgno format.PageNo) (*interior, error) {
+// viewNode fetches a node for a read-only descent in a single pager Get, returning
+// its page type and whichever of the decoded leaf or interior it is. The descent code
+// needs the type to decide whether it has reached a leaf and needs the decoded body to
+// continue, and doing both from one Get halves the per-node buffer-pool traffic versus
+// a typeOf probe followed by a separate view fetch (spec 01 Finding 1 follow-on: the
+// node-decode cache left the read path bound on the per-node shard-lock acquisitions, so
+// fetching each node once rather than twice is the next cut). Like viewLeaf it serves
+// the frame-cached decode on a hit and caches a fresh decode on a miss, and the returned
+// node is shared and immutable.
+func (t *BTree) viewNode(pgno format.PageNo) (format.PageType, *leaf, *interior, error) {
 	fr, err := t.pgr.Get(pgno, pager.Read)
 	if err != nil {
-		return nil, err
+		return 0, nil, nil, err
 	}
-	if in, ok := fr.Decoded().(*interior); ok {
+	switch n := fr.Decoded().(type) {
+	case *leaf:
 		t.pgr.Unpin(fr, false)
-		return in, nil
+		return format.PageBTreeLeaf, n, nil, nil
+	case *interior:
+		t.pgr.Unpin(fr, false)
+		return format.PageBTreeInterior, nil, n, nil
 	}
 	data := fr.Data()
-	if len(data) < format.CommonHeaderSize || format.DecodeCommonHeader(data).Type != format.PageBTreeInterior {
+	if len(data) < format.CommonHeaderSize {
 		t.pgr.Unpin(fr, false)
-		return nil, format.ErrCorrupt
+		return 0, nil, nil, format.ErrCorrupt
 	}
-	in, err := unmarshalInterior(data)
-	if err == nil {
-		fr.SetDecoded(in)
+	switch typ := format.DecodeCommonHeader(data).Type; typ {
+	case format.PageBTreeLeaf:
+		l, err := unmarshalLeaf(data)
+		if err == nil {
+			fr.SetDecoded(l)
+		}
+		t.pgr.Unpin(fr, false)
+		return format.PageBTreeLeaf, l, nil, err
+	case format.PageBTreeInterior:
+		in, err := unmarshalInterior(data)
+		if err == nil {
+			fr.SetDecoded(in)
+		}
+		t.pgr.Unpin(fr, false)
+		return format.PageBTreeInterior, nil, in, err
+	default:
+		t.pgr.Unpin(fr, false)
+		return typ, nil, nil, format.ErrCorrupt
 	}
-	t.pgr.Unpin(fr, false)
-	return in, err
 }
 
 func (t *BTree) storeLeaf(pgno format.PageNo, l *leaf) error {
