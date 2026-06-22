@@ -60,10 +60,19 @@ func (t *BTree) gatherPoint(userKey []byte) ([]entry, error) {
 			if err != nil {
 				return nil, err
 			}
-			for i := range l.keys {
-				if format.CompareUser(format.UserKey(l.keys[i]), userKey) == 0 {
-					group = append(group, entry{ik: l.keys[i], val: l.vals[i]})
+			// A user key's versions are contiguous in the leaf (cells sort by user
+			// key first), so binary-search to the lower bound of the group and walk
+			// forward while the user key matches, instead of scanning the whole leaf
+			// (spec 01 Finding 3). The probe compares user keys directly so it needs
+			// no allocated search key.
+			lo := sort.Search(len(l.keys), func(i int) bool {
+				return format.CompareUser(format.UserKey(l.keys[i]), userKey) >= 0
+			})
+			for i := lo; i < len(l.keys); i++ {
+				if format.CompareUser(format.UserKey(l.keys[i]), userKey) != 0 {
+					break
 				}
+				group = append(group, entry{ik: l.keys[i], val: l.vals[i]})
 			}
 			break
 		}
