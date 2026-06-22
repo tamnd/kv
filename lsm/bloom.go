@@ -89,14 +89,30 @@ func bloomK(bitsPerKey int) uint32 {
 }
 
 // newBloom returns an empty filter sized for numKeys distinct keys at bitsPerKey
-// bits each, with a small floor so even a tiny segment carries a usable filter.
+// bits each, with a small floor so even a tiny segment carries a usable filter. The
+// bit count is rounded up to a power of two so every probe reduces a hash to a bit
+// index with a mask (h & (n-1)) instead of a division (h % n). The padding is a small
+// fraction of a data segment, where the values dominate, so the space cost is in the
+// noise while the per-probe division, paid k times on every segment a read touches, is
+// gone. A larger array also lowers the false-positive rate, so the rounding never makes
+// the filter weaker.
 func newBloom(numKeys, bitsPerKey int) *bloomFilter {
 	bits := numKeys * bitsPerKey
 	if bits < 64 {
 		bits = 64
 	}
-	nbytes := (bits + 7) / 8
+	bits = nextPow2(bits)
+	nbytes := bits / 8 // bits is a power of two >= 64, so it divides evenly into bytes
 	return &bloomFilter{bits: make([]byte, nbytes), k: bloomK(bitsPerKey)}
+}
+
+// nextPow2 returns the smallest power of two >= x (x >= 1).
+func nextPow2(x int) int {
+	p := 1
+	for p < x {
+		p <<= 1
+	}
+	return p
 }
 
 // nbits reports the bit-array length, the modulus every probe reduces against.
@@ -107,6 +123,15 @@ func (f *bloomFilter) add(key []byte) {
 	h := bloomHash(key)
 	delta := (h >> 17) | (h << 15) // a second independent hash by rotation
 	n := f.nbits()
+	if n&(n-1) == 0 { // power of two: reduce with a mask, no division
+		mask := n - 1
+		for i := uint32(0); i < f.k; i++ {
+			bit := h & mask
+			f.bits[bit/8] |= 1 << (bit % 8)
+			h += delta
+		}
+		return
+	}
 	for i := uint32(0); i < f.k; i++ {
 		bit := h % n
 		f.bits[bit/8] |= 1 << (bit % 8)
@@ -114,9 +139,12 @@ func (f *bloomFilter) add(key []byte) {
 	}
 }
 
-// mayContain reports whether key might be in the segment. False is definitive: the
-// key was never added. True may be a false positive. A nil or empty filter returns
-// true, so a segment without a filter is always read.
+// mayContain reports whether key might be in the segment. False is definitive: the key
+// was never added. True may be a false positive. A nil or empty filter returns true, so
+// a segment without a filter is always read. A filter whose bit array is a power of two
+// long (every filter newBloom builds) reduces each probe with a mask; a filter loaded
+// from an older segment whose array is not a power of two falls back to the division, so
+// both layouts read correctly with no format change.
 func (f *bloomFilter) mayContain(key []byte) bool {
 	if f == nil || len(f.bits) == 0 {
 		return true
@@ -124,6 +152,17 @@ func (f *bloomFilter) mayContain(key []byte) bool {
 	h := bloomHash(key)
 	delta := (h >> 17) | (h << 15)
 	n := f.nbits()
+	if n&(n-1) == 0 { // power of two: reduce with a mask, no division
+		mask := n - 1
+		for i := uint32(0); i < f.k; i++ {
+			bit := h & mask
+			if f.bits[bit/8]&(1<<(bit%8)) == 0 {
+				return false
+			}
+			h += delta
+		}
+		return true
+	}
 	for i := uint32(0); i < f.k; i++ {
 		bit := h % n
 		if f.bits[bit/8]&(1<<(bit%8)) == 0 {
