@@ -38,7 +38,13 @@ func (r *reader) Get(userKey []byte) ([]byte, error) {
 	if len(res) == 0 {
 		return nil, engine.ErrNotFound
 	}
-	return append([]byte(nil), res[0].val...), nil
+	// resolveStream already returns a freshly allocated, caller-owned value (it copies
+	// the folded version out of the shared decoded node), and res is local here, so
+	// res[0].val is not aliased anywhere else. Hand it back directly rather than copying
+	// it a second time: the value was copied three to four times on the read path, and
+	// this drops the redundant final copy so the fold-step copy is the only one (spec 01
+	// Finding 2). The shared leaf bytes are never exposed, so the no-alias contract holds.
+	return res[0].val, nil
 }
 
 // gatherPoint descends from the root to the leaf covering userKey and returns the
