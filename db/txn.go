@@ -591,6 +591,12 @@ func (t *Txn) Discard() {
 	t.finish()
 }
 
+// CommitVersion returns the version this transaction committed at, valid only after a
+// successful Commit. It is zero before commit and for a read-only or empty transaction,
+// which commit no writes. The server's interactive transaction path reads it to report a
+// commit version without racing the database's global version counter.
+func (t *Txn) CommitVersion() uint64 { return t.commitTs }
+
 // finish releases the snapshot exactly once. A borrowed read transaction leaves the
 // readMark alone: its owning Snapshot holds and releases it.
 func (t *Txn) finish() {

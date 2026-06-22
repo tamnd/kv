@@ -212,6 +212,110 @@ func (srv *Server) dispatchBinary(body []byte) []byte {
 		e.uint64(uint64(reclaimed))
 		return e.buf
 
+	case opBeginTxn:
+		writable := d.byte() == 1
+		if d.err != nil {
+			return decodeErrResponse()
+		}
+		id, err := s.BeginTxn(writable)
+		if err != nil {
+			return errResponse(err)
+		}
+		return encodeVersionResponse(id) // the id rides the uint64 response shape
+
+	case opTxnGet:
+		id := d.uint64()
+		key := d.bytes()
+		if d.err != nil {
+			return decodeErrResponse()
+		}
+		v, found, err := s.TxnGet(id, key)
+		if err != nil {
+			return errResponse(err)
+		}
+		return encodeReadResponse(found, v)
+
+	case opTxnExists:
+		id := d.uint64()
+		key := d.bytes()
+		if d.err != nil {
+			return decodeErrResponse()
+		}
+		found, err := s.TxnExists(id, key)
+		if err != nil {
+			return errResponse(err)
+		}
+		return encodeReadResponse(found, nil)
+
+	case opTxnSet:
+		id := d.uint64()
+		key := d.bytes()
+		value := d.bytes()
+		ttl := time.Duration(d.uint64()) * time.Millisecond
+		if d.err != nil {
+			return decodeErrResponse()
+		}
+		if err := s.TxnSet(id, key, value, ttl); err != nil {
+			return errResponse(err)
+		}
+		return []byte{byte(statusOK)}
+
+	case opTxnDelete:
+		id := d.uint64()
+		key := d.bytes()
+		if d.err != nil {
+			return decodeErrResponse()
+		}
+		if err := s.TxnDelete(id, key); err != nil {
+			return errResponse(err)
+		}
+		return []byte{byte(statusOK)}
+
+	case opTxnDeleteRange:
+		id := d.uint64()
+		lo := d.bytes()
+		hi := d.bytes()
+		if d.err != nil {
+			return decodeErrResponse()
+		}
+		if err := s.TxnDeleteRange(id, lo, hi); err != nil {
+			return errResponse(err)
+		}
+		return []byte{byte(statusOK)}
+
+	case opTxnMerge:
+		id := d.uint64()
+		key := d.bytes()
+		operand := d.bytes()
+		if d.err != nil {
+			return decodeErrResponse()
+		}
+		if err := s.TxnMerge(id, key, operand); err != nil {
+			return errResponse(err)
+		}
+		return []byte{byte(statusOK)}
+
+	case opTxnCommit:
+		id := d.uint64()
+		if d.err != nil {
+			return decodeErrResponse()
+		}
+		version, err := s.CommitTxn(id)
+		if err != nil {
+			return errResponse(err)
+		}
+		return encodeVersionResponse(version)
+
+	case opTxnDiscard:
+		id := d.uint64()
+		if d.err != nil {
+			return decodeErrResponse()
+		}
+		if err := s.DiscardTxn(id); err != nil {
+			return errResponse(err)
+		}
+		return []byte{byte(statusOK)}
+
 	default:
 		return encodeError(statusBadRequest, "kv: unknown opcode")
 	}
@@ -380,6 +484,8 @@ func errBinaryStatus(s status, msg string) error {
 		return wrapBinary(kv.ErrReadOnly, msg)
 	case statusUnavail:
 		return wrapBinary(kv.ErrNeedsRecovery, msg)
+	case statusNoTxn:
+		return wrapBinary(ErrNoSuchTxn, msg)
 	default:
 		return errors.New(msg)
 	}

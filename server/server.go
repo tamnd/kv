@@ -81,5 +81,11 @@ func (srv *Server) Serve(ln net.Listener) error {
 // draining and a final checkpoint into this path.
 func (srv *Server) Shutdown(ctx context.Context) error {
 	srv.cancel()
-	return srv.http.Shutdown(ctx)
+	err := srv.http.Shutdown(ctx)
+	// Force-discard any open interactive transactions and stop their reaper, releasing the
+	// snapshots they pin before the caller closes the database (spec 17 §6). This runs after the
+	// HTTP drain so a request committing an interactive transaction during the drain still finds
+	// its session; anything still open after the drain belongs to a gone client and is discarded.
+	srv.svc.Close()
+	return err
 }

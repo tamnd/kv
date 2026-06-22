@@ -43,6 +43,16 @@ const (
 	opCompact     opcode = 11
 	opScan        opcode = 12
 	opWatch       opcode = 13
+
+	opBeginTxn       opcode = 14
+	opTxnGet         opcode = 15
+	opTxnExists      opcode = 16
+	opTxnSet         opcode = 17
+	opTxnDelete      opcode = 18
+	opTxnDeleteRange opcode = 19
+	opTxnMerge       opcode = 20
+	opTxnCommit      opcode = 21
+	opTxnDiscard     opcode = 22
 )
 
 // status is the first byte of a response body. statusOK means the result fields follow; any
@@ -59,6 +69,7 @@ const (
 	statusUnavail    status = 4 // fenced-for-recovery, corrupt, or closed database
 	statusBadRequest status = 5 // a malformed frame or argument
 	statusInternal   status = 6 // any other failure
+	statusNoTxn      status = 7 // an interactive transaction id the server does not hold
 )
 
 // maxFrameSize caps a single message body so a corrupt or hostile length prefix cannot make
@@ -201,7 +212,9 @@ func statusForError(err error) status {
 		return statusConflict
 	case errors.Is(err, kv.ErrReadOnly):
 		return statusReadOnly
-	case errors.Is(err, kv.ErrNeedsRecovery), errors.Is(err, kv.ErrCorrupt), errors.Is(err, kv.ErrClosed):
+	case errors.Is(err, ErrNoSuchTxn):
+		return statusNoTxn
+	case errors.Is(err, ErrTooManyTxns), errors.Is(err, kv.ErrNeedsRecovery), errors.Is(err, kv.ErrCorrupt), errors.Is(err, kv.ErrClosed):
 		return statusUnavail
 	default:
 		return statusInternal
