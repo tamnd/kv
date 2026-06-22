@@ -14,15 +14,40 @@ import (
 // folded), and a write transaction's own buffered mutations are overlaid on the
 // snapshot (read-your-writes, spec 11 §6).
 //
-// For the B-tree core there is a single engine source, so this layer materializes
-// the resolved range once and overlays the small private write buffer on it, rather
-// than running a streaming heap-merge (which the LSM core's many sources will need).
-// Streaming and read-ahead are later slices; the protocol the caller sees is final.
+// The buffer `items` holds the resolved entries in ascending user-key order. There
+// are two ways it gets populated. A read-only forward scan over an engine that can
+// stream (an unbuffered B-tree) fills it lazily from the engine one entry at a time,
+// so a bounded scan reads O(ScanLen) entries instead of the whole range (spec 04).
+// A write transaction (its buffered writes must overlay the base), a reverse scan,
+// or an engine that cannot stream, falls back to materializing the whole resolved
+// range up front; that path sets drained and leaves stream nil, so every navigation
+// method below indexes a complete buffer exactly as it did before streaming existed.
 type Iterator struct {
-	items    []iterItem // ascending by user key, already resolved and overlaid
+	items    []iterItem // ascending by user key, resolved and overlaid; grows lazily when streaming
 	pos      int
 	reverse  bool
 	keysOnly bool
+
+	// Streaming state. stream is nil for the materialized path (drained already true).
+	db      *DB
+	rd      engine.Reader
+	stream  forwardScanner
+	lower   []byte
+	upper   []byte
+	after   []byte // exclusive cursor: the last key pulled from stream, nil before the first pull
+	drained bool   // no more entries to pull (range exhausted, or fully materialized)
+	err     error  // first mid-scan error, surfaced through Error
+}
+
+// forwardScanner is the optional capability an engine reader exposes when it can
+// serve a forward streaming scan without materializing the range. The db Iterator
+// type-asserts it and, when present and streamable, drives it one entry at a time
+// under the engine read lock instead of copying the whole range up front. Readers
+// that cannot stream (the LSM core today, or a buffered B-tree) do not satisfy it
+// or return StreamForward false, and the Iterator materializes.
+type forwardScanner interface {
+	StreamForward() bool
+	ScanForward(after, lower, upper []byte, keysOnly bool) (key, val []byte, ok bool, err error)
 }
 
 // iterItem is one resolved, visible user key and its value at the iterator's
@@ -54,6 +79,40 @@ func (t *Txn) NewIterator(opts engine.IterOptions) (*Iterator, error) {
 	// a scan phantom protection a per-key read set could not.
 	t.trackRange(lower, upper)
 
+	// Streaming fast path: a read-only, forward scan over an engine that can stream
+	// pulls entries lazily so a bounded scan does not walk the whole range (spec 04).
+	// A write transaction needs the buffered-write overlay and a reverse scan needs the
+	// whole range to walk backward, so both take the materialized path below.
+	if len(t.ops) == 0 && !opts.Reverse {
+		// Create the reader under the read lock, the same lock the materialized walk
+		// takes: an engine reader may snapshot mutable engine state (the LSM segment
+		// list) at construction and must not race a flush or compaction. The streaming
+		// path keeps the reader open afterward and reacquires the lock per pull.
+		t.db.mu.RLock()
+		rd, err := t.db.eng.NewReader(engine.Snapshot{Version: t.readVersion, Now: t.db.now()})
+		if err != nil {
+			t.db.mu.RUnlock()
+			return nil, err
+		}
+		sf, ok := rd.(forwardScanner)
+		streamable := ok && sf.StreamForward()
+		if !streamable {
+			rd.Close()
+		}
+		t.db.mu.RUnlock()
+		if streamable {
+			return &Iterator{
+				pos:      -1,
+				keysOnly: opts.KeysOnly,
+				db:       t.db,
+				rd:       rd,
+				stream:   sf,
+				lower:    lower,
+				upper:    upper,
+			}, nil
+		}
+	}
+
 	base, err := t.db.rangeSnapshot(t.readVersion, lower, upper, opts.KeysOnly)
 	if err != nil {
 		return nil, err
@@ -62,7 +121,60 @@ func (t *Txn) NewIterator(opts engine.IterOptions) (*Iterator, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Iterator{items: items, pos: -1, reverse: opts.Reverse, keysOnly: opts.KeysOnly}, nil
+	return &Iterator{items: items, pos: -1, reverse: opts.Reverse, keysOnly: opts.KeysOnly, drained: true}, nil
+}
+
+// pullOne pulls the next streamed entry into items, or marks the iterator drained
+// at end of range. It takes the engine read lock only for the single ScanForward
+// call: ScanForward holds no position across calls, so the lock spans one step, not
+// the whole scan, and a writer or checkpoint is never blocked behind a slow consumer.
+func (it *Iterator) pullOne() {
+	if it.drained || it.stream == nil {
+		it.drained = true
+		return
+	}
+	it.db.mu.RLock()
+	k, v, ok, err := it.stream.ScanForward(it.after, it.lower, it.upper, it.keysOnly)
+	it.db.mu.RUnlock()
+	if err != nil {
+		it.err = err
+		it.drained = true
+		return
+	}
+	if !ok {
+		it.drained = true
+		return
+	}
+	it.items = append(it.items, iterItem{key: k, val: v})
+	it.after = k
+}
+
+// fillTo pulls until items[n] exists or the range is drained. A no-op once
+// materialized (drained set, stream nil), so the navigation methods are unchanged
+// on that path.
+func (it *Iterator) fillTo(n int) {
+	for !it.drained && len(it.items) <= n {
+		it.pullOne()
+	}
+}
+
+// fillKeyGE pulls until the last buffered key is >= key or the range is drained, so
+// a forward SeekGE/SeekLT can binary-search the buffer for the boundary.
+func (it *Iterator) fillKeyGE(key []byte) {
+	for !it.drained {
+		if len(it.items) > 0 && bytes.Compare(it.items[len(it.items)-1].key, key) >= 0 {
+			return
+		}
+		it.pullOne()
+	}
+}
+
+// drainAll materializes the rest of the range. A reverse walk or a Last needs the
+// final entry, which on a forward stream is only known once the range is exhausted.
+func (it *Iterator) drainAll() {
+	for !it.drained {
+		it.pullOne()
+	}
 }
 
 // rangeSnapshot materializes the resolved, version-collapsed view of [lower, upper)
@@ -196,29 +308,38 @@ func inBounds(key, lower, upper []byte) bool {
 // whether the iterator is valid. Under reverse it positions at the last key <= the
 // equivalent point, mirroring the engine primitive (spec 11 §3).
 func (it *Iterator) SeekGE(key []byte) bool {
-	idx := sort.Search(len(it.items), func(i int) bool {
-		return bytes.Compare(it.items[i].key, key) >= 0
-	})
 	if it.reverse {
+		// Reverse needs the whole materialized range to step backward; it always
+		// comes through the materialized path, so the buffer is already complete.
+		idx := sort.Search(len(it.items), func(i int) bool {
+			return bytes.Compare(it.items[i].key, key) >= 0
+		})
 		// In reverse, "seek to >= key" means the largest key <= the search point;
 		// step back from the first key >= key.
 		it.pos = idx - 1
-	} else {
-		it.pos = idx
+		return it.Valid()
 	}
+	it.fillKeyGE(key)
+	it.pos = sort.Search(len(it.items), func(i int) bool {
+		return bytes.Compare(it.items[i].key, key) >= 0
+	})
 	return it.Valid()
 }
 
 // SeekLT positions at the last visible key < key in the iteration direction.
 func (it *Iterator) SeekLT(key []byte) bool {
+	if it.reverse {
+		idx := sort.Search(len(it.items), func(i int) bool {
+			return bytes.Compare(it.items[i].key, key) >= 0
+		})
+		it.pos = idx
+		return it.Valid()
+	}
+	it.fillKeyGE(key)
 	idx := sort.Search(len(it.items), func(i int) bool {
 		return bytes.Compare(it.items[i].key, key) >= 0
 	})
-	if it.reverse {
-		it.pos = idx
-	} else {
-		it.pos = idx - 1
-	}
+	it.pos = idx - 1
 	return it.Valid()
 }
 
@@ -227,6 +348,7 @@ func (it *Iterator) First() bool {
 	if it.reverse {
 		it.pos = len(it.items) - 1
 	} else {
+		it.fillTo(0)
 		it.pos = 0
 	}
 	return it.Valid()
@@ -237,6 +359,7 @@ func (it *Iterator) Last() bool {
 	if it.reverse {
 		it.pos = 0
 	} else {
+		it.drainAll()
 		it.pos = len(it.items) - 1
 	}
 	return it.Valid()
@@ -248,6 +371,7 @@ func (it *Iterator) Next() bool {
 		it.pos--
 	} else {
 		it.pos++
+		it.fillTo(it.pos)
 	}
 	return it.Valid()
 }
@@ -283,14 +407,23 @@ func (it *Iterator) Value() ([]byte, error) {
 	return it.items[it.pos].val, nil
 }
 
-// Error reports any error that ended iteration. The materialized iterator surfaces
-// build-time errors at NewIterator, so this is always nil for now; it exists so the
-// streaming form can report mid-scan I/O errors without an API change.
-func (it *Iterator) Error() error { return nil }
+// Error reports any error that ended iteration. The materialized path surfaces its
+// build-time error at NewIterator and never sets this; the streaming path records a
+// mid-scan ScanForward error here so a fill that stops early is distinguishable from
+// a genuine end of range.
+func (it *Iterator) Error() error { return it.err }
 
-// Close releases the iterator. The materialized form holds no engine resources past
-// construction, so this resets state; the streaming form will unpin sources here.
+// Close releases the iterator. The streaming path holds an engine reader open for its
+// lifetime (ScanForward re-descends per call, so it pins nothing between calls, but the
+// reader object itself is closed here); the materialized path holds no engine resources
+// past construction.
 func (it *Iterator) Close() error {
+	if it.rd != nil {
+		it.rd.Close()
+		it.rd = nil
+	}
+	it.stream = nil
+	it.drained = true
 	it.items = nil
 	it.pos = -1
 	return nil
