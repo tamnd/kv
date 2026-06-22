@@ -60,6 +60,21 @@ func (srv *Server) serveBinaryConn(conn net.Conn) {
 		if err != nil {
 			return // EOF or a framing error: the connection is done.
 		}
+		// The streaming opcodes write many frames for one request, so they are handled before
+		// the unary dispatch, which writes exactly one. A scan returns to the loop after its end
+		// frame; a watch takes over the connection for its life, so the loop ends after it.
+		if len(body) > 0 {
+			switch opcode(body[0]) {
+			case opScan:
+				if err := srv.serveBinaryScan(w, body); err != nil {
+					return
+				}
+				continue
+			case opWatch:
+				srv.serveBinaryWatch(conn, w, body)
+				return
+			}
+		}
 		resp := srv.dispatchBinary(body)
 		if err := writeFrame(w, resp); err != nil {
 			return
