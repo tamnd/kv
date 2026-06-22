@@ -110,6 +110,91 @@ func (r *reader) NewIter(opts engine.IterOptions) (engine.Cursor, error) {
 
 func (r *reader) Close() error { return nil }
 
+// StreamForward reports whether this reader can serve a forward streaming scan
+// (spec 04). A buffered (Bε) tree parks messages in the interior nodes that the
+// single-leaf group gather in ScanForward would miss, so a buffered tree cannot
+// stream and the db layer materializes the range instead. An unbuffered tree keeps
+// every version in the leaf chain, so the leaf-chain walk sees everything.
+func (r *reader) StreamForward() bool { return !r.t.buffered }
+
+// ScanForward returns the next version-resolved, visible user key strictly greater
+// than after (or the first key >= lower when after is nil) within [lower, upper), at
+// the reader's snapshot, ascending. ok is false when the range is exhausted. keysOnly
+// drops the value. The returned key and value are freshly allocated and caller-owned.
+//
+// It holds no leaf pin or scan position across calls: it re-descends from the root
+// every call and walks the leaf-link chain only as far as the next visible group.
+// That is what lets the caller release and reacquire the engine lock between calls,
+// the same consistency a point Get gives: each call reads a stable tree under the
+// caller's read lock, and the fixed snapshot version makes the sequence of calls
+// consistent even though writers may run in the gaps. Tombstoned or range-deleted
+// groups fold to absent and are skipped, so a call may cross several groups and leaf
+// boundaries before it returns a visible one. Only valid when StreamForward is true.
+func (r *reader) ScanForward(after, lower, upper []byte, keysOnly bool) (uk, val []byte, ok bool, err error) {
+	t := r.t
+	// Descend to the leaf to start from: the one covering `after` (we want the first
+	// key strictly past it), or on the first call the leaf covering lower, or the
+	// leftmost leaf when the range is left-open.
+	var pgno format.PageNo
+	switch {
+	case after != nil:
+		pgno, err = t.leafCovering(after)
+	case lower != nil:
+		pgno, err = t.leafCovering(lower)
+	default:
+		pgno, err = t.leftmostLeaf()
+	}
+	if err != nil {
+		return nil, nil, false, err
+	}
+
+	for pgno != format.NoPage {
+		l, err := t.viewLeaf(pgno)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		// Skip the already-consumed prefix of the leaf with a binary search: the first
+		// cell strictly past `after`, or the first cell >= lower on the first call.
+		i := 0
+		switch {
+		case after != nil:
+			i = sort.Search(len(l.keys), func(j int) bool {
+				return format.CompareUser(format.UserKey(l.keys[j]), after) > 0
+			})
+		case lower != nil:
+			i = sort.Search(len(l.keys), func(j int) bool {
+				return format.CompareUser(format.UserKey(l.keys[j]), lower) >= 0
+			})
+		}
+		for i < len(l.keys) {
+			guk := format.UserKey(l.keys[i])
+			if upper != nil && format.CompareUser(guk, upper) >= 0 {
+				return nil, nil, false, nil // crossed the upper bound: range exhausted
+			}
+			// A user key's whole version group is contiguous in this one leaf (splitPoint
+			// never cuts a group), so gather it here and fold it in isolation.
+			j := i
+			var group []entry
+			for j < len(l.keys) && format.CompareUser(format.UserKey(l.keys[j]), guk) == 0 {
+				group = append(group, entry{ik: l.keys[j], val: l.vals[j]})
+				j++
+			}
+			res := resolveStream(group, r.snap, t.merge, t.rangeDels)
+			if len(res) > 0 {
+				v := res[0].val
+				if keysOnly {
+					v = nil
+				}
+				return res[0].uk, v, true, nil
+			}
+			// Folded to absent (tombstone or covering range delete): skip and keep going.
+			i = j
+		}
+		pgno = l.next
+	}
+	return nil, nil, false, nil
+}
+
 // entry is one raw cell (full internal key + value) read from a leaf.
 type entry struct {
 	ik  []byte
