@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/pem"
 	"flag"
 	"fmt"
 	"net"
@@ -45,6 +47,16 @@ func cmdServe(args []string) int {
 	// leaves the server open for a database on a trusted socket. The file maps each token to an
 	// identity and its per-prefix grants; see server.ParseTokenAuth for the format.
 	authFile := fs.String("auth-file", "", "path to a token table to require authentication (empty serves open)")
+	// JWT bearer authentication (spec 17 §6): an alternative to the static token table that validates
+	// signed JWTs and maps their claims to the same per-prefix identities. A key source is required to
+	// turn it on, exactly one of a shared HMAC secret, a PEM public key, or an OIDC JWKS URL. The issuer
+	// and audience, when set, must match the token's iss and aud. JWT and -auth-file are mutually
+	// exclusive, since a server has one authenticator.
+	jwtHS256SecretFile := fs.String("jwt-hs256-secret-file", "", "path to a file holding the HMAC secret for HS256/384/512 JWTs")
+	jwtPublicKeyFile := fs.String("jwt-public-key-file", "", "path to a PEM public key (RSA or EC) verifying RS/PS/ES JWTs")
+	jwtJWKSURL := fs.String("jwt-jwks-url", "", "URL of an OIDC JWKS endpoint to fetch signing keys from")
+	jwtIssuer := fs.String("jwt-issuer", "", "required JWT issuer (iss claim); empty accepts any issuer")
+	jwtAudience := fs.String("jwt-audience", "", "required JWT audience (aud claim); empty accepts any audience")
 	// Transport security (spec 17 §6). -tls-cert/-tls-key turn on TLS on both listeners; -tls-client-ca
 	// additionally turns on mTLS, verifying client certificates against that CA and mapping each to an
 	// identity by the -mtls-identity-file table. A non-loopback bind without TLS is refused unless
@@ -58,7 +70,7 @@ func cmdServe(args []string) int {
 		return exitUsage
 	}
 	if fs.NArg() != 1 {
-		return usageErr("usage: kv serve <db> [-addr host:port] [-binary-addr host:port] [-auth-file path] [-tls-cert path -tls-key path] [limit flags]")
+		return usageErr("usage: kv serve <db> [-addr host:port] [-binary-addr host:port] [-auth-file path | -jwt-jwks-url url] [-tls-cert path -tls-key path] [limit flags]")
 	}
 	limits := server.Limits{
 		MaxKeySize:   *maxKeySize,
@@ -67,11 +79,24 @@ func cmdServe(args []string) int {
 		MaxScanLimit: *maxScanLimit,
 	}
 
-	// Load the token table before opening the database so a malformed auth file fails before the
-	// file is touched. A nil authenticator leaves the server open.
+	// Resolve the authenticator before opening the database so a malformed auth file, an unreadable
+	// key, or a contradictory flag combination fails before the file is touched. The token table and
+	// JWT are mutually exclusive, since the server holds one authenticator; a nil result leaves the
+	// server open.
+	jwtConfigured := *jwtHS256SecretFile != "" || *jwtPublicKeyFile != "" || *jwtJWKSURL != ""
+	if *authFile != "" && jwtConfigured {
+		return fail(fmt.Errorf("kv: -auth-file and the -jwt-* flags are mutually exclusive"))
+	}
 	var auth server.Authenticator
-	if *authFile != "" {
+	switch {
+	case *authFile != "":
 		a, err := loadAuthFile(*authFile)
+		if err != nil {
+			return fail(err)
+		}
+		auth = a
+	case jwtConfigured:
+		a, err := buildJWT(*jwtHS256SecretFile, *jwtPublicKeyFile, *jwtJWKSURL, *jwtIssuer, *jwtAudience)
 		if err != nil {
 			return fail(err)
 		}
@@ -174,6 +199,73 @@ func loadAuthFile(path string) (server.Authenticator, error) {
 	}
 	defer f.Close()
 	return server.ParseTokenAuth(f)
+}
+
+// buildJWT assembles a JWT bearer authenticator from the CLI flags. It requires exactly one key
+// source, a shared HMAC secret, a PEM public key, or an OIDC JWKS URL, so an operator cannot
+// half-configure it; the issuer and audience are optional and, when set, become required claim
+// checks. The HMAC secret is the file content with a trailing newline trimmed, so a secret written
+// with a plain editor or `echo` works without a stray byte; a deployment that needs an exact secret
+// with trailing whitespace should not store it in a text file.
+func buildJWT(hs256SecretFile, publicKeyFile, jwksURL, issuer, audience string) (server.Authenticator, error) {
+	sources := 0
+	for _, s := range []string{hs256SecretFile, publicKeyFile, jwksURL} {
+		if s != "" {
+			sources++
+		}
+	}
+	if sources != 1 {
+		return nil, fmt.Errorf("kv: configure exactly one of -jwt-hs256-secret-file, -jwt-public-key-file, or -jwt-jwks-url")
+	}
+
+	var keys server.KeySource
+	switch {
+	case hs256SecretFile != "":
+		raw, err := os.ReadFile(hs256SecretFile)
+		if err != nil {
+			return nil, fmt.Errorf("kv: reading JWT HMAC secret: %w", err)
+		}
+		secret := bytes.TrimRight(raw, "\r\n")
+		if len(secret) == 0 {
+			return nil, fmt.Errorf("kv: JWT HMAC secret file %s is empty", hs256SecretFile)
+		}
+		keys = server.NewStaticKeySet(nil, secret)
+	case publicKeyFile != "":
+		pub, err := loadPEMPublicKey(publicKeyFile)
+		if err != nil {
+			return nil, err
+		}
+		keys = server.NewStaticKeySet(nil, pub)
+	case jwksURL != "":
+		keys = server.NewRemoteKeySet(server.JWKSOptions{URL: jwksURL})
+	}
+
+	return server.NewJWTAuthenticator(server.JWTOptions{
+		Keys:     keys,
+		Issuer:   issuer,
+		Audience: audience,
+	}), nil
+}
+
+// loadPEMPublicKey reads a PEM-encoded public key (an RSA or EC key in PKIX/SubjectPublicKeyInfo
+// form, the `BEGIN PUBLIC KEY` block) and returns the parsed key for the JWT validator. A PKCS#1 RSA
+// key (`BEGIN RSA PUBLIC KEY`) is accepted too, since some tooling emits that form.
+func loadPEMPublicKey(path string) (any, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("kv: reading JWT public key: %w", err)
+	}
+	block, _ := pem.Decode(raw)
+	if block == nil {
+		return nil, fmt.Errorf("kv: -jwt-public-key-file %s contains no PEM block", path)
+	}
+	if pub, err := x509.ParsePKIXPublicKey(block.Bytes); err == nil {
+		return pub, nil
+	}
+	if pub, err := x509.ParsePKCS1PublicKey(block.Bytes); err == nil {
+		return pub, nil
+	}
+	return nil, fmt.Errorf("kv: -jwt-public-key-file %s is not a supported RSA or EC public key", path)
 }
 
 // buildTLS assembles the server's TLS config and mTLS peer authenticator from the four transport
