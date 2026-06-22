@@ -236,7 +236,7 @@ func (srv *Server) httpHandler() http.Handler {
 	// Authentication wraps the whole router: with an authenticator configured every non-exempt
 	// request must carry a valid credential before it reaches a handler, and with none the wrap is
 	// a pass-through. Authorization happens inside each handler, where the keys are known.
-	return srv.authMiddleware(mux)
+	return srv.authMiddleware(srv.overloadMiddleware(mux))
 }
 
 // decodeKey reads the {key} path segment and decodes it under the request's ?encoding
@@ -419,6 +419,12 @@ func writeServiceErr(w http.ResponseWriter, err error) {
 		http.Error(w, err.Error(), http.StatusMethodNotAllowed)
 	case errors.Is(err, ErrLimitExceeded):
 		http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
+	case errors.Is(err, ErrRateLimited):
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, err.Error(), http.StatusTooManyRequests)
+	case errors.Is(err, ErrOverloaded):
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 	case errors.Is(err, kv.ErrNeedsRecovery), errors.Is(err, kv.ErrCorrupt), errors.Is(err, kv.ErrClosed):
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 	default:

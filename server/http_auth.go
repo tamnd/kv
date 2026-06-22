@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"strings"
+	"time"
 )
 
 // This file is the HTTP half of authentication and authorization (spec 17 §6). It sits between the
@@ -70,6 +71,33 @@ func (srv *Server) authMiddleware(next http.Handler) http.Handler {
 			return
 		}
 		next.ServeHTTP(w, r.WithContext(withIdentity(r.Context(), id)))
+	})
+}
+
+// overloadMiddleware applies the per-caller rate limit and the global in-flight cap to every
+// non-exempt request (spec 17 §4, §6). It runs inside authMiddleware so it can key the rate limit by
+// the resolved identity, falling back to the remote address on an open server; the operational
+// health and metrics routes are exempt, so a scrape or a load-balancer probe is never rate-limited
+// or shed. A rate-limited request is refused with 429 and an overloaded one with 503, both carrying
+// a Retry-After, before the handler runs. An admitted request holds an in-flight slot until the
+// handler returns, which for a scan or a watch is the stream's life: a long stream counts as one
+// in-flight request, the cost of bounding concurrent streams by the same simple cap.
+func (srv *Server) overloadMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isAuthExempt(r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if srv.rate != nil && !srv.rate.allow(rateKey(identityFrom(r.Context()), r.RemoteAddr), time.Now()) {
+			writeServiceErr(w, ErrRateLimited)
+			return
+		}
+		if !srv.inflight.acquire() {
+			writeServiceErr(w, ErrOverloaded)
+			return
+		}
+		defer srv.inflight.release()
+		next.ServeHTTP(w, r)
 	})
 }
 

@@ -32,6 +32,15 @@ func cmdServe(args []string) int {
 	maxValueSize := fs.Int("max-value-size", defaults.MaxValueSize, "largest value in bytes (0 disables)")
 	maxBatchOps := fs.Int("max-batch-ops", defaults.MaxBatchOps, "most ops in a batch or transaction (0 disables)")
 	maxScanLimit := fs.Int("max-scan-limit", defaults.MaxScanLimit, "most pairs one scan returns (0 disables)")
+	// Overload guardrails (spec 17 §4, §6): caps on how many connections, how many concurrent
+	// requests, and how fast one caller may send, plus a final checkpoint on shutdown. Each is off
+	// by default (zero), so a database on a trusted socket pays nothing; an exposed one sets them to
+	// protect the single process from being swamped by the number of requests rather than their size.
+	maxConns := fs.Int("max-conns", 0, "most simultaneously open connections per listener (0 unlimited)")
+	maxInFlight := fs.Int("max-in-flight", 0, "most concurrent in-progress requests (0 unlimited)")
+	ratePerSecond := fs.Float64("rate", 0, "per-caller request rate in requests per second (0 unlimited)")
+	rateBurst := fs.Int("rate-burst", 0, "per-caller burst of requests allowed at once (0 defaults to the rate)")
+	checkpointOnShutdown := fs.Bool("checkpoint-on-shutdown", false, "fold the WAL into the main file on graceful shutdown")
 	// Authentication is opt-in (spec 17 §6): -auth-file names a token table, and an empty value
 	// leaves the server open for a database on a trusted socket. The file maps each token to an
 	// identity and its per-prefix grants; see server.ParseTokenAuth for the format.
@@ -101,11 +110,16 @@ func cmdServe(args []string) int {
 		return fail(err)
 	}
 	srv := server.New(d, server.Options{
-		Addr:      ln.Addr().String(),
-		Limits:    &limits,
-		Auth:      auth,
-		PeerAuth:  peerAuth,
-		TLSConfig: tlsConfig,
+		Addr:                 ln.Addr().String(),
+		Limits:               &limits,
+		Auth:                 auth,
+		PeerAuth:             peerAuth,
+		TLSConfig:            tlsConfig,
+		MaxConns:             *maxConns,
+		MaxInFlight:          *maxInFlight,
+		RatePerSecond:        *ratePerSecond,
+		RateBurst:            *rateBurst,
+		CheckpointOnShutdown: *checkpointOnShutdown,
 	})
 
 	// The announced scheme reflects whether TLS is on, so the printed URL is one a client can use

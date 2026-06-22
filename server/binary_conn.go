@@ -22,9 +22,10 @@ import (
 // is the binary analog of the HTTP Serve: a host that wants the efficient protocol runs this on
 // a second listener alongside the HTTP one. It returns when accepting stops.
 func (srv *Server) ServeBinary(ln net.Listener) error {
-	// Wrap the listener in TLS when configured, so the binary face gets the same transport security
-	// as HTTP and an accepted connection is a *tls.Conn the rest of the loop treats transparently.
-	ln = srv.wrapTLS(ln)
+	// Apply the connection cap and TLS the same way the HTTP face does, so the binary listener gets
+	// the same backpressure and transport security and an accepted connection is treated
+	// transparently by the rest of the loop.
+	ln = srv.wrapListener(ln)
 	// Close the listener when the server shuts down so a blocked Accept returns and this loop
 	// exits, the same way http.Server.Shutdown unblocks its own Accept.
 	stop := context.AfterFunc(srv.baseCtx, func() { ln.Close() })
@@ -72,29 +73,64 @@ func (srv *Server) serveBinaryConn(conn net.Conn) {
 		if err != nil {
 			return // EOF or a framing error: the connection is done.
 		}
-		// The streaming opcodes write many frames for one request, so they are handled before
-		// the unary dispatch, which writes exactly one. A scan returns to the loop after its end
-		// frame; a watch takes over the connection for its life, so the loop ends after it.
-		if len(body) > 0 {
-			switch opcode(body[0]) {
-			case opScan:
-				if err := srv.serveBinaryScan(w, body, sess); err != nil {
-					return
-				}
-				continue
-			case opWatch:
-				srv.serveBinaryWatch(conn, w, body, sess)
+		// Apply the overload guardrails before the operation runs: a per-caller rate limit and a
+		// global in-flight cap, each shedding an excess request with a retryable error frame and
+		// looping rather than dropping the connection, so a client backs off and retries on the same
+		// connection. An admitted request holds an in-flight slot until it completes; a stream holds
+		// it for the stream's life, which is the cost of counting a stream as one in-flight request.
+		if srv.rate != nil && !srv.rate.allow(binaryRateKey(sess, conn), time.Now()) {
+			if !writeFlush(w, encodeError(statusRateLimited, ErrRateLimited.Error())) {
 				return
 			}
+			continue
 		}
-		resp := srv.dispatchBinary(body, sess)
-		if err := writeFrame(w, resp); err != nil {
-			return
+		if !srv.inflight.acquire() {
+			if !writeFlush(w, encodeError(statusOverloaded, ErrOverloaded.Error())) {
+				return
+			}
+			continue
 		}
-		if err := w.Flush(); err != nil {
+		keepGoing := srv.handleBinaryFrame(conn, w, body, sess)
+		srv.inflight.release()
+		if !keepGoing {
 			return
 		}
 	}
+}
+
+// handleBinaryFrame dispatches one already-admitted request frame and reports whether the
+// connection loop should continue. The streaming opcodes write many frames for one request, so they
+// are handled before the unary dispatch, which writes exactly one: a scan returns to the loop after
+// its end frame, while a watch takes over the connection for its life and so ends the loop. A write
+// error on the response ends the connection.
+func (srv *Server) handleBinaryFrame(conn net.Conn, w *bufio.Writer, body []byte, sess *binarySession) bool {
+	if len(body) > 0 {
+		switch opcode(body[0]) {
+		case opScan:
+			return srv.serveBinaryScan(w, body, sess) == nil
+		case opWatch:
+			srv.serveBinaryWatch(conn, w, body, sess)
+			return false
+		}
+	}
+	resp := srv.dispatchBinary(body, sess)
+	return writeFlush(w, resp)
+}
+
+// writeFlush writes one frame and flushes it, reporting success so the caller can end the connection
+// on a write error. It is the unary write path the dispatch and the shed-request responses share.
+func writeFlush(w *bufio.Writer, body []byte) bool {
+	if err := writeFrame(w, body); err != nil {
+		return false
+	}
+	return w.Flush() == nil
+}
+
+// binaryRateKey names the caller a binary connection's rate limit applies to: the authenticated
+// identity when the connection presented one, or the remote address when it runs open, mirroring the
+// HTTP face's keying so a token's budget is the same on either wire.
+func binaryRateKey(sess *binarySession, conn net.Conn) string {
+	return rateKey(sess.ident, conn.RemoteAddr().String())
 }
 
 // binarySession is the per-connection state of the binary protocol that outlives one request
@@ -627,6 +663,10 @@ func errBinaryStatus(s status, msg string) error {
 		return wrapBinary(ErrUnauthenticated, msg)
 	case statusForbidden:
 		return wrapBinary(ErrForbidden, msg)
+	case statusOverloaded:
+		return wrapBinary(ErrOverloaded, msg)
+	case statusRateLimited:
+		return wrapBinary(ErrRateLimited, msg)
 	default:
 		return errors.New(msg)
 	}
