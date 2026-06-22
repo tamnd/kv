@@ -53,6 +53,8 @@ const (
 	opTxnMerge       opcode = 20
 	opTxnCommit      opcode = 21
 	opTxnDiscard     opcode = 22
+
+	opAuth opcode = 23 // authenticate the connection, binding an identity for later ops
 )
 
 // status is the first byte of a response body. statusOK means the result fields follow; any
@@ -71,6 +73,9 @@ const (
 	statusInternal   status = 6 // any other failure
 	statusNoTxn      status = 7 // an interactive transaction id the server does not hold
 	statusTooLarge   status = 8 // a request past a configured size limit
+
+	statusUnauthenticated status = 9  // a missing or unrecognized credential
+	statusForbidden       status = 10 // a recognized identity without a grant for the key
 )
 
 // maxFrameSize caps a single message body so a corrupt or hostile length prefix cannot make
@@ -217,6 +222,10 @@ func statusForError(err error) status {
 		return statusNoTxn
 	case errors.Is(err, ErrLimitExceeded):
 		return statusTooLarge
+	case errors.Is(err, ErrUnauthenticated):
+		return statusUnauthenticated
+	case errors.Is(err, ErrForbidden):
+		return statusForbidden
 	case errors.Is(err, ErrTooManyTxns), errors.Is(err, kv.ErrNeedsRecovery), errors.Is(err, kv.ErrCorrupt), errors.Is(err, kv.ErrClosed):
 		return statusUnavail
 	default:

@@ -46,7 +46,7 @@ func encodeStreamError(s status, msg string) []byte {
 // error frame, the streaming convention for a failure that cannot change an already-started
 // response. It returns a non-nil error only when the connection itself broke, which tells the
 // caller to drop it.
-func (srv *Server) serveBinaryScan(w *bufio.Writer, body []byte) error {
+func (srv *Server) serveBinaryScan(w *bufio.Writer, body []byte, sess *binarySession) error {
 	d := newDecoder(body)
 	d.byte() // opScan, already known by the dispatcher
 	opts := ScanOptions{
@@ -59,6 +59,17 @@ func (srv *Server) serveBinaryScan(w *bufio.Writer, body []byte) error {
 	}
 	if d.err != nil {
 		if e := writeFrame(w, encodeStreamError(statusBadRequest, "kv: malformed scan request")); e != nil {
+			return e
+		}
+		return w.Flush()
+	}
+	// A scan may return any key in its selected region, so it needs a read grant covering that
+	// region: the explicit prefix, or the bound the from/to range shares. Authorizing before the
+	// first item frame lets a denial be a clean error frame rather than a torn stream.
+	if err := srv.authorizeBinary(sess, func(id *Identity) bool {
+		return id.canReadScan(scanAuthPrefix(opts.Prefix, opts.Lower, opts.Upper))
+	}); err != nil {
+		if e := writeFrame(w, encodeStreamError(statusForError(err), err.Error())); e != nil {
 			return e
 		}
 		return w.Flush()
@@ -106,13 +117,20 @@ func (srv *Server) serveBinaryScan(w *bufio.Writer, body []byte) error {
 // request, so any read returning at all means the client hung up, and that cancels the feed. A
 // real feed error (the consumer fell too far behind) rides an error frame before the connection
 // closes, so a lagged client learns why.
-func (srv *Server) serveBinaryWatch(conn net.Conn, w *bufio.Writer, body []byte) {
+func (srv *Server) serveBinaryWatch(conn net.Conn, w *bufio.Writer, body []byte, sess *binarySession) {
 	d := newDecoder(body)
 	d.byte() // opWatch
 	prefix := d.bytes()
 	since := d.uint64()
 	if d.err != nil {
 		writeFrame(w, encodeStreamError(statusBadRequest, "kv: malformed watch request"))
+		w.Flush()
+		return
+	}
+	// A watch delivers every committed change under its prefix, so it needs a read grant covering
+	// that prefix; an empty prefix watches the whole keyspace and needs a global read grant.
+	if err := srv.authorizeBinary(sess, func(id *Identity) bool { return id.canReadScan(prefix) }); err != nil {
+		writeFrame(w, encodeStreamError(statusForError(err), err.Error()))
 		w.Flush()
 		return
 	}

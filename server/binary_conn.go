@@ -55,6 +55,10 @@ func (srv *Server) serveBinaryConn(conn net.Conn) {
 
 	r := bufio.NewReader(conn)
 	w := bufio.NewWriter(conn)
+	// One session per connection holds the identity an opAuth handshake binds, so a token is
+	// presented once and every later operation on the connection is authorized against it. It
+	// stays nil on an open server, where authorizeBinary allows everything.
+	sess := &binarySession{}
 	for {
 		body, err := readFrame(r)
 		if err != nil {
@@ -66,16 +70,16 @@ func (srv *Server) serveBinaryConn(conn net.Conn) {
 		if len(body) > 0 {
 			switch opcode(body[0]) {
 			case opScan:
-				if err := srv.serveBinaryScan(w, body); err != nil {
+				if err := srv.serveBinaryScan(w, body, sess); err != nil {
 					return
 				}
 				continue
 			case opWatch:
-				srv.serveBinaryWatch(conn, w, body)
+				srv.serveBinaryWatch(conn, w, body, sess)
 				return
 			}
 		}
-		resp := srv.dispatchBinary(body)
+		resp := srv.dispatchBinary(body, sess)
 		if err := writeFrame(w, resp); err != nil {
 			return
 		}
@@ -85,11 +89,42 @@ func (srv *Server) serveBinaryConn(conn net.Conn) {
 	}
 }
 
+// binarySession is the per-connection state of the binary protocol that outlives one request
+// frame. ident is the caller an opAuth handshake authenticated; it is nil until the connection
+// authenticates and stays nil for the life of an open server, where every operation is allowed.
+type binarySession struct {
+	ident *Identity
+}
+
+// authorizeBinary is the binary analog of the HTTP authorize gate. With auth disabled it allows
+// everything. With auth on it runs the predicate against the identity bound to the connection by
+// opAuth, returning ErrForbidden when the predicate denies and ErrUnauthenticated when the
+// connection never authenticated. It calls the same Identity grant methods the HTTP path does, so
+// a token authorizes the same operations on either wire.
+func (srv *Server) authorizeBinary(sess *binarySession, allowed func(*Identity) bool) error {
+	if srv.auth == nil {
+		return nil
+	}
+	if sess.ident == nil {
+		return ErrUnauthenticated
+	}
+	if !allowed(sess.ident) {
+		return ErrForbidden
+	}
+	return nil
+}
+
+// binaryAuthed is the authorize predicate for an operation that any authenticated identity may
+// perform regardless of its grants: opening, committing, or discarding an interactive transaction,
+// none of which touch a key by itself (the per-key checks ride the transaction's own reads and
+// writes). It exists so those cases read the same as the keyed ones.
+func binaryAuthed(*Identity) bool { return true }
+
 // dispatchBinary decodes one request body, performs the operation against the Service, and
 // returns the encoded response body. A decode failure becomes a bad-request response rather
 // than a dropped connection. The streaming opcodes (scan, watch) are not served here; they get
 // their own framing in a later slice and a unary dispatch rejects them as bad requests.
-func (srv *Server) dispatchBinary(body []byte) []byte {
+func (srv *Server) dispatchBinary(body []byte, sess *binarySession) []byte {
 	d := newDecoder(body)
 	op := opcode(d.byte())
 	if d.err != nil {
@@ -98,10 +133,32 @@ func (srv *Server) dispatchBinary(body []byte) []byte {
 	s := srv.svc
 
 	switch op {
+	case opAuth:
+		// The authentication handshake. It is the one opcode that needs no prior authorization,
+		// since it is what establishes the identity every later op is authorized against. On an
+		// open server it is a no-op success with an empty identity name, so a client that always
+		// authenticates works against an open server too.
+		cred := d.bytes()
+		if d.err != nil {
+			return decodeErrResponse()
+		}
+		if srv.auth == nil {
+			return encodeAuthResponse("")
+		}
+		id, ok := srv.auth.Authenticate(string(cred))
+		if !ok {
+			return encodeError(statusUnauthenticated, ErrUnauthenticated.Error())
+		}
+		sess.ident = id
+		return encodeAuthResponse(id.Name)
+
 	case opGet:
 		key := d.bytes()
 		if d.err != nil {
 			return decodeErrResponse()
+		}
+		if err := srv.authorizeBinary(sess, func(id *Identity) bool { return id.canRead(key) }); err != nil {
+			return errResponse(err)
 		}
 		v, found, err := s.Get(key)
 		if err != nil {
@@ -113,6 +170,9 @@ func (srv *Server) dispatchBinary(body []byte) []byte {
 		key := d.bytes()
 		if d.err != nil {
 			return decodeErrResponse()
+		}
+		if err := srv.authorizeBinary(sess, func(id *Identity) bool { return id.canRead(key) }); err != nil {
+			return errResponse(err)
 		}
 		found, err := s.Exists(key)
 		if err != nil {
@@ -127,6 +187,9 @@ func (srv *Server) dispatchBinary(body []byte) []byte {
 		if d.err != nil {
 			return decodeErrResponse()
 		}
+		if err := srv.authorizeBinary(sess, func(id *Identity) bool { return id.canWrite(key) }); err != nil {
+			return errResponse(err)
+		}
 		version, err := s.Set(key, value, ttl)
 		if err != nil {
 			return errResponse(err)
@@ -137,6 +200,9 @@ func (srv *Server) dispatchBinary(body []byte) []byte {
 		key := d.bytes()
 		if d.err != nil {
 			return decodeErrResponse()
+		}
+		if err := srv.authorizeBinary(sess, func(id *Identity) bool { return id.canWrite(key) }); err != nil {
+			return errResponse(err)
 		}
 		version, err := s.Delete(key)
 		if err != nil {
@@ -150,6 +216,9 @@ func (srv *Server) dispatchBinary(body []byte) []byte {
 		if d.err != nil {
 			return decodeErrResponse()
 		}
+		if err := srv.authorizeBinary(sess, func(id *Identity) bool { return id.canWriteRange(lo, hi) }); err != nil {
+			return errResponse(err)
+		}
 		version, err := s.DeleteRange(lo, hi)
 		if err != nil {
 			return errResponse(err)
@@ -162,6 +231,9 @@ func (srv *Server) dispatchBinary(body []byte) []byte {
 		if d.err != nil {
 			return decodeErrResponse()
 		}
+		if err := srv.authorizeBinary(sess, func(id *Identity) bool { return id.canWrite(key) }); err != nil {
+			return errResponse(err)
+		}
 		version, err := s.Merge(key, operand)
 		if err != nil {
 			return errResponse(err)
@@ -172,6 +244,11 @@ func (srv *Server) dispatchBinary(body []byte) []byte {
 		req, ok := decodeTxnRequest(d)
 		if !ok {
 			return decodeErrResponse()
+		}
+		// The whole transaction is authorized before any of it applies, so a mixed-grant
+		// transaction is refused as a unit and never commits the part it was allowed.
+		if err := srv.authorizeBinary(sess, func(id *Identity) bool { return id.canDoTxn(req.Asserts, req.Ops) }); err != nil {
+			return errResponse(err)
 		}
 		res, err := s.Txn(req)
 		if err != nil {
@@ -184,6 +261,9 @@ func (srv *Server) dispatchBinary(body []byte) []byte {
 		if !ok {
 			return decodeErrResponse()
 		}
+		if err := srv.authorizeBinary(sess, func(id *Identity) bool { return id.canDoTxn(nil, ops) }); err != nil {
+			return errResponse(err)
+		}
 		version, err := s.Batch(ops)
 		if err != nil {
 			return errResponse(err)
@@ -191,9 +271,15 @@ func (srv *Server) dispatchBinary(body []byte) []byte {
 		return encodeVersionResponse(version)
 
 	case opStats:
+		if err := srv.authorizeBinary(sess, isAdmin); err != nil {
+			return errResponse(err)
+		}
 		return encodeStatsResponse(s.Stats())
 
 	case opCheckpoint:
+		if err := srv.authorizeBinary(sess, isAdmin); err != nil {
+			return errResponse(err)
+		}
 		if err := s.Checkpoint(); err != nil {
 			return errResponse(err)
 		}
@@ -203,6 +289,9 @@ func (srv *Server) dispatchBinary(body []byte) []byte {
 		budget := int(d.uint64())
 		if d.err != nil {
 			return decodeErrResponse()
+		}
+		if err := srv.authorizeBinary(sess, isAdmin); err != nil {
+			return errResponse(err)
 		}
 		reclaimed, err := s.Compact(budget)
 		if err != nil {
@@ -217,6 +306,11 @@ func (srv *Server) dispatchBinary(body []byte) []byte {
 		if d.err != nil {
 			return decodeErrResponse()
 		}
+		// Opening a transaction touches no key, so any authenticated identity may; its reads and
+		// writes are authorized op by op as they arrive.
+		if err := srv.authorizeBinary(sess, binaryAuthed); err != nil {
+			return errResponse(err)
+		}
 		id, err := s.BeginTxn(writable)
 		if err != nil {
 			return errResponse(err)
@@ -229,6 +323,9 @@ func (srv *Server) dispatchBinary(body []byte) []byte {
 		if d.err != nil {
 			return decodeErrResponse()
 		}
+		if err := srv.authorizeBinary(sess, func(id *Identity) bool { return id.canRead(key) }); err != nil {
+			return errResponse(err)
+		}
 		v, found, err := s.TxnGet(id, key)
 		if err != nil {
 			return errResponse(err)
@@ -240,6 +337,9 @@ func (srv *Server) dispatchBinary(body []byte) []byte {
 		key := d.bytes()
 		if d.err != nil {
 			return decodeErrResponse()
+		}
+		if err := srv.authorizeBinary(sess, func(id *Identity) bool { return id.canRead(key) }); err != nil {
+			return errResponse(err)
 		}
 		found, err := s.TxnExists(id, key)
 		if err != nil {
@@ -255,6 +355,9 @@ func (srv *Server) dispatchBinary(body []byte) []byte {
 		if d.err != nil {
 			return decodeErrResponse()
 		}
+		if err := srv.authorizeBinary(sess, func(id *Identity) bool { return id.canWrite(key) }); err != nil {
+			return errResponse(err)
+		}
 		if err := s.TxnSet(id, key, value, ttl); err != nil {
 			return errResponse(err)
 		}
@@ -265,6 +368,9 @@ func (srv *Server) dispatchBinary(body []byte) []byte {
 		key := d.bytes()
 		if d.err != nil {
 			return decodeErrResponse()
+		}
+		if err := srv.authorizeBinary(sess, func(id *Identity) bool { return id.canWrite(key) }); err != nil {
+			return errResponse(err)
 		}
 		if err := s.TxnDelete(id, key); err != nil {
 			return errResponse(err)
@@ -278,6 +384,9 @@ func (srv *Server) dispatchBinary(body []byte) []byte {
 		if d.err != nil {
 			return decodeErrResponse()
 		}
+		if err := srv.authorizeBinary(sess, func(id *Identity) bool { return id.canWriteRange(lo, hi) }); err != nil {
+			return errResponse(err)
+		}
 		if err := s.TxnDeleteRange(id, lo, hi); err != nil {
 			return errResponse(err)
 		}
@@ -290,6 +399,9 @@ func (srv *Server) dispatchBinary(body []byte) []byte {
 		if d.err != nil {
 			return decodeErrResponse()
 		}
+		if err := srv.authorizeBinary(sess, func(id *Identity) bool { return id.canWrite(key) }); err != nil {
+			return errResponse(err)
+		}
 		if err := s.TxnMerge(id, key, operand); err != nil {
 			return errResponse(err)
 		}
@@ -299,6 +411,9 @@ func (srv *Server) dispatchBinary(body []byte) []byte {
 		id := d.uint64()
 		if d.err != nil {
 			return decodeErrResponse()
+		}
+		if err := srv.authorizeBinary(sess, binaryAuthed); err != nil {
+			return errResponse(err)
 		}
 		version, err := s.CommitTxn(id)
 		if err != nil {
@@ -311,6 +426,9 @@ func (srv *Server) dispatchBinary(body []byte) []byte {
 		if d.err != nil {
 			return decodeErrResponse()
 		}
+		if err := srv.authorizeBinary(sess, binaryAuthed); err != nil {
+			return errResponse(err)
+		}
 		if err := s.DiscardTxn(id); err != nil {
 			return errResponse(err)
 		}
@@ -319,6 +437,15 @@ func (srv *Server) dispatchBinary(body []byte) []byte {
 	default:
 		return encodeError(statusBadRequest, "kv: unknown opcode")
 	}
+}
+
+// encodeAuthResponse encodes a successful authentication: the OK status then the identity's name,
+// which the client returns so a caller can confirm which identity its token resolved to. The name
+// is empty when the server runs open and there is no identity to bind.
+func encodeAuthResponse(name string) []byte {
+	e := encoder{buf: []byte{byte(statusOK)}}
+	e.bytes([]byte(name))
+	return e.buf
 }
 
 // decodeTxnRequest decodes the asserts and ops of a transaction request. An assert carries an
@@ -488,6 +615,10 @@ func errBinaryStatus(s status, msg string) error {
 		return wrapBinary(ErrNoSuchTxn, msg)
 	case statusTooLarge:
 		return wrapBinary(ErrLimitExceeded, msg)
+	case statusUnauthenticated:
+		return wrapBinary(ErrUnauthenticated, msg)
+	case statusForbidden:
+		return wrapBinary(ErrForbidden, msg)
 	default:
 		return errors.New(msg)
 	}

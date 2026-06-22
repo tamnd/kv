@@ -62,6 +62,26 @@ func (c *Client) roundTrip(body []byte) ([]byte, error) {
 	return readFrame(c.r)
 }
 
+// Authenticate presents a credential to bind an identity to the connection, the handshake every
+// later operation on this Client is authorized against. It returns the identity name the server
+// resolved the token to, which is empty when the server runs open and the handshake is a no-op. A
+// bad token returns an error wrapping ErrUnauthenticated. Because the identity lives on the
+// connection, a host authenticates once after Dial rather than per call; a reconnect re-presents
+// the credential. Like the other calls it serializes on the connection lock.
+func (c *Client) Authenticate(token string) (string, error) {
+	e := encoder{buf: []byte{byte(opAuth)}}
+	e.bytes([]byte(token))
+	resp, err := c.roundTrip(e.buf)
+	if err != nil {
+		return "", err
+	}
+	d := newDecoder(resp)
+	if st := status(d.byte()); st != statusOK {
+		return "", decodeError(d, st)
+	}
+	return string(d.bytes()), nil
+}
+
 // Get reads a key, reporting whether it was present.
 func (c *Client) Get(key []byte) (value []byte, found bool, err error) {
 	e := encoder{buf: []byte{byte(opGet)}}
