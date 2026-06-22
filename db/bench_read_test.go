@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/tamnd/kv/engine"
+	"github.com/tamnd/kv/format"
 	"github.com/tamnd/kv/vfs"
 	"github.com/tamnd/kv/wal"
 )
@@ -82,6 +83,65 @@ func BenchmarkForwardScan(b *testing.B) {
 					wb.Set([]byte(key), []byte("value-payload"))
 				}); err != nil {
 					b.Fatalf("seed: %v", err)
+				}
+			}
+			start := []byte("k00000000")
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				if err := d.View(func(txn *Txn) error {
+					it, err := txn.NewIterator(engine.IterOptions{Lower: start})
+					if err != nil {
+						return err
+					}
+					defer it.Close()
+					n := 0
+					for ok := it.First(); ok && n < scanLen; ok = it.Next() {
+						_ = it.Key()
+						n++
+					}
+					return it.Error()
+				}); err != nil {
+					b.Fatalf("scan: %v", err)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkForwardScanLSM is the LSM-engine companion to BenchmarkForwardScan: seed N keys,
+// settle them into the leveled tree, then seek and read ScanLen entries. The materialized
+// foldRange drained the whole merge to the end of the keyspace before the first entry; the
+// streaming ScanForward pulls one folded group per step off a fresh merge heap and stops after
+// ScanLen, so the cost stops scaling with the keyspace the same way the B-tree side does (spec
+// 04 slice 7).
+func BenchmarkForwardScanLSM(b *testing.B) {
+	const scanLen = 100
+	for _, keys := range []int{1000, 100000} {
+		b.Run(fmt.Sprintf("keys=%d", keys), func(b *testing.B) {
+			fs := vfs.NewMem()
+			d, err := Open(fs, "bench.kv", Options{PageSize: 4096, Engine: format.EngineLSM, MemtableSize: 1 << 20, Sync: wal.SyncOff})
+			if err != nil {
+				b.Fatalf("open: %v", err)
+			}
+			defer d.Close()
+			for i := range keys {
+				key := fmt.Sprintf("k%08d", i)
+				if _, err := d.Write(func(wb *engine.WriteBatch) {
+					wb.Set([]byte(key), []byte("value-payload"))
+				}); err != nil {
+					b.Fatalf("seed: %v", err)
+				}
+			}
+			// Drain L0 into the leveled tree so a scan crosses the merged levels, not one big
+			// memtable.
+			for {
+				rep, err := d.Maintain(0)
+				if err != nil {
+					b.Fatalf("maintain: %v", err)
+				}
+				if rep.PagesCompacted == 0 {
+					break
 				}
 			}
 			start := []byte("k00000000")
