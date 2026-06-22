@@ -599,49 +599,87 @@ func (r *reader) Get(userKey []byte) ([]byte, error) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 
-	var cells []srcCell
-	collect := func(ik, val []byte) bool {
-		cells = append(cells, srcCell{
-			ik:  append([]byte(nil), ik...),
-			val: append([]byte(nil), val...),
-		})
-		return true
-	}
-	l.mem.getGroup(userKey, collect)
-	for _, seg := range l.allSegmentsLocked() {
-		// The membership filter answers a miss definitively, so a segment it rejects
-		// holds no version of the key and its block index need never be touched. A
-		// segment without a filter has a nil one, so the read always proceeds.
-		if seg.filter != nil && !seg.filter.mayContain(userKey) {
-			continue
-		}
-		if err := seg.getGroup(l.pgr, userKey, collect); err != nil {
-			return nil, err
-		}
-	}
+	// The deletes that may cover the key live in the memtable's live set and in each
+	// segment's persisted range-delete list, all already in memory, so the covering
+	// marker is known before any segment page is touched.
+	rd := format.NewestCoveringRangeDel(l.liveRangeDels(), userKey, r.snap.Version)
 
-	// Order the gathered group newest version first, the order Fold expects.
-	sort.SliceStable(cells, func(i, j int) bool {
-		return format.CompareInternal(cells[i].ik, cells[j].ik) < 0
-	})
 	var ops []format.Op
-	for _, c := range cells {
+	var matErr error
+	collect := func(ik, val []byte) bool {
 		// A point Get always wants the value, so keysOnly is false: a separated value is
 		// dereferenced through the vLog here.
-		op, ok, err := l.materializeOp(c.ik, c.val, r.snap.Now, false)
+		op, ok, err := l.materializeOp(ik, val, r.snap.Now, false)
 		if err != nil {
-			return nil, err
+			matErr = err
+			return false
 		}
-		if !ok {
-			continue // range markers resolve through rangeDels, not as ops
+		if ok {
+			ops = append(ops, op) // range markers resolve through rangeDels, not as ops
 		}
-		ops = append(ops, op)
+		return true
 	}
 
-	// The deletes that may cover the key live in the memtable's live set and in each
-	// segment's persisted range-delete list, so the fold sees every covering marker
-	// without scanning the runs for them.
-	rd := format.NewestCoveringRangeDel(l.liveRangeDels(), userKey, r.snap.Version)
+	// resolved reports whether the versions gathered so far already fix the value at the
+	// snapshot. It mirrors Fold's base search: walking newest-first, the first visible set
+	// or delete (or a covering range delete newer than the op under it) is the base, and
+	// every older version is shadowed. Once a base is in hand, deeper (older) sources
+	// cannot change the answer, so they need never be read.
+	resolved := func() bool {
+		sort.SliceStable(ops, func(i, j int) bool { return ops[i].Version > ops[j].Version })
+		for _, op := range ops {
+			if op.Version > r.snap.Version {
+				continue // not visible at this snapshot
+			}
+			if rd > op.Version {
+				return true // the covering range delete is the base
+			}
+			if op.Kind == format.KindMerge {
+				continue // a merge needs an older base to fold over
+			}
+			return true // a set or delete fixes the result
+		}
+		return false
+	}
+
+	l.mem.getGroup(userKey, collect)
+	if matErr != nil {
+		return nil, matErr
+	}
+	if !resolved() {
+		// Probe the on-disk levels shallowest first and stop at the first level that
+		// supplies a base: a key's newest version always sits in the shallowest level
+		// that holds it (a new write enters at the memtable and only ever migrates down),
+		// so once a base is found a deeper level carries only shadowed versions. The whole
+		// level is gathered before the check because a level may hold overlapping runs
+		// (L0, and a tiered bottom kept in minKey order) whose relative age is not encoded
+		// by their position, so a partial read of such a level could miss the newest
+		// version; a level boundary is the coarsest unit at which newest-first holds.
+		for lvl := 0; lvl < len(l.levels); lvl++ {
+			touched := false
+			for _, seg := range l.levels[lvl] {
+				// The membership filter answers a miss definitively, so a segment it
+				// rejects holds no version of the key and its block index need never be
+				// touched. A segment without a filter has a nil one, so the read proceeds.
+				if seg.filter != nil && !seg.filter.mayContain(userKey) {
+					continue
+				}
+				if err := seg.getGroup(l.pgr, userKey, collect); err != nil {
+					return nil, err
+				}
+				if matErr != nil {
+					return nil, matErr
+				}
+				touched = true
+			}
+			if touched && resolved() {
+				break
+			}
+		}
+	}
+
+	// ops is sorted newest-first by the final resolved() call, the order Fold expects;
+	// the covering range delete folds in as a synthetic delete at rd.
 	val, ok := format.Fold(ops, r.snap.Version, rd, l.merge)
 	if !ok {
 		return nil, engine.ErrNotFound
