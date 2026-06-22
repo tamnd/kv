@@ -1,6 +1,10 @@
 package engine
 
-import "github.com/tamnd/kv/format"
+import (
+	"bytes"
+
+	"github.com/tamnd/kv/format"
+)
 
 // BatchEntry is one internal-key mutation. The kind (set/delete/merge/range) is
 // encoded in the internal key's trailing byte (spec 02 §8.4); Value is the
@@ -76,7 +80,24 @@ func (b *WriteBatch) Merge(userKey, operand []byte) {
 // in [lo, hi) older than this version as absent; the marker itself never surfaces
 // as a user key (spec 11 §4, spec 02 §8.4).
 func (b *WriteBatch) DeleteRange(lo, hi []byte) {
-	b.Add(format.EncodeInternalKey(lo, b.version, format.KindRangeBegin), hi)
+	ik := format.EncodeInternalKey(lo, b.version, format.KindRangeBegin)
+	// Every entry in a batch shares the batch version, so two range deletes with the same lo encode to
+	// the identical internal key (lo, version, KindRangeBegin). The engine stores a range delete as one
+	// marker cell keyed there, and a cell key is unique, so a second marker would overwrite the first and
+	// only the last hi would survive a checkpoint and reopen. Their union over any covered key is
+	// [lo, max(hi)), so fold a repeat into the existing marker by keeping the larger hi rather than
+	// appending a duplicate the store cannot keep. Range deletes are rare and batches small, so the scan
+	// is cheap.
+	for i := range b.entries {
+		if bytes.Equal(b.entries[i].InternalKey, ik) {
+			if bytes.Compare(hi, b.entries[i].Value) > 0 {
+				b.size += len(hi) - len(b.entries[i].Value)
+				b.entries[i].Value = hi
+			}
+			return
+		}
+	}
+	b.Add(ik, hi)
 }
 
 // Encode serializes the batch to its wire form. This is the exact payload the WAL

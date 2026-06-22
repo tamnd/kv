@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/tamnd/kv/engine"
+	"github.com/tamnd/kv/vfs"
 )
 
 // TestDeleteRangeCommit deletes a half-open interval and checks the covered keys
@@ -54,6 +55,48 @@ func TestDeleteRangeReadYourWrites(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("update: %v", err)
+	}
+}
+
+// TestDeleteRangeSameLoCheckpointReopen is a regression for the bug the operation fuzzer found: two
+// range deletes in one transaction that share a lower bound. They share the transaction's commit
+// version, so both encode to the same marker-cell key (lo, version, KindRangeBegin), and the engine
+// keeps one cell per key, so before the fix only the last hi survived a checkpoint and reopen and a key
+// the wider range had deleted came back. The collapse in WriteBatch.DeleteRange folds same-lo ranges to
+// the widest hi, so the surviving marker still covers every key either range deleted.
+func TestDeleteRangeSameLoCheckpointReopen(t *testing.T) {
+	fs := vfs.NewMem()
+	d, err := Open(fs, "test.kv", Options{})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	if err := d.Update(func(txn *Txn) error { return txn.Set([]byte("k07"), []byte("v48")) }); err != nil {
+		t.Fatalf("seed set: %v", err)
+	}
+	// Two ranges sharing lo k06: the wide [k06,k08) covers k07, the narrow [k06,k07) does not.
+	if err := d.Update(func(txn *Txn) error {
+		if err := txn.DeleteRange([]byte("k06"), []byte("k08")); err != nil {
+			return err
+		}
+		return txn.DeleteRange([]byte("k06"), []byte("k07"))
+	}); err != nil {
+		t.Fatalf("delete ranges: %v", err)
+	}
+	if err := d.Checkpoint(); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	d, err = Open(fs, "test.kv", Options{})
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer d.Close()
+	if _, ok := txnGet(t, d, "k07"); ok {
+		t.Fatalf("k07 resurrected after checkpoint and reopen: the wide range delete was lost")
 	}
 }
 
