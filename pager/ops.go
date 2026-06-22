@@ -18,18 +18,40 @@ func (p *Pager) Get(pgno uint32, intent Intent) (*Frame, error) {
 		return nil, fmt.Errorf("pager: page 0 is the null page")
 	}
 	sh := p.shardFor(pgno)
+	// Fast path: a resident page is pinned under the shard's read lock, so concurrent
+	// readers of the same hot frame (the root and upper interiors every lookup touches)
+	// pin in parallel instead of serializing on an exclusive lock. The pin is an atomic
+	// increment, and eviction needs the exclusive lock, so it cannot take this frame
+	// while a reader holds the read lock and is mid-pin.
+	sh.mu.RLock()
+	if fr, ok := sh.index[pgno]; ok {
+		p.cacheHits.Add(1)
+		if intent == Write {
+			// The caller is about to mutate the page bytes, so any decoded view cached
+			// against the old bytes is now stale. Drop it before the writer can touch the
+			// page so the next reader re-decodes the new bytes. A write-intent Get runs
+			// under the DB's write lock, so no reader observes the page between here and
+			// the mutation.
+			fr.clearDecoded()
+		}
+		fr.pins.Add(1)
+		fr.ref.Store(true)
+		sh.mu.RUnlock()
+		return fr, nil
+	}
+	sh.mu.RUnlock()
+
+	// Miss: take the exclusive lock to admit and read. Re-check first, since another
+	// goroutine may have admitted the page between the read-lock release and here.
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
 	if fr, ok := sh.index[pgno]; ok {
 		p.cacheHits.Add(1)
 		if intent == Write {
-			// The caller is about to mutate the page bytes, so any decoded view cached
-			// against the old bytes is now stale. Drop it under the shard lock, before
-			// the writer can touch the page, so the next reader re-decodes the new bytes.
 			fr.clearDecoded()
 		}
 		fr.pins.Add(1)
-		fr.ref = true
+		fr.ref.Store(true)
 		return fr, nil
 	}
 	fr, err := p.admit(sh, pgno)
@@ -65,21 +87,28 @@ func (p *Pager) Get(pgno uint32, intent Intent) (*Frame, error) {
 		return nil, fmt.Errorf("pager: page %d: %w", pgno, err)
 	}
 	fr.pins.Add(1)
-	fr.ref = true
+	fr.ref.Store(true)
 	return fr, nil
 }
 
 // Unpin releases one pin. If dirty, the frame is marked for write-back at the
 // next checkpoint. The caller still holds a pin when calling, so the frame cannot
 // be evicted underneath this and fr.pgno still names its shard.
+//
+// It takes the shard's read lock, not the exclusive lock: the pin count is atomic,
+// so the decrement needs no exclusion, and taking the read lock keeps Unpin off the
+// path that eviction and admission serialize on, so it does not re-serialize the
+// parallel cache-hit reads in Get. The dirty flag is only set true by the write
+// path, which the DB serializes behind its single write lock, so the two writers of
+// fr.dirty (this and the exclusive-locked evict/writeBack) never overlap.
 func (p *Pager) Unpin(fr *Frame, dirty bool) {
 	sh := p.shardFor(fr.pgno)
-	sh.mu.Lock()
+	sh.mu.RLock()
 	if dirty {
 		fr.dirty = true
 	}
 	fr.pins.Add(-1)
-	sh.mu.Unlock()
+	sh.mu.RUnlock()
 }
 
 // admit finds a free or evictable frame in sh, binds it to pgno, and indexes it.
@@ -91,7 +120,7 @@ func (p *Pager) admit(sh *shard, pgno uint32) (*Frame, error) {
 	}
 	fr.pgno = pgno
 	fr.dirty = false
-	fr.ref = false
+	fr.ref.Store(false)
 	// The frame is being rebound to a different page (or to a freshly allocated one),
 	// so a decoded view left over from its previous page must not survive into this one.
 	fr.clearDecoded()
@@ -118,8 +147,8 @@ func (p *Pager) evict(sh *shard) *Frame {
 		if fr.pins.Load() != 0 {
 			continue
 		}
-		if fr.ref {
-			fr.ref = false
+		if fr.ref.Load() {
+			fr.ref.Store(false)
 			continue
 		}
 		// Victim found.
@@ -307,7 +336,7 @@ func (p *Pager) GetAllocated(pgno uint32) (*Frame, error) {
 	}
 	fr.dirty = true
 	fr.pins.Add(1)
-	fr.ref = true
+	fr.ref.Store(true)
 	return fr, nil
 }
 
@@ -321,7 +350,7 @@ func (p *Pager) Free(pgno uint32) {
 		delete(sh.index, pgno)
 		fr.pgno = 0
 		fr.dirty = false
-		fr.ref = false
+		fr.ref.Store(false)
 		fr.clearDecoded()
 	}
 	sh.mu.Unlock()
@@ -490,7 +519,7 @@ func (p *Pager) TruncateTail(budget int) (int, error) {
 			delete(sh.index, p.dbSize)
 			fr.pgno = 0
 			fr.dirty = false
-			fr.ref = false
+			fr.ref.Store(false)
 		}
 		p.dbSize--
 		freed++
