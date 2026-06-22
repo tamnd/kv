@@ -151,12 +151,12 @@ func FuzzOps(f *testing.F) {
 	// A few hand-written programs so the corpus starts from inputs that already touch every op, rather
 	// than waiting for the mutator to discover the opcodes. Each byte is opcode-then-operands; the exact
 	// decoding is in the fuzz body, so these are just plausible starting points the mutator works from.
-	f.Add([]byte{0, 1, 2, 0, 3, 3, 5, 0, 15, 0, 6, 0})            // set, set, get, scan, commit
-	f.Add([]byte{0, 5, 9, 1, 5, 3, 5, 0, 9, 1, 6, 1})             // set, delete, scan reverse, commit+checkpoint
-	f.Add([]byte{0, 2, 7, 3, 0, 12, 4, 2, 4, 7, 6, 2})            // set, delete-range, get, get, commit+reopen
-	f.Add(bytes.Repeat([]byte{0, 1, 2}, 40))                      // many overwrites of the same few keys
-	f.Add([]byte{6, 6, 6, 6})                                     // empty transactions
-	f.Add([]byte{3, 0, 4, 1, 5, 0, 15, 0})                        // reads against an empty database
+	f.Add([]byte{0, 1, 2, 0, 3, 3, 5, 0, 15, 0, 6, 0}) // set, set, get, scan, commit
+	f.Add([]byte{0, 5, 9, 1, 5, 3, 5, 0, 9, 1, 6, 1})  // set, delete, scan reverse, commit+checkpoint
+	f.Add([]byte{0, 2, 7, 3, 0, 12, 4, 2, 4, 7, 6, 2}) // set, delete-range, get, get, commit+reopen
+	f.Add(bytes.Repeat([]byte{0, 1, 2}, 40))           // many overwrites of the same few keys
+	f.Add([]byte{6, 6, 6, 6})                          // empty transactions
+	f.Add([]byte{3, 0, 4, 1, 5, 0, 15, 0})             // reads against an empty database
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		fs := vfs.NewMem()

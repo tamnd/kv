@@ -124,6 +124,14 @@ func Recover(readAt func(p []byte, off int64) (int, error), size int64) (Recover
 			res.Batches = append(res.Batches, pending...)
 			pending = pending[:0]
 		case FrameCheckpoint:
+			// A well-formed checkpoint frame carries an 8-byte folded LSN. A frame that
+			// chained correctly but is shorter than that is malformed; stop the scan at it
+			// rather than over-read its payload (spec 23 §5: a decoder never reads past a
+			// frame's bytes, even one whose checksum somehow validated).
+			if len(payload) < 8 {
+				res.TornTail = true
+				goto done
+			}
 			res.LastCheckpointLSN = binary.BigEndian.Uint64(payload[:8])
 			// A checkpoint frame ends a generation; the salt rotates after it. In a
 			// single-generation scan we simply note the boundary and continue: any
@@ -139,6 +147,7 @@ func Recover(readAt func(p []byte, off int64) (int, error), size int64) (Recover
 		res.DurableEndOff = off
 		res.DurableSum = prevSum
 	}
+done:
 	// pending (uncommitted trailing) batches are dropped: not durable.
 	return res, nil
 }
