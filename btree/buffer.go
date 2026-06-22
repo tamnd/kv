@@ -134,7 +134,7 @@ func (t *BTree) applyLeafMessages(pgno format.PageNo, msgs []message) ([]childSp
 	for _, m := range msgs {
 		l.insert(m.ik, m.val)
 	}
-	if len(marshalLeaf(l)) <= t.usable {
+	if leafEncodedSize(l) <= t.usable {
 		return nil, t.storeLeaf(pgno, l)
 	}
 
@@ -286,7 +286,7 @@ func (in *interior) absorbSplits(splitsByChild map[int][]childSplit) {
 func splitLeafPieces(l *leaf, usable int) []*leaf {
 	var pieces []*leaf
 	cur := l
-	for len(marshalLeaf(cur)) > usable {
+	for leafEncodedSize(cur) > usable {
 		sp := cur.splitPoint()
 		if sp == 0 {
 			break

@@ -11,10 +11,11 @@
 //
 // M1 scope: search, insert, leaf and interior split, and the Engine SPI end to end
 // through the real pager, verified against the conformance oracle. Deletes are
-// tombstone cells folded at read time -- no separate delete path. Whole-node
-// decode/re-encode stands in for the in-place slotted edit the final layout wants;
-// Bε write buffers, optimistic lock coupling, prefix compression, overflow values,
-// and lazy node merge are later milestones. None of them change this SPI.
+// tombstone cells folded at read time -- no separate delete path. Leaves are slotted
+// pages edited in place on the common insert (node.go, perf/02 Finding 1); interior
+// nodes still decode/re-encode whole, and Bε write buffers, optimistic lock coupling,
+// prefix compression, overflow values, and lazy node merge are later milestones. None
+// of them change this SPI.
 package btree
 
 import (
@@ -25,6 +26,12 @@ import (
 	"github.com/tamnd/kv/format"
 	"github.com/tamnd/kv/pager"
 )
+
+// leafInPlaceEnabled gates the slotted-leaf in-place insert fast path (perf/02 Finding
+// 1). It is always true in production; the benchmark flips it to false to measure the
+// whole-leaf decode/re-encode path it replaced. The fall-through path is the correct
+// retry path either way, so the gate only changes performance, never semantics.
+var leafInPlaceEnabled = true
 
 // BTree is an opened B-tree core over a pager.
 type BTree struct {
@@ -184,12 +191,34 @@ func (t *BTree) insertOne(ik, value []byte) error {
 		pgno = in.children[in.childFor(uk)]
 	}
 
+	// Fast path: edit the slotted leaf in place under a write pin, appending one cell
+	// body and splicing one slot, without decoding and re-encoding the whole leaf (perf/02
+	// Finding 1). This is the common case and what cuts the per-insert CPU.
+	if leafInPlaceEnabled {
+		fr, err := t.pgr.Get(pgno, pager.Write)
+		if err != nil {
+			return err
+		}
+		if len(fr.Data()) < format.CommonHeaderSize || format.DecodeCommonHeader(fr.Data()).Type != format.PageBTreeLeaf {
+			t.pgr.Unpin(fr, false)
+			return format.ErrCorrupt
+		}
+		done, ok := leafInsertInPlace(fr.Data(), t.usable, ik, value)
+		t.pgr.Unpin(fr, done)
+		if ok && done {
+			return nil
+		}
+	}
+
+	// The in-place edit did not fit the contiguous gap (or the page was malformed): decode
+	// the leaf and insert into the decoded form, which also reclaims any dead space a prior
+	// overwrite or delete left. The page was not mutated above, so this is a clean retry.
 	l, err := t.loadLeaf(pgno)
 	if err != nil {
 		return err
 	}
 	l.insert(ik, value)
-	if len(marshalLeaf(l)) <= t.usable {
+	if leafEncodedSize(l) <= t.usable {
 		return t.storeLeaf(pgno, l)
 	}
 
@@ -377,7 +406,7 @@ func (t *BTree) viewNode(pgno format.PageNo) (format.PageType, *leaf, *interior,
 }
 
 func (t *BTree) storeLeaf(pgno format.PageNo, l *leaf) error {
-	return t.writePage(pgno, marshalLeaf(l))
+	return t.writePage(pgno, marshalLeaf(l, t.usable))
 }
 
 func (t *BTree) storeInterior(pgno format.PageNo, in *interior) error {
@@ -406,7 +435,7 @@ func (t *BTree) storeLeafNew(l *leaf) (format.PageNo, error) {
 	if err != nil {
 		return 0, err
 	}
-	body := marshalLeaf(l)
+	body := marshalLeaf(l, t.usable)
 	copy(fr.Data(), body)
 	t.pgr.Unpin(fr, true)
 	return pgno, nil

@@ -11,11 +11,35 @@ import (
 // spec 05 §2); for an interior node it is the rightmost child.
 const nodeHeaderSize = format.CommonHeaderSize + 4
 
-// leaf is the decoded form of a B-tree leaf page. M1 decodes a whole page into
-// this struct, mutates it, and re-encodes -- correctness over the in-place slotted
-// edit the spec's layout (spec 05 §2) ultimately wants. Leaves hold full internal
-// keys (user_key || ^version || kind) so a user key's version group sorts together,
-// newest first (the version is stored inverted).
+// leafHeaderSize is the leaf-only header: the shared node header plus a 2-byte
+// content-start pointer (the lowest byte offset a live cell body occupies). The
+// slot array begins right after it. An interior node has no content-start field, so
+// its header stays nodeHeaderSize.
+const leafHeaderSize = nodeHeaderSize + 2
+
+// A leaf page is slotted (spec 05 §2): a cell-pointer (slot) array grows down from
+// the header in ascending key order, and cell bodies grow up from the end of the
+// usable region in arbitrary physical order, with free space in the middle. Inserting
+// a cell appends its body into the free space, splices one 2-byte slot into the array,
+// and bumps the count, touching only the bytes that change instead of re-encoding every
+// existing cell. The layout is:
+//
+//	[0:8]            common header (type, cell count)
+//	[8:12]           next sibling page number (the B-link)
+//	[12:14]          content start: offset of the lowest live cell body
+//	[14 : 14+2n]     slot array, n big-endian uint16 body offsets, ascending by key
+//	  ... free ...
+//	[contentStart : usable]   cell bodies, each (uvarint klen, key, uvarint vlen, val)
+//
+// An overwrite or delete leaves its old body as dead space the slot no longer names;
+// a later insert that does not fit the contiguous gap compacts the page (repacking the
+// live bodies) before splitting, so dead space is reclaimed without a structural change.
+
+// leaf is the decoded form of a B-tree leaf page: the slotted bytes read back into
+// parallel key/value slices. The read path and the split/gc/buffer paths work on this
+// decoded form; the hot insert path edits the slotted bytes in place and never builds
+// it. Leaves hold full internal keys (user_key || ^version || kind) so a user key's
+// version group sorts together, newest first (the version is stored inverted).
 type leaf struct {
 	keys [][]byte // internal keys, ascending by format.CompareInternal
 	vals [][]byte // inline values, parallel to keys (overflow is deferred)
@@ -40,20 +64,53 @@ type interior struct {
 	msgVals  [][]byte        // buffered message values, parallel to msgKeys
 }
 
-// marshalLeaf encodes l to its on-disk bytes (header + cells). The caller checks
-// len(out) <= pageSize before committing it to a page; an over-long result means
-// the leaf must split.
-func marshalLeaf(l *leaf) []byte {
-	out := make([]byte, nodeHeaderSize)
-	format.CommonHeader{Type: format.PageBTreeLeaf, CellCount: uint16(len(l.keys))}.Encode(out)
-	binary.BigEndian.PutUint32(out[format.CommonHeaderSize:nodeHeaderSize], l.next)
+// cellBodySize reports the encoded length of one leaf cell body: the key length
+// varint, the key, the value length varint, and the value.
+func cellBodySize(key, val []byte) int {
+	return format.UvarintLen(uint64(len(key))) + len(key) +
+		format.UvarintLen(uint64(len(val))) + len(val)
+}
+
+// leafEncodedSize reports the slotted bytes l would occupy: the header, one slot per
+// cell, and every cell body. It replaces the old len(marshalLeaf(l)) the fit and
+// overflow checks used, since a marshaled slotted page is always usable-sized (the
+// free gap is part of the image) and so its length no longer signals overflow.
+func leafEncodedSize(l *leaf) int {
+	sz := leafHeaderSize
 	for i := range l.keys {
-		out = format.AppendUvarint(out, uint64(len(l.keys[i])))
-		out = append(out, l.keys[i]...)
-		out = format.AppendUvarint(out, uint64(len(l.vals[i])))
-		out = append(out, l.vals[i]...)
+		sz += 2 + cellBodySize(l.keys[i], l.vals[i])
 	}
+	return sz
+}
+
+// appendCellBody writes one cell body (klen, key, vlen, val) at out and returns the
+// extended slice. It is the single encoder both the in-place insert and the full
+// marshal share, so the on-disk cell shape is defined in one place.
+func appendCellBody(out []byte, key, val []byte) []byte {
+	out = format.AppendUvarint(out, uint64(len(key)))
+	out = append(out, key...)
+	out = format.AppendUvarint(out, uint64(len(val)))
+	out = append(out, val...)
 	return out
+}
+
+// marshalLeaf encodes l into a full usable-sized slotted page image: bodies packed
+// against the end, the slot array in key order at the front, free space between. The
+// caller must have checked leafEncodedSize(l) <= usable; a leaf that does not fit must
+// split instead. A fresh empty leaf encodes with content start at usable and no slots.
+func marshalLeaf(l *leaf, usable int) []byte {
+	page := make([]byte, usable)
+	format.CommonHeader{Type: format.PageBTreeLeaf, CellCount: uint16(len(l.keys))}.Encode(page)
+	binary.BigEndian.PutUint32(page[format.CommonHeaderSize:nodeHeaderSize], l.next)
+	content := usable
+	for i := range l.keys {
+		body := appendCellBody(nil, l.keys[i], l.vals[i])
+		content -= len(body)
+		copy(page[content:], body)
+		binary.BigEndian.PutUint16(page[leafHeaderSize+2*i:], uint16(content))
+	}
+	binary.BigEndian.PutUint16(page[nodeHeaderSize:leafHeaderSize], uint16(content))
+	return page
 }
 
 // nodeReader is a bounds-checked cursor over a node page. Every read advances the offset and reports
@@ -100,16 +157,26 @@ func (r *nodeReader) bytes(n uint64) ([]byte, error) {
 	return b, nil
 }
 
-// unmarshalLeaf decodes a leaf page, returning format.ErrCorrupt when the bytes do not describe a
-// well-formed leaf rather than panicking on an out-of-range read.
+// unmarshalLeaf decodes a slotted leaf page into parallel key/value slices, walking the
+// slot array in key order and following each slot to its cell body. It returns
+// format.ErrCorrupt when a slot offset or a body length runs off the page rather than
+// panicking on an out-of-range read (spec 23 §5).
 func unmarshalLeaf(p []byte) (*leaf, error) {
-	if len(p) < nodeHeaderSize {
+	if len(p) < leafHeaderSize {
 		return nil, format.ErrCorrupt
 	}
 	h := format.DecodeCommonHeader(p)
 	l := &leaf{next: binary.BigEndian.Uint32(p[format.CommonHeaderSize:nodeHeaderSize])}
-	r := &nodeReader{p: p, off: nodeHeaderSize}
-	for i := 0; i < int(h.CellCount); i++ {
+	n := int(h.CellCount)
+	if leafHeaderSize+2*n > len(p) {
+		return nil, format.ErrCorrupt
+	}
+	for i := 0; i < n; i++ {
+		off := int(binary.BigEndian.Uint16(p[leafHeaderSize+2*i:]))
+		if off < leafHeaderSize+2*n || off > len(p) {
+			return nil, format.ErrCorrupt
+		}
+		r := &nodeReader{p: p, off: off}
 		klen, err := r.uvarint()
 		if err != nil {
 			return nil, err
@@ -130,6 +197,131 @@ func unmarshalLeaf(p []byte) (*leaf, error) {
 		l.vals = append(l.vals, val)
 	}
 	return l, nil
+}
+
+// leafSlotKey returns the internal key of the cell named by slot i as a subslice of the
+// page (no copy), for the in-place search to compare against without decoding the whole
+// leaf. It reports false if the slot offset or key length runs off the page.
+func leafSlotKey(p []byte, n, i int) ([]byte, bool) {
+	if leafHeaderSize+2*(i+1) > len(p) {
+		return nil, false
+	}
+	off := int(binary.BigEndian.Uint16(p[leafHeaderSize+2*i:]))
+	if off < leafHeaderSize+2*n || off >= len(p) {
+		return nil, false
+	}
+	klen, m := format.Uvarint(p[off:])
+	if m <= 0 {
+		return nil, false
+	}
+	start := off + m
+	end := start + int(klen)
+	if end > len(p) || end < start {
+		return nil, false
+	}
+	return p[start:end], true
+}
+
+// leafSlotSearch returns the slot index of the first cell whose internal key is >= ik
+// (the insert position), and whether that cell's key equals ik. It binary-searches the
+// slot array, reading each candidate's key in place. A malformed slot reports !ok so the
+// caller falls back to the decode path rather than trusting a bad page.
+func leafSlotSearch(p []byte, n int, ik []byte) (idx int, found, ok bool) {
+	lo, hi := 0, n
+	for lo < hi {
+		mid := (lo + hi) / 2
+		key, kok := leafSlotKey(p, n, mid)
+		if !kok {
+			return 0, false, false
+		}
+		if format.CompareInternal(key, ik) < 0 {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	if lo < n {
+		key, kok := leafSlotKey(p, n, lo)
+		if !kok {
+			return 0, false, false
+		}
+		if format.CompareInternal(key, ik) == 0 {
+			return lo, true, true
+		}
+	}
+	return lo, false, true
+}
+
+// leafInsertInPlace inserts (ik, value) into the slotted leaf page directly, the hot
+// path's whole point: instead of decoding the leaf, inserting into a slice, and
+// re-encoding every cell, it appends one cell body into the free gap and splices one
+// slot into the array, touching only the bytes that change. An existing identical
+// internal key is overwritten in place (its old body becomes dead space), which keeps
+// WAL redo idempotent.
+//
+// It returns done=true when the edit landed. It returns done=false, with the page
+// untouched, when the cell does not fit the contiguous free gap; the caller then decodes
+// the page and either compacts-and-reinserts (dead space reclaimed) or splits (genuinely
+// full), the rare slow path. ok=false signals a malformed page so the caller falls back
+// to the decode path. The caller holds the page under a write pin.
+func leafInsertInPlace(p []byte, usable int, ik, value []byte) (done, ok bool) {
+	if len(p) < leafHeaderSize || usable > len(p) {
+		return false, false
+	}
+	n := int(format.DecodeCommonHeader(p).CellCount)
+	if leafHeaderSize+2*n > usable {
+		return false, false
+	}
+	idx, found, sok := leafSlotSearch(p, n, ik)
+	if !sok {
+		return false, false
+	}
+	content := int(binary.BigEndian.Uint16(p[nodeHeaderSize:leafHeaderSize]))
+	if content < leafHeaderSize+2*n || content > usable {
+		return false, false
+	}
+	bodyLen := cellBodySize(ik, value)
+
+	if found {
+		// Overwrite: write a new body and repoint the slot. The old body stays as dead
+		// space a later compaction reclaims. Needs room for the body alone, no new slot.
+		gap := content - (leafHeaderSize + 2*n)
+		if gap < bodyLen {
+			return false, true
+		}
+		newOff := content - bodyLen
+		copyCellBody(p, newOff, ik, value)
+		binary.BigEndian.PutUint16(p[leafHeaderSize+2*idx:], uint16(newOff))
+		binary.BigEndian.PutUint16(p[nodeHeaderSize:leafHeaderSize], uint16(newOff))
+		return true, true
+	}
+
+	// Insert: needs room for the body plus one new slot, which the slot array's growth by
+	// two bytes also consumes from the gap.
+	gap := content - (leafHeaderSize + 2*n)
+	if gap < bodyLen+2 {
+		return false, true
+	}
+	newOff := content - bodyLen
+	copyCellBody(p, newOff, ik, value)
+	// Splice the slot at idx: shift the slots from idx..n right by one (two bytes).
+	slotBase := leafHeaderSize
+	copy(p[slotBase+2*(idx+1):slotBase+2*(n+1)], p[slotBase+2*idx:slotBase+2*n])
+	binary.BigEndian.PutUint16(p[slotBase+2*idx:], uint16(newOff))
+	binary.BigEndian.PutUint16(p[nodeHeaderSize:leafHeaderSize], uint16(newOff))
+	h := format.DecodeCommonHeader(p)
+	h.CellCount = uint16(n + 1)
+	h.Encode(p)
+	return true, true
+}
+
+// copyCellBody writes one cell body at offset off in page p.
+func copyCellBody(p []byte, off int, key, val []byte) {
+	o := off
+	o += format.PutUvarint(p[o:], uint64(len(key)))
+	o += copy(p[o:], key)
+	o += format.PutUvarint(p[o:], uint64(len(val)))
+	copy(p[o:], val)
 }
 
 // marshalInterior encodes an interior node: header (with rightmost child in the
