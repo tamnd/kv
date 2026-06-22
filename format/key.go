@@ -1,6 +1,9 @@
 package format
 
-import "encoding/binary"
+import (
+	"bytes"
+	"encoding/binary"
+)
 
 // Kind is the one-byte tag appended to an internal key. The values are frozen
 // for format generation 1 (spec 02 §8.4).
@@ -125,27 +128,15 @@ func CompareUser(a, b []byte) int {
 	return compareBytes(a, b)
 }
 
+// compareBytes orders two byte slices by the default memcmp collation: bytewise, and a
+// shorter slice that is a prefix of a longer one sorts first. It delegates to bytes.Compare,
+// whose result (-1, 0, +1) and ordering are identical to the hand-rolled loop it replaced.
+// bytes.Compare lowers to an assembly routine that compares a machine word at a time, several
+// times faster than a per-byte loop for keys longer than a few bytes, and the read path runs
+// it about twenty times per lookup across the interior steps and the leaf search (spec 01
+// Finding 4).
 func compareBytes(a, b []byte) int {
-	n := len(a)
-	if len(b) < n {
-		n = len(b)
-	}
-	for i := 0; i < n; i++ {
-		if a[i] != b[i] {
-			if a[i] < b[i] {
-				return -1
-			}
-			return 1
-		}
-	}
-	switch {
-	case len(a) < len(b):
-		return -1
-	case len(a) > len(b):
-		return 1
-	default:
-		return 0
-	}
+	return bytes.Compare(a, b)
 }
 
 // PrefixSuccessor returns the smallest key strictly greater than every key with
