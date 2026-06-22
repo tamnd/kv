@@ -39,13 +39,22 @@ const (
 // Frame is the in-memory home of one page. Its data slice is a window into the
 // pool's arena, stable for the pool's lifetime; frames are reused in place.
 type Frame struct {
-	pgno  uint32
-	data  []byte
-	pins  atomic.Int32
-	dirty bool
-	ref   bool // CLOCK reference bit
-	slot  int  // index into the pool, -1 if not pooled
+	pgno    uint32
+	data    []byte
+	pins    atomic.Int32
+	dirty   bool
+	ref     bool // CLOCK reference bit
+	slot    int  // index into the pool, -1 if not pooled
+	decoded atomic.Pointer[decodedNode]
 }
+
+// decodedNode boxes a caller-supplied decoded view of the frame's page so the
+// engine can cache the structure it unmarshals from the bytes (a B-tree node, say)
+// and reuse it on the next read of the same resident page instead of decoding the
+// bytes again. The pager treats the value as opaque; it only guarantees the box is
+// cleared before the page's bytes can change or the frame is rebound to another
+// page, so a non-nil Decoded always describes the bytes currently in the frame.
+type decodedNode struct{ v any }
 
 // PageNo returns the frame's page number.
 func (f *Frame) PageNo() uint32 { return f.pgno }
@@ -53,6 +62,30 @@ func (f *Frame) PageNo() uint32 { return f.pgno }
 // Data returns the frame's page bytes. The caller must hold a pin and, for
 // writes, must have pinned with Write intent and unpin with dirty=true.
 func (f *Frame) Data() []byte { return f.data }
+
+// Decoded returns the cached decoded view the engine last attached to this frame
+// with SetDecoded, or nil if none is cached or it was invalidated. It is safe to
+// call under a read pin without the shard lock: the pager only ever stores nil into
+// the slot while a write-intent pin or a rebind holds the page, which a concurrent
+// reader is excluded from, so a non-nil result describes the frame's current bytes.
+func (f *Frame) Decoded() any {
+	if b := f.decoded.Load(); b != nil {
+		return b.v
+	}
+	return nil
+}
+
+// SetDecoded caches v as the decoded view of the frame's current bytes. The engine
+// calls it after unmarshaling a page it just read so the next read of the same
+// resident page can skip the decode. v must be treated as immutable by every reader
+// that retrieves it, since they all share the one instance; a writer that mutates the
+// page decodes its own private copy and never calls this.
+func (f *Frame) SetDecoded(v any) { f.decoded.Store(&decodedNode{v: v}) }
+
+// clearDecoded drops any cached decoded view. The pager calls it at every point the
+// frame's bytes may change (a write-intent pin) or the frame stops representing its
+// page (rebind or free), which is what keeps a cached view honest.
+func (f *Frame) clearDecoded() { f.decoded.Store(nil) }
 
 // Options configure a pager at open.
 type Options struct {

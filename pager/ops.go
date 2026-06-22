@@ -22,6 +22,12 @@ func (p *Pager) Get(pgno uint32, intent Intent) (*Frame, error) {
 	defer sh.mu.Unlock()
 	if fr, ok := sh.index[pgno]; ok {
 		p.cacheHits.Add(1)
+		if intent == Write {
+			// The caller is about to mutate the page bytes, so any decoded view cached
+			// against the old bytes is now stale. Drop it under the shard lock, before
+			// the writer can touch the page, so the next reader re-decodes the new bytes.
+			fr.clearDecoded()
+		}
 		fr.pins.Add(1)
 		fr.ref = true
 		return fr, nil
@@ -86,6 +92,9 @@ func (p *Pager) admit(sh *shard, pgno uint32) (*Frame, error) {
 	fr.pgno = pgno
 	fr.dirty = false
 	fr.ref = false
+	// The frame is being rebound to a different page (or to a freshly allocated one),
+	// so a decoded view left over from its previous page must not survive into this one.
+	fr.clearDecoded()
 	sh.index[pgno] = fr
 	return fr, nil
 }
@@ -313,6 +322,7 @@ func (p *Pager) Free(pgno uint32) {
 		fr.pgno = 0
 		fr.dirty = false
 		fr.ref = false
+		fr.clearDecoded()
 	}
 	sh.mu.Unlock()
 	p.metaMu.Lock()
