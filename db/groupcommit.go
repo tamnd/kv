@@ -1,0 +1,189 @@
+package db
+
+import (
+	"context"
+	"time"
+
+	"github.com/tamnd/kv/engine"
+)
+
+// commitReq is one buffered commit waiting to join a group. prepare runs under the
+// leader's write lock (d.mu): it assigns the commit version, runs conflict detection for
+// a transaction, and builds the engine batch at that version. It reports skip=true for a
+// no-op (an empty blind write, which consumes no version) and an error for a lost conflict
+// or a read-only replica. The leader logs every prepared batch, issues one shared fsync for
+// the whole group, then applies them in version order.
+type commitReq struct {
+	prepare func() (b *engine.WriteBatch, v uint64, skip bool, err error)
+
+	// Set by the leader while it processes the group. b/v/commitLSN describe an appended
+	// batch waiting to be applied; appended marks that its WAL frames are on disk.
+	b         *engine.WriteBatch
+	v         uint64
+	commitLSN uint64
+	appended  bool
+
+	// The outcome the submitter returns. ready is set once the leader has finished with
+	// this request, success or failure.
+	result uint64
+	err    error
+	ready  bool
+}
+
+// submitCommit enqueues req and drives it to completion through group commit. The first
+// submitter to find no leader becomes the leader and processes the whole queued group; the
+// rest wait on ccond until their request is marked ready. Every submitter blocks until its
+// own request is done, so the call is synchronous from the caller's view even though the
+// durable fsync was shared with the rest of the group.
+func (d *DB) submitCommit(req *commitReq) (uint64, error) {
+	d.cmu.Lock()
+	d.cqueue = append(d.cqueue, req)
+	for {
+		if req.ready {
+			r, e := req.result, req.err
+			d.cmu.Unlock()
+			return r, e
+		}
+		if d.cleader {
+			// Another goroutine is leading a group; wait for it to finish, which either
+			// completes our request (it was in that group) or frees the leadership for us.
+			d.ccond.Wait()
+			continue
+		}
+		// Become the leader for the next group: take everything queued so far and process
+		// it off cmu, so late arrivals queue behind us for the following group.
+		d.cleader = true
+		group := d.cqueue
+		d.cqueue = nil
+		d.cmu.Unlock()
+
+		d.mu.Lock()
+		d.processGroup(group)
+		d.mu.Unlock()
+
+		d.cmu.Lock()
+		// Publish every outcome under cmu. processGroup filled each request's result/err off
+		// the lock; setting ready here, under the same mutex the waiters poll it with, gives
+		// the happens-before that makes those off-lock writes safe to read (spec 06 F3).
+		for _, r := range group {
+			r.ready = true
+		}
+		d.cleader = false
+		// Wake every waiter: those in the group we just finished return their result, and
+		// one of the rest takes leadership for the batch that queued while we ran.
+		d.ccond.Broadcast()
+	}
+}
+
+// processGroup logs, durably commits, and applies a queued group of commits as one unit.
+// The caller holds d.mu. It runs the three phases of group commit: order-and-append (assign
+// versions and write every batch's WAL frames, no fsync), one shared fsync, then apply in
+// version order. A WAL append or fsync failure is a fatal durability fault that fences the
+// database and fails every appended request in the group (spec 06 F3, spec 07 §6).
+func (d *DB) processGroup(group []*commitReq) {
+	if d.fatal != nil {
+		for _, r := range group {
+			r.fail(d.fatal)
+		}
+		return
+	}
+
+	// Phase 1: assign versions and append every batch's WAL frames. Conflicts and empty
+	// writes resolve here and never reach the log.
+	appended := make([]*commitReq, 0, len(group))
+	durableStart := time.Now()
+	for i, r := range group {
+		b, v, skip, err := r.prepare()
+		if err != nil {
+			r.fail(err)
+			continue
+		}
+		if skip {
+			r.succeed(v)
+			continue
+		}
+		encoded := b.Encode()
+		if err := d.wal.LogBatch(v, encoded); err != nil {
+			d.fenceGroup(append(appended, group[i:]...), err)
+			return
+		}
+		commitLSN, err := d.wal.AppendCommit(v)
+		if err != nil {
+			d.fenceGroup(append(appended, group[i:]...), err)
+			return
+		}
+		r.b, r.v, r.commitLSN, r.appended = b, v, commitLSN, true
+		appended = append(appended, r)
+	}
+
+	// Phase 2: one fsync makes every appended batch durable. At SyncOff/SyncNormal this is
+	// a no-op and durability is finalized at the next checkpoint.
+	if err := d.wal.Sync(); err != nil {
+		d.fenceGroup(appended, err)
+		return
+	}
+	durable := time.Since(durableStart)
+
+	// Phase 3: apply each durable batch to the engine in version order, then make it
+	// visible. The shared fsync above covers every batch, so a reader that sees the newest
+	// applied version sees only durable state.
+	for _, r := range appended {
+		d.applyDurable(r, durable)
+	}
+	d.maybeCheckpoint()
+}
+
+// applyDurable applies one already-durable batch to the engine and makes its version
+// visible, the apply phase of group commit. The caller holds d.mu and calls it in version
+// order. durable is the group's shared fsync latency, folded into the commit-latency metric
+// and the per-batch tracing span so the I/O cost stays attributed even though it was shared.
+func (d *DB) applyDurable(r *commitReq, durable time.Duration) {
+	// Per-commit spans: the durable span carries the (shared) fsync cost, the apply span the
+	// engine cost, the same I/O-versus-engine split the slow-op log reports (spec 19 §3).
+	ctx, commitSpan := d.startSpan(context.Background(), "kv.commit")
+	_, durableSpan := d.startSpan(ctx, "kv.commit.durable")
+	endSpan(durableSpan)
+
+	d.counters.commits.Add(1)
+	d.counters.commitNanos.Add(uint64(durable))
+	d.noteLSN(r.commitLSN)
+
+	applyStart := time.Now()
+	_, applySpan := d.startSpan(ctx, "kv.commit.apply")
+	if err := d.eng.Apply(r.b, r.v); err != nil {
+		endSpan(applySpan)
+		endSpan(commitSpan)
+		r.fail(err)
+		return
+	}
+	endSpan(applySpan)
+	endSpan(commitSpan)
+
+	if d.slowOpEnabled() {
+		apply := time.Since(applyStart)
+		if total := durable + apply; total >= d.slowOp {
+			d.logSlowCommit(r.b, r.v, durable, apply, total)
+		}
+	}
+	d.pgr.Header().LastCommitVersion = r.v
+	d.publish(r.b, r.v)
+	d.orc.applied(r.v)
+	r.succeed(r.v)
+}
+
+// fenceGroup records a fatal durability fault and fails every request that had reached the
+// log in this group. Apply never ran for them, so the engine is untouched and recovery
+// rebuilds exactly the durable state from the WAL; the database stays fenced until reopen.
+func (d *DB) fenceGroup(reqs []*commitReq, cause error) {
+	d.fatal = wrapFatalSync(cause)
+	d.logFatal(d.fatal)
+	for _, r := range reqs {
+		r.fail(d.fatal)
+	}
+}
+
+// succeed and fail record a request's outcome. They run inside processGroup with cmu
+// released; submitCommit publishes the ready flag for the whole group under cmu once
+// processing returns, so these writes are read only after that lock-mediated barrier.
+func (r *commitReq) succeed(v uint64) { r.result = v }
+func (r *commitReq) fail(err error)   { r.err = err }

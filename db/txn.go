@@ -2,6 +2,7 @@ package db
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -41,6 +42,10 @@ var ErrClosed = errors.New("kv: database closed")
 // than a process whose kernel may have silently dropped the un-synced bytes. It wraps
 // the underlying I/O error for context. The public package maps it to ErrNeedsRecovery.
 var ErrFatalSync = errors.New("kv: fatal write fault; reopen to recover")
+
+// wrapFatalSync tags an underlying WAL append or sync error as the fatal durability fault
+// that fences the database, preserving the cause for context.
+func wrapFatalSync(cause error) error { return fmt.Errorf("%w: %v", ErrFatalSync, cause) }
 
 // Isolation selects a transaction's isolation level (spec 10 §3, §4). The zero value
 // is SnapshotIsolation, the high-performance default; Serializable adds read-set

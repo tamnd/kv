@@ -295,6 +295,17 @@ type DB struct {
 	// Reads are unaffected: they continue to serve the last consistent state.
 	fatal error
 
+	// Group commit (spec 06 F3). Committers queue their request under cmu and the first
+	// to find no leader becomes one: it drains the queue, appends every batch's WAL
+	// frames, issues one shared fsync for the whole group, and applies them in version
+	// order under d.mu. So N concurrent committers pay one fsync, not N in series, and
+	// only the leader contends for d.mu while the rest wait on ccond. cleader is true
+	// while a leader is processing a group.
+	cmu     sync.Mutex
+	ccond   *sync.Cond
+	cqueue  []*commitReq
+	cleader bool
+
 	// Auto-checkpointer (spec 09 §1.3). When ckptThreshold is positive a single
 	// long-lived goroutine folds the WAL in the background: a commit that pushes the
 	// backlog past the threshold signals ckptSig (non-blocking, coalesced through the
@@ -368,6 +379,7 @@ func create(fs vfs.FS, path string, opts Options) (*DB, error) {
 	}
 	d := &DB{fs: fs, path: path, pgr: pgr, wal: w, eng: eng, orc: newOracle(0), crypto: enc,
 		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, bufferedInserts: opts.BufferedInserts, compression: opts.Compression, now: opts.clock(), logger: opts.Logger, slowOp: opts.SlowOpThreshold, tracer: opts.Tracer, readReplica: opts.ReadReplica, archive: opts.WALArchive}
+	d.ccond = sync.NewCond(&d.cmu)
 	if err := d.openEngine(opts.Merge); err != nil {
 		w.Close()
 		pgr.Close()
@@ -396,6 +408,7 @@ func openExisting(fs vfs.FS, path string, opts Options) (*DB, error) {
 	}
 	d := &DB{fs: fs, path: path, pgr: pgr, eng: eng, crypto: enc,
 		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, bufferedInserts: opts.BufferedInserts, compression: opts.Compression, now: opts.clock(), logger: opts.Logger, slowOp: opts.SlowOpThreshold, tracer: opts.Tracer, readReplica: opts.ReadReplica, archive: opts.WALArchive}
+	d.ccond = sync.NewCond(&d.cmu)
 	if err := d.openEngine(opts.Merge); err != nil {
 		pgr.Close()
 		return nil, err
@@ -521,32 +534,29 @@ func newEngine(kind format.EngineKind, pgr *pager.Pager) (engine.Engine, error) 
 // commits it to the WAL, and only then applies it to the engine -- the write-ahead
 // rule (spec 07 §1). It returns the assigned commit version. At SyncFull the batch
 // is durable before Write returns: a crash afterward will redo it.
+//
+// The commit joins a group: concurrent Writes queue together and share one fsync rather
+// than each paying its own (spec 06 F3). The batch is built inside the leader's prepare
+// step so it is stamped at the version the commit is actually assigned.
 func (d *DB) Write(fn func(b *engine.WriteBatch)) (uint64, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	if d.fatal != nil {
-		return 0, d.fatal
-	}
-	if d.readReplica {
-		return 0, ErrReadOnlyTxn
-	}
-	// Under the single-writer lock the next version is stable between this peek and
-	// the formal commit, so the batch can be built at it before it is reserved.
-	v := d.orc.peekNext()
-	b := engine.NewWriteBatch(v)
-	fn(b)
-	if b.Len() == 0 {
-		// An empty write still consumes no version; report the last committed one.
-		return v - 1, nil
-	}
-
-	got := d.orc.commit(batchKeys(b))
-	if err := d.applyCommitted(b, got); err != nil {
-		return 0, err
-	}
-	d.orc.applied(got)
-	return got, nil
+	return d.submitCommit(&commitReq{
+		prepare: func() (*engine.WriteBatch, uint64, bool, error) {
+			if d.readReplica {
+				return nil, 0, false, ErrReadOnlyTxn
+			}
+			// Under the leader's write lock the next version is stable between this peek
+			// and the formal commit, so the batch is built at it before it is reserved.
+			v := d.orc.peekNext()
+			b := engine.NewWriteBatch(v)
+			fn(b)
+			if b.Len() == 0 {
+				// An empty write consumes no version; report the last committed one.
+				return nil, v - 1, true, nil
+			}
+			got := d.orc.commit(batchKeys(b))
+			return b, got, false, nil
+		},
+	})
 }
 
 // Load bulk-populates the database from key/value pairs delivered in ascending key
@@ -651,20 +661,18 @@ func (d *DB) loadBatched(next func() (key, value []byte, ok bool)) (uint64, erro
 // version visible (spec 10 §3, §5.1). It returns the assigned commit version, or
 // ErrConflict if the transaction lost a write-write race.
 func (d *DB) commitTxn(readVersion uint64, ops []pendingOp, conflictKeys []string) (uint64, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	if d.fatal != nil {
-		return 0, d.fatal
-	}
-	if d.readReplica {
-		return 0, ErrReadOnlyTxn
-	}
-	v, ok := d.orc.newCommitTs(readVersion, conflictKeys)
-	if !ok {
-		return 0, ErrConflict
-	}
-	return d.applyTxn(v, ops)
+	return d.submitCommit(&commitReq{
+		prepare: func() (*engine.WriteBatch, uint64, bool, error) {
+			if d.readReplica {
+				return nil, 0, false, ErrReadOnlyTxn
+			}
+			v, ok := d.orc.newCommitTs(readVersion, conflictKeys)
+			if !ok {
+				return nil, 0, false, ErrConflict
+			}
+			return d.buildOpsBatch(v, ops), v, false, nil
+		},
+	})
 }
 
 // commitTxnSerializable is the serializable-isolation commit path (spec 10 §4): it is
@@ -673,26 +681,26 @@ func (d *DB) commitTxn(readVersion uint64, ops []pendingOp, conflictKeys []strin
 // ranges are what the transaction read (rw-antidependency detection). It returns the
 // assigned commit version, or ErrConflict if either check fails.
 func (d *DB) commitTxnSerializable(readVersion uint64, ops []pendingOp, writeKeys, readKeys []string, ranges []keyRange) (uint64, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	if d.fatal != nil {
-		return 0, d.fatal
-	}
-	if d.readReplica {
-		return 0, ErrReadOnlyTxn
-	}
-	v, ok := d.orc.newCommitTsSerializable(readVersion, writeKeys, readKeys, ranges)
-	if !ok {
-		return 0, ErrConflict
-	}
-	return d.applyTxn(v, ops)
+	return d.submitCommit(&commitReq{
+		prepare: func() (*engine.WriteBatch, uint64, bool, error) {
+			if d.readReplica {
+				return nil, 0, false, ErrReadOnlyTxn
+			}
+			v, ok := d.orc.newCommitTsSerializable(readVersion, writeKeys, readKeys, ranges)
+			if !ok {
+				return nil, 0, false, ErrConflict
+			}
+			return d.buildOpsBatch(v, ops), v, false, nil
+		},
+	})
 }
 
-// applyTxn builds the write batch for an admitted commit at version v, applies it
-// through the write-ahead path, and makes the version visible. The caller holds d.mu
-// and has already cleared conflict detection.
-func (d *DB) applyTxn(v uint64, ops []pendingOp) (uint64, error) {
+// buildOpsBatch assembles the engine write batch for an admitted transaction at its
+// assigned version v. It runs inside the leader's prepare closure (under d.mu) so the
+// version baked into each internal key is the one the oracle actually handed out, the
+// same build the old single-writer applyTxn did before group commit took over the log
+// and apply phases.
+func (d *DB) buildOpsBatch(v uint64, ops []pendingOp) *engine.WriteBatch {
 	b := engine.NewWriteBatch(v)
 	for _, op := range ops {
 		switch op.kind {
@@ -708,82 +716,7 @@ func (d *DB) applyTxn(v uint64, ops []pendingOp) (uint64, error) {
 			b.DeleteRange(op.key, op.value)
 		}
 	}
-	if err := d.applyCommitted(b, v); err != nil {
-		return 0, err
-	}
-	d.orc.applied(v)
-	return v, nil
-}
-
-// applyCommitted enforces the write-ahead rule for an already-versioned batch: log
-// and commit it durably, then apply it to the engine, then record the durable
-// version in the header (persisted at the next checkpoint). The caller holds d.mu
-// and calls oracle.applied after, in version order (spec 07 §1, spec 10 §2).
-func (d *DB) applyCommitted(b *engine.WriteBatch, v uint64) error {
-	encoded := b.Encode()
-	// Trace the whole commit and split it into its durable and apply phases, so a span
-	// backend can attribute commit latency to fsync versus engine cost the same way the
-	// slow-op log does (spec 19 §3). The spans are no-ops when no tracer is set.
-	ctx, commitSpan := d.startSpan(context.Background(), "kv.commit")
-	defer endSpan(commitSpan)
-	// Time the durable-commit sequence (log append plus fsync) for the commit-latency
-	// metric (spec 19 §1.1). time.Now is the right clock here, not d.now: this measures
-	// real fsync cost, independent of the injectable TTL clock, and Go's monotonic
-	// reading makes the delta immune to wall-clock steps.
-	commitStart := time.Now()
-	_, durableSpan := d.startSpan(ctx, "kv.commit.durable")
-	// A failed log append or commit sync is a fatal durability fault (fsyncgate, spec
-	// 07 §6): the kernel may have dropped the un-synced bytes, so the commit must not
-	// be acknowledged and the database is fenced until reopen. Apply runs only after a
-	// durable commit, so a fault here leaves the engine untouched and this version
-	// unapplied, exactly the state recovery reconstructs from the durable log.
-	if err := d.wal.LogBatch(v, encoded); err != nil {
-		endSpan(durableSpan)
-		d.fatal = fmt.Errorf("%w: %v", ErrFatalSync, err)
-		d.logFatal(d.fatal)
-		return d.fatal
-	}
-	commitLSN, err := d.wal.Commit(v)
-	if err != nil {
-		endSpan(durableSpan)
-		d.fatal = fmt.Errorf("%w: %v", ErrFatalSync, err)
-		d.logFatal(d.fatal)
-		return d.fatal
-	}
-	endSpan(durableSpan)
-	// The batch is durable: count it and fold in its latency. Only a successful, durable
-	// commit is tallied, so the average latency is over acknowledged commits, never over
-	// the faults that fenced the database above.
-	durable := time.Since(commitStart)
-	d.counters.commits.Add(1)
-	d.counters.commitNanos.Add(uint64(durable))
-	// Tell an LSN-tracking engine (the LSM core) the batch's WAL position before
-	// applying it, so its durable mark can later report how far a flush has reached.
-	d.noteLSN(commitLSN)
-	applyStart := time.Now()
-	_, applySpan := d.startSpan(ctx, "kv.commit.apply")
-	if err := d.eng.Apply(b, v); err != nil {
-		endSpan(applySpan)
-		return err
-	}
-	endSpan(applySpan)
-	// Slow-op log (spec 19 §3): if the commit ran past the threshold, name it with a
-	// durable/apply phase split so an operator can tell fsync cost from engine cost. The
-	// timing is read only when the slow-op log is armed, so a database with no logger
-	// pays nothing here.
-	if d.slowOpEnabled() {
-		apply := time.Since(applyStart)
-		if total := durable + apply; total >= d.slowOp {
-			d.logSlowCommit(b, v, durable, apply, total)
-		}
-	}
-	d.pgr.Header().LastCommitVersion = v
-	d.maybeCheckpoint()
-	// The commit is now durable and visible, so surface it to the change feed. publish
-	// only enqueues onto subscriber channels and never calls user code, so holding the
-	// write lock across it stays cheap (spec 15 §7).
-	d.publish(b, v)
-	return nil
+	return b
 }
 
 // batchKeys returns the unique user keys a blind batch wrote, so a Write
