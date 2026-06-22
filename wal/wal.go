@@ -319,11 +319,12 @@ func (w *WAL) LogBatch(version uint64, encoded []byte) error {
 	return nil
 }
 
-// Commit appends a commit frame for version and flushes per the sync level. After
-// it returns at SyncFull/SyncExtra the batch is durable: a crash will redo it. The
-// returned LSN is the commit frame's LSN, which the caller records as the
-// checkpoint boundary once the batch is folded into the main file.
-func (w *WAL) Commit(version uint64) (uint64, error) {
+// AppendCommit appends a commit frame for version without flushing. It is the first
+// half of a commit: the caller (a group-commit leader) appends one or more batches and
+// their commit frames, then issues a single Sync that makes the whole run durable. The
+// returned LSN is the commit frame's LSN, which the caller records as the checkpoint
+// boundary once the batch is folded into the main file.
+func (w *WAL) AppendCommit(version uint64) (uint64, error) {
 	commitLSN := w.lsn
 	var p [4]byte
 	binary.BigEndian.PutUint32(p[:], w.batchN)
@@ -331,6 +332,24 @@ func (w *WAL) Commit(version uint64) (uint64, error) {
 		return 0, err
 	}
 	w.batchN = 0
+	return commitLSN, nil
+}
+
+// Sync flushes the log per the configured sync level. After it returns at
+// SyncFull/SyncExtra every frame appended so far is durable: a crash will redo it. At
+// SyncOff/SyncNormal it is a no-op, since those levels defer durability to checkpoint.
+// One Sync covers every batch a group-commit leader appended, so N commits share one
+// fsync instead of paying N in series.
+func (w *WAL) Sync() error { return w.sync() }
+
+// Commit appends a commit frame for version and flushes per the sync level, the serial
+// single-committer path the replica-apply stream uses (the foreground commit path batches
+// these two halves across a group). The returned LSN is the commit frame's LSN.
+func (w *WAL) Commit(version uint64) (uint64, error) {
+	commitLSN, err := w.AppendCommit(version)
+	if err != nil {
+		return 0, err
+	}
 	if err := w.sync(); err != nil {
 		return 0, err
 	}
