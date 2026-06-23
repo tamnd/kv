@@ -125,13 +125,54 @@ func (d *DB) processGroup(group []*commitReq) {
 	}
 	durable := time.Since(durableStart)
 
-	// Phase 3: apply each durable batch to the engine in version order, then make it
-	// visible. The shared fsync above covers every batch, so a reader that sees the newest
-	// applied version sees only durable state.
-	for _, r := range appended {
-		d.applyDurable(r, durable)
+	// Phase 3: apply each durable batch to the engine, then make it visible. The shared fsync
+	// above covers every batch, so a reader that sees the newest applied version sees only
+	// durable state. An engine that can apply a whole group at once (the LSM core) spreads the
+	// inserts across cores; the bookkeeping that makes each batch visible still runs serially in
+	// version order. An engine without that capability (the B-tree core) takes one Apply per
+	// batch.
+	if ga, ok := d.eng.(engine.GroupApplier); ok && len(appended) > 0 {
+		d.applyGroupDurable(ga, appended, durable)
+	} else {
+		for _, r := range appended {
+			d.applyDurable(r, durable)
+		}
 	}
 	d.maybeCheckpoint()
+}
+
+// applyGroupDurable applies an already-durable group to a group-capable engine in one parallel
+// call, then publishes each batch's version in order. The engine insert is the parallel part;
+// the visibility bookkeeping (counters, header, subscriptions, the oracle's applied mark, the
+// caller's result) stays serial and in version order so a reader never sees version N+1 before N.
+// The group's apply latency is the shared engine cost, attributed to each batch the way the shared
+// fsync latency already is. An engine apply failure fails the whole group: on the LSM core it is a
+// sticky flush fault that would fail every batch in turn anyway.
+func (d *DB) applyGroupDurable(ga engine.GroupApplier, appended []*commitReq, durable time.Duration) {
+	batches := make([]*engine.WriteBatch, len(appended))
+	versions := make([]uint64, len(appended))
+	var maxLSN uint64
+	for i, r := range appended {
+		batches[i], versions[i] = r.b, r.v
+		if r.commitLSN > maxLSN {
+			maxLSN = r.commitLSN
+		}
+	}
+	// Fold the group's largest commit LSN into the engine's durable mark once, the group-apply
+	// analog of the per-batch noteLSN the serial path makes before each Apply.
+	d.noteLSN(maxLSN)
+
+	applyStart := time.Now()
+	if err := ga.ApplyGroup(batches, versions); err != nil {
+		for _, r := range appended {
+			r.fail(err)
+		}
+		return
+	}
+	apply := time.Since(applyStart)
+	for _, r := range appended {
+		d.publishApplied(r, durable, apply)
+	}
 }
 
 // applyDurable applies one already-durable batch to the engine and makes its version
@@ -162,6 +203,37 @@ func (d *DB) applyDurable(r *commitReq, durable time.Duration) {
 
 	if d.slowOpEnabled() {
 		apply := time.Since(applyStart)
+		if total := durable + apply; total >= d.slowOp {
+			d.logSlowCommit(r.b, r.v, durable, apply, total)
+		}
+	}
+	d.pgr.Header().LastCommitVersion = r.v
+	d.publish(r.b, r.v)
+	d.orc.applied(r.v)
+	r.succeed(r.v)
+}
+
+// publishApplied makes a batch visible after the engine has already applied it as part of a
+// parallel group apply: it records the commit, spans, and slow-op log, advances the durable
+// header version, fans the batch to subscribers, marks its version applied in the oracle, and
+// returns the result. The caller runs it serially in version order, so the oracle's applied
+// mark and the subscription feed advance monotonically even though the inserts ran out of order.
+// durable is the group's shared fsync latency and apply is the group's shared engine latency,
+// both attributed to each batch since both costs were genuinely shared across the group.
+func (d *DB) publishApplied(r *commitReq, durable, apply time.Duration) {
+	ctx, commitSpan := d.startSpan(context.Background(), "kv.commit")
+	_, durableSpan := d.startSpan(ctx, "kv.commit.durable")
+	endSpan(durableSpan)
+	_, applySpan := d.startSpan(ctx, "kv.commit.apply")
+	endSpan(applySpan)
+	endSpan(commitSpan)
+
+	d.counters.commits.Add(1)
+	d.counters.commitNanos.Add(uint64(durable))
+	// The durable mark was already folded once for the whole group, with its largest commit
+	// LSN, before the parallel apply ran, so there is no per-batch noteLSN here.
+
+	if d.slowOpEnabled() {
 		if total := durable + apply; total >= d.slowOp {
 			d.logSlowCommit(r.b, r.v, durable, apply, total)
 		}

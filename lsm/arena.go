@@ -16,16 +16,17 @@ import (
 // into the old one; the concurrent memtable is exactly that reader, so reallocation is
 // out and the arena is a list of fixed blocks instead.
 //
-// Allocation is concurrent. The parallel-apply path inserts from many goroutines at once,
-// so two allocations can run together; without synchronization they would race on the
-// bump cursor and hand two nodes the same offset, whose bytes and towers would then
-// overlap and corrupt the list. The cursor and the block list are therefore guarded by a
-// mutex taken only by allocators. Readers never take it: the block list is published
-// through an atomic pointer to an immutable snapshot, swapped on the rare append of a new
-// block, so a reader loads a stable snapshot and indexes a block that never moves. The
-// short critical section is just the cursor bump; the expensive work of an insert (copying
-// the key and value, walking the towers to find the splice) happens outside it, so the
-// apply still spreads across cores.
+// Allocation is lock-free on its common path. The parallel-apply path inserts from many
+// goroutines at once, and a mutex around every allocation would serialize them and erase
+// the win: a profile of an early build showed the insert wall-clock pinned by lock
+// handoff on the allocator, with the skip-list descent that was meant to spread across
+// cores waiting its turn behind the lock. So the bump is a single atomic cursor advanced
+// by compare-and-swap, and the only mutex is taken on the rare event of appending a new
+// block (once per megabyte) or laying down an oversized allocation. The cursor packs the
+// current block index in its high 32 bits and the next free offset within that block in
+// its low 32, so one CAS both reserves the bytes and reports where they are. Readers never
+// touch the cursor at all: they navigate the skip list and resolve an offset against the
+// block snapshot, which is published through an atomic pointer and only ever grows.
 //
 // blockShift sets the chunk size to 1 MiB, the same figure defaultArenaCap used as the
 // old arena's starting size, so a tiny database still pays one 1 MiB block and no more.
@@ -37,6 +38,15 @@ const (
 	blockSize  = 1 << blockShift
 	blockMask  = blockSize - 1
 )
+
+// packCursor and the unpackers move a (blockIndex, within) pair through the single atomic
+// cursor word. within is kept explicit, never derived by masking the offset, so the
+// exact-boundary case where an allocation fills a block to its final byte leaves within at
+// blockSize and forces the next allocation onto a new block, instead of silently decoding a
+// within of zero in a block that was never grown.
+func packCursor(blockIdx, within uint32) uint64 { return uint64(blockIdx)<<32 | uint64(within) }
+func cursorBlock(c uint64) uint32               { return uint32(c >> 32) }
+func cursorWithin(c uint64) uint32              { return uint32(c) }
 
 // arena is a never-moving bump allocator over a list of fixed 1 MiB blocks. Allocations
 // bump within the current block; one that would cross the block's end starts a fresh
@@ -55,16 +65,15 @@ const (
 // spills past blockSize: bytes are only ever sliced forward from a start offset on that
 // same block.
 //
-// The bump target is always the last block in the snapshot; within is the next free byte
-// in it, so the invariant "the last block exists and has within bytes used" holds after
-// every call and a global offset is (lastBlockIndex << blockShift) + within with within
-// always below blockSize. mu guards within, used, and swaps of the blocks snapshot; the
-// blocks pointer is loaded atomically by readers without the lock.
+// cur is the atomic bump cursor; blocks is the published, only-growing block snapshot; used
+// is the running footprint, bumped atomically. mu serializes only the two rare structural
+// events, growing the block list and laying down an oversized block, so the snapshot is
+// never replaced concurrently.
 type arena struct {
 	mu     sync.Mutex
-	blocks atomic.Pointer[[][]byte] // immutable snapshot, replaced under mu on append
-	within uint32                   // next free byte within the last (bump) block, under mu
-	used   int                      // bytes handed out, the seal-threshold footprint, under mu
+	blocks atomic.Pointer[[][]byte] // immutable snapshot, replaced under mu on grow
+	cur    atomic.Uint64            // packed (blockIndex, within), advanced lock-free by CAS
+	used   atomic.Int64             // bytes handed out, the seal-threshold footprint
 }
 
 // newArena returns an arena with its first 1 MiB block in place and byte 0 burned as the
@@ -73,63 +82,85 @@ type arena struct {
 // and a mask.
 func newArena(capacity int) *arena {
 	_ = capacity
-	a := &arena{within: 1, used: 1}
+	a := &arena{}
 	blocks := [][]byte{make([]byte, blockSize)}
 	a.blocks.Store(&blocks)
+	a.cur.Store(packCursor(0, 1)) // block 0, byte 0 burned
+	a.used.Store(1)
 	return a
 }
 
-// alloc reserves size bytes and returns the global offset of the first. Within the current
-// block it is a pointer bump; when the allocation would cross the block's end it opens a
-// fresh block and bumps there. An allocation larger than a block gets its own right-sized
-// block, followed by filler indices that cover the physical spill so the next bump block's
-// virtual range never overlaps it, then a fresh bump block. The cursor and the block list
-// are mutated under mu, and a new block list is published atomically so a concurrent reader
-// loading the snapshot sees either the list before or after the append, never a torn one.
+// alloc reserves size bytes and returns the global offset of the first. The common path is
+// a lock-free CAS that advances the cursor within the current block. When the allocation
+// would cross the block end, grow appends a fresh block under mu and the loop retries on the
+// new block; an allocation larger than a block takes the oversized path, which lays down its
+// own right-sized block under mu.
 func (a *arena) alloc(size int) uint32 {
+	if size > blockSize {
+		return a.allocOversized(size)
+	}
+	for {
+		old := a.cur.Load()
+		blockIdx, within := cursorBlock(old), cursorWithin(old)
+		if int(within)+size <= blockSize {
+			if a.cur.CompareAndSwap(old, packCursor(blockIdx, within+uint32(size))) {
+				a.used.Add(int64(size))
+				return blockIdx<<blockShift | within
+			}
+			continue // lost the race, reload and retry
+		}
+		a.grow(blockIdx) // current block is full; append the next one
+	}
+}
+
+// grow appends one fresh block after the block fullIdx, then points the cursor at its start.
+// It double-checks under mu that the block list has not already grown past fullIdx, so two
+// allocators that both find the same block full append only one block between them. The
+// cursor is published after the block, so a winner of the next CAS names a block that exists.
+func (a *arena) grow(fullIdx uint32) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.used += size
 	cur := *a.blocks.Load()
-	if size > blockSize {
-		oidx := uint32(len(cur))
-		next := make([][]byte, len(cur), len(cur)+2)
-		copy(next, cur)
-		next = append(next, make([]byte, size))
-		// The oversized block physically spans ceil(size/blockSize) block indices; reserve
-		// the extra ones with nil fillers so no later allocation is handed a virtual offset
-		// that decodes into the oversized block's tail.
-		span := uint32((size + blockSize - 1) >> blockShift)
-		for k := uint32(1); k < span; k++ {
-			next = append(next, nil)
-		}
-		next = append(next, make([]byte, blockSize)) // fresh bump block after it
-		a.blocks.Store(&next)
-		a.within = 0
-		return oidx << blockShift
+	if uint32(len(cur)-1) > fullIdx {
+		return // another allocator already appended; retry will find the room
 	}
-	if int(a.within)+size > blockSize {
-		next := make([][]byte, len(cur), len(cur)+1)
-		copy(next, cur)
-		next = append(next, make([]byte, blockSize))
-		a.blocks.Store(&next)
-		a.within = 0
-		cur = next
+	next := make([][]byte, len(cur), len(cur)+1)
+	copy(next, cur)
+	next = append(next, make([]byte, blockSize))
+	a.blocks.Store(&next)
+	a.cur.Store(packCursor(uint32(len(next)-1), 0))
+}
+
+// allocOversized lays down a single allocation larger than a block as its own right-sized
+// block, followed by nil filler indices that cover its physical spill so no later offset
+// decodes into its tail, then a fresh bump block the cursor is moved onto. It runs under mu
+// because it replaces the block snapshot; a concurrent CAS bump either loses to the cursor
+// store and retries on the new bump block, or wins first and keeps its offset in the old
+// block, which still exists. Either way no two allocations overlap.
+func (a *arena) allocOversized(size int) uint32 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	cur := *a.blocks.Load()
+	oidx := uint32(len(cur))
+	next := make([][]byte, len(cur), len(cur)+2)
+	copy(next, cur)
+	next = append(next, make([]byte, size))
+	span := uint32((size + blockSize - 1) >> blockShift)
+	for k := uint32(1); k < span; k++ {
+		next = append(next, nil)
 	}
-	off := (uint32(len(cur)-1) << blockShift) + a.within
-	a.within += uint32(size)
-	return off
+	next = append(next, make([]byte, blockSize)) // fresh bump block after it
+	a.blocks.Store(&next)
+	a.cur.Store(packCursor(uint32(len(next)-1), 0))
+	a.used.Add(int64(size))
+	return oidx << blockShift
 }
 
 // size reports the bytes the arena has handed out, the memtable's footprint used to
 // decide when to seal it. It counts allocated bytes, not the wasted block tails, so the
-// seal fires on real data rather than on internal fragmentation. It takes mu because used
-// is bumped under mu by concurrent allocators.
-func (a *arena) size() int {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.used
-}
+// seal fires on real data rather than on internal fragmentation. It is an atomic load,
+// since used is bumped atomically by concurrent allocators.
+func (a *arena) size() int { return int(a.used.Load()) }
 
 // bytesAt returns the n-byte slice that starts at off. The slice points into the block's
 // fixed backing array, so it is stable for the life of the memtable and may be held by a
@@ -175,46 +206,59 @@ const (
 // make and never reused, so a freshly allocated tower reads as all-nil without explicit
 // clearing.
 //
-// Like the byte arena it is concurrent: alloc runs the cursor bump and any block append
-// under mu, and the block list is published through an atomic pointer so the lock-free
-// slot accessors load a stable snapshot.
+// It bumps lock-free exactly like the byte arena: an atomic packed cursor advanced by CAS,
+// with a mutex taken only to append a block. Keeping the within counter explicit in the
+// cursor (rather than masking the offset) is what makes the exact-boundary case correct,
+// where a tower fills a block to its last slot; the next allocation then sees within at
+// u32Size and grows, instead of decoding a base into a block that was never allocated.
 type uint32Arena struct {
 	mu     sync.Mutex
-	blocks atomic.Pointer[[][]uint32] // immutable snapshot, replaced under mu on append
-	cur    uint32                     // next free slot, under mu
+	blocks atomic.Pointer[[][]uint32] // immutable snapshot, replaced under mu on grow
+	cur    atomic.Uint64              // packed (blockIndex, within), advanced lock-free by CAS
 }
 
 // newUint32Arena returns a tower arena with its first block in place and slot 0 burned as
 // the nil sentinel.
 func newUint32Arena() *uint32Arena {
-	u := &uint32Arena{cur: 1}
+	u := &uint32Arena{}
 	blocks := [][]uint32{make([]uint32, u32Size)}
 	u.blocks.Store(&blocks)
+	u.cur.Store(packCursor(0, 1)) // block 0, slot 0 burned
 	return u
 }
 
 // alloc reserves n contiguous slots and returns the index of the first. A tower is small
 // enough that a single allocation always fits in one block, so a request that would cross
-// the block end simply opens a fresh block and allocates at its start. The cursor and the
-// block list move under mu, with the new list published atomically.
+// the block end grows a fresh block and the loop retries. The common path is a lock-free
+// CAS; only the block append takes mu.
 func (u *uint32Arena) alloc(n int) uint32 {
+	for {
+		old := u.cur.Load()
+		blockIdx, within := cursorBlock(old), cursorWithin(old)
+		if int(within)+n <= u32Size {
+			if u.cur.CompareAndSwap(old, packCursor(blockIdx, within+uint32(n))) {
+				return blockIdx<<u32Shift | within
+			}
+			continue
+		}
+		u.grow(blockIdx)
+	}
+}
+
+// grow appends one fresh tower block after fullIdx and moves the cursor onto it, double-
+// checking under mu so concurrent growers append only one block between them.
+func (u *uint32Arena) grow(fullIdx uint32) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	within := u.cur & u32Mask
-	if int(within)+n > u32Size {
-		cur := *u.blocks.Load()
-		idx := uint32(len(cur))
-		next := make([][]uint32, len(cur), len(cur)+1)
-		copy(next, cur)
-		next = append(next, make([]uint32, u32Size))
-		u.blocks.Store(&next)
-		base := idx << u32Shift
-		u.cur = base + uint32(n)
-		return base
+	cur := *u.blocks.Load()
+	if uint32(len(cur)-1) > fullIdx {
+		return
 	}
-	base := u.cur
-	u.cur += uint32(n)
-	return base
+	next := make([][]uint32, len(cur), len(cur)+1)
+	copy(next, cur)
+	next = append(next, make([]uint32, u32Size))
+	u.blocks.Store(&next)
+	u.cur.Store(packCursor(uint32(len(next)-1), 0))
 }
 
 // slot returns a pointer to the uint32 at index i. The pointer is stable for the

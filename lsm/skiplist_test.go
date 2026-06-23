@@ -136,6 +136,38 @@ func TestArenaGrowthPreservesOffsets(t *testing.T) {
 	}
 }
 
+// TestUint32ArenaExactBlockBoundary covers the boundary case a packed-cursor allocator gets
+// wrong: a tower that fills the last block to its final slot. The cursor then sits exactly on
+// the block boundary, and a packed cursor decoded by shift-and-mask reads a within-block offset
+// of zero and hands the next allocation a base in a block that was never allocated, which a
+// later atomic access faults on. The explicit within counter must instead reach u32Size and
+// open a fresh block on the following allocation, so every base decodes into a block that
+// exists.
+func TestUint32ArenaExactBlockBoundary(t *testing.T) {
+	u := newUint32Arena()
+	// Slot 0 is burned, so within starts at 1; u32Size-1 more slots bring it to exactly
+	// u32Size, landing the cursor on the block boundary without opening a new block.
+	base0 := u.alloc(u32Size - 1)
+	if base0 != 1 {
+		t.Fatalf("first alloc base = %d, want 1", base0)
+	}
+	// The next allocation must open block 1 and return a base inside it.
+	base1 := u.alloc(4)
+	if bi := base1 >> u32Shift; bi != 1 {
+		t.Fatalf("post-boundary base = %d decodes to block %d, want block 1", base1, bi)
+	}
+	// Both ends must be addressable through the atomic accessors: the last slot of block 0
+	// and the first slot of block 1. A base in a never-allocated block would panic here.
+	u.store(u32Size-1, 0xdeadbeef)
+	u.store(base1, 0x12345678)
+	if got := u.load(u32Size - 1); got != 0xdeadbeef {
+		t.Fatalf("last slot of block 0 = %#x, want 0xdeadbeef", got)
+	}
+	if got := u.load(base1); got != 0x12345678 {
+		t.Fatalf("first slot of block 1 = %#x, want 0x12345678", got)
+	}
+}
+
 // TestSkiplistConcurrentInsert hammers the lock-free insert from many goroutines, each
 // owning a disjoint key range the way the parallel-apply path does (versions differ across
 // batches, so no two goroutines insert the same internal key), and confirms every key is

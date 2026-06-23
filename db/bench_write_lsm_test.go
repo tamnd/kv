@@ -13,6 +13,50 @@ import (
 	"github.com/tamnd/kv/wal"
 )
 
+// BenchmarkLargeBatchApplyLSM measures the per-entry cost of applying a large batch into the
+// LSM core, the workload the parallel group apply targets: one Write of many entries forms a
+// group the leader can spread across cores at apply time (perf/03 W1, perf/07). Durability is
+// out of the picture (mem path is not used here, but SyncNormal defers the sync to checkpoint),
+// so what it isolates is the memtable insert. b.N counts entries, not batches, so ns/op is the
+// per-entry apply cost; batch is the number of entries fused into one Write.
+func BenchmarkLargeBatchApplyLSM(b *testing.B) {
+	for _, batch := range []int{256, 4096} {
+		b.Run(fmt.Sprintf("batch=%d", batch), func(b *testing.B) {
+			fs := vfs.NewOS()
+			path := filepath.Join(b.TempDir(), "bench.kv")
+			d, err := Open(fs, path, Options{
+				PageSize:     4096,
+				Engine:       format.EngineLSM,
+				Sync:         wal.SyncNormal,
+				MemtableSize: 256 << 20,
+			})
+			if err != nil {
+				b.Fatalf("open: %v", err)
+			}
+			defer d.Close()
+
+			val := []byte("value-payload-1234567890")
+			b.ResetTimer()
+			done := 0
+			for round := 0; done < b.N; round++ {
+				n := batch
+				if rem := b.N - done; rem < n {
+					n = rem
+				}
+				base := done
+				if _, err := d.Write(func(wb *engine.WriteBatch) {
+					for i := 0; i < n; i++ {
+						wb.Set([]byte(fmt.Sprintf("r%06d-k%010d", round, base+i)), val)
+					}
+				}); err != nil {
+					b.Fatalf("write: %v", err)
+				}
+				done += n
+			}
+		})
+	}
+}
+
 // BenchmarkConcurrentWriteLSM measures concurrent blind-write throughput into the LSM core
 // with fsync removed from the picture (mem VFS, SyncNormal defers the sync to checkpoint), so
 // what it isolates is the in-memory commit path: the group-commit ordering lock, the leader's
