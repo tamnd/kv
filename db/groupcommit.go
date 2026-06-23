@@ -65,9 +65,9 @@ func (d *DB) submitCommit(req *commitReq) (uint64, error) {
 		d.cqueue = nil
 		d.cmu.Unlock()
 
-		d.rl.lock()
+		d.rl.Lock()
 		d.processGroup(group)
-		d.rl.unlock()
+		d.rl.Unlock()
 
 		d.cmu.Lock()
 		// Publish every outcome under cmu. processGroup filled each request's result/err off

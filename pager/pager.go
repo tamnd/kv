@@ -23,6 +23,7 @@ import (
 
 	"github.com/tamnd/kv/crypto"
 	"github.com/tamnd/kv/format"
+	"github.com/tamnd/kv/latch"
 	"github.com/tamnd/kv/vfs"
 )
 
@@ -132,7 +133,13 @@ const (
 // among them. Every field is guarded by mu. A page number maps to exactly one shard for
 // the pool's lifetime, so a frame in this shard only ever caches pages that belong here.
 type shard struct {
-	mu      sync.RWMutex
+	// rl is the distributed read latch (perf/10 R2). It replaces a plain sync.RWMutex so that
+	// concurrent readers of the hot upper nodes (the root and interiors every descent touches,
+	// which cluster into a few shards) do not serialize on one shared reader-count word. A reader
+	// locks only its P's stripe; admission, eviction, and checkpoint take the write side (all
+	// stripes). The contract is a sync.RWMutex's, so the lock order and the "caller must hold
+	// sh.mu" invariants below are unchanged.
+	rl      *latch.RLatch
 	index   map[uint32]*Frame // resident frames by page number, this shard only
 	frames  []*Frame          // frames owned by this shard, pinned or free
 	hand    int               // CLOCK hand into frames
@@ -437,6 +444,7 @@ func newPager(fs vfs.FS, f vfs.File, path string, pageSize, cacheFrames int) *Pa
 			n++
 		}
 		sh := &shard{
+			rl:     latch.New(),
 			index:  make(map[uint32]*Frame, n),
 			frames: make([]*Frame, 0, n),
 		}

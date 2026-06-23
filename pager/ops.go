@@ -23,7 +23,7 @@ func (p *Pager) Get(pgno uint32, intent Intent) (*Frame, error) {
 	// pin in parallel instead of serializing on an exclusive lock. The pin is an atomic
 	// increment, and eviction needs the exclusive lock, so it cannot take this frame
 	// while a reader holds the read lock and is mid-pin.
-	sh.mu.RLock()
+	s := sh.rl.RLock()
 	if fr, ok := sh.index[pgno]; ok {
 		sh.cacheHits.Add(1)
 		if intent == Write {
@@ -39,10 +39,10 @@ func (p *Pager) Get(pgno uint32, intent Intent) (*Frame, error) {
 		}
 		fr.pins.Add(1)
 		fr.ref.Store(true)
-		sh.mu.RUnlock()
+		sh.rl.RUnlock(s)
 		return fr, nil
 	}
-	sh.mu.RUnlock()
+	sh.rl.RUnlock(s)
 	return p.getMiss(sh, pgno, intent)
 }
 
@@ -52,8 +52,8 @@ func (p *Pager) Get(pgno uint32, intent Intent) (*Frame, error) {
 // pinned, like Get. It is split out of Get so the pin-free ViewDecoded can share the exact
 // same miss handling.
 func (p *Pager) getMiss(sh *shard, pgno uint32, intent Intent) (*Frame, error) {
-	sh.mu.Lock()
-	defer sh.mu.Unlock()
+	sh.rl.Lock()
+	defer sh.rl.Unlock()
 	if fr, ok := sh.index[pgno]; ok {
 		sh.cacheHits.Add(1)
 		if intent == Write {
@@ -132,7 +132,7 @@ func (p *Pager) ViewDecoded(pgno uint32) (any, *Frame, error) {
 		return nil, nil, fmt.Errorf("pager: page 0 is the null page")
 	}
 	sh := p.shardFor(pgno)
-	sh.mu.RLock()
+	s := sh.rl.RLock()
 	if fr, ok := sh.index[pgno]; ok {
 		if b := fr.decoded.Load(); b != nil {
 			sh.cacheHits.Add(1)
@@ -144,7 +144,7 @@ func (p *Pager) ViewDecoded(pgno uint32) (any, *Frame, error) {
 			if !fr.ref.Load() {
 				fr.ref.Store(true)
 			}
-			sh.mu.RUnlock()
+			sh.rl.RUnlock(s)
 			return b.v, nil, nil
 		}
 		// Resident but not decoded yet: pin it so the caller can decode from the bytes and
@@ -152,10 +152,10 @@ func (p *Pager) ViewDecoded(pgno uint32) (any, *Frame, error) {
 		sh.cacheHits.Add(1)
 		fr.pins.Add(1)
 		fr.ref.Store(true)
-		sh.mu.RUnlock()
+		sh.rl.RUnlock(s)
 		return nil, fr, nil
 	}
-	sh.mu.RUnlock()
+	sh.rl.RUnlock(s)
 	fr, err := p.getMiss(sh, pgno, Read)
 	if err != nil {
 		return nil, nil, err
@@ -175,7 +175,7 @@ func (p *Pager) ViewDecoded(pgno uint32) (any, *Frame, error) {
 // fr.dirty (this and the exclusive-locked evict/writeBack) never overlap.
 func (p *Pager) Unpin(fr *Frame, dirty bool) {
 	sh := p.shardFor(fr.pgno)
-	sh.mu.RLock()
+	s := sh.rl.RLock()
 	if dirty {
 		fr.dirty = true
 	}
@@ -185,7 +185,7 @@ func (p *Pager) Unpin(fr *Frame, dirty bool) {
 	// Unpin runs, the write session is over and the frame is safe to flush.
 	fr.writePinned.Store(false)
 	fr.pins.Add(-1)
-	sh.mu.RUnlock()
+	sh.rl.RUnlock(s)
 }
 
 // BeginExternalWrite marks the start of a page-producing section that runs outside the
@@ -414,8 +414,8 @@ func (p *Pager) allocateNumberLocked() uint32 {
 // bulk writer can materialize reserved pages one at a time.
 func (p *Pager) GetAllocated(pgno uint32) (*Frame, error) {
 	sh := p.shardFor(pgno)
-	sh.mu.Lock()
-	defer sh.mu.Unlock()
+	sh.rl.Lock()
+	defer sh.rl.Unlock()
 	fr, err := p.admit(sh, pgno)
 	if err != nil {
 		return nil, err
@@ -434,7 +434,7 @@ func (p *Pager) GetAllocated(pgno uint32) (*Frame, error) {
 // meta, the global lock order).
 func (p *Pager) Free(pgno uint32) {
 	sh := p.shardFor(pgno)
-	sh.mu.Lock()
+	sh.rl.Lock()
 	if fr, ok := sh.index[pgno]; ok {
 		delete(sh.index, pgno)
 		fr.pgno = 0
@@ -442,7 +442,7 @@ func (p *Pager) Free(pgno uint32) {
 		fr.ref.Store(false)
 		fr.clearDecoded()
 	}
-	sh.mu.Unlock()
+	sh.rl.Unlock()
 	p.metaMu.Lock()
 	p.free = append(p.free, pgno)
 	p.metaMu.Unlock()
@@ -455,11 +455,11 @@ func (p *Pager) Free(pgno uint32) {
 // shards-ascending then metaMu.
 func (p *Pager) lockAllShards() func() {
 	for _, sh := range p.shards {
-		sh.mu.Lock()
+		sh.rl.Lock()
 	}
 	return func() {
 		for i := len(p.shards) - 1; i >= 0; i-- {
-			p.shards[i].mu.Unlock()
+			p.shards[i].rl.Unlock()
 		}
 	}
 }
@@ -605,8 +605,8 @@ func (p *Pager) flushHeaderLocked() error {
 // The caller holds no pager lock; Rekey takes the page-1 shard then metaMu itself.
 func (p *Pager) Rekey(newScheme *crypto.Scheme, newDescriptor []byte) error {
 	sh := p.shardFor(1)
-	sh.mu.Lock()
-	defer sh.mu.Unlock()
+	sh.rl.Lock()
+	defer sh.rl.Unlock()
 	p.metaMu.Lock()
 	defer p.metaMu.Unlock()
 	if p.cryptoScheme() == nil {

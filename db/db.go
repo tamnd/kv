@@ -720,18 +720,18 @@ func (d *DB) Write(fn func(b *engine.WriteBatch)) (uint64, error) {
 // without the capability, Load falls back to a chunked sequence of ordinary commits,
 // which is slower, accepts any order, and is durable per chunk like a WriteBatch.
 func (d *DB) Load(next func() (key, value []byte, ok bool)) (uint64, error) {
-	d.rl.lock()
+	d.rl.Lock()
 	if d.fatal != nil {
-		d.rl.unlock()
+		d.rl.Unlock()
 		return 0, d.fatal
 	}
 	bl, ok := d.eng.(engine.BulkLoader)
 	if ok && d.orc.lastCommitted() == 0 {
 		v, err := d.loadFast(bl, next)
-		d.rl.unlock()
+		d.rl.Unlock()
 		return v, err
 	}
-	d.rl.unlock()
+	d.rl.Unlock()
 	return d.loadBatched(next)
 }
 
@@ -915,8 +915,8 @@ const batchKeysLinearMax = 16
 func (d *DB) snapshotGet(version uint64, key []byte) ([]byte, bool, error) {
 	_, span := d.startSpan(context.Background(), "kv.get")
 	defer endSpan(span)
-	sh := d.rl.rlock()
-	defer d.rl.runlock(sh)
+	sh := d.rl.RLock()
+	defer d.rl.RUnlock(sh)
 	rd, err := d.eng.NewReader(engine.Snapshot{Version: version, Clock: d.now})
 	if err != nil {
 		return nil, false, err
@@ -941,8 +941,8 @@ func (d *DB) snapshotGet(version uint64, key []byte) ([]byte, bool, error) {
 func (d *DB) snapshotGetZeroCopy(version uint64, key []byte) ([]byte, bool, error) {
 	_, span := d.startSpan(context.Background(), "kv.get")
 	defer endSpan(span)
-	sh := d.rl.rlock()
-	defer d.rl.runlock(sh)
+	sh := d.rl.RLock()
+	defer d.rl.RUnlock(sh)
 	rd, err := d.eng.NewReader(engine.Snapshot{Version: version, Clock: d.now})
 	if err != nil {
 		return nil, false, err
@@ -1018,8 +1018,8 @@ func (d *DB) Get(userKey []byte) ([]byte, error) {
 // is true when the budget ran out before the work was done and Maintain should be
 // called again.
 func (d *DB) Maintain(maxPages int) (engine.MaintReport, error) {
-	d.rl.lock()
-	defer d.rl.unlock()
+	d.rl.Lock()
+	defer d.rl.Unlock()
 	budget := engine.MaintBudget{MaxPages: maxPages, Watermark: d.orc.readMark(), Now: d.now()}
 	// Trace the maintenance round (compaction, version GC) so a span backend can see how
 	// much of a request's latency is background work serialized behind the writer lock
@@ -1039,8 +1039,8 @@ func (d *DB) Maintain(maxPages int) (engine.MaintReport, error) {
 // commit or mid checkpoint. It returns ErrUnsupported when the engine has no verifier,
 // so the CLI can say so plainly rather than reporting a silent pass.
 func (d *DB) Verify() (*engine.VerifyReport, error) {
-	d.rl.lock()
-	defer d.rl.unlock()
+	d.rl.Lock()
+	defer d.rl.Unlock()
 	v, ok := d.eng.(engine.Verifier)
 	if !ok {
 		return nil, ErrUnsupported
@@ -1112,8 +1112,8 @@ type Stats struct {
 // Stats gathers a Stats snapshot under a read lock, so it is consistent against a
 // concurrent commit without blocking one for long (spec 09 §4).
 func (d *DB) Stats() Stats {
-	sh := d.rl.rlock()
-	defer d.rl.runlock(sh)
+	sh := d.rl.RLock()
+	defer d.rl.RUnlock(sh)
 
 	es := d.eng.Stats()
 	// LSN is the next frame number to assign, so the last frame written is LSN-1, and a
@@ -1194,9 +1194,9 @@ func (d *DB) SetSyncMode(s wal.Sync) { d.wal.SetSync(s) }
 // AutoCheckpointFrames returns the WAL backlog threshold at which the background
 // checkpointer fires, 0 when auto-checkpointing is disabled (spec 22 §3).
 func (d *DB) AutoCheckpointFrames() int {
-	sh := d.rl.rlock()
+	sh := d.rl.RLock()
 	t := d.ckptThreshold
-	d.rl.runlock(sh)
+	d.rl.RUnlock(sh)
 	return t
 }
 
@@ -1204,9 +1204,9 @@ func (d *DB) AutoCheckpointFrames() int {
 // frames. Zero or negative disables auto-checkpointing (spec 22 §3). The change takes
 // effect on the next commit; the background worker goroutine (if any) continues running.
 func (d *DB) SetAutoCheckpointFrames(n int) {
-	d.rl.lock()
+	d.rl.Lock()
 	d.ckptThreshold = n
-	d.rl.unlock()
+	d.rl.Unlock()
 }
 
 // CacheFrames returns the buffer pool capacity in frames (pages). Multiply by PageSize
@@ -1369,9 +1369,9 @@ func (d *DB) CheckpointMode(m CheckpointMode) error {
 	d.ckptMu.Lock()
 	defer d.ckptMu.Unlock()
 
-	d.rl.lock()
+	d.rl.Lock()
 	foldedLSN, lastCommitVersion, resetWAL := d.prepareCheckpointLocked()
-	d.rl.unlock()
+	d.rl.Unlock()
 
 	// Page writeback and fsync run without d.mu. The pager's own shard locks and
 	// ckptGate provide the necessary mutual exclusion for the I/O, so foreground
@@ -1382,8 +1382,8 @@ func (d *DB) CheckpointMode(m CheckpointMode) error {
 		return err
 	}
 
-	d.rl.lock()
-	defer d.rl.unlock()
+	d.rl.Lock()
+	defer d.rl.Unlock()
 	if err := d.finalizeCheckpointLocked(foldedLSN, resetWAL); err != nil {
 		return err
 	}
@@ -1536,8 +1536,8 @@ func (d *DB) noteLSN(lsn uint64) {
 // it after large deletes, or periodically with a small budget, the kv analog of
 // SQLite's "PRAGMA incremental_vacuum(N)".
 func (d *DB) Vacuum(budget int) (int, error) {
-	d.rl.lock()
-	defer d.rl.unlock()
+	d.rl.Lock()
+	defer d.rl.Unlock()
 	if err := d.checkpointLocked(); err != nil {
 		return 0, err
 	}
@@ -1547,20 +1547,20 @@ func (d *DB) Vacuum(budget int) (int, error) {
 // ApplicationID reports the application-defined file tag stored in the header (spec 22 §2).
 // It is a free-form identifier an application stamps so a tool can recognize its own files.
 func (d *DB) ApplicationID() uint32 {
-	d.rl.lock()
-	defer d.rl.unlock()
+	d.rl.Lock()
+	defer d.rl.Unlock()
 	return d.pgr.Header().ApplicationID
 }
 
 func (d *DB) FullPageWrites() bool {
-	d.rl.lock()
-	defer d.rl.unlock()
+	d.rl.Lock()
+	defer d.rl.Unlock()
 	return d.fullPageWrites
 }
 
 func (d *DB) AutoVacuumMode() uint8 {
-	d.rl.lock()
-	defer d.rl.unlock()
+	d.rl.Lock()
+	defer d.rl.Unlock()
 	return d.autoVacuumMode
 }
 
@@ -1572,8 +1572,8 @@ func (d *DB) CommitLingerUs() uint32 { return d.lingerUs.Load() }
 // plus all committed data) and fsyncs, so the tag is durable even across a crash and the
 // header never desyncs from the WAL.
 func (d *DB) SetApplicationID(id uint32) error {
-	d.rl.lock()
-	defer d.rl.unlock()
+	d.rl.Lock()
+	defer d.rl.Unlock()
 	d.pgr.Header().ApplicationID = id
 	return d.checkpointLocked()
 }
@@ -1581,8 +1581,8 @@ func (d *DB) SetApplicationID(id uint32) error {
 // UserVersion reports the application-defined schema/version counter stored in the header
 // (spec 22 §2), the kv analog of SQLite's user_version. kv never interprets it.
 func (d *DB) UserVersion() uint32 {
-	d.rl.lock()
-	defer d.rl.unlock()
+	d.rl.Lock()
+	defer d.rl.Unlock()
 	return d.pgr.Header().UserVersion
 }
 
@@ -1590,8 +1590,8 @@ func (d *DB) UserVersion() uint32 {
 // it durably (spec 22 §2). Like SetApplicationID it is a persistent-runtime setting folded
 // into the main file by a checkpoint.
 func (d *DB) SetUserVersion(v uint32) error {
-	d.rl.lock()
-	defer d.rl.unlock()
+	d.rl.Lock()
+	defer d.rl.Unlock()
 	d.pgr.Header().UserVersion = v
 	return d.checkpointLocked()
 }
@@ -1631,8 +1631,8 @@ func (d *DB) runAutoVacuumLocked() {
 // The change takes effect immediately on the next checkpoint; it is persisted in
 // the file header so it survives re-open.
 func (d *DB) SetFullPageWrites(on bool) error {
-	d.rl.lock()
-	defer d.rl.unlock()
+	d.rl.Lock()
+	defer d.rl.Unlock()
 	d.fullPageWrites = on
 	if on {
 		d.pgr.Header().FullPageWritesOff = 0
@@ -1648,8 +1648,8 @@ func (d *DB) SetFullPageWrites(on bool) error {
 // TruncateTail(0) after every checkpoint. The mode is persisted in the file
 // header so it survives re-open.
 func (d *DB) SetAutoVacuumMode(mode uint8) error {
-	d.rl.lock()
-	defer d.rl.unlock()
+	d.rl.Lock()
+	defer d.rl.Unlock()
 	if mode > 2 {
 		return fmt.Errorf("kv: invalid auto_vacuum mode %d", mode)
 	}
@@ -1664,8 +1664,8 @@ func (d *DB) SetAutoVacuumMode(mode uint8) error {
 // immediately visible to the commit path and is persisted in the file header.
 func (d *DB) SetCommitLingerUs(us uint32) error {
 	d.lingerUs.Store(us)
-	d.rl.lock()
-	defer d.rl.unlock()
+	d.rl.Lock()
+	defer d.rl.Unlock()
 	d.pgr.Header().CommitLingerUs = us
 	return d.checkpointLocked()
 }
@@ -1685,8 +1685,8 @@ func (d *DB) SetCommitLingerUs(us uint32) error {
 // The database must have been created with an encryption key; otherwise it returns
 // ErrNotEncrypted.
 func (d *DB) RotateEncryptionKey() error {
-	d.rl.lock()
-	defer d.rl.unlock()
+	d.rl.Lock()
+	defer d.rl.Unlock()
 	if d.crypto == nil {
 		return ErrNotEncrypted
 	}
@@ -1735,8 +1735,8 @@ func (d *DB) Close() error {
 		d.logClosed()
 	})
 
-	d.rl.lock()
-	defer d.rl.unlock()
+	d.rl.Lock()
+	defer d.rl.Unlock()
 	var firstErr error
 	if d.wal != nil {
 		if err := d.wal.Close(); err != nil {
