@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +12,8 @@ import (
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/tamnd/kv"
 )
 
 // capture runs fn with os.Stdout redirected to a pipe and returns what it wrote, so the
@@ -828,3 +831,80 @@ func TestShellPragma(t *testing.T) {
 		}
 	}
 }
+
+// TestWatchUsageErrors confirms bad invocations return the usage exit code.
+func TestWatchUsageErrors(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+	}{
+		{"no args", []string{"watch"}},
+		{"too many args", []string{"watch", "a.kv", "extra"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if code := run(tc.args); code != exitUsage {
+				t.Fatalf("got exit %d, want %d (exitUsage)", code, exitUsage)
+			}
+		})
+	}
+}
+
+// TestWatchMissingDB confirms that a non-existent file returns the cannot-open code.
+func TestWatchMissingDB(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nope.kv")
+	if code := run([]string{"watch", path}); code != exitOpen {
+		t.Fatalf("missing db: got exit %d, want %d (exitOpen)", code, exitOpen)
+	}
+}
+
+// TestWatchChangeKindName tests the JSONL kind strings for every ChangeKind value.
+func TestWatchChangeKindName(t *testing.T) {
+	cases := []struct {
+		kind kv.ChangeKind
+		want string
+	}{
+		{kv.ChangeSet, "set"},
+		{kv.ChangeDelete, "delete"},
+		{kv.ChangeMerge, "merge"},
+		{kv.ChangeRangeDelete, "range-delete"},
+	}
+	for _, tc := range cases {
+		got := changeKindName(tc.kind)
+		if got != tc.want {
+			t.Errorf("changeKindName(%v) = %q, want %q", tc.kind, got, tc.want)
+		}
+	}
+	// An unknown value must not panic and must not match a valid kind name.
+	unknown := changeKindName(kv.ChangeKind(255))
+	if unknown == "set" || unknown == "delete" || unknown == "merge" || unknown == "range-delete" {
+		t.Errorf("changeKindName(255) = %q, want a non-matching fallback", unknown)
+	}
+}
+
+// TestWatchCancelledContextExitsOK injects a pre-cancelled context and confirms
+// the watch command returns exitOK (context.Canceled is treated as a clean stop).
+func TestWatchCancelledContextExitsOK(t *testing.T) {
+	p := dbPath(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already cancelled before watch starts
+	watchContextOverride = ctx
+	t.Cleanup(func() { watchContextOverride = nil })
+
+	code := run([]string{"watch", p})
+	if code != exitOK {
+		t.Fatalf("watch with cancelled context: exit %d, want 0", code)
+	}
+}
+
+// TestWatchPrefixBadEncoding confirms a bad --prefix value is a usage error.
+func TestWatchPrefixBadEncoding(t *testing.T) {
+	p := dbPath(t)
+	// --base64 is active; "!!!" is not valid base64.
+	code := run([]string{"watch", p, "--base64", "--prefix", "!!!"})
+	if code != exitUsage {
+		t.Fatalf("bad prefix: exit %d, want %d (exitUsage)", code, exitUsage)
+	}
+}
+
