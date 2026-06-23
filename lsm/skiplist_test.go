@@ -1,7 +1,7 @@
 package lsm
 
 import (
-	"bytes"
+	"encoding/binary"
 	"fmt"
 	"testing"
 
@@ -87,23 +87,50 @@ func TestSkiplistManyKeysStayOrdered(t *testing.T) {
 	}
 }
 
-// TestArenaGrowthPreservesOffsets writes a recognizable pattern, forces several
-// growths, and confirms earlier allocations still read back unchanged: an offset is
-// an index that must survive a reallocation.
+// TestArenaGrowthPreservesOffsets writes a recognizable pattern across enough
+// allocations to span several fixed blocks, mixes in an oversized allocation larger
+// than a block, and confirms every earlier allocation still reads back unchanged: an
+// offset names (block, within) and must stay valid as later blocks are appended,
+// because the blocks never move.
 func TestArenaGrowthPreservesOffsets(t *testing.T) {
 	a := newArena(8)
-	var offs []uint32
-	for i := 0; i < 100; i++ {
-		off := a.alloc(4)
-		a.putU32(off, uint32(i*7+1))
-		offs = append(offs, off)
+	type rec struct {
+		off  uint32
+		want uint32
+		n    int
 	}
-	for i, off := range offs {
-		if got := a.getU32(off); got != uint32(i*7+1) {
-			t.Fatalf("offset %d (alloc %d) = %d, want %d", off, i, got, i*7+1)
+	var recs []rec
+	// 4 KiB chunks past several block boundaries, then a chunk larger than a block, then
+	// more normal chunks so the oversized block is not the last thing allocated.
+	sizes := make([]int, 0, 700)
+	for i := 0; i < 600; i++ {
+		sizes = append(sizes, 4096)
+	}
+	sizes = append(sizes, blockSize+4096) // oversized: its own right-sized block
+	for i := 0; i < 100; i++ {
+		sizes = append(sizes, 4096)
+	}
+	for i, n := range sizes {
+		off := a.alloc(n)
+		marker := uint32(i*7 + 1)
+		// Write a head and tail marker through the allocation's own slice, the way the
+		// skip list reaches a node's bytes: bytesAt(off, n) returns the whole contiguous
+		// allocation, including the spill of an oversized block past blockSize.
+		s := a.bytesAt(off, n)
+		binary.LittleEndian.PutUint32(s[:4], marker)
+		binary.LittleEndian.PutUint32(s[n-4:], marker^0x5a5a5a5a)
+		recs = append(recs, rec{off: off, want: marker, n: n})
+	}
+	for i, r := range recs {
+		s := a.bytesAt(r.off, r.n)
+		if got := binary.LittleEndian.Uint32(s[:4]); got != r.want {
+			t.Fatalf("alloc %d at off %d = %d, want %d", i, r.off, got, r.want)
+		}
+		if got := binary.LittleEndian.Uint32(s[r.n-4:]); got != r.want^0x5a5a5a5a {
+			t.Fatalf("alloc %d tail at off %d = %d, want %d", i, r.off, got, r.want^0x5a5a5a5a)
 		}
 	}
-	if !bytes.Equal(a.buf[:1], []byte{0}) {
+	if a.bytesAt(0, 1)[0] != 0 {
 		t.Fatal("offset 0 sentinel was overwritten")
 	}
 }

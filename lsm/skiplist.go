@@ -10,83 +10,87 @@ const maxHeight = 12
 // skiplist is an arena-backed ordered index over internal keys (spec 06 §2). Keys
 // are ordered by the shared format.CompareInternal, so the memtable iterates in
 // exactly the order a flush needs to emit sorted data blocks and the order the
-// read-path merge expects. A node's key and value bytes are copied into the arena
-// at insert and never move; only the forward-pointer tower mutates, in place.
+// read-path merge expects. A node's key and value bytes are copied into the byte
+// arena at insert and never move; its forward-pointer tower lives in the parallel
+// uint32 arena, also never moving, so a reader may slice into either without a lock.
 //
-// This slice writes the list under the engine's write lock and reads it under a
-// read lock (the memtable wrapper holds the mutex), so the structure itself is not
-// yet lock-free; the arena and tower layout are the same a later lock-light
-// concurrent version will use, so that refinement does not disturb the format.
+// This slice still writes the list under the engine's write lock and reads it under
+// a read lock (the memtable wrapper holds the mutex), so the structure is not yet
+// lock-free; what changed is the layout. Splitting the tower into a separate uint32
+// arena puts every forward pointer on a 4-byte boundary, which is what the lock-light
+// concurrent version needs for atomic load and compare-and-swap, and the never-moving
+// blocks remove the reallocation a concurrent reader could not tolerate. The
+// concurrent insert path lands in the slice that follows, on exactly this layout.
 type skiplist struct {
 	a      *arena
+	tw     *uint32Arena
 	head   uint32 // offset of the sentinel head node, tower-only
 	height int    // current highest occupied level, 1..maxHeight
 	count  int    // number of entries inserted
 	rng    uint64 // xorshift state for height generation, deterministic and seeded
 }
 
-// node header field offsets within an allocation.
+// node header field offsets within a byte-arena allocation. The tower no longer lives
+// inline; nodeTowerOff now holds the base slot index of the node's tower in the uint32
+// arena, and the key and value follow the fixed-size header at nodeDataOff.
 const (
-	nodeHeightOff = 0 // 1 byte: tower height
-	nodeKeyLenOff = 1 // 4 bytes
-	nodeValLenOff = 5 // 4 bytes
-	nodeTowerOff  = 9 // height*4 bytes, then key bytes, then value bytes
+	nodeHeightOff = 0  // 1 byte: tower height
+	nodeKeyLenOff = 1  // 4 bytes
+	nodeValLenOff = 5  // 4 bytes
+	nodeTowerOff  = 9  // 4 bytes: tower base index into the uint32 arena
+	nodeDataOff   = 13 // key bytes, then value bytes
 )
 
 // newSkiplist returns an empty list with a full-height head sentinel.
 func newSkiplist(arenaCap int) *skiplist {
-	a := newArena(arenaCap)
-	sl := &skiplist{a: a, height: 1, rng: 0x9E3779B97F4A7C15}
+	sl := &skiplist{a: newArena(arenaCap), tw: newUint32Arena(), height: 1, rng: 0x9E3779B97F4A7C15}
 	// The head is a tower-only node at full height with no key or value.
 	sl.head = sl.allocNode(maxHeight, nil, nil)
 	return sl
 }
 
-// allocNode lays out a node and returns its offset. The tower pointers are left
-// zero (nil) for the caller to splice.
+// allocNode lays out a node across the two arenas and returns its byte-arena offset. The
+// header, key, and value go to the byte arena; the height tower of forward pointers goes
+// to the uint32 arena, and its base index is stored in the header. The tower slots are
+// left zero (nil) for the caller to splice; a freshly allocated tower reads as all-nil
+// because the uint32 blocks are zero-filled and never reused.
 func (sl *skiplist) allocNode(height int, key, val []byte) uint32 {
-	size := nodeTowerOff + height*4 + len(key) + len(val)
-	off := sl.a.alloc(size)
-	sl.a.buf[off+nodeHeightOff] = byte(height)
+	off := sl.a.alloc(nodeDataOff + len(key) + len(val))
+	towerBase := sl.tw.alloc(height)
+	sl.a.bytesAt(off, 1)[0] = byte(height)
 	sl.a.putU32(off+nodeKeyLenOff, uint32(len(key)))
 	sl.a.putU32(off+nodeValLenOff, uint32(len(val)))
-	// Zero the tower (alloc may hand back reused-looking bytes only on a fresh
-	// slice, but be explicit so a grown buffer is always clean here).
-	for i := 0; i < height; i++ {
-		sl.a.putU32(off+nodeTowerOff+uint32(i*4), 0)
-	}
-	keyStart := off + nodeTowerOff + uint32(height*4)
-	copy(sl.a.buf[keyStart:], key)
-	copy(sl.a.buf[keyStart+uint32(len(key)):], val)
+	sl.a.putU32(off+nodeTowerOff, towerBase)
+	dst := sl.a.bytesAt(off+nodeDataOff, len(key)+len(val))
+	copy(dst, key)
+	copy(dst[len(key):], val)
 	return off
 }
 
-func (sl *skiplist) nodeHeight(off uint32) int { return int(sl.a.buf[off+nodeHeightOff]) }
+func (sl *skiplist) nodeHeight(off uint32) int { return int(sl.a.bytesAt(off, 1)[0]) }
+
+func (sl *skiplist) towerBase(off uint32) uint32 { return sl.a.getU32(off + nodeTowerOff) }
 
 func (sl *skiplist) nodeNext(off uint32, level int) uint32 {
-	return sl.a.getU32(off + nodeTowerOff + uint32(level*4))
+	return *sl.tw.slot(sl.towerBase(off) + uint32(level))
 }
 
 func (sl *skiplist) setNodeNext(off uint32, level int, next uint32) {
-	sl.a.putU32(off+nodeTowerOff+uint32(level*4), next)
+	*sl.tw.slot(sl.towerBase(off) + uint32(level)) = next
 }
 
-// nodeKey returns the internal key bytes of a node as a sub-slice of the arena.
+// nodeKey returns the internal key bytes of a node as a sub-slice of the byte arena.
 // The bytes are stable for the life of the memtable, so the slice may be held.
 func (sl *skiplist) nodeKey(off uint32) []byte {
-	h := sl.nodeHeight(off)
 	klen := sl.a.getU32(off + nodeKeyLenOff)
-	start := off + nodeTowerOff + uint32(h*4)
-	return sl.a.buf[start : start+klen]
+	return sl.a.bytesAt(off+nodeDataOff, int(klen))
 }
 
-// nodeValue returns the value bytes of a node as a sub-slice of the arena.
+// nodeValue returns the value bytes of a node as a sub-slice of the byte arena.
 func (sl *skiplist) nodeValue(off uint32) []byte {
-	h := sl.nodeHeight(off)
 	klen := sl.a.getU32(off + nodeKeyLenOff)
 	vlen := sl.a.getU32(off + nodeValLenOff)
-	start := off + nodeTowerOff + uint32(h*4) + klen
-	return sl.a.buf[start : start+vlen]
+	return sl.a.bytesAt(off+nodeDataOff+klen, int(vlen))
 }
 
 // randomHeight draws a tower height with a 1-in-4 promotion per level, using a
