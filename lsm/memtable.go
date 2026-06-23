@@ -45,7 +45,7 @@ func (m *memtable) set(internalKey, value []byte) {
 func (m *memtable) size() int { return m.sl.a.size() }
 
 // count reports how many distinct internal-key cells the memtable holds.
-func (m *memtable) count() int { return m.sl.count }
+func (m *memtable) count() int { return int(m.sl.count.Load()) }
 
 // getGroup calls fn for every cell of userKey's version group, in ascending
 // internal-key order (newest version first), seeking the skip list to the group
