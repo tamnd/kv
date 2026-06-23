@@ -206,6 +206,9 @@ func (l *LSM) Open(env *engine.Env) error {
 	if env != nil && env.Options.ValueSepThreshold > 0 {
 		l.valueSepThreshold = env.Options.ValueSepThreshold
 	}
+	if env != nil && env.Options.LevelSizeRatio > 0 {
+		l.levelRatio = env.Options.LevelSizeRatio
+	}
 	if env != nil && env.Options.RangeIndex {
 		l.rangeIndex = true
 	}
