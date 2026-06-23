@@ -317,7 +317,6 @@ func TestVacuumKeepsDatabaseSound(t *testing.T) {
 	if err := d.Checkpoint(); err != nil {
 		t.Fatalf("checkpoint: %v", err)
 	}
-	before := d.Stats().PageCount
 
 	for i := n / 2; i < n; i++ {
 		if err := d.Update(func(txn *kv.Txn) error {
@@ -326,6 +325,12 @@ func TestVacuumKeepsDatabaseSound(t *testing.T) {
 			t.Fatalf("delete %d: %v", i, err)
 		}
 	}
+
+	// Snapshot the page count right before the vacuum: the invariant under test is that the
+	// vacuum call itself never grows the file. The deletes ahead of it can legitimately split
+	// leaves (a sequential load now packs leaves full, so a tombstone may not fit in place),
+	// which is a write-path effect, not a vacuum effect.
+	before := d.Stats().PageCount
 
 	freed, err := d.Vacuum(0)
 	if err != nil {
