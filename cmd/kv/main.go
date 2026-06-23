@@ -69,6 +69,7 @@ func commands() []command {
 		{"metrics", "print observability metrics in Prometheus text format", cmdMetrics},
 		{"watch", "stream committed changes as JSONL (change feed)", cmdWatch},
 		{"serve", "serve the database over HTTP/JSON", cmdServe},
+		{"version", "print the build and library version", cmdVersion},
 	}
 }
 
@@ -86,6 +87,8 @@ func run(args []string) int {
 	case "-h", "--help", "help":
 		usage(os.Stdout)
 		return exitOK
+	case "-v", "--version":
+		return cmdVersion(args[1:])
 	}
 	for _, c := range commands() {
 		if c.name == args[0] {

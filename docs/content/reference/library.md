@@ -1,0 +1,198 @@
+---
+title: "Library API"
+description: "Every exported type, method, option, and error in the github.com/tamnd/kv package, grouped by what it does."
+weight: 10
+---
+
+This is the complete public surface of the `kv` package. Import it as `github.com/tamnd/kv`. For task-oriented walkthroughs, see the [guides](/guides/); this page is the index.
+
+## Opening and closing
+
+```go
+func Open(path string, opts ...Option) (*DB, error)
+func (db *DB) Close() error
+```
+
+`Open` creates the file if absent and runs crash recovery if present. `Close` flushes, stops background work, and releases the file. The package-level `Version` constant holds the library version as a string.
+
+## Transactions
+
+```go
+func (db *DB) View(fn func(txn *Txn) error) error
+func (db *DB) Update(fn func(txn *Txn) error) error
+func (db *DB) UpdateVersion(fn func(txn *Txn) error) (uint64, error)
+func (db *DB) Begin(writable bool) *Txn
+```
+
+`View` runs a read-only closure at a consistent snapshot. `Update` runs a read-write closure and commits it atomically if the closure returns nil, retrying on conflict up to the configured bound. `UpdateVersion` is `Update` that also returns the commit version. `Begin` opens an explicit transaction you commit or discard yourself.
+
+### Transaction methods
+
+```go
+func (txn *Txn) Get(key []byte) ([]byte, error)
+func (txn *Txn) GetCopy(key []byte) ([]byte, error)
+func (txn *Txn) Exists(key []byte) (bool, error)
+func (txn *Txn) Set(key, value []byte) error
+func (txn *Txn) SetWithTTL(key, value []byte, ttl time.Duration) error
+func (txn *Txn) Delete(key []byte) error
+func (txn *Txn) DeleteRange(lo, hi []byte) error
+func (txn *Txn) Merge(key, operand []byte) error
+func (txn *Txn) NewIterator(opts IterOptions) (*Iterator, error)
+func (txn *Txn) Commit() error
+func (txn *Txn) Discard()
+```
+
+`Get` returns bytes valid only until the transaction ends; `GetCopy` returns a copy you own past it. `Commit` applies an explicit transaction and may return `ErrConflict`. `Discard` releases the snapshot and is a no-op after a successful `Commit`; always call it, typically with `defer`.
+
+## Iterators
+
+```go
+type IterOptions struct {
+	Lower    []byte // inclusive lower bound; nil means unbounded below
+	Upper    []byte // exclusive upper bound; nil means unbounded above
+	Prefix   []byte // restrict to keys with this prefix
+	Reverse  bool   // iterate high to low
+	KeysOnly bool   // skip value materialization
+}
+
+func (it *Iterator) First() bool
+func (it *Iterator) Last() bool
+func (it *Iterator) Next() bool
+func (it *Iterator) Prev() bool
+func (it *Iterator) SeekGE(key []byte) bool
+func (it *Iterator) SeekLT(key []byte) bool
+func (it *Iterator) Valid() bool
+func (it *Iterator) Key() []byte
+func (it *Iterator) Value() ([]byte, error)
+func (it *Iterator) Error() error
+func (it *Iterator) Close() error
+```
+
+An iterator is snapshot-consistent over a prefix or a `[Lower, Upper)` range, forward or reverse. The cursor methods return whether they landed on a valid position, so `for it.First(); it.Valid(); it.Next()` and `for ok := it.First(); ok; ok = it.Next()` both work. Seek to a key with `SeekGE` (first key at or after) or `SeekLT` (last key before). Check `Error` after the loop for any deferred error, and `Close` when done.
+
+## Snapshots
+
+```go
+func (db *DB) Snapshot() *Snapshot
+func (snap *Snapshot) View(fn func(txn *Txn) error) error
+func (snap *Snapshot) Close() error
+```
+
+A `Snapshot` pins one read version across many separate read transactions. Close it as soon as the work is done, since a pinned version holds back space reclamation.
+
+## Batches and bulk load
+
+```go
+func (db *DB) NewWriteBatch(maxOps int) *WriteBatch
+func (b *WriteBatch) Set(key, value []byte) error
+func (b *WriteBatch) Delete(key []byte) error
+func (b *WriteBatch) Flush() error
+func (b *WriteBatch) Count() int
+func (b *WriteBatch) Pending() int
+func (b *WriteBatch) Close() error
+
+func (db *DB) Load(next func() (key, value []byte, ok bool)) (uint64, error)
+```
+
+A `WriteBatch` accumulates writes and flushes them in committed chunks of at most `maxOps` operations, the efficient path for bulk loading. `Flush` commits what is pending; `Count` and `Pending` report total and uncommitted operations; `Close` flushes and releases it. `Load` pulls key/value pairs from a generator and writes them in batches, returning the final commit version.
+
+## Maintenance
+
+```go
+func (db *DB) Checkpoint() error
+func (db *DB) CheckpointMode(m CheckpointMode) error
+func (db *DB) Vacuum(budget int) (int, error)
+func Compact(path string, opts ...Option) error
+func (db *DB) Stats() Stats
+func (db *DB) Check() (*CheckReport, error)
+```
+
+`Checkpoint` folds the WAL into the main file; `CheckpointMode` does the same with an explicit passive, full, restart, or truncate mode. `Vacuum` returns up to `budget` trailing free pages to the OS (0 means all) and reports how many it reclaimed. `Compact` rewrites a database in place into a fresh, maximally compact file. `Stats` reports space and durability accounting, including per-engine detail like LSM `Levels`, `CompactionScore`, and `Amplification`. `Check` walks the structure and returns a report on its integrity.
+
+## Backup and replication
+
+```go
+func (db *DB) Backup(w io.Writer) (uint64, error)
+func RestoreBackup(path string, r io.Reader) error
+func (db *DB) ShipWAL(w io.Writer) (uint64, error)
+func (db *DB) ApplyWAL(r io.Reader) (uint64, error)
+func (db *DB) ApplyWALUntil(r io.Reader, target uint64) (uint64, error)
+```
+
+`Backup` streams a consistent physical image and returns its version; `RestoreBackup` rebuilds from that stream and refuses to overwrite. `ShipWAL` streams the current WAL generation as a replication delta; `ApplyWAL` replays it on a follower (idempotent over applied versions, `ErrReplicaGap` on a hole); `ApplyWALUntil` stops after `target` for point-in-time recovery. See the [backup guide](/guides/backup-and-replication/).
+
+## Encryption
+
+```go
+func (db *DB) RotateEncryptionKey() error
+```
+
+Supply the 32-byte master key at open time with `WithEncryptionKey`. `RotateEncryptionKey` advances the internal data-encryption key to a new epoch and re-encrypts lazily as pages are written, without changing the master key you open with. See the [encryption guide](/guides/encryption/).
+
+## Change feed
+
+```go
+func (db *DB) Subscribe(ctx context.Context, prefix []byte, fn func([]Change) error) error
+```
+
+`Subscribe` calls `fn` with batches of committed changes under `prefix` until `ctx` is cancelled or `fn` returns an error. A subscriber that lags is dropped with `ErrSubscriberLagged` rather than stalling writers.
+
+## Options
+
+Every option is a function passed to `Open` (or `Compact`). Create-time options are recorded in the file and take effect only when it is created; open-time options apply on every open.
+
+| Option | When | Effect |
+| --- | --- | --- |
+| `WithEngine(EngineKind)` | create | `BTree` (default) or `LSM`. |
+| `WithPageSize(int)` | create | Page size in bytes for a fresh file. |
+| `WithEncryptionKey([]byte)` | create | 32-byte AES-256-GCM master key. |
+| `WithMergeOperator(name, fn)` | create + every open | Registers the associative merge operator. |
+| `WithCacheSize(int)` | open | Buffer-pool capacity in bytes. |
+| `WithSynchronous(Sync)` | open | `SyncOff`, `SyncNormal`, `SyncBarrier`, `SyncFull` (default), `SyncExtra`. |
+| `WithAutoCheckpoint(int)` | open | WAL frame backlog before background checkpoint; negative disables. |
+| `WithMaxRetries(int)` | open | Bound on `Update` conflict retries. |
+| `WithIsolation(Isolation)` | open | `SnapshotIsolation` (default) or `Serializable`. |
+| `WithReadReplica()` | open | Open read-only; only `ApplyWAL` advances state. |
+| `WithWALArchive(sink)` | open | Sink for each WAL generation before checkpoint. |
+| `WithLogger(*slog.Logger)` | open | Structured operational logging. |
+| `WithSlowOpThreshold(time.Duration)` | open | WARN log for ops at or above the threshold (needs `WithLogger`). |
+| `WithTracer(Tracer)` | open | Tracing hooks for OpenTelemetry. |
+| `WithFillFactor(float64)` | open | B-tree target leaf occupancy in (0, 1]. |
+| `WithMaxInlineValue(int)` | open | B-tree inline value cap; larger values overflow. |
+| `WithBtreeBuffers(bool)` | open | B-tree Bε buffered write path. |
+| `WithMemtableSize(int)` | open | LSM memtable flush threshold. |
+| `WithLevelRatio(int)` | open | LSM size multiplier between levels. |
+| `WithFilter(FilterKind)` | open | `FilterBloom` (default) or `FilterRibbon`; LSM only. |
+| `WithRangeIndex(bool)` | open | LSM REMIX scan index. |
+| `WithValueSeparation(int)` | open | LSM WiscKey value-log threshold in bytes. |
+| `WithCompression(bool)` | open | LSM heat-tiered block compression. |
+| `WithColdCompression(bool)` | open | LSM cold-levels-only compression; overrides `WithCompression`. |
+
+## Errors
+
+Match these with `errors.Is`.
+
+| Error | Meaning |
+| --- | --- |
+| `ErrNotFound` | Key absent or tombstoned. |
+| `ErrConflict` | Write-write or serializable conflict; retry the transaction. |
+| `ErrReadOnly` | Write attempted on a read-only transaction or database. |
+| `ErrClosed` | Operation on a closed database or finished transaction. |
+| `ErrTxnTooBig` | A single transaction exceeded its size bound. |
+| `ErrCorrupt` | Checksum or authentication failure on a page or frame. |
+| `ErrNeedsRecovery` | A prior fatal fsync error fenced the database; reopen to recover. |
+| `ErrUnsupported` | The engine lacks an optional capability. |
+| `ErrSnapshotClosed` | Snapshot used after `Close`. |
+| `ErrBatchClosed` | Write batch used after `Close`. |
+| `ErrSubscriberLagged` | A change-feed subscriber lagged and was dropped. |
+| `ErrWrongKey` | Wrong encryption key, or a corrupt descriptor. |
+| `ErrEncryptionKeyRequired` | File is encrypted but opened with no key. |
+| `ErrKeyOnPlaintext` | Key supplied for a file created unencrypted. |
+| `ErrNotEncrypted` | Key rotation requested on an unencrypted database. |
+| `ErrBackupFormat` | `RestoreBackup` was handed a stream that is not a backup. |
+| `ErrReplicaGap` | `ApplyWAL` stream begins past the applied version. |
+
+## Next
+
+- The [configuration reference](/reference/configuration/) covers every option's default and range.
+- The [CLI reference](/reference/cli/) covers the command-line client.

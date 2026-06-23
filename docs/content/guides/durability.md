@@ -1,0 +1,76 @@
+---
+title: "Durability and recovery"
+description: "How kv survives a crash through a write-ahead log, what each synchronous level guarantees, and how checkpointing and vacuum keep the file in shape."
+weight: 30
+---
+
+A database is only as good as its promise that a committed write survives a crash. This guide explains how kv keeps that promise, and the dial you can turn to trade durability for speed.
+
+## The write-ahead log
+
+While a database is open, kv keeps a write-ahead log (WAL) in a file next to the main one, `app.kv-wal` beside `app.kv`. Every commit is written to the WAL first, as a sequence of checksummed frames, before the change is considered durable. The main file is updated later, in the background, by a process called checkpointing.
+
+This ordering is what makes a crash survivable. If the process dies at any point, the next `Open` reads the WAL, verifies each frame's checksum, replays every committed transaction it finds, and discards any torn or partial tail. The database comes back at exactly its last committed state. Recovery is automatic; there is no repair step to run.
+
+A frame that fails its checksum marks the end of the valid log: kv stops there, because anything past a corrupt frame cannot be trusted. A transaction whose commit frame never made it to disk is simply not replayed, which is correct, it was never durable, so it never committed.
+
+## The synchronous levels
+
+"Written to the WAL" can mean several things, depending on how hard kv leans on the operating system to actually put the bytes on the platter. That is the `synchronous` setting, and it is the main durability-versus-speed dial:
+
+| Level | What it does | Loses on power failure |
+| --- | --- | --- |
+| `SyncOff` | Never fsyncs. The OS flushes on its own schedule. | Recent commits, possibly many. |
+| `SyncNormal` | fdatasyncs at checkpoint and periodically. | A small window of recent commits. |
+| `SyncBarrier` | A write-ordering barrier on every commit (`F_BARRIERFSYNC` on macOS, fdatasync on Linux). | Nothing reordered past the barrier, though the very last commit may not be flushed. |
+| `SyncFull` | fdatasyncs on every commit, batched across concurrent committers. The safe default. | Nothing acknowledged. |
+| `SyncExtra` | `SyncFull` plus a directory sync when the file grows. | Nothing, including the file's existence after growth. |
+
+`SyncFull` is the default and is what you want unless you have a specific reason to change it. It guarantees that once a commit returns, the data is on disk; a power failure the instant after cannot lose it.
+
+Set the level at open time or change it at runtime:
+
+```go
+db, _ := kv.Open("app.kv", kv.WithSynchronous(kv.SyncFull))
+
+// or later, for example to bulk-load fast then tighten back up
+db.SetSynchronous(kv.SyncOff)
+// ... load a million keys ...
+db.SetSynchronous(kv.SyncFull)
+db.Checkpoint()
+```
+
+That bulk-load pattern, drop to `SyncOff`, load, restore the level, and checkpoint, is the standard way to ingest a large dataset quickly while ending in a fully durable state. The risk window is only during the load, and if it crashes you just start the load over.
+
+## Group commit
+
+`SyncFull` fsyncs on every commit, but it does not fsync once per commit when many commits arrive at once. kv batches concurrent committers so that one fsync covers a whole group, which is why write throughput under concurrency stays high even at the safe durability level. You can widen the batching window deliberately with the `commit_linger_us` setting, which makes a commit wait a few microseconds for others to join its group, trading a little latency for fewer fsyncs under heavy write load.
+
+## Checkpointing
+
+The WAL grows as commits accumulate. Checkpointing folds the committed frames back into the main file and resets the log, keeping both the WAL bounded and reads fast (a read never has to consult an unbounded log). kv checkpoints automatically in the background once the WAL passes a threshold you set with `WithAutoCheckpoint`, and you can trigger one yourself:
+
+```go
+db.Checkpoint() // passive: fold what is committed, do not block writers
+```
+
+The checkpoint modes give finer control when you need it: passive folds without blocking, full and restart additionally reset the log for reuse, and truncate shrinks the `-wal` file back down. The [CLI](/reference/cli/) exposes them through `kv checkpoint --mode`. For almost all uses, the automatic background checkpointer is enough and you never call this.
+
+## Reclaiming space
+
+Checkpointing keeps the WAL in check; vacuum keeps the main file in check. As keys are deleted and updated, pages free up inside the file. `Vacuum` returns trailing free pages to the operating system, shrinking the file on disk:
+
+```go
+reclaimed, err := db.Vacuum(0) // 0 = reclaim everything available
+```
+
+It is incremental: pass a page budget to bound how much work one call does, so a large reclaim can be spread across several calls without a long pause. For a full rebuild into a fresh, maximally compact file, `kv.Compact` (and `kv vacuum --full` on the CLI) rewrites the database from scratch. You can also set an automatic policy with the `auto_vacuum` setting so space is returned without an explicit call.
+
+## When durability is fenced off
+
+If an fsync ever fails, the operating system is telling kv that a write it promised is durable might not be. kv treats that as fatal: it fences the database into a needs-recovery state and fails subsequent operations with `ErrNeedsRecovery`, rather than carrying on as if the write succeeded. The fix is to close and reopen, which runs recovery from the WAL and brings the database back to its last known-good committed state. This is deliberate; silently continuing after a durability failure is how databases lose data without anyone noticing.
+
+## Next
+
+- [Backup and replication](/guides/backup-and-replication/) covers getting a consistent copy off the machine.
+- The [configuration reference](/reference/configuration/) lists the durability settings and their defaults.
