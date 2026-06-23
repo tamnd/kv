@@ -815,6 +815,30 @@ func (l *LSM) foldRange(snap engine.Snapshot, lower, upper []byte, keysOnly bool
 type reader struct {
 	l    *LSM
 	snap engine.Snapshot
+	// scan is the held forward-scan cursor, built on the first ScanForward and advanced
+	// across calls instead of rebuilt per step. It is nil until a streaming scan starts and
+	// is released at Close. A reader serves one consumer at a time (the db iterator pulls it
+	// sequentially), so this needs no synchronization of its own.
+	scan *scanState
+}
+
+// scanState is a streaming range scan held across ScanForward calls. It pins one immutable
+// snapshot of the sources -- a referenced version whose segments stay off the freelist, plus
+// the memtable skip lists captured at build, which the held memSources keep alive -- and a
+// merge iterator seeded once over them. Each ScanForward then advances the same iterator
+// rather than rebuilding the heap and re-seeking every source, so a scan of N keys costs
+// O(N log sources) advances over O(N) heap builds, not O(N x sources x log) re-seeks. The
+// snapshot is consistent without holding l.mu during the advance for the same reasons a point
+// Get's snapshot is: segments are immutable and never rewritten in place, a sealed memtable is
+// write-frozen, and the active memtable only ever gains cells newer than the snapshot version,
+// which the fold ignores. The pager is concurrency-safe, so the page reads a segment source
+// does when it crosses a data page need no engine lock.
+type scanState struct {
+	ver       *version
+	mi        *mergeIter
+	rangeDels []format.RangeDel
+	lower     []byte
+	upper     []byte
 }
 
 // Get resolves one user key without materializing the whole keyspace: it gathers
@@ -986,7 +1010,15 @@ func (r *reader) NewIter(opts engine.IterOptions) (engine.Cursor, error) {
 	return &cursor{view: view, pos: -1, reverse: opts.Reverse}, nil
 }
 
-func (r *reader) Close() error { return nil }
+func (r *reader) Close() error {
+	if r.scan != nil {
+		// Release the pinned source version so a compaction that retired it can finally free
+		// its segments' pages; the held memtable skip lists drop with the scan for the GC.
+		r.l.releaseVersion(r.scan.ver)
+		r.scan = nil
+	}
+	return nil
+}
 
 // StreamForward reports that the LSM reader can serve the db layer's forward
 // streaming scan (spec 04). The sources (memtable plus segments) keep every visible
@@ -994,29 +1026,20 @@ func (r *reader) Close() error { return nil }
 // merge heap yields the same view foldRange would, without materializing the range.
 func (r *reader) StreamForward() bool { return true }
 
-// ScanForward returns the next visible user key strictly greater than after (or the
-// first key >= lower when after is nil) within [lower, upper) at the reader's snapshot,
-// or ok=false at end of range. It mirrors the B-tree reader's primitive: it holds no
-// merge state across calls. Each call builds a fresh merge heap seeked to the start
-// group and pulls forward only until the first visible group resolves, so the db layer
-// can drop and retake l.mu between steps the way it does for a point Get. A flush or
-// compaction between two calls is invisible: the next call re-seeks the new sources,
-// and the fixed snapshot version keeps the sequence consistent.
-//
-// Re-seeking per call costs an O(log) heap build and source seek each step instead of
-// O(1) off a held heap, but a bounded scan takes ScanLen steps, so the work is
-// O(ScanLen log sources) rather than the O(keyspace) the materialized foldRange paid.
-func (r *reader) ScanForward(after, lower, upper []byte, keysOnly bool) (uk, val []byte, ok bool, err error) {
+// buildScan pins one source snapshot and seeds the merge iterator for a streaming scan,
+// under a single l.mu.RLock that captures a consistent (memtable, sealed queue, version)
+// triple the same way a point Get does. The referenced version is released at reader Close.
+// The iterator is seeked to the group at after (exclusive, skipped below) or at lower;
+// MaxVersion gives the smallest internal key in the group so the seek lands on its first cell.
+func (r *reader) buildScan(after, lower, upper []byte) (*scanState, error) {
 	l := r.l
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 
-	rangeDels := l.liveRangeDels(l.allSegmentsLocked())
+	v := l.acquireVersionLocked()
+	rangeDels := l.liveRangeDels(flattenSegments(v.levels))
 	sources := l.rangeSourcesLocked()
 
-	// Seek the merge to the start of the group at after (which is then skipped, after is
-	// exclusive) or at lower. MaxVersion gives the smallest internal key in the group, so
-	// the seek lands at the group's first cell and skips none of it.
 	var seekKey []byte
 	switch {
 	case after != nil:
@@ -1030,8 +1053,39 @@ func (r *reader) ScanForward(after, lower, upper []byte, keysOnly bool) (uk, val
 	}
 	mi, err := newMergeIter(sources, target)
 	if err != nil {
-		return nil, nil, false, err
+		l.releaseVersion(v)
+		return nil, err
 	}
+	return &scanState{ver: v, mi: mi, rangeDels: rangeDels, lower: lower, upper: upper}, nil
+}
+
+// ScanForward returns the next visible user key strictly greater than after (or the
+// first key >= lower when after is nil) within [lower, upper) at the reader's snapshot,
+// or ok=false at end of range. The first call pins an immutable source snapshot and seeds
+// a merge iterator (buildScan); every call advances that same held iterator until the next
+// visible group resolves. The held heap means a step is one O(log sources) advance off the
+// retained merge, not a fresh heap build and a re-seek of every source, so a scan of N keys
+// is O(N log sources) total rather than O(N x sources x log). The db layer still drops and
+// retakes its own lock between pulls; that is safe here because the pinned version keeps the
+// segments immutable and alive and the fold ignores any newer memtable cell, so no engine
+// lock is held during the advance.
+func (r *reader) ScanForward(after, lower, upper []byte, keysOnly bool) (uk, val []byte, ok bool, err error) {
+	l := r.l
+	if r.scan == nil || !bytes.Equal(r.scan.lower, lower) || !bytes.Equal(r.scan.upper, upper) {
+		// First call, or the reader is reused for a new range: pin a fresh source snapshot and
+		// seed the iterator once. A reused reader releases the prior pin before repinning.
+		if r.scan != nil {
+			l.releaseVersion(r.scan.ver)
+			r.scan = nil
+		}
+		r.scan, err = r.buildScan(after, lower, upper)
+		if err != nil {
+			return nil, nil, false, err
+		}
+	}
+	sc := r.scan
+	mi := sc.mi
+	rangeDels := sc.rangeDels
 
 	var ops []format.Op
 	var groupKey []byte
