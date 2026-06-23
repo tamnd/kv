@@ -101,6 +101,29 @@ type Options struct {
 	// latency is the engine's headline; it helps write-heavier workloads that still
 	// want the B-tree's tight space and ordered scans. The LSM core ignores it.
 	BufferedInserts bool
+	// FillFactor is the B-tree core's target leaf occupancy before it splits a node, in
+	// the range (0, 1]. Zero takes the engine default (~0.7). A higher value packs more
+	// keys per page (fewer pages, better read fan-out) at the cost of more splits on
+	// random inserts. The LSM core ignores it (spec 05 §3).
+	FillFactor float64
+	// MaxInlineValue is the maximum value size the B-tree core stores inline on a leaf
+	// page; larger values overflow to dedicated overflow pages. Zero takes the engine
+	// default (¼ page). Increasing it avoids overflow page I/O for medium values at the
+	// cost of sparser leaves; decreasing it keeps leaves dense for key-heavy workloads
+	// (spec 05 §2.2). The LSM core ignores it.
+	MaxInlineValue int
+	// LevelRatio is the LSM core's size multiplier between adjacent levels: each level
+	// is LevelRatio times larger than the one above it (spec 06 §4). Zero takes the
+	// engine default (10). A larger ratio reduces write amplification by doing fewer,
+	// bigger compactions at the cost of higher read fan-out on the cold levels. The
+	// B-tree core ignores it.
+	LevelRatio int
+	// ValueSepThreshold, when positive, enables the LSM core's WiscKey value separation
+	// (spec 06 §7): values larger than this many bytes are written to a separate vLog
+	// file and only a pointer lives in the main segment, so large-value workloads keep
+	// the tree small and cache-resident. Zero disables separation. The B-tree core
+	// ignores it.
+	ValueSepThreshold int
 	// Compression turns on the LSM core's heat-tiered block compression (spec 13): segment
 	// data pages are compressed with a cheap fast codec on the hot shallow levels and a
 	// higher-ratio codec on the cold deep ones, packing more cells per page so the file
@@ -289,6 +312,10 @@ type DB struct {
 	bufferedInserts bool
 	compression     engine.CompressionMode
 	noAutoCompact   bool
+	fillFactor      float64
+	maxInlineValue  int
+	levelRatio      int
+	valueSepThresh  int
 
 	// readReplica makes this a read-only follower (spec 18 §4): user writes are refused
 	// and state advances only through ApplyWAL replaying shipped frames. replicaHigh is
@@ -420,7 +447,7 @@ func create(fs vfs.FS, path string, opts Options) (*DB, error) {
 		return nil, err
 	}
 	d := &DB{fs: fs, path: path, pgr: pgr, wal: w, eng: eng, orc: newOracle(0), crypto: enc,
-		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, bufferedInserts: opts.BufferedInserts, compression: opts.compressionMode(), noAutoCompact: opts.disableAutoCompaction, now: opts.clock(), logger: opts.Logger, slowOp: opts.SlowOpThreshold, tracer: opts.Tracer, readReplica: opts.ReadReplica, archive: opts.WALArchive}
+		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, bufferedInserts: opts.BufferedInserts, compression: opts.compressionMode(), noAutoCompact: opts.disableAutoCompaction, fillFactor: opts.FillFactor, maxInlineValue: opts.MaxInlineValue, levelRatio: opts.LevelRatio, valueSepThresh: opts.ValueSepThreshold, now: opts.clock(), logger: opts.Logger, slowOp: opts.SlowOpThreshold, tracer: opts.Tracer, readReplica: opts.ReadReplica, archive: opts.WALArchive}
 	d.ccond = sync.NewCond(&d.cmu)
 	if err := d.openEngine(opts.Merge); err != nil {
 		w.Close()
@@ -449,7 +476,7 @@ func openExisting(fs vfs.FS, path string, opts Options) (*DB, error) {
 		return nil, err
 	}
 	d := &DB{fs: fs, path: path, pgr: pgr, eng: eng, crypto: enc,
-		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, bufferedInserts: opts.BufferedInserts, compression: opts.compressionMode(), noAutoCompact: opts.disableAutoCompaction, now: opts.clock(), logger: opts.Logger, slowOp: opts.SlowOpThreshold, tracer: opts.Tracer, readReplica: opts.ReadReplica, archive: opts.WALArchive}
+		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, bufferedInserts: opts.BufferedInserts, compression: opts.compressionMode(), noAutoCompact: opts.disableAutoCompaction, fillFactor: opts.FillFactor, maxInlineValue: opts.MaxInlineValue, levelRatio: opts.LevelRatio, valueSepThresh: opts.ValueSepThreshold, now: opts.clock(), logger: opts.Logger, slowOp: opts.SlowOpThreshold, tracer: opts.Tracer, readReplica: opts.ReadReplica, archive: opts.WALArchive}
 	d.ccond = sync.NewCond(&d.cmu)
 	if err := d.openEngine(opts.Merge); err != nil {
 		pgr.Close()
@@ -542,6 +569,10 @@ func (d *DB) openEngine(merge func(existing, operand []byte) []byte) error {
 			Filter:          d.filter,
 			BufferedInserts: d.bufferedInserts,
 			CompressionMode: d.compression,
+			FillFactor:      d.fillFactor,
+			MaxInlineValue:  d.maxInlineValue,
+			LevelSizeRatio:  d.levelRatio,
+			ValueSepThreshold: d.valueSepThresh,
 
 			DisableAutoCompaction: d.noAutoCompact,
 		},
