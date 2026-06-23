@@ -975,3 +975,98 @@ func TestPragmaCacheSize(t *testing.T) {
 		t.Fatalf("cache_size=100: exit %d, want usage (%d)", code, exitUsage)
 	}
 }
+
+// TestPragmaFullPageWrites confirms full_page_writes reads "on" by default, can be
+// toggled off and back on, and that the new value survives a re-open.
+func TestPragmaFullPageWrites(t *testing.T) {
+	p := dbPath(t)
+
+	got := strings.TrimSpace(capture(t, func() { run([]string{"pragma", p, "full_page_writes"}) }))
+	if got != "on" {
+		t.Fatalf("default full_page_writes = %q, want on", got)
+	}
+
+	if code := run([]string{"pragma", p, "full_page_writes=off"}); code != exitOK {
+		t.Fatalf("set full_page_writes=off: exit %d", code)
+	}
+	got = strings.TrimSpace(capture(t, func() { run([]string{"pragma", p, "full_page_writes"}) }))
+	if got != "off" {
+		t.Fatalf("full_page_writes after set off = %q, want off", got)
+	}
+
+	if code := run([]string{"pragma", p, "full_page_writes=on"}); code != exitOK {
+		t.Fatalf("set full_page_writes=on: exit %d", code)
+	}
+	got = strings.TrimSpace(capture(t, func() { run([]string{"pragma", p, "full_page_writes"}) }))
+	if got != "on" {
+		t.Fatalf("full_page_writes after set on = %q, want on", got)
+	}
+
+	if code := run([]string{"pragma", p, "full_page_writes=bad"}); code != exitUsage {
+		t.Fatalf("bad full_page_writes value: exit %d, want %d", code, exitUsage)
+	}
+}
+
+// TestPragmaAutoVacuum confirms auto_vacuum reads "none" by default, can be set to
+// incremental or full, and persists across re-opens.
+func TestPragmaAutoVacuum(t *testing.T) {
+	p := dbPath(t)
+
+	got := strings.TrimSpace(capture(t, func() { run([]string{"pragma", p, "auto_vacuum"}) }))
+	if got != "none" {
+		t.Fatalf("default auto_vacuum = %q, want none", got)
+	}
+
+	if code := run([]string{"pragma", p, "auto_vacuum=incremental"}); code != exitOK {
+		t.Fatalf("set auto_vacuum=incremental: exit %d", code)
+	}
+	got = strings.TrimSpace(capture(t, func() { run([]string{"pragma", p, "auto_vacuum"}) }))
+	if got != "incremental" {
+		t.Fatalf("auto_vacuum after set = %q, want incremental", got)
+	}
+
+	if code := run([]string{"pragma", p, "auto_vacuum=full"}); code != exitOK {
+		t.Fatalf("set auto_vacuum=full: exit %d", code)
+	}
+	got = strings.TrimSpace(capture(t, func() { run([]string{"pragma", p, "auto_vacuum"}) }))
+	if got != "full" {
+		t.Fatalf("auto_vacuum after full = %q, want full", got)
+	}
+
+	if code := run([]string{"pragma", p, "auto_vacuum=none"}); code != exitOK {
+		t.Fatalf("set auto_vacuum=none: exit %d", code)
+	}
+	got = strings.TrimSpace(capture(t, func() { run([]string{"pragma", p, "auto_vacuum"}) }))
+	if got != "none" {
+		t.Fatalf("auto_vacuum after reset = %q, want none", got)
+	}
+
+	if code := run([]string{"pragma", p, "auto_vacuum=bogus"}); code != exitUsage {
+		t.Fatalf("bad auto_vacuum value: exit %d, want %d", code, exitUsage)
+	}
+}
+
+// TestPragmaCommitLingerUs confirms commit_linger_us reads 0 by default, accepts an
+// integer set, and echoes back the value.
+func TestPragmaCommitLingerUs(t *testing.T) {
+	p := dbPath(t)
+
+	got := strings.TrimSpace(capture(t, func() { run([]string{"pragma", p, "commit_linger_us"}) }))
+	if got != "0" {
+		t.Fatalf("default commit_linger_us = %q, want 0", got)
+	}
+
+	got = strings.TrimSpace(capture(t, func() { run([]string{"pragma", p, "commit_linger_us=500"}) }))
+	if got != "500" {
+		t.Fatalf("commit_linger_us set echo = %q, want 500", got)
+	}
+
+	got = strings.TrimSpace(capture(t, func() { run([]string{"pragma", p, "commit_linger_us"}) }))
+	if got != "500" {
+		t.Fatalf("commit_linger_us after set = %q, want 500", got)
+	}
+
+	if code := run([]string{"pragma", p, "commit_linger_us=not-a-number"}); code != exitUsage {
+		t.Fatalf("bad commit_linger_us value: exit %d, want %d", code, exitUsage)
+	}
+}

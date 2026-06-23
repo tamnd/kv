@@ -774,6 +774,36 @@ func (kdb *DB) UserVersion() uint32 { return kdb.d.UserVersion() }
 // (spec 22 §2). Like the application id it is persistent-runtime and fsynced before return.
 func (kdb *DB) SetUserVersion(v uint32) error { return wrap(kdb.d.SetUserVersion(v)) }
 
+// FullPageWrites reports whether checkpoint pre-image logging is enabled (spec 07 §5).
+func (kdb *DB) FullPageWrites() bool { return kdb.d.FullPageWrites() }
+
+// AutoVacuumMode returns the current auto-vacuum policy: 0=NONE, 1=INCREMENTAL, 2=FULL.
+func (kdb *DB) AutoVacuumMode() uint8 { return kdb.d.AutoVacuumMode() }
+
+// CommitLingerUs returns the current group-commit linger window in microseconds.
+func (kdb *DB) CommitLingerUs() uint32 { return kdb.d.CommitLingerUs() }
+
+// SetFullPageWrites enables or disables pre-image logging during checkpoints (spec 07 §5).
+// When on (the default), the checkpoint logs the on-disk pre-image of each dirty page to
+// the WAL before overwriting it; recovery uses these images to restore any page that an
+// interrupted checkpoint left corrupt. Disabling trades that safety for lower checkpoint
+// write amplification. The setting is persisted in the file header.
+func (kdb *DB) SetFullPageWrites(on bool) error { return wrap(kdb.d.SetFullPageWrites(on)) }
+
+// SetAutoVacuumMode sets the automatic space-reclamation policy (spec 09 §3.3).
+// 0 = NONE (off, the default for existing files), 1 = INCREMENTAL, 2 = FULL.
+// Both non-zero modes call TruncateTail after every checkpoint. The setting is
+// persisted in the file header.
+func (kdb *DB) SetAutoVacuumMode(mode uint8) error {
+	return wrap(kdb.d.SetAutoVacuumMode(mode))
+}
+
+// SetCommitLingerUs sets the group-commit linger window in microseconds (spec 07 §4).
+// The commit leader waits up to this long for additional writers to join the batch
+// before flushing. Zero (the default) disables the window. The setting is persisted
+// in the file header and takes effect immediately.
+func (kdb *DB) SetCommitLingerUs(us uint32) error { return wrap(kdb.d.SetCommitLingerUs(us)) }
+
 // CheckProblem is one structural violation found by Check: a corruption class, the page
 // it was found on (zero for a file-wide problem), and a human-readable description
 // (spec 16 §4, spec 23 §3).

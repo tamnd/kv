@@ -419,6 +419,31 @@ func (p *Pager) Checkpoint(checkpointLSN, lastCommitVersion uint64) error {
 	p.metaMu.Lock()
 	defer p.metaMu.Unlock()
 
+	// When full-page writes are enabled, log a pre-image for each dirty page before
+	// overwriting it on disk. All images are logged first, then flushed to the WAL
+	// (making them durable), and only then are pages written to disk. This ordering
+	// guarantees that recovery always finds a valid pre-image for any page that a
+	// crash left partially written (spec 07 §5).
+	if p.pageImageLogger != nil {
+		imgBuf := make([]byte, p.pageSize)
+		for _, sh := range p.shards {
+			for _, fr := range sh.frames {
+				if fr.pgno != 0 && fr.dirty && !fr.writePinned.Load() {
+					off := int64(fr.pgno-1) * int64(p.pageSize)
+					n, _ := p.file.ReadAt(imgBuf, off)
+					if n == p.pageSize {
+						if err := p.pageImageLogger(fr.pgno, imgBuf); err != nil {
+							return err
+						}
+					}
+				}
+			}
+		}
+		if err := p.pageImageFlusher(); err != nil {
+			return err
+		}
+	}
+
 	// Flush dirty data frames across every shard. Skip frames that are write-pinned:
 	// a concurrent commit's B-tree is still writing those bytes (it holds d.mu, the
 	// checkpoint released d.mu for the lock-free I/O phase). Their WAL frames are at
@@ -602,6 +627,35 @@ func (p *Pager) TruncateTail(budget int) (int, error) {
 		return 0, err
 	}
 	return freed, nil
+}
+
+// RestorePageImages writes pre-images from a WAL recovery scan back to disk for any
+// page whose current on-disk checksum is invalid. Called during Open recovery after
+// the WAL is scanned but before kv-batch redo (spec 07 §5, spec 08 §3).
+// A page with a valid checksum is skipped: the checkpoint completed for that page, so
+// the pre-image is redundant.
+func (p *Pager) RestorePageImages(images map[uint32][]byte) error {
+	if len(images) == 0 {
+		return nil
+	}
+	buf := make([]byte, p.pageSize)
+	for pgno, img := range images {
+		if len(img) != p.pageSize {
+			continue // image size mismatch; skip
+		}
+		off := int64(pgno-1) * int64(p.pageSize)
+		n, _ := p.file.ReadAt(buf, off)
+		if n == p.pageSize {
+			if err := verifyPageChecksum(buf, p.header.Checksum); err == nil {
+				continue // checksum valid; page was written cleanly, pre-image not needed
+			}
+		}
+		// Page is corrupt or unreadable — restore from pre-image.
+		if _, err := p.file.WriteAt(img, off); err != nil {
+			return fmt.Errorf("pager: restore page %d: %w", pgno, err)
+		}
+	}
+	return p.file.Sync(vfs.SyncFull)
 }
 
 // Close flushes nothing implicitly; it just releases the file. Callers checkpoint

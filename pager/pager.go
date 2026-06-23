@@ -185,11 +185,31 @@ type Pager struct {
 	// so a Stats reader can sample them without taking a pager lock off the hot path.
 	pageReads atomic.Uint64
 	cacheHits atomic.Uint64
+
+	// pageImageLogger, when non-nil, is called for each dirty page before Checkpoint
+	// overwrites it. It logs the page's current on-disk content as a WAL pre-image so
+	// recovery can restore it after an interrupted checkpoint (spec 07 §5). The logger
+	// is set by the db layer when full_page_writes is enabled.
+	pageImageLogger func(pgno uint32, data []byte) error
+	// pageImageFlusher, when non-nil, is called after all pre-images are logged and
+	// before any pages are written to disk. It must make the logged images durable (WAL
+	// sync) so they are present for recovery even if the checkpoint is interrupted.
+	pageImageFlusher func() error
 }
 
 // shardFor returns the shard that owns pgno. The mapping is a fixed mask over the page
 // number, so a page lives in the same shard for the pool's lifetime.
 func (p *Pager) shardFor(pgno uint32) *shard { return p.shards[pgno&p.shardMask] }
+
+// SetPageImageLogger installs callbacks used during Checkpoint to log full-page
+// pre-images to the WAL before overwriting each page on disk (spec 07 §5,
+// full_page_writes). logger is called for each dirty page with its current on-disk
+// content; flusher is called after all images are logged to make them durable before
+// any page is written. Both must be non-nil together; pass nil, nil to disable.
+func (p *Pager) SetPageImageLogger(logger func(pgno uint32, data []byte) error, flusher func() error) {
+	p.pageImageLogger = logger
+	p.pageImageFlusher = flusher
+}
 
 // cryptoScheme loads the live encryption scheme, or nil for an unencrypted file.
 func (p *Pager) cryptoScheme() *crypto.Scheme { return p.crypto.Load() }
