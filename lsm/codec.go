@@ -46,9 +46,9 @@ const (
 // A bytes.Buffer pool feeds the compress side so the backing array grows once and is
 // reused across page-compression calls on the same goroutine.
 var (
-	fastWriterPool = sync.Pool{New: func() any { w, _ := flate.NewWriter(io.Discard, flate.BestSpeed); return w }}
-	highWriterPool = sync.Pool{New: func() any { w, _ := flate.NewWriter(io.Discard, flate.BestCompression); return w }}
-	readerPool     = sync.Pool{New: func() any { return flate.NewReader(bytes.NewReader(nil)) }}
+	fastWriterPool  = sync.Pool{New: func() any { w, _ := flate.NewWriter(io.Discard, flate.BestSpeed); return w }}
+	highWriterPool  = sync.Pool{New: func() any { w, _ := flate.NewWriter(io.Discard, flate.BestCompression); return w }}
+	readerPool      = sync.Pool{New: func() any { return flate.NewReader(bytes.NewReader(nil)) }}
 	compressBufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
 )
 

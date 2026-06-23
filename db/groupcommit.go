@@ -96,39 +96,16 @@ func (d *DB) processGroup(group []*commitReq) {
 		return
 	}
 
-	// Phase 1: assign versions and append every batch's WAL frames. Conflicts and empty
-	// writes resolve here and never reach the log.
-	appended := make([]*commitReq, 0, len(group))
+	// Phases 1 and 2 (append every batch's frames, then one shared fsync) run under the
+	// WAL append lock so they cannot interleave with a background checkpoint's
+	// full_page_writes page-image logging, which appends to the same single-writer WAL
+	// tail off d.mu since slice 95 moved page writeback into the pager. The lock spans the
+	// whole append-plus-sync run, not each frame, so a checkpoint sees either none of a
+	// group's frames or all of them, never a torn interleave. fenceGroup is terminal but
+	// still returns through the deferred unlock so a racing checkpoint never deadlocks.
 	durableStart := time.Now()
-	for i, r := range group {
-		b, v, skip, err := r.prepare()
-		if err != nil {
-			r.fail(err)
-			continue
-		}
-		if skip {
-			r.succeed(v)
-			continue
-		}
-		// Serialize the batch straight into the WAL frame buffer rather than into a
-		// throwaway buffer that LogBatch would copy in again (perf/02 Finding 4).
-		if err := d.wal.LogBatchAppend(v, b.AppendEncoded); err != nil {
-			d.fenceGroup(append(appended, group[i:]...), err)
-			return
-		}
-		commitLSN, err := d.wal.AppendCommit(v)
-		if err != nil {
-			d.fenceGroup(append(appended, group[i:]...), err)
-			return
-		}
-		r.b, r.v, r.commitLSN, r.appended = b, v, commitLSN, true
-		appended = append(appended, r)
-	}
-
-	// Phase 2: one fsync makes every appended batch durable. At SyncOff/SyncNormal this is
-	// a no-op and durability is finalized at the next checkpoint.
-	if err := d.wal.Sync(); err != nil {
-		d.fenceGroup(appended, err)
+	appended, ok := d.appendGroupLocked(group)
+	if !ok {
 		return
 	}
 	durable := time.Since(durableStart)
@@ -147,6 +124,53 @@ func (d *DB) processGroup(group []*commitReq) {
 		}
 	}
 	d.maybeCheckpoint()
+}
+
+// appendGroupLocked runs phases 1 and 2 of group commit under the WAL append lock: it assigns
+// a version to each request, appends its batch and commit frames, and issues the one shared
+// fsync that makes the whole run durable. It returns the requests that reached the log and
+// ok=true on success. Conflicts and empty writes resolve here (fail/succeed) and never reach
+// the log. A WAL append or fsync error fences the database and returns ok=false; the caller
+// stops, since every appended request has already been failed. The append lock is released by
+// defer on every path, so a checkpoint waiting to log page images never blocks on a fenced
+// group.
+func (d *DB) appendGroupLocked(group []*commitReq) (appended []*commitReq, ok bool) {
+	d.wal.AppendLock()
+	defer d.wal.AppendUnlock()
+
+	appended = make([]*commitReq, 0, len(group))
+	for i, r := range group {
+		b, v, skip, err := r.prepare()
+		if err != nil {
+			r.fail(err)
+			continue
+		}
+		if skip {
+			r.succeed(v)
+			continue
+		}
+		// Serialize the batch straight into the WAL frame buffer rather than into a
+		// throwaway buffer that LogBatch would copy in again (perf/02 Finding 4).
+		if err := d.wal.LogBatchAppend(v, b.AppendEncoded); err != nil {
+			d.fenceGroup(append(appended, group[i:]...), err)
+			return appended, false
+		}
+		commitLSN, err := d.wal.AppendCommit(v)
+		if err != nil {
+			d.fenceGroup(append(appended, group[i:]...), err)
+			return appended, false
+		}
+		r.b, r.v, r.commitLSN, r.appended = b, v, commitLSN, true
+		appended = append(appended, r)
+	}
+
+	// Phase 2: one fsync makes every appended batch durable. At SyncOff/SyncNormal this is
+	// a no-op and durability is finalized at the next checkpoint.
+	if err := d.wal.Sync(); err != nil {
+		d.fenceGroup(appended, err)
+		return appended, false
+	}
+	return appended, true
 }
 
 // applyGroupDurable applies an already-durable group to a group-capable engine in one parallel
