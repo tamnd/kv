@@ -738,6 +738,7 @@ func (l *LSM) foldRange(snap engine.Snapshot, lower, upper []byte, keysOnly bool
 	var out []resolved
 	var ops []format.Op
 	var groupKey []byte
+	tc := snap.TTLClock()
 	flush := func() {
 		if groupKey == nil {
 			return
@@ -765,7 +766,7 @@ func (l *LSM) foldRange(snap engine.Snapshot, lower, upper []byte, keysOnly bool
 		// it. materializeOp also owns the value bytes it returns (it copies the borrowed
 		// source value, and a separated value comes back fresh from the vLog), so nothing
 		// here aliases mi.value(), which dies on the next advance.
-		op, ok, err := l.materializeOp(ik, mi.value(), snap.Now, keysOnly)
+		op, ok, err := l.materializeOp(ik, mi.value(), tc.For(format.KindOf(ik)), keysOnly)
 		if err != nil {
 			return nil, err
 		}
@@ -804,10 +805,11 @@ func (r *reader) Get(userKey []byte) ([]byte, error) {
 	var ops []format.Op
 	var matErr error
 	var rd uint64
+	tc := r.snap.TTLClock()
 	collect := func(ik, val []byte) bool {
 		// A point Get always wants the value, so keysOnly is false: a separated value is
 		// dereferenced through the vLog here.
-		op, ok, err := l.materializeOp(ik, val, r.snap.Now, false)
+		op, ok, err := l.materializeOp(ik, val, tc.For(format.KindOf(ik)), false)
 		if err != nil {
 			matErr = err
 			return false
@@ -1009,6 +1011,7 @@ func (r *reader) ScanForward(after, lower, upper []byte, keysOnly bool) (uk, val
 
 	var ops []format.Op
 	var groupKey []byte
+	tc := r.snap.TTLClock()
 	resolve := func() ([]byte, []byte, bool) {
 		rd := format.NewestCoveringRangeDel(rangeDels, groupKey, r.snap.Version)
 		v, vok := format.Fold(ops, r.snap.Version, rd, l.merge)
@@ -1056,7 +1059,7 @@ func (r *reader) ScanForward(after, lower, upper []byte, keysOnly bool) (uk, val
 		// materializeOp owns the value bytes it returns (it copies the borrowed source value
 		// and dereferences a separated value fresh from the vLog), so nothing kept here
 		// aliases mi.value(), which dies on the next advance.
-		op, opok, err := l.materializeOp(ik, mi.value(), r.snap.Now, keysOnly)
+		op, opok, err := l.materializeOp(ik, mi.value(), tc.For(format.KindOf(ik)), keysOnly)
 		if err != nil {
 			return nil, nil, false, err
 		}

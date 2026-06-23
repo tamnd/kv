@@ -217,6 +217,7 @@ type resolvedKV struct {
 // never reads.
 func resolveStream(entries []entry, snap engine.Snapshot, merge func(existing, operand []byte) []byte, rangeDels []format.RangeDel) []resolvedKV {
 	var out []resolvedKV
+	tc := snap.TTLClock()
 	i := 0
 	for i < len(entries) {
 		uk := format.UserKey(entries[i].ik)
@@ -228,7 +229,7 @@ func resolveStream(entries []entry, snap engine.Snapshot, merge func(existing, o
 			ik := entries[j].ik
 			val := entries[j].val
 			j++
-			op, ok := format.OpFromCell(ik, val, snap.Now)
+			op, ok := format.OpFromCell(ik, val, tc.For(format.KindOf(ik)))
 			if !ok {
 				continue // range markers resolve through rangeDels, not as ops
 			}

@@ -90,7 +90,7 @@ func (t *Txn) NewIterator(opts engine.IterOptions) (*Iterator, error) {
 		// list) at construction and must not race a flush or compaction. The streaming
 		// path keeps the reader open afterward and reacquires the lock per pull.
 		t.db.mu.RLock()
-		rd, err := t.db.eng.NewReader(engine.Snapshot{Version: t.readVersion, Now: t.db.now()})
+		rd, err := t.db.eng.NewReader(engine.Snapshot{Version: t.readVersion, Clock: t.db.now})
 		if err != nil {
 			t.db.mu.RUnlock()
 			return nil, err
@@ -184,7 +184,7 @@ func (it *Iterator) drainAll() {
 func (d *DB) rangeSnapshot(version uint64, lower, upper []byte, keysOnly bool) ([]iterItem, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	rd, err := d.eng.NewReader(engine.Snapshot{Version: version, Now: d.now()})
+	rd, err := d.eng.NewReader(engine.Snapshot{Version: version, Clock: d.now})
 	if err != nil {
 		return nil, err
 	}

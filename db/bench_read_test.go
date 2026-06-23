@@ -260,3 +260,36 @@ func BenchmarkGetLargeValue(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkPointReadNoTTLClock measures a single-thread cache-resident point read of a key
+// that carries no TTL, the overwhelmingly common case. It runs on the real system clock (no
+// injected Clock), so the time it does or does not spend reading the wall clock per read is
+// part of the number. With the eager clock the read called time.Now() once per Get even
+// though no folded cell carried a TTL; the lazy resolver skips that call entirely (perf/01
+// F6), so this isolates that one clock read from the descent and lock costs the parallel
+// BenchmarkConcurrentGet is dominated by.
+func BenchmarkPointReadNoTTLClock(b *testing.B) {
+	const keys = 10000
+	fs := vfs.NewMem()
+	d, err := Open(fs, "bench.kv", Options{PageSize: 4096, Sync: wal.SyncOff})
+	if err != nil {
+		b.Fatalf("open: %v", err)
+	}
+	defer d.Close()
+	for i := range keys {
+		key := fmt.Sprintf("k%08d", i)
+		if _, err := d.Write(func(wb *engine.WriteBatch) {
+			wb.Set([]byte(key), []byte("value-payload"))
+		}); err != nil {
+			b.Fatalf("seed: %v", err)
+		}
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := range b.N {
+		key := fmt.Sprintf("k%08d", i%keys)
+		if _, err := d.Get([]byte(key)); err != nil {
+			b.Fatalf("get: %v", err)
+		}
+	}
+}

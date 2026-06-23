@@ -119,6 +119,7 @@ func (m *Model) snapshot(snap Snapshot) []resolved {
 	})
 
 	var out []resolved
+	tc := snap.TTLClock()
 	var i int
 	for i < len(iks) {
 		uk := format.UserKey(iks[i])
@@ -129,7 +130,7 @@ func (m *Model) snapshot(snap Snapshot) []resolved {
 		for j < len(iks) && bytes.Equal(format.UserKey(iks[j]), uk) {
 			ik := iks[j]
 			j++
-			op, ok := format.OpFromCell(ik, m.store[string(ik)], snap.Now)
+			op, ok := format.OpFromCell(ik, m.store[string(ik)], tc.For(format.KindOf(ik)))
 			if !ok {
 				continue // range markers resolve through rangeDels, not as ops
 			}
