@@ -2,6 +2,7 @@ package lsm
 
 import (
 	"sync"
+	"sync/atomic"
 
 	"github.com/tamnd/kv/format"
 )
@@ -21,14 +22,16 @@ import (
 // recorded here as an interval.
 type memtable struct {
 	sl *skiplist
-	// rdmu guards rangeDels against the parallel group apply, where several workers insert
-	// into one active memtable at once and a range-delete marker on each would append to the
-	// same slice concurrently. The skip list itself is lock-free, so the common point write
-	// takes no lock here; only a range-delete marker does. A reader gathering the live set
-	// runs under the engine's l.mu, which the apply holds for its duration, so this guards
-	// worker against worker, not worker against reader.
+	// rdmu serializes the copy-on-write append to rangeDels among the parallel group-apply
+	// workers, where several workers insert into one active memtable at once and a range-delete
+	// marker on each would otherwise race the read-modify-write of the published slice. The skip
+	// list itself is lock-free, so the common point write takes no lock here; only a range-delete
+	// marker does. The slice is published through rangeDels (an atomic pointer to an immutable
+	// snapshot), so a reader gathering the live set loads a complete list with no lock even while
+	// an insert runs outside the engine's l.mu (perf/03 W1): the apply no longer holds l.mu across
+	// its inserts, so this must guard worker against reader as well as worker against worker.
 	rdmu      sync.Mutex
-	rangeDels []format.RangeDel
+	rangeDels atomic.Pointer[[]format.RangeDel]
 }
 
 // newMemtable returns an empty memtable with an arena pre-sized to a fraction of
@@ -44,14 +47,36 @@ func newMemtable(arenaCap int) *memtable {
 func (m *memtable) set(internalKey, value []byte) {
 	m.sl.insert(internalKey, value)
 	if format.KindOf(internalKey) == format.KindRangeBegin {
+		// Copy-on-write append: build a fresh slice one longer than the published one and
+		// store it atomically, so a reader loading rangeDels sees either the old complete list
+		// or the new complete list, never a slice mid-grow. rdmu serializes two workers that
+		// both add a marker, so neither loses the other's append.
 		m.rdmu.Lock()
-		m.rangeDels = append(m.rangeDels, format.RangeDel{
+		var base []format.RangeDel
+		if p := m.rangeDels.Load(); p != nil {
+			base = *p
+		}
+		next := make([]format.RangeDel, len(base)+1)
+		copy(next, base)
+		next[len(base)] = format.RangeDel{
 			Lo:      append([]byte(nil), format.UserKey(internalKey)...),
 			Hi:      append([]byte(nil), value...),
 			Version: format.Version(internalKey),
-		})
+		}
+		m.rangeDels.Store(&next)
 		m.rdmu.Unlock()
 	}
+}
+
+// liveDels returns the memtable's range-delete intervals as an immutable snapshot. The slice
+// is published atomically by set, so a reader folds a complete list with no lock even while a
+// concurrent insert (which now runs outside l.mu) appends a new marker (perf/03 W1).
+func (m *memtable) liveDels() []format.RangeDel {
+	p := m.rangeDels.Load()
+	if p == nil {
+		return nil
+	}
+	return *p
 }
 
 // size reports the memtable's in-memory footprint, used to decide when to seal it.

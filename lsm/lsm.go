@@ -279,23 +279,38 @@ func (l *LSM) SetMergeFunc(f func(existing, operand []byte) []byte) {
 // The seal blocks only when the queue is already full, the backpressure that keeps a
 // write burst that outruns the flusher from growing memory without bound.
 func (l *LSM) Apply(batch *engine.WriteBatch, commitVersion uint64) error {
+	// The lock covers only the structural decisions: the seal check, capturing the active
+	// memtable, and the LSN bump. The inserts then run with the lock released, so a concurrent
+	// reader (which captures its snapshot under a brief l.mu.RLock and folds outside it) proceeds
+	// in parallel (perf/03 W1). This is safe because the host serializes writers above the seam,
+	// so only this goroutine inserts into the active memtable; the inserts race only readers,
+	// which the lock-free skip list handles. The seal that would swap the active memtable out
+	// happens here, under the lock, before the capture, so mem is the memtable the inserts belong
+	// in for the whole call.
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	if l.flushErr != nil {
+		l.mu.Unlock()
 		return l.flushErr
 	}
 	if l.mem.count() > 0 && l.mem.size() >= l.memtableCap {
 		if err := l.sealForFlushLocked(); err != nil {
+			l.mu.Unlock()
 			return err
 		}
 	}
-	for _, e := range batch.Entries() {
-		l.mem.set(e.InternalKey, e.Value)
-	}
-	// Track the largest WAL LSN now resident in the active memtable, so a later flush
-	// knows how far the segment it writes lets the host reclaim the log.
+	mem := l.mem
+	// Track the largest WAL LSN now resident in the active memtable, so a later flush knows how
+	// far the segment it writes lets the host reclaim the log. It is recorded before the inserts
+	// rather than after, which is equivalent under the single-writer rule: no seal can snapshot
+	// this memtable's mark between here and the inserts completing, since seal runs only on this
+	// same goroutine.
 	if l.pendingLSN > l.memMaxLSN {
 		l.memMaxLSN = l.pendingLSN
+	}
+	l.mu.Unlock()
+
+	for _, e := range batch.Entries() {
+		mem.set(e.InternalKey, e.Value)
 	}
 	return nil
 }
@@ -314,29 +329,38 @@ const parallelApplyMinEntries = 64
 // batches, so a single group may push the memtable a little past its cap and seal at the next
 // group boundary. The cap is a soft target, so a bounded overshoot of one group's bytes is fine.
 //
-// The lock is held for the whole apply. That keeps the active memtable from being swapped under
-// the workers and keeps a reader (which captures the memtables under l.mu.RLock) excluded for the
-// apply, exactly as a single Apply did; the win is that the apply now finishes in less wall-clock
-// because it runs on several cores, so the exclusion window is shorter. The workers insert through
-// the lock-free skip list, which makes their concurrent inserts safe without any lock of their own;
-// they share the active memtable only, and every entry across the group carries a distinct internal
-// key (versions differ across batches), so no two workers ever insert the same key.
+// The lock covers only the structural prefix: the seal check, capturing the active memtable, and
+// the LSN bump. The inserts, serial or fanned across cores, then run with the lock released, so a
+// concurrent reader proceeds in parallel instead of waiting out the whole apply (perf/03 W1); the
+// win compounds with the fan-out, since the apply both runs on several cores and no longer holds a
+// reader off while it does. The host serializes writers above the seam, so only this call inserts
+// into the active memtable, and the seal that would swap it out runs here under the lock before the
+// capture, so mem is stable for the inserts. The workers insert through the lock-free skip list,
+// which makes their concurrent inserts safe without any lock of their own; they share the active
+// memtable only, and every entry across the group carries a distinct internal key (versions differ
+// across batches), so no two workers ever insert the same key, and none races a reader's fold.
 func (l *LSM) ApplyGroup(batches []*engine.WriteBatch, versions []uint64) error {
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	if l.flushErr != nil {
+		l.mu.Unlock()
 		return l.flushErr
 	}
 	if l.mem.count() > 0 && l.mem.size() >= l.memtableCap {
 		if err := l.sealForFlushLocked(); err != nil {
+			l.mu.Unlock()
 			return err
 		}
 	}
+	mem := l.mem
+	if l.pendingLSN > l.memMaxLSN {
+		l.memMaxLSN = l.pendingLSN
+	}
+	l.mu.Unlock()
+
 	total := 0
 	for _, b := range batches {
 		total += len(b.Entries())
 	}
-	mem := l.mem
 	if total < parallelApplyMinEntries {
 		for _, b := range batches {
 			for _, e := range b.Entries() {
@@ -345,9 +369,6 @@ func (l *LSM) ApplyGroup(batches []*engine.WriteBatch, versions []uint64) error 
 		}
 	} else {
 		applyEntriesParallel(mem, batches, total)
-	}
-	if l.pendingLSN > l.memMaxLSN {
-		l.memMaxLSN = l.pendingLSN
 	}
 	return nil
 }
@@ -819,37 +840,47 @@ func (r *reader) Get(userKey []byte) ([]byte, error) {
 		return false
 	}
 
-	// The active and sealed memtables are not lock-free against a concurrent Apply, so they,
-	// the current version's reference, the covering range-delete mark, and the merge resolver
-	// are all captured under one brief l.mu.RLock, a single consistent snapshot. The lock is
-	// then released and the on-disk segments, the slow part, are probed with no lock held: a
-	// flush or compaction may swap the current version meanwhile, but the referenced version
-	// keeps its segments' pages off the freelist until the deferred release below, so the
-	// probe reads only stable, still-allocated pages (version.go, perf/03 R3).
+	// One brief l.mu.RLock captures a consistent snapshot: a reference on the current version,
+	// the covering range-delete mark, the merge resolver, the active memtable pointer, and the
+	// sealed queue as it stands. The lock is then released and every slow step (the memtable
+	// folds and the on-disk segment probes) runs with no lock held, so a concurrent Apply, whose
+	// inserts now run outside l.mu, proceeds in parallel with this read (perf/03 W1).
+	//
+	// The captured snapshot stays consistent without the lock because of how each piece behaves
+	// once released. The active memtable (memSnap) is mutated only by Apply, lock-free through the
+	// skip list, and only with cells newer than this snapshot's version, which the fold ignores;
+	// the lock-free walk never returns a torn key. A sealed memtable is write-frozen the moment
+	// seal moves it out of the active slot, so folding immSnap reads immutable skip lists. The
+	// seal that moves a memtable from active to sealed, and the flush that turns a sealed memtable
+	// into a segment and pops it, each happen entirely under l.mu, so the captured (memSnap,
+	// immSnap, version) triple holds every memtable exactly once: a key is folded from the active
+	// memtable, or one sealed memtable, or one segment, never two, so a merge never applies its
+	// operand twice. The referenced version keeps its segments' pages off the freelist until the
+	// deferred release, so the segment probes read only stable, still-allocated pages (perf/03 R3).
 	l.mu.RLock()
 	v := l.acquireVersionLocked()
 	rd = format.NewestCoveringRangeDel(l.liveRangeDels(flattenSegments(v.levels)), userKey, r.snap.Version)
 	mergeFn := l.merge
-	l.mem.getGroup(userKey, collect)
-	// Fold the sealed memtables awaiting flush between the active memtable and the on-disk
-	// levels: each is older than the active one but newer than any segment, and a sealed
-	// memtable becomes a segment only in the one critical section that also pops it, so a key
-	// is folded from exactly one of the two and a merge never applies its operand twice.
-	// Newest-first means the most recently sealed (the tail of the queue) folds first.
-	for i := len(l.imm) - 1; matErr == nil && i >= 0; i-- {
-		l.imm[i].mem.getGroup(userKey, collect)
-	}
-	// resolved() also sorts ops newest-first, the order the final Fold expects, so it is
-	// evaluated before the lock drops whenever the memtables alone might already fix the key.
-	done := matErr == nil && resolved()
+	memSnap := l.mem
+	immSnap := append([]*immMem(nil), l.imm...)
 	l.mu.RUnlock()
 	defer l.releaseVersion(v)
 
+	// Fold the active memtable, then the sealed memtables awaiting flush between it and the
+	// on-disk levels: each sealed memtable is older than the active one but newer than any
+	// segment. Newest-first means the most recently sealed (the tail of the queue) folds first.
+	memSnap.getGroup(userKey, collect)
+	for i := len(immSnap) - 1; matErr == nil && i >= 0; i-- {
+		immSnap[i].mem.getGroup(userKey, collect)
+	}
 	if matErr != nil {
 		return nil, matErr
 	}
 
-	if !done {
+	// resolved() sorts ops newest-first, the order the final Fold expects, so it is evaluated
+	// here whenever the memtables alone might already fix the key and let the segment probes be
+	// skipped.
+	if !resolved() {
 		// Probe the on-disk levels shallowest first and stop at the first level that
 		// supplies a base: a key's newest version always sits in the shallowest level
 		// that holds it (a new write enters at the memtable and only ever migrates down),
@@ -901,10 +932,11 @@ func (r *reader) Get(userKey []byte) ([]byte, error) {
 // once at open and never change, so they are safe to read from a referenced version with the
 // lock dropped).
 func (l *LSM) liveRangeDels(segs []*segment) []format.RangeDel {
-	dels := make([]format.RangeDel, 0, len(l.mem.rangeDels))
-	dels = append(dels, l.mem.rangeDels...)
+	active := l.mem.liveDels()
+	dels := make([]format.RangeDel, 0, len(active))
+	dels = append(dels, active...)
 	for _, e := range l.imm {
-		dels = append(dels, e.mem.rangeDels...)
+		dels = append(dels, e.mem.liveDels()...)
 	}
 	for _, seg := range segs {
 		dels = append(dels, seg.rangeDels...)
