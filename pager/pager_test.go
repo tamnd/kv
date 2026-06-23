@@ -255,6 +255,74 @@ func TestIOStatsCountsHitsAndReads(t *testing.T) {
 	}
 }
 
+// decodedBox is a stand-in for an engine's decoded node (a B-tree leaf or interior) in the
+// ViewDecoded tests: an immutable heap object cached on a frame and shared by readers.
+type decodedBox struct{ n uint32 }
+
+// TestViewDecodedHitIsPinFreeAndSurvivesEviction locks in the N1 contract (perf/09): a decoded
+// hit returns the cached node without a pin to release, and the returned node stays valid after
+// its frame is evicted and rebound, because the node is a separate immutable object kept alive
+// by the caller's reference, not by the frame's reused data buffer.
+func TestViewDecodedHitIsPinFreeAndSurvivesEviction(t *testing.T) {
+	_, p := newTestPager(t, Options{PageSize: 4096, CacheFrames: 8})
+
+	// Allocate a page and cache a decoded view on its frame, then unpin it.
+	pgno, fr, err := p.Allocate()
+	if err != nil {
+		t.Fatalf("allocate: %v", err)
+	}
+	writePattern(fr.Data(), pgno)
+	fr.SetDecoded(&decodedBox{n: pgno})
+	p.Unpin(fr, true)
+
+	// A decoded hit returns the cached node and NO frame: the caller does not (and must not)
+	// unpin, since nothing was pinned. If a pin had leaked here the frame could never be
+	// evicted and the miss assertion below would fail.
+	d, hitFr, err := p.ViewDecoded(pgno)
+	if err != nil {
+		t.Fatalf("view decoded hit: %v", err)
+	}
+	if hitFr != nil {
+		t.Fatalf("decoded hit returned a frame to unpin; the pin-free path is broken")
+	}
+	box, ok := d.(*decodedBox)
+	if !ok || box.n != pgno {
+		t.Fatalf("decoded hit = %v, want decodedBox{%d}", d, pgno)
+	}
+
+	// Force the frame out: touch far more distinct pages than the pool holds so CLOCK evicts
+	// and rebinds the frame that held pgno. The decoded view we already hold must stay valid.
+	for i := 0; i < 64; i++ {
+		_, nfr, err := p.Allocate()
+		if err != nil {
+			t.Fatalf("allocate filler %d: %v", i, err)
+		}
+		writePattern(nfr.Data(), nfr.PageNo())
+		p.Unpin(nfr, true)
+	}
+	if box.n != pgno {
+		t.Fatalf("decoded view changed after its frame was evicted: got %d, want %d", box.n, pgno)
+	}
+
+	// pgno's frame was reused, so its cached decode is gone: ViewDecoded now takes the miss
+	// path and returns a pinned frame (no cached node) the caller must unpin. The page still
+	// reads back intact, proving the miss re-read real bytes rather than a stale frame.
+	d2, missFr, err := p.ViewDecoded(pgno)
+	if err != nil {
+		t.Fatalf("view decoded after eviction: %v", err)
+	}
+	if d2 != nil {
+		t.Fatalf("expected a decode miss after eviction, got cached node %v", d2)
+	}
+	if missFr == nil {
+		t.Fatalf("decode miss returned no frame to decode")
+	}
+	if !checkPattern(missFr.Data(), pgno) {
+		t.Fatalf("page %d came back corrupt on the decode-miss re-read", pgno)
+	}
+	p.Unpin(missFr, false)
+}
+
 // TestTruncateTailShrinksFile allocates a run of pages, frees the ones at the very end,
 // and confirms TruncateTail hands them back to the file (the page count and on-disk size
 // both fall), while a free page buried in the middle is left on the freelist (spec 09 §3.1).
