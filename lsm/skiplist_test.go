@@ -3,6 +3,7 @@ package lsm
 import (
 	"encoding/binary"
 	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/tamnd/kv/format"
@@ -46,8 +47,8 @@ func TestSkiplistInsertIsIdempotent(t *testing.T) {
 	sl := newSkiplist(256)
 	sl.insert(ik("k", 1), []byte("v"))
 	sl.insert(ik("k", 1), []byte("v"))
-	if sl.count != 1 {
-		t.Fatalf("count = %d after duplicate insert, want 1", sl.count)
+	if int(sl.count.Load()) != 1 {
+		t.Fatalf("count = %d after duplicate insert, want 1", sl.count.Load())
 	}
 	n := 0
 	for off := sl.first(); off != 0; off = sl.next(off) {
@@ -69,8 +70,8 @@ func TestSkiplistManyKeysStayOrdered(t *testing.T) {
 		k := (i * 2654435761) % n
 		sl.insert(ik(fmt.Sprintf("key%06d", k), 1), []byte("v"))
 	}
-	if sl.count != n {
-		t.Fatalf("count = %d, want %d", sl.count, n)
+	if int(sl.count.Load()) != n {
+		t.Fatalf("count = %d, want %d", sl.count.Load(), n)
 	}
 	var prev []byte
 	seen := 0
@@ -132,5 +133,80 @@ func TestArenaGrowthPreservesOffsets(t *testing.T) {
 	}
 	if a.bytesAt(0, 1)[0] != 0 {
 		t.Fatal("offset 0 sentinel was overwritten")
+	}
+}
+
+// TestSkiplistConcurrentInsert hammers the lock-free insert from many goroutines, each
+// owning a disjoint key range the way the parallel-apply path does (versions differ across
+// batches, so no two goroutines insert the same internal key), and confirms every key is
+// present exactly once, in order, and reachable by seek. Readers run alongside the writers
+// so the atomic forward-pointer loads are exercised against live inserts. It is the
+// load-bearing check for this slice and must pass under -race, which is what would catch a
+// torn link or a lost update in the CAS retry loop.
+func TestSkiplistConcurrentInsert(t *testing.T) {
+	sl := newSkiplist(1024)
+	const writers = 8
+	const perWriter = 4000
+	total := writers * perWriter
+
+	var wg sync.WaitGroup
+	// Writers: goroutine g inserts keys g, g+writers, g+2*writers, ... so the ranges are
+	// disjoint and interleave across the keyspace, stressing splices at every level.
+	for g := 0; g < writers; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < perWriter; i++ {
+				k := g + i*writers
+				sl.insert(ik(fmt.Sprintf("key%08d", k), 1), []byte(fmt.Sprintf("v%d", k)))
+			}
+		}(g)
+	}
+	// A reader that walks and seeks while the writers run, just to drive the atomic read
+	// path concurrently with inserts; it asserts nothing about completeness mid-flight, only
+	// that the structure never hands back an out-of-order or torn key.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for r := 0; r < 200; r++ {
+			var prev []byte
+			for off := sl.first(); off != 0; off = sl.next(off) {
+				key := sl.nodeKey(off)
+				if prev != nil && format.CompareInternal(prev, key) >= 0 {
+					t.Errorf("concurrent walk not ascending at %q after %q", key, prev)
+					return
+				}
+				prev = append([]byte(nil), key...)
+			}
+		}
+	}()
+	wg.Wait()
+
+	if got := int(sl.count.Load()); got != total {
+		t.Fatalf("count = %d, want %d", got, total)
+	}
+
+	// Every key present exactly once, in strict order.
+	seen := 0
+	var prev []byte
+	for off := sl.first(); off != 0; off = sl.next(off) {
+		key := sl.nodeKey(off)
+		if prev != nil && format.CompareInternal(prev, key) >= 0 {
+			t.Fatalf("final walk not strictly ascending at %q after %q", key, prev)
+		}
+		prev = append([]byte(nil), key...)
+		seen++
+	}
+	if seen != total {
+		t.Fatalf("final walk visited %d nodes, want %d", seen, total)
+	}
+
+	// Every key reachable by seek, landing on its own node.
+	for k := 0; k < total; k++ {
+		want := ik(fmt.Sprintf("key%08d", k), 1)
+		off := sl.seek(want)
+		if off == 0 || format.CompareInternal(sl.nodeKey(off), want) != 0 {
+			t.Fatalf("seek did not find key %d", k)
+		}
 	}
 }
