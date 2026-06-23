@@ -16,6 +16,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1189,9 +1190,18 @@ func (d *DB) oldestSnapshotAgeNanos() uint64 {
 }
 
 // defaultGCPagesPerCheckpoint is the per-Maintain call page budget the auto-GC step
-// uses after each background checkpoint. 512 pages = 2 MiB at the default 4 KiB page
-// size, a single GC batch that leaves the writer lock free between passes.
-const defaultGCPagesPerCheckpoint = 512
+// uses after each background checkpoint. Each Maintain call holds the writer latch
+// (d.rl) exclusive for the whole batch, and a point read takes that same latch shared,
+// so a fat batch is an exclusive window that bounds how long a read arriving mid-drain can
+// stall. At 512 pages (2 MiB) one Maintain call held the latch ~5ms on an M4 under overwrite
+// pressure (maxHold ~6.9ms, BenchmarkMaintainLatchHold), so a read that opened on a drain
+// window paid that. 64 pages (256 KiB) keeps each exclusive hold under ~1ms (mean ~0.65ms,
+// max ~1.05ms), a ~6.5x narrower worst case, and drainGC yields between batches so a blocked
+// reader acquires the latch in the gap instead of the drain re-locking immediately. This
+// bounds the worst-case read stall behind GC; it does not change read throughput or typical
+// latency, which the drain windows are too rare to touch. Total GC work is unchanged: the
+// drain still loops until the engine reports no more, just in narrower windows.
+const defaultGCPagesPerCheckpoint = 64
 
 // startCheckpointer launches the background passive-checkpoint worker when threshold
 // is positive. It is called once at the end of open, after every field the worker
@@ -1267,8 +1277,13 @@ func (d *DB) checkpointLoop() {
 }
 
 // drainGC runs Maintain in a loop until no more GC work is ready or Close signals the
-// worker to stop. Each call holds d.mu only for one bounded batch, so writers are not
-// locked out for longer than a single GC pass.
+// worker to stop. Each call holds the writer latch only for one bounded batch
+// (defaultGCPagesPerCheckpoint), so readers and writers are not locked out for longer
+// than a single GC pass. Between batches it yields the processor: Maintain releases the
+// latch at the end of each call, but without a yield this loop would re-acquire it
+// immediately and a reader blocked on the exclusive acquire would never see the gap. The
+// Gosched hands the scheduler the window to run those blocked readers before the next
+// exclusive batch (perf/12 F1).
 func (d *DB) drainGC() {
 	for {
 		select {
@@ -1280,6 +1295,7 @@ func (d *DB) drainGC() {
 		if err != nil || !rep.More {
 			return
 		}
+		runtime.Gosched()
 	}
 }
 
