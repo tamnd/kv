@@ -16,6 +16,7 @@ package wal
 
 import (
 	"encoding/binary"
+	"sync/atomic"
 
 	"github.com/tamnd/kv/crypto"
 	"github.com/tamnd/kv/format"
@@ -101,7 +102,7 @@ type WAL struct {
 	path string
 
 	pageSize int
-	syncMode Sync
+	syncMode atomic.Int32 // stores a Sync value; updated by SetSync
 
 	salt    uint64
 	lsn     uint64 // next LSN to assign
@@ -151,12 +152,12 @@ func Create(fs vfs.FS, path string, opts Options) (*WAL, error) {
 		file:     f,
 		path:     path,
 		pageSize: opts.PageSize,
-		syncMode: opts.Sync,
 		salt:     opts.Salt,
 		lsn:      1,
 		tailOff:  headerSize,
 		crypto:   opts.Encryption,
 	}
+	w.syncMode.Store(int32(opts.Sync))
 	if err := w.writeHeader(); err != nil {
 		f.Close()
 		return nil, err
@@ -212,13 +213,13 @@ func Open(fs vfs.FS, path string, opts Options) (*WAL, RecoverResult, error) {
 		file:     f,
 		path:     path,
 		pageSize: opts.PageSize,
-		syncMode: opts.Sync,
 		salt:     res.Salt,
 		lsn:      res.DurableLSN + 1,
 		lastSum:  res.DurableSum,
 		tailOff:  res.DurableEndOff,
 		crypto:   opts.Encryption,
 	}
+	w.syncMode.Store(int32(opts.Sync))
 	return w, res, nil
 }
 
@@ -448,11 +449,18 @@ func (w *WAL) Commit(version uint64) (uint64, error) {
 	return commitLSN, nil
 }
 
+// SetSync changes the WAL's sync level, taking effect on the next commit.
+// Safe to call concurrently with ongoing commits.
+func (w *WAL) SetSync(s Sync) { w.syncMode.Store(int32(s)) }
+
+// SyncMode returns the current sync level.
+func (w *WAL) SyncMode() Sync { return Sync(w.syncMode.Load()) }
+
 // sync flushes the WAL according to the configured level. A sync error is fatal
 // and non-retryable (fsyncgate, spec 07 §6): the caller must treat it as a failed
 // commit and stop writing until the database is reopened and recovered.
 func (w *WAL) sync() error {
-	switch w.syncMode {
+	switch Sync(w.syncMode.Load()) {
 	case SyncOff, SyncNormal:
 		// NORMAL defers the per-commit sync; durability is finalized at checkpoint.
 		return nil

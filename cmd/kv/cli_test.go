@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -908,3 +909,69 @@ func TestWatchPrefixBadEncoding(t *testing.T) {
 	}
 }
 
+// TestPragmaSynchronous reads and sets the WAL sync level through the pragma surface.
+func TestPragmaSynchronous(t *testing.T) {
+	p := dbPath(t)
+	// Initial level is full (the default).
+	got := strings.TrimSpace(capture(t, func() { run([]string{"pragma", p, "synchronous"}) }))
+	if got != "full" {
+		t.Fatalf("synchronous = %q, want full", got)
+	}
+	// Set to off and read back; result echoes the new name.
+	out := strings.TrimSpace(capture(t, func() {
+		if code := run([]string{"pragma", p, "synchronous=off"}); code != exitOK {
+			t.Fatalf("set synchronous=off: exit %d", code)
+		}
+	}))
+	if out != "off" {
+		t.Fatalf("set synchronous=off echoed %q, want off", out)
+	}
+	// All five names and numeric aliases are accepted.
+	for _, name := range []string{"normal", "barrier", "full", "extra"} {
+		expr := "synchronous=" + name
+		if code := run([]string{"pragma", p, expr}); code != exitOK {
+			t.Fatalf("pragma %s: exit %d", expr, code)
+		}
+	}
+	// A bad value must report a usage error, not an IO error.
+	if code := run([]string{"pragma", p, "synchronous=bogus"}); code != exitUsage {
+		t.Fatalf("synchronous=bogus: exit %d, want usage (%d)", code, exitUsage)
+	}
+}
+
+// TestPragmaWALAutoCheckpoint reads and sets the auto-checkpoint threshold.
+func TestPragmaWALAutoCheckpoint(t *testing.T) {
+	p := dbPath(t)
+	// Default is 1000 frames.
+	got := strings.TrimSpace(capture(t, func() { run([]string{"pragma", p, "wal_autocheckpoint"}) }))
+	if got != "1000" {
+		t.Fatalf("wal_autocheckpoint = %q, want 1000", got)
+	}
+	// Change threshold and confirm the echo.
+	out := strings.TrimSpace(capture(t, func() {
+		if code := run([]string{"pragma", p, "wal_autocheckpoint=500"}); code != exitOK {
+			t.Fatalf("set wal_autocheckpoint=500: exit %d", code)
+		}
+	}))
+	if out != "500" {
+		t.Fatalf("set wal_autocheckpoint=500 echoed %q, want 500", out)
+	}
+	// Bad value is a usage error.
+	if code := run([]string{"pragma", p, "wal_autocheckpoint=not-a-number"}); code != exitUsage {
+		t.Fatalf("wal_autocheckpoint=not-a-number: exit %d, want usage (%d)", code, exitUsage)
+	}
+}
+
+// TestPragmaCacheSize confirms cache_size reports the pool capacity and rejects writes.
+func TestPragmaCacheSize(t *testing.T) {
+	p := dbPath(t)
+	got := strings.TrimSpace(capture(t, func() { run([]string{"pragma", p, "cache_size"}) }))
+	n, err := strconv.Atoi(got)
+	if err != nil || n <= 0 {
+		t.Fatalf("cache_size = %q, want a positive integer", got)
+	}
+	// Writing it is a usage error (read-only pragma).
+	if code := run([]string{"pragma", p, "cache_size=100"}); code != exitUsage {
+		t.Fatalf("cache_size=100: exit %d, want usage (%d)", code, exitUsage)
+	}
+}

@@ -304,7 +304,6 @@ type DB struct {
 
 	merge           func(existing, operand []byte) []byte
 	maxRetries      int
-	syncMode        wal.Sync
 	isolation       Isolation
 	memtableSize    int
 	rangeIndex      bool
@@ -447,7 +446,7 @@ func create(fs vfs.FS, path string, opts Options) (*DB, error) {
 		return nil, err
 	}
 	d := &DB{fs: fs, path: path, pgr: pgr, wal: w, eng: eng, orc: newOracle(0), crypto: enc,
-		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, bufferedInserts: opts.BufferedInserts, compression: opts.compressionMode(), noAutoCompact: opts.disableAutoCompaction, fillFactor: opts.FillFactor, maxInlineValue: opts.MaxInlineValue, levelRatio: opts.LevelRatio, valueSepThresh: opts.ValueSepThreshold, now: opts.clock(), logger: opts.Logger, slowOp: opts.SlowOpThreshold, tracer: opts.Tracer, readReplica: opts.ReadReplica, archive: opts.WALArchive}
+		merge: opts.Merge, maxRetries: opts.maxRetries(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, bufferedInserts: opts.BufferedInserts, compression: opts.compressionMode(), noAutoCompact: opts.disableAutoCompaction, fillFactor: opts.FillFactor, maxInlineValue: opts.MaxInlineValue, levelRatio: opts.LevelRatio, valueSepThresh: opts.ValueSepThreshold, now: opts.clock(), logger: opts.Logger, slowOp: opts.SlowOpThreshold, tracer: opts.Tracer, readReplica: opts.ReadReplica, archive: opts.WALArchive}
 	d.ccond = sync.NewCond(&d.cmu)
 	if err := d.openEngine(opts.Merge); err != nil {
 		w.Close()
@@ -476,7 +475,7 @@ func openExisting(fs vfs.FS, path string, opts Options) (*DB, error) {
 		return nil, err
 	}
 	d := &DB{fs: fs, path: path, pgr: pgr, eng: eng, crypto: enc,
-		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, bufferedInserts: opts.BufferedInserts, compression: opts.compressionMode(), noAutoCompact: opts.disableAutoCompaction, fillFactor: opts.FillFactor, maxInlineValue: opts.MaxInlineValue, levelRatio: opts.LevelRatio, valueSepThresh: opts.ValueSepThreshold, now: opts.clock(), logger: opts.Logger, slowOp: opts.SlowOpThreshold, tracer: opts.Tracer, readReplica: opts.ReadReplica, archive: opts.WALArchive}
+		merge: opts.Merge, maxRetries: opts.maxRetries(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, bufferedInserts: opts.BufferedInserts, compression: opts.compressionMode(), noAutoCompact: opts.disableAutoCompaction, fillFactor: opts.FillFactor, maxInlineValue: opts.MaxInlineValue, levelRatio: opts.LevelRatio, valueSepThresh: opts.ValueSepThreshold, now: opts.clock(), logger: opts.Logger, slowOp: opts.SlowOpThreshold, tracer: opts.Tracer, readReplica: opts.ReadReplica, archive: opts.WALArchive}
 	d.ccond = sync.NewCond(&d.cmu)
 	if err := d.openEngine(opts.Merge); err != nil {
 		pgr.Close()
@@ -563,15 +562,15 @@ func (d *DB) openEngine(merge func(existing, operand []byte) []byte) error {
 		Pager: d.pgr,
 		Clock: engineWatermark{d},
 		Options: engine.EngineOptions{
-			PageSize:        d.pgr.PageSize(),
-			MemtableSize:    d.memtableSize,
-			RangeIndex:      d.rangeIndex,
-			Filter:          d.filter,
-			BufferedInserts: d.bufferedInserts,
-			CompressionMode: d.compression,
-			FillFactor:      d.fillFactor,
-			MaxInlineValue:  d.maxInlineValue,
-			LevelSizeRatio:  d.levelRatio,
+			PageSize:          d.pgr.PageSize(),
+			MemtableSize:      d.memtableSize,
+			RangeIndex:        d.rangeIndex,
+			Filter:            d.filter,
+			BufferedInserts:   d.bufferedInserts,
+			CompressionMode:   d.compression,
+			FillFactor:        d.fillFactor,
+			MaxInlineValue:    d.maxInlineValue,
+			LevelSizeRatio:    d.levelRatio,
 			ValueSepThreshold: d.valueSepThresh,
 
 			DisableAutoCompaction: d.noAutoCompact,
@@ -1080,6 +1079,34 @@ const defaultGCPagesPerCheckpoint = 512
 // non-positive threshold leaves all of the worker channels nil, which maybeCheckpoint
 // and Close both treat as "auto-checkpointing disabled" (spec 09 §1.3). When the
 // worker starts, it also arms the post-checkpoint auto-GC step unless gcPages is zero.
+// SyncMode returns the WAL's current sync level (spec 22 §3).
+func (d *DB) SyncMode() wal.Sync { return d.wal.SyncMode() }
+
+// SetSyncMode changes the WAL sync level, taking effect on the next commit (spec 22 §3).
+func (d *DB) SetSyncMode(s wal.Sync) { d.wal.SetSync(s) }
+
+// AutoCheckpointFrames returns the WAL backlog threshold at which the background
+// checkpointer fires, 0 when auto-checkpointing is disabled (spec 22 §3).
+func (d *DB) AutoCheckpointFrames() int {
+	d.mu.RLock()
+	t := d.ckptThreshold
+	d.mu.RUnlock()
+	return t
+}
+
+// SetAutoCheckpointFrames changes the background-checkpoint trigger threshold in WAL
+// frames. Zero or negative disables auto-checkpointing (spec 22 §3). The change takes
+// effect on the next commit; the background worker goroutine (if any) continues running.
+func (d *DB) SetAutoCheckpointFrames(n int) {
+	d.mu.Lock()
+	d.ckptThreshold = n
+	d.mu.Unlock()
+}
+
+// CacheFrames returns the buffer pool capacity in frames (pages). Multiply by PageSize
+// for bytes (spec 22 §5).
+func (d *DB) CacheFrames() int { return d.pgr.CacheFrames() }
+
 func (d *DB) startCheckpointer(threshold, gcPages int) {
 	if threshold <= 0 {
 		return

@@ -27,11 +27,10 @@ func usagePragma(format string, a ...any) error {
 //
 // kv's configuration model has three tiers (spec 22 §1): create-time settings fixed for the
 // file's life, persistent-runtime settings remembered in the file, and session settings
-// chosen per open. This registry exposes the knobs that have real backing state today: the
-// read-only informational counters, the two persistent header tags (application_id,
-// user_version), the create-time identity (engine, page_size) which read here but can only be
-// set at `kv create`, and the incremental_vacuum action. Knobs for unbuilt subsystems (LSM,
-// compression, encryption, server) are intentionally absent rather than stubbed.
+// chosen per open. This registry exposes: the runtime-settable knobs (synchronous,
+// wal_autocheckpoint), the read-only operational counters (cache_size, page_count, etc.),
+// the two persistent header tags (application_id, user_version), and the create-time
+// identity (engine, page_size) which read here but can only be set at `kv create`.
 type pragma struct {
 	name    string
 	summary string
@@ -124,6 +123,41 @@ func pragmas() []pragma {
 			get:     stat(func(s kv.Stats) string { return strconv.FormatUint(s.Syncs, 10) }),
 		},
 		{
+			name:    "synchronous",
+			summary: "WAL sync level: off|normal|barrier|full|extra (session)",
+			get:     func(d *kv.DB) (string, error) { return syncName(d.Synchronous()), nil },
+			set: func(d *kv.DB, val string) (string, error) {
+				s, ok := parseSyncLevel(val)
+				if !ok {
+					return "", usagePragma("synchronous wants off|normal|barrier|full|extra, got %q", val)
+				}
+				if err := d.SetSynchronous(s); err != nil {
+					return "", err
+				}
+				return syncName(s), nil
+			},
+		},
+		{
+			name:    "wal_autocheckpoint",
+			summary: "WAL backlog threshold in frames before auto-checkpoint; 0 disables (session)",
+			get:     func(d *kv.DB) (string, error) { return strconv.Itoa(d.AutoCheckpointFrames()), nil },
+			set: func(d *kv.DB, val string) (string, error) {
+				n, err := strconv.Atoi(strings.TrimSpace(val))
+				if err != nil {
+					return "", usagePragma("wal_autocheckpoint wants a frame count, got %q", val)
+				}
+				if err := d.SetAutoCheckpointFrames(n); err != nil {
+					return "", err
+				}
+				return strconv.Itoa(n), nil
+			},
+		},
+		{
+			name:    "cache_size",
+			summary: "buffer pool capacity in frames (read-only); multiply by page_size for bytes",
+			get:     func(d *kv.DB) (string, error) { return strconv.Itoa(d.CacheFrames()), nil },
+		},
+		{
 			name:    "wal_checkpoint",
 			summary: "checkpoint the WAL; value passive|full|restart|truncate selects the mode",
 			get: func(d *kv.DB) (string, error) {
@@ -166,6 +200,41 @@ func pragmas() []pragma {
 			},
 		},
 	}
+}
+
+// syncName maps a Sync value to its canonical lowercase name.
+func syncName(s kv.Sync) string {
+	switch s {
+	case kv.SyncOff:
+		return "off"
+	case kv.SyncNormal:
+		return "normal"
+	case kv.SyncBarrier:
+		return "barrier"
+	case kv.SyncFull:
+		return "full"
+	case kv.SyncExtra:
+		return "extra"
+	default:
+		return "unknown"
+	}
+}
+
+// parseSyncLevel converts an off|normal|barrier|full|extra string into the Sync constant.
+func parseSyncLevel(s string) (kv.Sync, bool) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "off", "0":
+		return kv.SyncOff, true
+	case "normal", "1":
+		return kv.SyncNormal, true
+	case "barrier", "2":
+		return kv.SyncBarrier, true
+	case "full", "3":
+		return kv.SyncFull, true
+	case "extra", "4":
+		return kv.SyncExtra, true
+	}
+	return 0, false
 }
 
 // setU32 adapts a uint32 header setter into a pragma set func, parsing decimal or 0x-hex.

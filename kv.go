@@ -51,6 +51,9 @@ const (
 	SyncOff = wal.SyncOff
 	// SyncNormal fdatasyncs at checkpoint and periodically, not every commit.
 	SyncNormal = wal.SyncNormal
+	// SyncBarrier issues a write-ordering barrier on every commit (F_BARRIERFSYNC on
+	// macOS, fdatasync on Linux); crash-durable but not power-loss-durable.
+	SyncBarrier = wal.SyncBarrier
 	// SyncFull fdatasyncs on every commit (group-batched); the safe default.
 	SyncFull = wal.SyncFull
 	// SyncExtra is SyncFull plus a directory sync on file growth.
@@ -728,6 +731,31 @@ func (kdb *DB) ApplyWALUntil(r io.Reader, target uint64) (uint64, error) {
 	v, err := kdb.d.ApplyWALUntil(r, target)
 	return v, wrap(err)
 }
+
+// Synchronous returns the WAL sync level in effect (spec 22 §3).
+func (kdb *DB) Synchronous() Sync { return Sync(kdb.d.SyncMode()) }
+
+// SetSynchronous changes the WAL sync level, taking effect on the next commit (spec 22 §3).
+// The change does not persist across reopen; set WithSynchronous at Open to make it sticky.
+func (kdb *DB) SetSynchronous(s Sync) error {
+	kdb.d.SetSyncMode(wal.Sync(s))
+	return nil
+}
+
+// AutoCheckpointFrames returns the WAL backlog threshold at which the background
+// checkpointer fires, 0 when auto-checkpointing is disabled (spec 22 §3).
+func (kdb *DB) AutoCheckpointFrames() int { return kdb.d.AutoCheckpointFrames() }
+
+// SetAutoCheckpointFrames changes the background-checkpoint trigger threshold in WAL
+// frames (spec 22 §3). Zero or negative disables auto-checkpointing.
+func (kdb *DB) SetAutoCheckpointFrames(n int) error {
+	kdb.d.SetAutoCheckpointFrames(n)
+	return nil
+}
+
+// CacheFrames returns the buffer pool capacity in frames (pages); multiply by
+// Stats().PageSize for the byte capacity (spec 22 §5).
+func (kdb *DB) CacheFrames() int { return kdb.d.CacheFrames() }
 
 // ApplicationID returns the application-defined file tag stored in the header (spec 22 §2),
 // the value an application stamps so a tool can recognize its own files. kv never interprets
