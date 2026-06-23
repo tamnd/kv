@@ -50,9 +50,17 @@ func (d *DB) submitCommit(req *commitReq) (uint64, error) {
 			d.ccond.Wait()
 			continue
 		}
-		// Become the leader for the next group: take everything queued so far and process
-		// it off cmu, so late arrivals queue behind us for the following group.
+		// Become the leader. Release cmu immediately so late arrivals can enqueue
+		// during the linger window before we drain and process the batch.
 		d.cleader = true
+		d.cmu.Unlock()
+
+		if us := d.lingerUs.Load(); us > 0 {
+			time.Sleep(time.Duration(us) * time.Microsecond)
+		}
+
+		// Drain everything that queued (original submitters + linger-window arrivals).
+		d.cmu.Lock()
 		group := d.cqueue
 		d.cqueue = nil
 		d.cmu.Unlock()

@@ -390,6 +390,25 @@ type DB struct {
 	ckptErrMu sync.Mutex
 	ckptErr   error
 
+	// fullPageWrites controls whether the checkpoint path logs a full pre-image of each
+	// dirty page to the WAL before overwriting it on disk (spec 07 §5). When true (the
+	// default), recovery can restore partially-written pages after an interrupted
+	// checkpoint. Set to false only on storage that guarantees atomic 4 KiB writes.
+	// Reads and writes under d.mu; persisted in the file header's FullPageWritesOff field.
+	fullPageWrites bool
+
+	// autoVacuumMode controls automatic space reclamation (spec 09 §3.3). 0=NONE (off),
+	// 1=INCREMENTAL (truncate trailing free pages after each checkpoint),
+	// 2=FULL (same as INCREMENTAL for now; pointer-map optimization is future work).
+	// Reads and writes under d.mu; persisted in the file header's AutoVacuumMode field.
+	autoVacuumMode uint8
+
+	// commitLingerUs is the maximum microseconds the group-commit leader waits for
+	// additional committers to join the group before flushing (spec 07 §4). 0=no explicit
+	// delay (adaptive, the existing behaviour). Writes to lingerUs are atomic; the zero
+	// value is a correct default even on first open before the header is loaded.
+	lingerUs atomic.Uint32
+
 	// Change-feed subscribers (spec 15 §7). publish enqueues each committed batch's
 	// matching mutations onto every registered subscription's buffered channel under
 	// subsMu; the Subscribe caller drains it. subClosed is closed on Close to wake any
@@ -445,9 +464,15 @@ func create(fs vfs.FS, path string, opts Options) (*DB, error) {
 		pgr.Close()
 		return nil, err
 	}
+	chdr := pgr.Header()
 	d := &DB{fs: fs, path: path, pgr: pgr, wal: w, eng: eng, orc: newOracle(0), crypto: enc,
-		merge: opts.Merge, maxRetries: opts.maxRetries(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, bufferedInserts: opts.BufferedInserts, compression: opts.compressionMode(), noAutoCompact: opts.disableAutoCompaction, fillFactor: opts.FillFactor, maxInlineValue: opts.MaxInlineValue, levelRatio: opts.LevelRatio, valueSepThresh: opts.ValueSepThreshold, now: opts.clock(), logger: opts.Logger, slowOp: opts.SlowOpThreshold, tracer: opts.Tracer, readReplica: opts.ReadReplica, archive: opts.WALArchive}
+		merge: opts.Merge, maxRetries: opts.maxRetries(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, bufferedInserts: opts.BufferedInserts, compression: opts.compressionMode(), noAutoCompact: opts.disableAutoCompaction, fillFactor: opts.FillFactor, maxInlineValue: opts.MaxInlineValue, levelRatio: opts.LevelRatio, valueSepThresh: opts.ValueSepThreshold, now: opts.clock(), logger: opts.Logger, slowOp: opts.SlowOpThreshold, tracer: opts.Tracer, readReplica: opts.ReadReplica, archive: opts.WALArchive,
+		fullPageWrites: chdr.FullPageWritesOff == 0,
+		autoVacuumMode: chdr.AutoVacuumMode,
+	}
 	d.ccond = sync.NewCond(&d.cmu)
+	d.lingerUs.Store(chdr.CommitLingerUs)
+	d.syncPageImageLogger()
 	if err := d.openEngine(opts.Merge); err != nil {
 		w.Close()
 		pgr.Close()
@@ -474,9 +499,14 @@ func openExisting(fs vfs.FS, path string, opts Options) (*DB, error) {
 		pgr.Close()
 		return nil, err
 	}
+	hdr := pgr.Header()
 	d := &DB{fs: fs, path: path, pgr: pgr, eng: eng, crypto: enc,
-		merge: opts.Merge, maxRetries: opts.maxRetries(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, bufferedInserts: opts.BufferedInserts, compression: opts.compressionMode(), noAutoCompact: opts.disableAutoCompaction, fillFactor: opts.FillFactor, maxInlineValue: opts.MaxInlineValue, levelRatio: opts.LevelRatio, valueSepThresh: opts.ValueSepThreshold, now: opts.clock(), logger: opts.Logger, slowOp: opts.SlowOpThreshold, tracer: opts.Tracer, readReplica: opts.ReadReplica, archive: opts.WALArchive}
+		merge: opts.Merge, maxRetries: opts.maxRetries(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, bufferedInserts: opts.BufferedInserts, compression: opts.compressionMode(), noAutoCompact: opts.disableAutoCompaction, fillFactor: opts.FillFactor, maxInlineValue: opts.MaxInlineValue, levelRatio: opts.LevelRatio, valueSepThresh: opts.ValueSepThreshold, now: opts.clock(), logger: opts.Logger, slowOp: opts.SlowOpThreshold, tracer: opts.Tracer, readReplica: opts.ReadReplica, archive: opts.WALArchive,
+		fullPageWrites: hdr.FullPageWritesOff == 0,
+		autoVacuumMode: hdr.AutoVacuumMode,
+	}
 	d.ccond = sync.NewCond(&d.cmu)
+	d.lingerUs.Store(hdr.CommitLingerUs)
 	if err := d.openEngine(opts.Merge); err != nil {
 		pgr.Close()
 		return nil, err
@@ -502,6 +532,17 @@ func openExisting(fs vfs.FS, path string, opts Options) (*DB, error) {
 		// checkpoint marker sits at the folded LSN. Resume past that marker so the next
 		// commit lands above it and redo on a later open keeps it (spec 08 §5).
 		d.wal.ResumeFrom(d.pgr.CheckpointLSN() + 1)
+		// If the WAL scan recovered any page pre-images, restore corrupt pages from them
+		// before replaying kv batches. This heals an interrupted checkpoint: pages the
+		// checkpoint started writing but did not finish are restored to their pre-write
+		// state, so redo can traverse the B-tree correctly (spec 07 §5).
+		if len(rec.PageImages) > 0 {
+			if err := d.pgr.RestorePageImages(rec.PageImages); err != nil {
+				w.Close()
+				pgr.Close()
+				return nil, err
+			}
+		}
 		// Count the committed batches recovery is about to replay before redo consumes
 		// them, so the recovery log can report exactly what was replayed and whether a
 		// torn tail was discarded.
@@ -520,6 +561,9 @@ func openExisting(fs vfs.FS, path string, opts Options) (*DB, error) {
 		}
 		d.wal = w
 	}
+
+	// Wire the full-page-write logger now that both d.wal and d.pgr are ready.
+	d.syncPageImageLogger()
 
 	if err := d.eng.RecoverFinished(maxVer); err != nil {
 		d.wal.Close()
@@ -1276,6 +1320,7 @@ func (d *DB) CheckpointMode(m CheckpointMode) error {
 	if err := d.finalizeCheckpointLocked(foldedLSN, resetWAL); err != nil {
 		return err
 	}
+	d.runAutoVacuumLocked()
 	if m == CheckpointTruncate {
 		// Truncating returns the -wal frame space to the OS, which is safe only when
 		// finalizeCheckpointLocked reset the log. When the engine lags (an unflushed
@@ -1362,7 +1407,11 @@ func (d *DB) checkpointLocked() error {
 	if err := d.pgr.Checkpoint(foldedLSN, lastCommitVersion); err != nil {
 		return err
 	}
-	return d.finalizeCheckpointLocked(foldedLSN, resetWAL)
+	if err := d.finalizeCheckpointLocked(foldedLSN, resetWAL); err != nil {
+		return err
+	}
+	d.runAutoVacuumLocked()
+	return nil
 }
 
 // archiveGeneration hands the current WAL generation's committed image to the archive
@@ -1436,6 +1485,20 @@ func (d *DB) ApplicationID() uint32 {
 	return d.pgr.Header().ApplicationID
 }
 
+func (d *DB) FullPageWrites() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.fullPageWrites
+}
+
+func (d *DB) AutoVacuumMode() uint8 {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.autoVacuumMode
+}
+
+func (d *DB) CommitLingerUs() uint32 { return d.lingerUs.Load() }
+
 // SetApplicationID records an application-defined file tag in the header and persists it
 // durably (spec 22 §2). It is a persistent-runtime setting: the value survives reopen. The
 // change is folded into the main file by a checkpoint, which writes a coherent image (header
@@ -1463,6 +1526,77 @@ func (d *DB) SetUserVersion(v uint32) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.pgr.Header().UserVersion = v
+	return d.checkpointLocked()
+}
+
+// syncPageImageLogger installs or clears the page-image callback on the pager
+// based on the current d.fullPageWrites value. Called at open time and whenever
+// SetFullPageWrites changes the setting. The caller must ensure d.wal is valid.
+func (d *DB) syncPageImageLogger() {
+	if d.fullPageWrites {
+		d.pgr.SetPageImageLogger(d.wal.LogPageImage, d.wal.Flush)
+	} else {
+		d.pgr.SetPageImageLogger(nil, nil)
+	}
+}
+
+// runAutoVacuumLocked reclaims trailing free pages after a checkpoint when
+// auto_vacuum is enabled (spec 09 §3.3). It is a best-effort call: errors are
+// logged but do not fail the checkpoint that triggered it. The caller holds d.mu.
+func (d *DB) runAutoVacuumLocked() {
+	if d.autoVacuumMode == 0 {
+		return
+	}
+	if _, err := d.pgr.TruncateTail(0); err != nil && d.logger != nil {
+		d.logger.Info("auto_vacuum truncate failed", "err", err)
+	}
+}
+
+// SetFullPageWrites enables or disables pre-image logging during checkpoints
+// (spec 07 §5). When on (the default), the checkpoint logs each page's on-disk
+// pre-image to the WAL before overwriting it; recovery uses these images to
+// restore any page left corrupt by an interrupted checkpoint. Disabling trades
+// that safety for lower checkpoint write amplification.
+//
+// The change takes effect immediately on the next checkpoint; it is persisted in
+// the file header so it survives re-open.
+func (d *DB) SetFullPageWrites(on bool) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.fullPageWrites = on
+	if on {
+		d.pgr.Header().FullPageWritesOff = 0
+	} else {
+		d.pgr.Header().FullPageWritesOff = 1
+	}
+	d.syncPageImageLogger()
+	return d.checkpointLocked()
+}
+
+// SetAutoVacuumMode sets the automatic space-reclamation policy (spec 09 §3.3).
+// 0 = NONE (off), 1 = INCREMENTAL, 2 = FULL. Both non-zero modes call
+// TruncateTail(0) after every checkpoint. The mode is persisted in the file
+// header so it survives re-open.
+func (d *DB) SetAutoVacuumMode(mode uint8) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if mode > 2 {
+		return fmt.Errorf("kv: invalid auto_vacuum mode %d", mode)
+	}
+	d.autoVacuumMode = mode
+	d.pgr.Header().AutoVacuumMode = mode
+	return d.checkpointLocked()
+}
+
+// SetCommitLingerUs sets the maximum microsecond delay a group-commit leader
+// waits for additional writers before flushing the batch (spec 07 §4). A value
+// of 0 disables the linger window (the current default). The change is
+// immediately visible to the commit path and is persisted in the file header.
+func (d *DB) SetCommitLingerUs(us uint32) error {
+	d.lingerUs.Store(us)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.pgr.Header().CommitLingerUs = us
 	return d.checkpointLocked()
 }
 

@@ -85,6 +85,25 @@ type Header struct {
 	// lives in the header's reserved headroom; an older reader that does not know
 	// the field simply ignores it.
 	LastCommitVersion uint64 // offset 100
+
+	// AutoVacuumMode controls automatic space reclamation after checkpoints
+	// (spec 22 §2, spec 09 §3.3). 0=NONE (default), 1=INCREMENTAL, 2=FULL.
+	// INCREMENTAL and FULL both run TruncateTail after each checkpoint; the
+	// distinction only matters once pointer-map pages are added in a future
+	// milestone.
+	AutoVacuumMode uint8 // offset 108
+
+	// FullPageWritesOff disables full-page image logging during checkpoint
+	// (spec 22 §2, spec 07 §5). 0=full-page writes ON (default, safe for all
+	// storage); 1=OFF (only safe on storage that guarantees atomic page writes).
+	// Inverted so the zero value is the safe default.
+	FullPageWritesOff uint8 // offset 109
+
+	// CommitLingerUs is the maximum microseconds the group-commit leader waits
+	// for additional committers to join the group before flushing (spec 22 §2,
+	// spec 07 §4). 0=adaptive (default; no explicit delay, batch whatever is
+	// already queued). Persistent so the DBA can tune it without a code change.
+	CommitLingerUs uint32 // offset 110
 }
 
 // Encode writes the header into the first 128 bytes of page, zeroing reserved
@@ -118,6 +137,9 @@ func (h *Header) Encode(page []byte) {
 	binary.BigEndian.PutUint32(page[92:96], h.VersionValidFor)
 	binary.BigEndian.PutUint32(page[96:100], h.WriterVersionNum)
 	binary.BigEndian.PutUint64(page[100:108], h.LastCommitVersion)
+	page[108] = h.AutoVacuumMode
+	page[109] = h.FullPageWritesOff
+	binary.BigEndian.PutUint32(page[110:114], h.CommitLingerUs)
 }
 
 // ErrBadMagic means the file does not begin with the kv magic string.
@@ -167,6 +189,9 @@ func DecodeHeader(page []byte) (*Header, error) {
 		VersionValidFor:   binary.BigEndian.Uint32(page[92:96]),
 		WriterVersionNum:  binary.BigEndian.Uint32(page[96:100]),
 		LastCommitVersion: binary.BigEndian.Uint64(page[100:108]),
+		AutoVacuumMode:    page[108],
+		FullPageWritesOff: page[109],
+		CommitLingerUs:    binary.BigEndian.Uint32(page[110:114]),
 	}
 	return h, nil
 }

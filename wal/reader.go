@@ -25,6 +25,10 @@ type CommittedBatch struct {
 type RecoverResult struct {
 	// Batches are the committed kv-batches in LSN order, ready to replay.
 	Batches []CommittedBatch
+	// PageImages maps pgno to the most recent pre-image logged during an
+	// interrupted checkpoint. Recovery uses these to restore pages whose on-disk
+	// checksum is invalid before replaying kv batches on top.
+	PageImages map[uint32][]byte
 	// LastCheckpointLSN is the highest foldedLSN recorded by a durable checkpoint
 	// frame, or 0 if none. Frames at or before it are already in the main file.
 	LastCheckpointLSN uint64
@@ -138,7 +142,17 @@ func Recover(readAt func(p []byte, off int64) (int, error), size int64) (Recover
 			// frames after it belong to the next generation and will mismatch this
 			// salt, naturally ending the walk.
 		case FramePageImage:
-			// Reserved; ignored by the logical redo path in this milestone.
+			// A full physical page pre-image logged before a checkpoint overwrote the
+			// page on disk. Recovery uses it to restore pages with invalid checksums so
+			// the logical redo path can then replay kv batches on top (spec 07 §5).
+			if len(payload) >= 4+1 {
+				pgno := binary.BigEndian.Uint32(payload[:4])
+				img := append([]byte(nil), payload[4:]...)
+				if res.PageImages == nil {
+					res.PageImages = make(map[uint32][]byte)
+				}
+				res.PageImages[pgno] = img
+			}
 		}
 
 		prevSum = sum

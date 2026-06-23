@@ -435,6 +435,18 @@ func (w *WAL) AppendCommit(version uint64) (uint64, error) {
 // fsync instead of paying N in series.
 func (w *WAL) Sync() error { return w.sync() }
 
+// LogPageImage appends a FramePageImage record for pgno carrying the page's current
+// on-disk content. The checkpoint path calls this before overwriting each page so that
+// recovery can restore the pre-image if a crash leaves the main file in a mixed state
+// (spec 07 §5, full_page_writes). The frame is written immediately; no commit is needed
+// and it does not advance the commit LSN.
+func (w *WAL) LogPageImage(pgno uint32, data []byte) error {
+	payload := make([]byte, 4+len(data))
+	binary.BigEndian.PutUint32(payload[:4], pgno)
+	copy(payload[4:], data)
+	return w.appendFrame(FramePageImage, 0, payload)
+}
+
 // Commit appends a commit frame for version and flushes per the sync level, the serial
 // single-committer path the replica-apply stream uses (the foreground commit path batches
 // these two halves across a group). The returned LSN is the commit frame's LSN.

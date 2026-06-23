@@ -178,6 +178,63 @@ func pragmas() []pragma {
 			},
 		},
 		{
+			name:    "full_page_writes",
+			summary: "log page pre-images before checkpoint overwrites (on|off, default on)",
+			get: func(d *kv.DB) (string, error) {
+				if d.FullPageWrites() {
+					return "on", nil
+				}
+				return "off", nil
+			},
+			set: func(d *kv.DB, val string) (string, error) {
+				switch strings.ToLower(strings.TrimSpace(val)) {
+				case "on", "1", "true":
+					return "on", d.SetFullPageWrites(true)
+				case "off", "0", "false":
+					return "off", d.SetFullPageWrites(false)
+				default:
+					return "", usagePragma("full_page_writes wants on|off, got %q", val)
+				}
+			},
+		},
+		{
+			name:    "auto_vacuum",
+			summary: "automatic space reclamation after checkpoint (none|incremental|full)",
+			get: func(d *kv.DB) (string, error) {
+				switch d.AutoVacuumMode() {
+				case 1:
+					return "incremental", nil
+				case 2:
+					return "full", nil
+				default:
+					return "none", nil
+				}
+			},
+			set: func(d *kv.DB, val string) (string, error) {
+				var mode uint8
+				switch strings.ToLower(strings.TrimSpace(val)) {
+				case "none", "0":
+					mode = 0
+				case "incremental", "1":
+					mode = 1
+				case "full", "2":
+					mode = 2
+				default:
+					return "", usagePragma("auto_vacuum wants none|incremental|full, got %q", val)
+				}
+				if err := d.SetAutoVacuumMode(mode); err != nil {
+					return "", err
+				}
+				return val, nil
+			},
+		},
+		{
+			name:    "commit_linger_us",
+			summary: "group-commit leader wait window in microseconds (0 = disabled)",
+			get:     func(d *kv.DB) (string, error) { return strconv.FormatUint(uint64(d.CommitLingerUs()), 10), nil },
+			set:     setU32(func(d *kv.DB, v uint32) error { return d.SetCommitLingerUs(v) }),
+		},
+		{
 			name:    "incremental_vacuum",
 			summary: "return up to N trailing free pages to the OS; 0 or empty means all",
 			get: func(d *kv.DB) (string, error) {
