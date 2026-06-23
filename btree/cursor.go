@@ -30,7 +30,14 @@ type reader struct {
 // descent: a pending write that has not yet reached its leaf is just a newer version
 // of the group, which resolveStream folds in the same fold (spec 05 §4).
 func (r *reader) Get(userKey []byte) ([]byte, error) {
-	group, err := r.t.gatherPoint(userKey)
+	// Back the version group with a small array in this frame so the overwhelmingly
+	// common case (a key with a handful of versions and buffered messages) gathers
+	// without touching the heap. gatherPoint appends into it and only spills to a heap
+	// grow for a pathologically deep version chain. The array stays on Get's stack: the
+	// group flows through resolveStream, which copies what it keeps and never retains the
+	// slice, so it does not escape (spec 01 Finding 2, perf/09 N3).
+	var scratch [8]entry
+	group, err := r.t.gatherPoint(userKey, scratch[:0])
 	if err != nil {
 		return nil, err
 	}
@@ -52,9 +59,10 @@ func (r *reader) Get(userKey []byte) ([]byte, error) {
 // down, in Bε mode, it picks up any buffered messages for the key from the interior
 // nodes on the path, then sorts the combined group so resolveStream sees one ordered
 // version list. With buffering off the interiors carry no messages and this collapses
-// to the single-leaf scan it replaces.
-func (t *BTree) gatherPoint(userKey []byte) ([]entry, error) {
-	var group []entry
+// to the single-leaf scan it replaces. group is a caller-supplied zero-length scratch
+// slice the versions are appended into, so the common shallow group is gathered without
+// a heap allocation; it grows on its own only for an unusually deep chain.
+func (t *BTree) gatherPoint(userKey []byte, group []entry) ([]entry, error) {
 	pgno := t.root()
 	for {
 		typ, l, in, err := t.viewNode(pgno)
@@ -85,10 +93,18 @@ func (t *BTree) gatherPoint(userKey []byte) ([]entry, error) {
 		}
 		pgno = in.children[in.childFor(userKey)]
 	}
-	if len(group) > 1 {
-		sort.Slice(group, func(i, j int) bool {
-			return format.CompareInternal(group[i].ik, group[j].ik) < 0
-		})
+	// Sort the combined group by internal key. A version group is small (a few versions
+	// plus any buffered messages on the path), so an in-place insertion sort beats
+	// sort.Slice here and, unlike sort.Slice, captures nothing in an escaping closure, so
+	// the caller's scratch backing array stays on the stack (perf/09 N3).
+	for i := 1; i < len(group); i++ {
+		e := group[i]
+		j := i - 1
+		for j >= 0 && format.CompareInternal(group[j].ik, e.ik) > 0 {
+			group[j+1] = group[j]
+			j--
+		}
+		group[j+1] = e
 	}
 	return group, nil
 }
