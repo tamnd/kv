@@ -802,7 +802,7 @@ func (d *DB) snapshotGet(version uint64, key []byte) ([]byte, bool, error) {
 	defer endSpan(span)
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	rd, err := d.eng.NewReader(engine.Snapshot{Version: version, Now: d.now()})
+	rd, err := d.eng.NewReader(engine.Snapshot{Version: version, Clock: d.now})
 	if err != nil {
 		return nil, false, err
 	}
@@ -828,7 +828,7 @@ func (d *DB) Version() uint64 {
 // lifetime; for snapshot-isolated reads prefer View/Begin, which manage the
 // snapshot and its watermark registration.
 func (d *DB) NewReader(version uint64) (engine.Reader, error) {
-	return d.eng.NewReader(engine.Snapshot{Version: version, Now: d.now()})
+	return d.eng.NewReader(engine.Snapshot{Version: version, Clock: d.now})
 }
 
 // Get reads userKey at the latest committed snapshot, a convenience over a View

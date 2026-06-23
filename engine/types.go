@@ -1,6 +1,10 @@
 package engine
 
-import "errors"
+import (
+	"errors"
+
+	"github.com/tamnd/kv/format"
+)
 
 // Snapshot is a consistent read version. A reader created at a snapshot sees the
 // newest committed version of each key that is <= Version (spec 10). It is a
@@ -13,6 +17,50 @@ type Snapshot struct {
 	// disables expiry, so a read with no clock, and GC, never expire a value the
 	// background sweep has not yet removed.
 	Now uint64
+	// Clock, when set, is a deferred wall clock the read path consults only after a fold
+	// first meets a TTL cell, instead of reading Now eagerly for every read (perf/01 F6).
+	// Nearly all keys carry no TTL, so a fold that never touches a TTL cell never calls
+	// Clock and pays no clock read at all. A fold that does meet one reads Clock once and
+	// caches the result for the rest of that fold through TTLClock. Clock takes precedence
+	// over Now when both are set; a fixed-time caller (GC, compaction, the model) leaves
+	// Clock nil and the fold uses the pinned Now.
+	Clock func() uint64
+}
+
+// TTLClock returns a per-fold resolver for the wall clock TTL expiry is tested against.
+// It defers reading Snapshot.Clock until For first sees a KindSetWithTTL cell and caches
+// it from then on, so a fold over keys that carry no TTL, which is almost every read,
+// never reads the clock (perf/01 F6). With Clock nil it always returns the pinned Now,
+// the behavior GC, compaction, and the model rely on. A TTLClock is single-fold state and
+// must not be shared across goroutines.
+func (s Snapshot) TTLClock() TTLClock {
+	return TTLClock{clock: s.Clock, fixed: s.Now}
+}
+
+// TTLClock resolves the TTL wall clock lazily within one fold. See Snapshot.TTLClock.
+type TTLClock struct {
+	clock    func() uint64
+	fixed    uint64
+	resolved bool
+	now      uint64
+}
+
+// For returns the wall clock to evaluate a cell of the given kind against. A non-TTL cell
+// needs no clock and returns zero without consulting it; a TTL cell reads the deferred
+// Clock once and reuses it for the rest of the fold. With no deferred Clock it returns the
+// pinned Now for every kind, matching the eager behavior fixed-time callers expect.
+func (c *TTLClock) For(kind format.Kind) uint64 {
+	if c.clock == nil {
+		return c.fixed
+	}
+	if kind != format.KindSetWithTTL {
+		return 0
+	}
+	if !c.resolved {
+		c.now = c.clock()
+		c.resolved = true
+	}
+	return c.now
 }
 
 // IterOptions controls a range scan (spec 11). All keys are user keys.

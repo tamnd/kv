@@ -64,8 +64,9 @@ func (o *Oracle) Apply(batch *WriteBatch, commitVersion uint64) {
 func (o *Oracle) Get(userKey []byte, snap Snapshot) ([]byte, bool) {
 	vers := o.versions[string(userKey)]
 	ops := make([]format.Op, 0, len(vers))
+	tc := snap.TTLClock()
 	for _, ver := range vers {
-		op, ok := format.OpFromParts(ver.version, ver.kind, ver.value, snap.Now)
+		op, ok := format.OpFromParts(ver.version, ver.kind, ver.value, tc.For(ver.kind))
 		if !ok {
 			continue // range markers resolve through rangeDels, not as ops
 		}
