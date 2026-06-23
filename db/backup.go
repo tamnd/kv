@@ -86,8 +86,8 @@ func decodeBackupHeader(b []byte) (backupHeader, error) {
 // (spec 18 §7). Backing the key up separately is mandatory: without it the backup is
 // unrecoverable.
 func (d *DB) Backup(w io.Writer) (uint64, error) {
-	d.rl.lock()
-	defer d.rl.unlock()
+	d.rl.Lock()
+	defer d.rl.Unlock()
 	if d.fatal != nil {
 		return 0, d.fatal
 	}

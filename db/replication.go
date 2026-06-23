@@ -84,8 +84,8 @@ func decodeShipHeader(b []byte) (shipHeader, error) {
 // the shipping stream is encrypted at rest exactly like a physical backup (spec 18 §7);
 // the follower needs the same key.
 func (d *DB) ShipWAL(w io.Writer) (uint64, error) {
-	d.rl.lock()
-	defer d.rl.unlock()
+	d.rl.Lock()
+	defer d.rl.Unlock()
 	if d.fatal != nil {
 		return 0, d.fatal
 	}
@@ -154,8 +154,8 @@ func (d *DB) ApplyWALUntil(r io.Reader, target uint64) (uint64, error) {
 // and replays every committed batch whose version is past the follower's applied version
 // and at or below target, in order. target is ^uint64(0) for the unbounded ApplyWAL.
 func (d *DB) applyWAL(r io.Reader, target uint64) (uint64, error) {
-	d.rl.lock()
-	defer d.rl.unlock()
+	d.rl.Lock()
+	defer d.rl.Unlock()
 	if d.fatal != nil {
 		return 0, d.fatal
 	}
