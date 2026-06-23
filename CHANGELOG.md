@@ -5,12 +5,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [1.0.0] — 2026-06-23
+## [0.1.0] — 2026-06-23
 
-First stable release. The public API of the `kv` package is frozen from this point. A
-file written by v1.0.0 can be opened by any future v1.x release.
+First public release. The library, CLI, and server are feature-complete and the on-disk
+format is fixed. The 0.x series keeps the API broadly stable while the surface settles
+toward a 1.0 commitment; the file format written by 0.1.0 is forward-compatible.
 
-### M8 — Hardening and 1.0
+This first release lands the full M0–M8 build: the two-engine core, MVCC transactions,
+the WAL and crash recovery, the CLI, the HTTP/binary server, encryption, replication,
+and the hardening campaign that closed it out. The sections below summarize each
+milestone that shipped into this release.
+
+### M8 — Hardening
 
 - File-format fuzzing: feeds mutated `.kv` bytes through `Open` via a mem-VFS.
   Found and fixed a real B-tree decoder panic on type-confused pages (bounds-checked
@@ -40,10 +46,13 @@ file written by v1.0.0 can be opened by any future v1.x release.
   `WithColdCompression`, `WithFilter`, `WithRangeIndex`, `WithValueSeparation`.
 - Runtime PRAGMAs: `synchronous`, `wal_autocheckpoint`, `cache_size` (live, no reopen).
 - Benchmark acceptance results updated to reflect Phase 3 perf campaign.
-- `kv.Version = "1.0.0"` added to the public package.
+- `kv.Version` constant added to the public package.
 - Comprehensive README: quick start, full API reference, engine guide, durability table,
   isolation table, encryption, replication, server, CLI, pragma examples, configuration
-  reference, error types, performance notes, and v1.0 stability statement.
+  reference, error types, performance notes, and the stability statement.
+- Documentation site at [kv.tamnd.com](https://kv.tamnd.com): getting-started, guides,
+  and the full reference, built with the tago-doks theme and deployed to Cloudflare Pages
+  and GitHub Pages.
 
 ### M7 — Server (v0.9)
 
