@@ -207,17 +207,16 @@ func (d *DB) applyDurable(r *commitReq, durable time.Duration) {
 			d.logSlowCommit(r.b, r.v, durable, apply, total)
 		}
 	}
-	d.pgr.Header().LastCommitVersion = r.v
 	d.publish(r.b, r.v)
 	d.orc.applied(r.v)
 	r.succeed(r.v)
 }
 
 // publishApplied makes a batch visible after the engine has already applied it as part of a
-// parallel group apply: it records the commit, spans, and slow-op log, advances the durable
-// header version, fans the batch to subscribers, marks its version applied in the oracle, and
-// returns the result. The caller runs it serially in version order, so the oracle's applied
-// mark and the subscription feed advance monotonically even though the inserts ran out of order.
+// parallel group apply: it records the commit, spans, and slow-op log, fans the batch to
+// subscribers, marks its version applied in the oracle, and returns the result. The caller runs
+// it serially in version order so the oracle's applied mark and the subscription feed advance
+// monotonically even though the inserts ran out of order.
 // durable is the group's shared fsync latency and apply is the group's shared engine latency,
 // both attributed to each batch since both costs were genuinely shared across the group.
 func (d *DB) publishApplied(r *commitReq, durable, apply time.Duration) {
@@ -238,7 +237,10 @@ func (d *DB) publishApplied(r *commitReq, durable, apply time.Duration) {
 			d.logSlowCommit(r.b, r.v, durable, apply, total)
 		}
 	}
-	d.pgr.Header().LastCommitVersion = r.v
+	// NOTE: header.LastCommitVersion is NOT updated here. It is set once at checkpoint time
+	// by pgr.Checkpoint (under the pager's own locks), which captures the oracle's committed
+	// version via prepareCheckpointLocked (under d.mu). Updating it here would race with the
+	// lock-free checkpoint I/O path (perf/02 F5).
 	d.publish(r.b, r.v)
 	d.orc.applied(r.v)
 	r.succeed(r.v)

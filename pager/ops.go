@@ -391,7 +391,12 @@ func (p *Pager) lockAllShards() func() {
 // header, and fsyncs. After it returns, the main file is a consistent image of
 // all committed work and contains no torn pages. checkpointLSN is recorded in the
 // header so recovery knows which WAL frames precede this checkpoint.
-func (p *Pager) Checkpoint(checkpointLSN uint64) error {
+// Checkpoint writes all dirty frames back to the main file, updates the header, and
+// fsyncs. lastCommitVersion is the oracle's committed version at the moment the
+// checkpoint was prepared (under d.mu in the host); setting it here, under the pager's
+// own shard and meta locks, avoids a data race with the commit path that also updates
+// LastCommitVersion under d.mu, a lock independent of the pager's own locks.
+func (p *Pager) Checkpoint(checkpointLSN, lastCommitVersion uint64) error {
 	// Exclude any external page producer (the LSM background flusher) for the duration: it
 	// writes frame buffers without the host write lock a checkpoint relies on, so without
 	// this gate the writeBack below could read a frame the flusher is still filling.
@@ -415,10 +420,14 @@ func (p *Pager) Checkpoint(checkpointLSN uint64) error {
 	if err := p.persistFreelistLocked(); err != nil {
 		return err
 	}
-	// Update and write the header page.
+	// Update and write the header page. LastCommitVersion is stamped here (not by the
+	// caller) so that the CheckpointMode lock-free path does not need to update the
+	// shared header field before releasing d.mu — which would race with concurrent
+	// commits that also write it under d.mu.
 	p.header.DBSize = p.dbSize
 	p.header.HighWaterMark = p.dbSize
 	p.header.CheckpointLSN = checkpointLSN
+	p.header.LastCommitVersion = lastCommitVersion
 	p.header.ChangeCounter++
 	p.header.VersionValidFor = p.header.ChangeCounter
 	if err := p.flushHeaderLocked(); err != nil {

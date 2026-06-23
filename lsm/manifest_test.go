@@ -92,7 +92,7 @@ func TestManifestPersistAcrossReopen(t *testing.T) {
 	// Fold the segment and MANIFEST pages to the file at the engine's durable mark, the
 	// checkpoint boundary a reopened pager reports.
 	dl := l.DurableLSN()
-	if err := pgr.Checkpoint(dl); err != nil {
+	if err := pgr.Checkpoint(dl, 0); err != nil {
 		t.Fatalf("checkpoint: %v", err)
 	}
 
@@ -141,7 +141,7 @@ func TestManifestVersionedAcrossReopen(t *testing.T) {
 	l.flushActive(t)
 
 	dl := l.DurableLSN()
-	if err := pgr.Checkpoint(dl); err != nil {
+	if err := pgr.Checkpoint(dl, 0); err != nil {
 		t.Fatalf("checkpoint: %v", err)
 	}
 
@@ -183,7 +183,7 @@ func TestManifestSpansMultiplePages(t *testing.T) {
 		t.Fatalf("wrote %d segments, want %d", len(l.allSegmentsLocked()), n)
 	}
 
-	if err := pgr.Checkpoint(l.DurableLSN()); err != nil {
+	if err := pgr.Checkpoint(l.DurableLSN(), 0); err != nil {
 		t.Fatalf("checkpoint: %v", err)
 	}
 	pgr2 := reopenPager(t, fs, pgr)

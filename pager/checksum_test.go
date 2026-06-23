@@ -23,7 +23,7 @@ func allocAndWrite(t *testing.T, p *Pager) uint32 {
 		data[i] = byte(i)
 	}
 	p.Unpin(fr, true)
-	if err := p.Checkpoint(0); err != nil {
+	if err := p.Checkpoint(0, 0); err != nil {
 		t.Fatalf("checkpoint: %v", err)
 	}
 	return pgno
@@ -111,7 +111,7 @@ func TestOpenRejectsCorruptHeaderPage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if err := p.Checkpoint(0); err != nil {
+	if err := p.Checkpoint(0, 0); err != nil {
 		t.Fatalf("checkpoint: %v", err)
 	}
 	if err := p.Close(); err != nil {

@@ -289,7 +289,8 @@ func (d *DB) applyShipped(version uint64, encoded []byte) error {
 	if err := d.eng.Apply(b, version); err != nil {
 		return fmt.Errorf("kv: apply shipped batch at version %d: %w", version, err)
 	}
-	d.pgr.Header().LastCommitVersion = version
+	// header.LastCommitVersion is stamped at checkpoint time by pgr.Checkpoint; do not
+	// update it here to avoid a data race with the lock-free checkpoint I/O path.
 	d.orc.advanceTo(version)
 	d.counters.commits.Add(1)
 	d.maybeCheckpoint()

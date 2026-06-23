@@ -171,7 +171,7 @@ func TestVLogGCSurvivesReopen(t *testing.T) {
 	}
 	forceVLogGC(t, l, 1<<30)
 	afterGC := vlogChainLen(t, l)
-	if err := pgr.Checkpoint(l.DurableLSN()); err != nil {
+	if err := pgr.Checkpoint(l.DurableLSN(), 0); err != nil {
 		t.Fatalf("checkpoint: %v", err)
 	}
 

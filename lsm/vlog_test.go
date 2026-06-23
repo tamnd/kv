@@ -138,7 +138,7 @@ func TestSeparatedPointersSurviveReopen(t *testing.T) {
 	big := bytes.Repeat([]byte("w"), 500)
 	applyLSN(t, l, 1, 1, func(b *engine.WriteBatch) { b.Set([]byte("k"), big) })
 	l.flushActive(t)
-	if err := pgr.Checkpoint(l.DurableLSN()); err != nil {
+	if err := pgr.Checkpoint(l.DurableLSN(), 0); err != nil {
 		t.Fatalf("checkpoint: %v", err)
 	}
 
