@@ -54,6 +54,8 @@ func commands() []command {
 		{"count", "count keys in a range or prefix", cmdCount},
 		{"dump", "stream all key/value pairs as JSONL", cmdDump},
 		{"load", "bulk-load key/value pairs from stdin or a file", cmdLoad},
+		{"export", "export key/value pairs as CSV, TSV, or JSONL", cmdExport},
+		{"import", "import key/value pairs from CSV, TSV, or JSONL", cmdImport},
 		{"checkpoint", "fold the WAL into the main file", cmdCheckpoint},
 		{"backup", "stream a consistent physical image to a file or stdout", cmdBackup},
 		{"restore", "rebuild a database from a backup stream", cmdRestore},
