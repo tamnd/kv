@@ -350,11 +350,16 @@ type DB struct {
 	// ckptStop closes on Close to retire the worker, ckptDone closes when it has; both
 	// are nil when auto-checkpointing is disabled. The worker takes d.mu itself, so the
 	// signal must be sent while holding it but the shutdown join must not.
-	ckptThreshold int
-	ckptSig       chan struct{}
-	ckptStop      chan struct{}
-	ckptDone      chan struct{}
-	closeOnce     sync.Once
+	//
+	// After each successful checkpoint the worker also drains dead B-tree MVCC versions
+	// with bounded Maintain calls (perf/05 F3c). gcPagesPerCheckpoint is the per-call
+	// page budget; the worker loops until More is false. Zero disables the GC step.
+	ckptThreshold        int
+	ckptSig              chan struct{}
+	ckptStop             chan struct{}
+	ckptDone             chan struct{}
+	gcPagesPerCheckpoint int
+	closeOnce            sync.Once
 
 	ckptErrMu sync.Mutex
 	ckptErr   error
@@ -422,7 +427,7 @@ func create(fs vfs.FS, path string, opts Options) (*DB, error) {
 		pgr.Close()
 		return nil, err
 	}
-	d.startCheckpointer(opts.autoCheckpoint())
+	d.startCheckpointer(opts.autoCheckpoint(), defaultGCPagesPerCheckpoint)
 	d.logOpened(0)
 	return d, nil
 }
@@ -504,7 +509,7 @@ func openExisting(fs vfs.FS, path string, opts Options) (*DB, error) {
 	}
 	d.orc = newOracle(last)
 	d.orcPub.Store(d.orc)
-	d.startCheckpointer(opts.autoCheckpoint())
+	d.startCheckpointer(opts.autoCheckpoint(), defaultGCPagesPerCheckpoint)
 	d.logOpened(last)
 	return d, nil
 }
@@ -1033,16 +1038,23 @@ func (d *DB) oldestSnapshotAgeNanos() uint64 {
 	return now - since
 }
 
+// defaultGCPagesPerCheckpoint is the per-Maintain call page budget the auto-GC step
+// uses after each background checkpoint. 512 pages = 2 MiB at the default 4 KiB page
+// size, a single GC batch that leaves the writer lock free between passes.
+const defaultGCPagesPerCheckpoint = 512
+
 // startCheckpointer launches the background passive-checkpoint worker when threshold
 // is positive. It is called once at the end of open, after every field the worker
 // reads is set, so a constructor that fails earlier never leaves a goroutine behind. A
 // non-positive threshold leaves all of the worker channels nil, which maybeCheckpoint
-// and Close both treat as "auto-checkpointing disabled" (spec 09 §1.3).
-func (d *DB) startCheckpointer(threshold int) {
+// and Close both treat as "auto-checkpointing disabled" (spec 09 §1.3). When the
+// worker starts, it also arms the post-checkpoint auto-GC step unless gcPages is zero.
+func (d *DB) startCheckpointer(threshold, gcPages int) {
 	if threshold <= 0 {
 		return
 	}
 	d.ckptThreshold = threshold
+	d.gcPagesPerCheckpoint = gcPages
 	d.ckptSig = make(chan struct{}, 1)
 	d.ckptStop = make(chan struct{})
 	d.ckptDone = make(chan struct{})
@@ -1063,7 +1075,32 @@ func (d *DB) checkpointLoop() {
 		case <-d.ckptSig:
 			if err := d.Checkpoint(); err != nil {
 				d.recordCheckpointErr(err)
+				continue
 			}
+			// A successful checkpoint advances the GC horizon (the oracle read-mark),
+			// making dead B-tree versions collectible. Run bounded Maintain passes until
+			// the engine reports no more work or the worker is asked to stop, so dead
+			// versions do not accumulate between explicit Maintain calls (perf/05 F3c).
+			if d.gcPagesPerCheckpoint > 0 {
+				d.drainGC()
+			}
+		}
+	}
+}
+
+// drainGC runs Maintain in a loop until no more GC work is ready or Close signals the
+// worker to stop. Each call holds d.mu only for one bounded batch, so writers are not
+// locked out for longer than a single GC pass.
+func (d *DB) drainGC() {
+	for {
+		select {
+		case <-d.ckptStop:
+			return
+		default:
+		}
+		rep, err := d.Maintain(d.gcPagesPerCheckpoint)
+		if err != nil || !rep.More {
+			return
 		}
 	}
 }
