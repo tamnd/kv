@@ -194,6 +194,9 @@ func (p *Pager) shardFor(pgno uint32) *shard { return p.shards[pgno&p.shardMask]
 // cryptoScheme loads the live encryption scheme, or nil for an unencrypted file.
 func (p *Pager) cryptoScheme() *crypto.Scheme { return p.crypto.Load() }
 
+// CacheFrames returns the buffer pool capacity in frames (pages).
+func (p *Pager) CacheFrames() int { return len(p.arena) / p.pageSize }
+
 // IOStats is the buffer pool's cumulative traffic since open. PageReads is physical reads
 // of a page from the main file (cache misses that hit disk); CacheHits is Gets served from
 // a resident frame. Their ratio is the cache hit rate, and PageReads over the number of
