@@ -294,6 +294,24 @@ func (t *BTree) propagateSplit(path []format.PageNo, uk []byte, leftChild format
 
 // --- page load/store helpers ---
 
+// nodeBytes returns the engine's usable node image for a frame: the physical page minus
+// the pager's reserved trailer (the per-page checksum, spec 02 §3.2). The node decoders
+// consume a usable-sized image, exactly what marshalLeaf and marshalInterior produce
+// (marshalLeaf allocates make([]byte, usable)); handing them the full physical page lets
+// unmarshalInterior misread the checksum trailer. An interior whose pivots fill the usable
+// area exactly leaves r.off at usable after the pivots, and the Bε message-count varint the
+// decoder reads there to detect an empty buffer would land on the stamped checksum bytes
+// instead of the zero padding it expects, decoding a bogus message count and rejecting the
+// page as corrupt. Slicing to usable keeps the decoder inside the bytes the engine owns and
+// restores the marshal/unmarshal size contract.
+func (t *BTree) nodeBytes(fr *pager.Frame) []byte {
+	d := fr.Data()
+	if t.usable < len(d) {
+		return d[:t.usable]
+	}
+	return d
+}
+
 func (t *BTree) typeOf(pgno format.PageNo) (format.PageType, error) {
 	fr, err := t.pgr.Get(pgno, pager.Read)
 	if err != nil {
@@ -309,7 +327,7 @@ func (t *BTree) loadLeaf(pgno format.PageNo) (*leaf, error) {
 	if err != nil {
 		return nil, err
 	}
-	data := fr.Data()
+	data := t.nodeBytes(fr)
 	// Guard against type confusion: a checksum-valid page reached as a leaf must actually be one, or a
 	// corrupt root pointer would have us decode an interior (or any other page) with the leaf decoder.
 	if len(data) < format.CommonHeaderSize || format.DecodeCommonHeader(data).Type != format.PageBTreeLeaf {
@@ -332,7 +350,7 @@ func (t *BTree) routeInterior(pgno format.PageNo, userKey []byte) (child format.
 	if err != nil {
 		return 0, false, false, err
 	}
-	data := fr.Data()
+	data := t.nodeBytes(fr)
 	if len(data) < format.CommonHeaderSize {
 		t.pgr.Unpin(fr, false)
 		return 0, false, false, nil
@@ -356,7 +374,7 @@ func (t *BTree) loadInterior(pgno format.PageNo) (*interior, error) {
 	if err != nil {
 		return nil, err
 	}
-	data := fr.Data()
+	data := t.nodeBytes(fr)
 	if len(data) < format.CommonHeaderSize || format.DecodeCommonHeader(data).Type != format.PageBTreeInterior {
 		t.pgr.Unpin(fr, false)
 		return nil, format.ErrCorrupt
@@ -392,7 +410,7 @@ func (t *BTree) viewLeaf(pgno format.PageNo) (*leaf, error) {
 		// (a corrupt pointer led here), the same type-confusion the decode path guards.
 		return nil, format.ErrCorrupt
 	}
-	data := fr.Data()
+	data := t.nodeBytes(fr)
 	if len(data) < format.CommonHeaderSize || format.DecodeCommonHeader(data).Type != format.PageBTreeLeaf {
 		t.pgr.Unpin(fr, false)
 		return nil, format.ErrCorrupt
@@ -433,7 +451,7 @@ func (t *BTree) viewNode(pgno format.PageNo) (format.PageType, *leaf, *interior,
 			return 0, nil, nil, format.ErrCorrupt
 		}
 	}
-	data := fr.Data()
+	data := t.nodeBytes(fr)
 	if len(data) < format.CommonHeaderSize {
 		t.pgr.Unpin(fr, false)
 		return 0, nil, nil, format.ErrCorrupt
