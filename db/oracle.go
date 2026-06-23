@@ -45,6 +45,12 @@ type oracle struct {
 	nextVersion    uint64
 	appliedVersion uint64
 
+	// Padding separates appliedPub onto its own cache line. nextVersion and
+	// appliedVersion are written under mu by the group-commit leader; appliedPub
+	// is read lock-free by every non-transactional Get. Without the pad, every
+	// reader load triggers a cache-line bounce from the committing core.
+	_ [64]byte
+
 	// appliedPub mirrors appliedVersion for the lock-free read path. It is published
 	// (stored) under mu every time appliedVersion advances, and read with a plain atomic
 	// load by lastCommitted, so a non-transactional Get takes its read snapshot without

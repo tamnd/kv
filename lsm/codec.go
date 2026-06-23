@@ -39,26 +39,33 @@ const (
 	codecHigh codecID = 2 // DEFLATE at best compression, the cold-level codec
 )
 
-// flate writers are expensive to allocate, so each level keeps a pool. A writer is reset
-// onto a fresh buffer per block and returned, so a busy flush or compaction reuses a small
-// fixed set rather than allocating one per page.
+// flate writers and readers are expensive to allocate. The compress side keeps a pool
+// per level; the decompress side keeps a single pool since both codec levels produce
+// standard DEFLATE streams that the same reader handles. A pooled reader is reset via
+// the flate.Resetter interface before each use so no internal state carries over.
+// A bytes.Buffer pool feeds the compress side so the backing array grows once and is
+// reused across page-compression calls on the same goroutine.
 var (
 	fastWriterPool = sync.Pool{New: func() any { w, _ := flate.NewWriter(io.Discard, flate.BestSpeed); return w }}
 	highWriterPool = sync.Pool{New: func() any { w, _ := flate.NewWriter(io.Discard, flate.BestCompression); return w }}
+	readerPool     = sync.Pool{New: func() any { return flate.NewReader(bytes.NewReader(nil)) }}
+	compressBufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
 )
 
 // deflate compresses raw with a pooled flate writer at the pool's level and returns the
-// compressed stream. Writing to a bytes.Buffer never errors (it is in-memory), and Close
-// flushes the final block, so the returned bytes are a complete, self-terminating DEFLATE
-// stream a flate reader decodes without an external length.
+// compressed stream. The output bytes.Buffer is pooled to avoid re-allocating the backing
+// array on each call; the result is copied out before the buffer is returned to the pool.
 func deflate(pool *sync.Pool, raw []byte) []byte {
-	var buf bytes.Buffer
+	buf := compressBufPool.Get().(*bytes.Buffer)
+	buf.Reset()
 	w := pool.Get().(*flate.Writer)
-	w.Reset(&buf)
+	w.Reset(buf)
 	_, _ = w.Write(raw)
 	_ = w.Close()
 	pool.Put(w)
-	return buf.Bytes()
+	out := append([]byte(nil), buf.Bytes()...)
+	compressBufPool.Put(buf)
+	return out
 }
 
 // compressBlock encodes raw into a self-describing frame: a one-byte codec id, a uvarint of
@@ -99,12 +106,14 @@ func decompressBlock(frame []byte) ([]byte, error) {
 	payload := frame[1+n:]
 	switch id {
 	case codecFast, codecHigh:
-		r := flate.NewReader(bytes.NewReader(payload))
+		r := readerPool.Get().(io.ReadCloser)
+		_ = r.(flate.Resetter).Reset(bytes.NewReader(payload), nil)
 		out := make([]byte, rawLen)
-		if _, err := io.ReadFull(r, out); err != nil {
+		_, err := io.ReadFull(r, out)
+		readerPool.Put(r)
+		if err != nil {
 			return nil, fmt.Errorf("lsm: decompress data block: %w", err)
 		}
-		_ = r.Close()
 		return out, nil
 	default: // codecNone and any unknown id: the payload is the raw bytes
 		if len(payload) < rawLen {
