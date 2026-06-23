@@ -43,9 +43,15 @@ func (p *Pager) Get(pgno uint32, intent Intent) (*Frame, error) {
 		return fr, nil
 	}
 	sh.mu.RUnlock()
+	return p.getMiss(sh, pgno, intent)
+}
 
-	// Miss: take the exclusive lock to admit and read. Re-check first, since another
-	// goroutine may have admitted the page between the read-lock release and here.
+// getMiss handles a Get that did not find the page resident under the read lock: it takes
+// the exclusive shard lock, re-checks (another goroutine may have admitted the page in the
+// gap), and otherwise admits a frame and reads the page from disk. It returns the frame
+// pinned, like Get. It is split out of Get so the pin-free ViewDecoded can share the exact
+// same miss handling.
+func (p *Pager) getMiss(sh *shard, pgno uint32, intent Intent) (*Frame, error) {
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
 	if fr, ok := sh.index[pgno]; ok {
@@ -97,6 +103,64 @@ func (p *Pager) Get(pgno uint32, intent Intent) (*Frame, error) {
 	fr.pins.Add(1)
 	fr.ref.Store(true)
 	return fr, nil
+}
+
+// ViewDecoded serves a read-only caller that wants the decoded view a previous read cached
+// on the page's frame (Frame.SetDecoded), without pinning. It is the pin-free fast path for
+// the steady-state read: the engine descends a tree of resident, already-decoded nodes, and
+// pinning every one of them ping-pongs the hot upper nodes' pin-counter cache lines across
+// every reader's core (perf/09 N1).
+//
+// On a hit it returns the cached decoded value and a nil frame, and the caller does NOT
+// Unpin: the decoded value is an immutable object (the SetDecoded contract: readers only
+// read it, writers decode a private copy), and it is loaded under the shard read lock, so it
+// is the decoded view of pgno at that instant and is kept alive by the returned interface
+// value regardless of what later happens to the frame. The frame may be evicted or rebound
+// the moment the lock is released; the caller's decoded snapshot stays valid because it is a
+// separate heap object, never the frame's reused data buffer. This is the same reason the
+// engine already uses the decoded node after Unpin today: the pin never protected the decoded
+// object, only the brief window of loading the pointer, which the read lock now covers.
+//
+// On a miss (the page is resident but not yet decoded, or not resident at all) it returns a
+// nil decoded value and a pinned frame, exactly like Get(pgno, Read): the caller decodes from
+// fr.Data(), may SetDecoded the result for the next reader, and MUST Unpin it. The decode
+// miss is the cold path (first touch of a page, or the read after a write invalidated the
+// cached view), so it keeps the real pin and pays nothing the steady state cannot afford.
+// Exactly one of the returned decoded value and frame is non-nil when err is nil.
+func (p *Pager) ViewDecoded(pgno uint32) (any, *Frame, error) {
+	if pgno == 0 {
+		return nil, nil, fmt.Errorf("pager: page 0 is the null page")
+	}
+	sh := p.shardFor(pgno)
+	sh.mu.RLock()
+	if fr, ok := sh.index[pgno]; ok {
+		if b := fr.decoded.Load(); b != nil {
+			sh.cacheHits.Add(1)
+			// Mark the frame referenced for CLOCK, but only with a store when it is not
+			// already set: a bare Store(true) on every read would invalidate the ref cache
+			// line on other cores the same way the pin counter does, re-introducing the
+			// ping-pong this path exists to remove. The guarded Load short-circuits for a hot
+			// frame (ref almost always already true), keeping the line shared and read-only.
+			if !fr.ref.Load() {
+				fr.ref.Store(true)
+			}
+			sh.mu.RUnlock()
+			return b.v, nil, nil
+		}
+		// Resident but not decoded yet: pin it so the caller can decode from the bytes and
+		// cache the result. This is the cold path, so the pin cost is irrelevant.
+		sh.cacheHits.Add(1)
+		fr.pins.Add(1)
+		fr.ref.Store(true)
+		sh.mu.RUnlock()
+		return nil, fr, nil
+	}
+	sh.mu.RUnlock()
+	fr, err := p.getMiss(sh, pgno, Read)
+	if err != nil {
+		return nil, nil, err
+	}
+	return nil, fr, nil
 }
 
 // Unpin releases one pin. If dirty, the frame is marked for write-back at the

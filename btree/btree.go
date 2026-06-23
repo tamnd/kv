@@ -339,13 +339,21 @@ func (t *BTree) loadInterior(pgno format.PageNo) (*interior, error) {
 // invalidates the cached view before any write-intent pin or frame rebind, so a hit
 // always describes the page's current bytes.
 func (t *BTree) viewLeaf(pgno format.PageNo) (*leaf, error) {
-	fr, err := t.pgr.Get(pgno, pager.Read)
+	// ViewDecoded serves the cached decode without a pin on the common hit, so a read-only
+	// descent does not ping-pong the hot nodes' pin counters across cores (perf/09 N1). A hit
+	// returns the immutable decoded node and no frame to unpin; a miss returns a pinned frame
+	// to decode and cache.
+	d, fr, err := t.pgr.ViewDecoded(pgno)
 	if err != nil {
 		return nil, err
 	}
-	if l, ok := fr.Decoded().(*leaf); ok {
-		t.pgr.Unpin(fr, false)
-		return l, nil
+	if d != nil {
+		if l, ok := d.(*leaf); ok {
+			return l, nil
+		}
+		// The cached node is not a leaf: this page is not the leaf the descent expected
+		// (a corrupt pointer led here), the same type-confusion the decode path guards.
+		return nil, format.ErrCorrupt
 	}
 	data := fr.Data()
 	if len(data) < format.CommonHeaderSize || format.DecodeCommonHeader(data).Type != format.PageBTreeLeaf {
@@ -370,17 +378,23 @@ func (t *BTree) viewLeaf(pgno format.PageNo) (*leaf, error) {
 // the frame-cached decode on a hit and caches a fresh decode on a miss, and the returned
 // node is shared and immutable.
 func (t *BTree) viewNode(pgno format.PageNo) (format.PageType, *leaf, *interior, error) {
-	fr, err := t.pgr.Get(pgno, pager.Read)
+	// ViewDecoded gives the cached decode pin-free on a hit, so the read-only descent does
+	// not pin every node it passes through and ping-pong the hot upper nodes' pin counters
+	// (perf/09 N1). A hit returns the immutable decoded node and no frame; a miss returns a
+	// pinned frame to decode and cache.
+	d, fr, err := t.pgr.ViewDecoded(pgno)
 	if err != nil {
 		return 0, nil, nil, err
 	}
-	switch n := fr.Decoded().(type) {
-	case *leaf:
-		t.pgr.Unpin(fr, false)
-		return format.PageBTreeLeaf, n, nil, nil
-	case *interior:
-		t.pgr.Unpin(fr, false)
-		return format.PageBTreeInterior, nil, n, nil
+	if d != nil {
+		switch n := d.(type) {
+		case *leaf:
+			return format.PageBTreeLeaf, n, nil, nil
+		case *interior:
+			return format.PageBTreeInterior, nil, n, nil
+		default:
+			return 0, nil, nil, format.ErrCorrupt
+		}
 	}
 	data := fr.Data()
 	if len(data) < format.CommonHeaderSize {
