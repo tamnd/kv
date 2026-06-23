@@ -206,6 +206,24 @@ func gcCollapseLeaf(l *leaf, w, sweepNow uint64, rangeDels []format.RangeDel, me
 // whole chain has been version-collapsed, so every key a dropped marker covered now
 // resolves without it. It returns the bytes reclaimed.
 func (t *BTree) dropDeadMarkers(w uint64) (int64, error) {
+	// A marker cell can be dead only if a live range delete sits at or below the watermark.
+	// The in-memory set mirrors every marker's version (begin and end share a version and are
+	// dropped together), so when none is at or below w there is nothing to drop, the set
+	// already matches the leaves, and the whole-chain scan plus the full-tree rebuildRangeDels
+	// it ends with would only reproduce the set byte for byte. Skip both. A pure-overwrite
+	// workload has no range deletes at all, so this turns the GC tail into a single comparison
+	// instead of a full leaf-chain decode every pass (perf/11 W3).
+	dead := false
+	for i := range t.rangeDels {
+		if t.rangeDels[i].Version <= w {
+			dead = true
+			break
+		}
+	}
+	if !dead {
+		return 0, nil
+	}
+
 	var reclaimed int64
 	pgno, err := t.leftmostLeaf()
 	if err != nil {
