@@ -29,10 +29,13 @@ func (p *Pager) Get(pgno uint32, intent Intent) (*Frame, error) {
 		if intent == Write {
 			// The caller is about to mutate the page bytes, so any decoded view cached
 			// against the old bytes is now stale. Drop it before the writer can touch the
-			// page so the next reader re-decodes the new bytes. A write-intent Get runs
-			// under the DB's write lock, so no reader observes the page between here and
-			// the mutation.
+			// page so the next reader re-decodes the new bytes.
+			// writePinned is set before the shard lock is released so that a concurrent
+			// lock-free checkpoint sees it and skips this frame's writeback; the checkpoint
+			// holds the exclusive shard lock, which waits for this RLock to drain, so the
+			// store is visible to the checkpoint by the time it calls writeBack.
 			fr.clearDecoded()
+			fr.writePinned.Store(true)
 		}
 		fr.pins.Add(1)
 		fr.ref.Store(true)
@@ -49,6 +52,7 @@ func (p *Pager) Get(pgno uint32, intent Intent) (*Frame, error) {
 		p.cacheHits.Add(1)
 		if intent == Write {
 			fr.clearDecoded()
+			fr.writePinned.Store(true)
 		}
 		fr.pins.Add(1)
 		fr.ref.Store(true)
@@ -86,6 +90,9 @@ func (p *Pager) Get(pgno uint32, intent Intent) (*Frame, error) {
 		fr.dirty = false
 		return nil, fmt.Errorf("pager: page %d: %w", pgno, err)
 	}
+	if intent == Write {
+		fr.writePinned.Store(true)
+	}
 	fr.pins.Add(1)
 	fr.ref.Store(true)
 	return fr, nil
@@ -107,6 +114,11 @@ func (p *Pager) Unpin(fr *Frame, dirty bool) {
 	if dirty {
 		fr.dirty = true
 	}
+	// Clear writePinned before releasing the shard lock. The checkpoint holds the
+	// exclusive shard lock while reading fr.data; it skips any frame where
+	// writePinned is true (the B-tree may still be writing its bytes). Once this
+	// Unpin runs, the write session is over and the frame is safe to flush.
+	fr.writePinned.Store(false)
 	fr.pins.Add(-1)
 	sh.mu.RUnlock()
 }
@@ -407,10 +419,16 @@ func (p *Pager) Checkpoint(checkpointLSN, lastCommitVersion uint64) error {
 	p.metaMu.Lock()
 	defer p.metaMu.Unlock()
 
-	// Flush dirty data frames across every shard.
+	// Flush dirty data frames across every shard. Skip frames that are write-pinned:
+	// a concurrent commit's B-tree is still writing those bytes (it holds d.mu, the
+	// checkpoint released d.mu for the lock-free I/O phase). Their WAL frames are at
+	// LSN > foldedLSN, so finalizeCheckpointLocked will detect actualFoldedLSN >
+	// foldedLSN and call Checkpoint again (under d.mu) to flush them. For callers of
+	// checkpointLocked (which hold d.mu throughout), no concurrent write-intent pins
+	// can exist and writePinned is always false, so the skip never fires there.
 	for _, sh := range p.shards {
 		for _, fr := range sh.frames {
-			if fr.pgno != 0 && fr.dirty {
+			if fr.pgno != 0 && fr.dirty && !fr.writePinned.Load() {
 				if err := p.writeBack(sh, fr); err != nil {
 					return err
 				}

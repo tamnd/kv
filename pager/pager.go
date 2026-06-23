@@ -39,13 +39,14 @@ const (
 // Frame is the in-memory home of one page. Its data slice is a window into the
 // pool's arena, stable for the pool's lifetime; frames are reused in place.
 type Frame struct {
-	pgno    uint32
-	data    []byte
-	pins    atomic.Int32
-	dirty   bool
-	ref     atomic.Bool // CLOCK reference bit
-	slot    int         // index into the pool, -1 if not pooled
-	decoded atomic.Pointer[decodedNode]
+	pgno       uint32
+	data       []byte
+	pins       atomic.Int32
+	dirty      bool
+	ref        atomic.Bool // CLOCK reference bit
+	slot       int         // index into the pool, -1 if not pooled
+	decoded    atomic.Pointer[decodedNode]
+	writePinned atomic.Bool // true between a write-intent Get and its Unpin
 }
 
 // decodedNode boxes a caller-supplied decoded view of the frame's page so the
