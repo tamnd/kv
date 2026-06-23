@@ -248,7 +248,7 @@ func TestVerifyDetectsChecksumCorruption(t *testing.T) {
 
 	// Flush every dirty page to disk with a valid checksum, then corrupt one content byte
 	// of the leaf on disk behind the pager's back.
-	if err := p.Checkpoint(0); err != nil {
+	if err := p.Checkpoint(0, 0); err != nil {
 		t.Fatalf("checkpoint: %v", err)
 	}
 	f, err := fs.Open("test.kv", vfs.OpenReadWrite)
@@ -300,7 +300,7 @@ func TestVerifyChecksumCleanFile(t *testing.T) {
 		t.Fatalf("open btree: %v", err)
 	}
 	applyKeys(t, bt, 300)
-	if err := p.Checkpoint(0); err != nil {
+	if err := p.Checkpoint(0, 0); err != nil {
 		t.Fatalf("checkpoint: %v", err)
 	}
 	rep, err := bt.Verify()

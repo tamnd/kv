@@ -79,7 +79,7 @@ func TestConcurrentShardedReads(t *testing.T) {
 		p.Unpin(fr, true)
 		nums[i] = pgno
 	}
-	if err := p.Checkpoint(0); err != nil {
+	if err := p.Checkpoint(0, 0); err != nil {
 		t.Fatalf("checkpoint: %v", err)
 	}
 

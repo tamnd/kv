@@ -281,7 +281,7 @@ func TestRangeDeleteReopen(t *testing.T) {
 	if err := bt.Apply(bd, 10); err != nil {
 		t.Fatalf("apply range delete: %v", err)
 	}
-	if err := p.Checkpoint(0); err != nil {
+	if err := p.Checkpoint(0, 0); err != nil {
 		t.Fatalf("checkpoint: %v", err)
 	}
 	if err := p.Close(); err != nil {
@@ -331,7 +331,7 @@ func TestReopenAfterCheckpoint(t *testing.T) {
 	if err := bt.Apply(b, 7); err != nil {
 		t.Fatalf("apply: %v", err)
 	}
-	if err := p.Checkpoint(0); err != nil {
+	if err := p.Checkpoint(0, 0); err != nil {
 		t.Fatalf("checkpoint: %v", err)
 	}
 	if err := p.Close(); err != nil {

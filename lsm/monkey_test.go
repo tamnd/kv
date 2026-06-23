@@ -104,7 +104,7 @@ func TestMonkeyDeepSegmentsGetFewerBits(t *testing.T) {
 
 	// The reduced probe count round-trips through the footer: a reopen rebuilds the same
 	// L2 filter from disk, with no flat default papering over a lost value.
-	if err := pgr.Checkpoint(l.DurableLSN()); err != nil {
+	if err := pgr.Checkpoint(l.DurableLSN(), 0); err != nil {
 		t.Fatalf("checkpoint: %v", err)
 	}
 	pgr2 := reopenPager(t, fs, pgr)

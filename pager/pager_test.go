@@ -27,7 +27,7 @@ func TestCreateThenOpenRoundTrip(t *testing.T) {
 	if p.DBSize() != 1 {
 		t.Fatalf("fresh db size = %d, want 1", p.DBSize())
 	}
-	if err := p.Checkpoint(0); err != nil {
+	if err := p.Checkpoint(0, 0); err != nil {
 		t.Fatalf("checkpoint: %v", err)
 	}
 	if err := p.Close(); err != nil {
@@ -92,7 +92,7 @@ func TestCheckpointDurability(t *testing.T) {
 		writePattern(fr.Data(), pgno)
 		p.Unpin(fr, true)
 	}
-	if err := p.Checkpoint(42); err != nil {
+	if err := p.Checkpoint(42, 0); err != nil {
 		t.Fatalf("checkpoint: %v", err)
 	}
 	// Dirty one more page but do NOT checkpoint it.
@@ -152,7 +152,7 @@ func TestAllocateFreeReuse(t *testing.T) {
 	// Free a couple, checkpoint, reopen, and confirm the freelist persisted.
 	p.Free(3)
 	p.Free(5)
-	if err := p.Checkpoint(7); err != nil {
+	if err := p.Checkpoint(7, 0); err != nil {
 		t.Fatalf("checkpoint: %v", err)
 	}
 	freeCount := len(p.free)
@@ -270,7 +270,7 @@ func TestTruncateTailShrinksFile(t *testing.T) {
 		pages = append(pages, pgno)
 		p.Unpin(fr, true)
 	}
-	if err := p.Checkpoint(1); err != nil {
+	if err := p.Checkpoint(1, 0); err != nil {
 		t.Fatalf("checkpoint: %v", err)
 	}
 	sizeBefore := p.DBSize()
@@ -323,7 +323,7 @@ func TestTruncateTailBudgetAndReopen(t *testing.T) {
 		pages = append(pages, pgno)
 		p.Unpin(fr, true)
 	}
-	if err := p.Checkpoint(1); err != nil {
+	if err := p.Checkpoint(1, 0); err != nil {
 		t.Fatalf("checkpoint: %v", err)
 	}
 	// Free the top four pages; reclaim only two this round.

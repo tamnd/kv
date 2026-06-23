@@ -149,7 +149,7 @@ func TestSegmentBloomSurvivesReopen(t *testing.T) {
 		applyLSN(t, l, uint64(i+1), uint64(i+1), func(b *engine.WriteBatch) { b.Set([]byte(key), []byte("v")) })
 	}
 	l.flushActive(t)
-	if err := pgr.Checkpoint(l.DurableLSN()); err != nil {
+	if err := pgr.Checkpoint(l.DurableLSN(), 0); err != nil {
 		t.Fatalf("checkpoint: %v", err)
 	}
 

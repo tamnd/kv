@@ -1186,21 +1186,42 @@ func (d *DB) Checkpoint() error {
 	return d.CheckpointMode(CheckpointPassive)
 }
 
-// CheckpointMode folds the WAL and resets the log like Checkpoint, then applies the extra
-// reclamation the mode asks for (spec 09 §1.2). Only TRUNCATE differs behaviorally in this
-// architecture: it shrinks the -wal file to its header after the fold, returning the frame
-// space to the operating system.
+// CheckpointMode folds the WAL and resets the log like Checkpoint, then applies the
+// extra reclamation the mode asks for (spec 09 §1.2). Only TRUNCATE differs
+// behaviorally: it shrinks the -wal file to its header after the fold, returning the
+// frame space to the operating system.
+//
+// The page-writeback and fsync (the slow I/O part) run without d.mu so foreground
+// writers can commit concurrently. d.mu is held only for the brief prepare step
+// (capture the fold LSN, stamp the header version) and the finalize step (WAL reset,
+// archive). This removes the periodic write stall the checkpoint caused before
+// (perf/02 F5).
 func (d *DB) CheckpointMode(m CheckpointMode) error {
+	_, span := d.startSpan(context.Background(), "kv.checkpoint")
+	defer endSpan(span)
+
+	d.mu.Lock()
+	foldedLSN, lastCommitVersion, resetWAL := d.prepareCheckpointLocked()
+	d.mu.Unlock()
+
+	// Page writeback and fsync run without d.mu. The pager's own shard locks and
+	// ckptGate provide the necessary mutual exclusion for the I/O, so foreground
+	// writers can commit into the WAL while the checkpoint is writing pages from the
+	// buffer pool to the main file. lastCommitVersion is passed in rather than read
+	// from p.header inside pgr.Checkpoint to avoid a data race with the commit path.
+	if err := d.pgr.Checkpoint(foldedLSN, lastCommitVersion); err != nil {
+		return err
+	}
+
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if err := d.checkpointLocked(); err != nil {
+	if err := d.finalizeCheckpointLocked(foldedLSN, resetWAL); err != nil {
 		return err
 	}
 	if m == CheckpointTruncate {
-		// Truncating returns the -wal frame space to the operating system, which is
-		// safe only when checkpointLocked reset the log. When the engine lags (an
-		// unflushed LSM memtable), checkpointLocked kept the tail and did not reset, so
-		// the frames past the durable point are still live and must not be discarded.
+		// Truncating returns the -wal frame space to the OS, which is safe only when
+		// finalizeCheckpointLocked reset the log. When the engine lags (an unflushed
+		// LSM memtable), the WAL tail was kept and must not be discarded.
 		if dl, tracked := d.engineDurableLSN(); tracked && dl < d.wal.LSN()-1 {
 			return nil
 		}
@@ -1209,50 +1230,81 @@ func (d *DB) CheckpointMode(m CheckpointMode) error {
 	return nil
 }
 
-// checkpointLocked is the body of Checkpoint; the caller holds d.mu. It is factored
-// out so other writer-lock operations that must fold the WAL first, such as Vacuum,
-// can reuse it without releasing and reacquiring the lock.
+// prepareCheckpointLocked captures the fold LSN, the WAL-reset flag, and the oracle's
+// commit version at this instant. The caller holds d.mu. No I/O is performed and the
+// pager header is not touched here — lastCommitVersion is passed to pgr.Checkpoint,
+// which stamps the header atomically under its own locks, avoiding a data race with the
+// commit path that also writes LastCommitVersion under d.mu (a lock independent of the
+// pager's shard + metaMu locks). The version reconstructed by redo replay reaches the
+// engine through eng.Apply and never goes through publishApplied, so capturing it here
+// from the oracle is the correct single source of truth (spec 08 §5, spec 10 §1).
+func (d *DB) prepareCheckpointLocked() (foldedLSN uint64, lastCommitVersion uint64, resetWAL bool) {
+	lastCommitVersion = d.orc.lastCommitted()
+	foldedLSN = d.wal.LSN() - 1
+	resetWAL = true
+	if dl, tracked := d.engineDurableLSN(); tracked && dl < foldedLSN {
+		// The engine has applied writes it has not yet persisted to the main file (an
+		// unflushed LSM memtable, spec 06 §4). Fold only to its durable point and keep
+		// the WAL frames past it: resetting here would drop applied-but-unflushed data.
+		// The next open replays the kept frames into the memtable.
+		foldedLSN = dl
+		resetWAL = false
+	}
+	return foldedLSN, lastCommitVersion, resetWAL
+}
+
+// finalizeCheckpointLocked logs the checkpoint and resets/archives the WAL when the
+// fold was complete. The caller holds d.mu. pgr.Checkpoint must have already succeeded.
+func (d *DB) finalizeCheckpointLocked(foldedLSN uint64, resetWAL bool) error {
+	if !resetWAL {
+		d.logCheckpoint(foldedLSN, d.orc.lastCommitted(), false)
+		return nil
+	}
+	// Commits that ran during the lock-free I/O phase (between d.mu release in
+	// CheckpointMode and re-acquire here) wrote WAL frames at LSNs > foldedLSN and
+	// then were blocked by pgr.Checkpoint's shard locks from applying their pages to
+	// the engine. Those pages were dirtied after pgr.Checkpoint's frame-flush loop, so
+	// they are not on disk yet. Their WAL frames are in the old generation: if we call
+	// wal.Checkpointed(foldedLSN) now, those frames become inaccessible (old generation,
+	// overwritten by the next write), and their page changes would be silently rolled back
+	// — a durability violation. Fix: run a second pgr.Checkpoint at the current WAL
+	// high-water mark. It flushes the remaining dirty pages and updates the on-disk
+	// header with the actual fold LSN and version, then wal.Checkpointed resets at the
+	// correct boundary. For checkpointLocked (which holds d.mu throughout), no concurrent
+	// commits can slip in and actualFoldedLSN == foldedLSN, so the extra call is skipped.
+	actualFoldedLSN := d.wal.LSN() - 1
+	actualVersion := d.orc.lastCommitted()
+	if actualFoldedLSN > foldedLSN {
+		if err := d.pgr.Checkpoint(actualFoldedLSN, actualVersion); err != nil {
+			return err
+		}
+		foldedLSN = actualFoldedLSN
+	}
+	d.logCheckpoint(foldedLSN, actualVersion, true)
+	// Archive the generation about to be folded before the reset discards it, so the
+	// committed history outlives the live -wal file for point-in-time recovery (spec 18
+	// §6). A failed archive fails the checkpoint, so the frames are never lost.
+	if err := d.archiveGeneration(); err != nil {
+		return err
+	}
+	return d.wal.Checkpointed(foldedLSN)
+}
+
+// checkpointLocked folds the WAL under d.mu for the duration, including the I/O.
+// It is used by callers that need full mutual exclusion (loadFast, Vacuum,
+// SetApplicationID, SetUserVersion, RotateEncryptionKey). The background and public
+// checkpoint paths use CheckpointMode, which releases d.mu for the I/O phase.
 func (d *DB) checkpointLocked() error {
 	// Trace the checkpoint (fold the WAL into the main file, fsync, reset the log) so a
 	// span backend can see checkpoint stalls in a request's timeline (spec 19 §3). It is
 	// a no-op when no tracer is set.
 	_, span := d.startSpan(context.Background(), "kv.checkpoint")
 	defer endSpan(span)
-	// Persist the durable commit version from the oracle, the single source of truth.
-	// A live commit keeps the header's version current through applyCommitted, but a
-	// version reconstructed by redo reaches the engine through eng.Apply directly and
-	// never touches the header, so without this the checkpoint would fold the redone
-	// pages under a stale version. The next open would then open a snapshot below those
-	// commits and find the data invisible (spec 08 §5, spec 10 §1).
-	d.pgr.Header().LastCommitVersion = d.orc.lastCommitted()
-
-	foldedLSN := d.wal.LSN() - 1
-	resetWAL := true
-	if dl, tracked := d.engineDurableLSN(); tracked && dl < foldedLSN {
-		// The engine has applied writes it has not yet persisted to the main file (an
-		// unflushed LSM memtable, spec 06 §4). Fold only to its durable point and keep
-		// the WAL frames past it: the WAL's Checkpointed resets the whole tail, which is
-		// correct only when the engine has folded everything, so resetting here would
-		// drop applied-but-unflushed data. The next open replays the kept frames into the
-		// memtable. The header is still written and fsynced below, so the commit version
-		// and any persistent setting remain durable.
-		foldedLSN = dl
-		resetWAL = false
-	}
-	if err := d.pgr.Checkpoint(foldedLSN); err != nil {
+	foldedLSN, lastCommitVersion, resetWAL := d.prepareCheckpointLocked()
+	if err := d.pgr.Checkpoint(foldedLSN, lastCommitVersion); err != nil {
 		return err
 	}
-	d.logCheckpoint(foldedLSN, d.orc.lastCommitted(), resetWAL)
-	if resetWAL {
-		// Archive the generation about to be folded before the reset discards it, so the
-		// committed history outlives the live -wal file for point-in-time recovery (spec 18
-		// §6). A failed archive fails the checkpoint, so the frames are never lost.
-		if err := d.archiveGeneration(); err != nil {
-			return err
-		}
-		return d.wal.Checkpointed(foldedLSN)
-	}
-	return nil
+	return d.finalizeCheckpointLocked(foldedLSN, resetWAL)
 }
 
 // archiveGeneration hands the current WAL generation's committed image to the archive

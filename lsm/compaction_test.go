@@ -335,7 +335,7 @@ func TestCompactionSurvivesReopen(t *testing.T) {
 	if len(l.allSegmentsLocked()) != 1 {
 		t.Fatalf("expected one segment after compaction, got %d", len(l.allSegmentsLocked()))
 	}
-	if err := pgr.Checkpoint(l.DurableLSN()); err != nil {
+	if err := pgr.Checkpoint(l.DurableLSN(), 0); err != nil {
 		t.Fatalf("checkpoint: %v", err)
 	}
 
@@ -551,7 +551,7 @@ func TestLeveledReopenRestoresLevels(t *testing.T) {
 	}
 	shapeBefore := levelShape(l)
 
-	if err := pgr.Checkpoint(l.DurableLSN()); err != nil {
+	if err := pgr.Checkpoint(l.DurableLSN(), 0); err != nil {
 		t.Fatalf("checkpoint: %v", err)
 	}
 	pgr2 := reopenPager(t, fs, pgr)
