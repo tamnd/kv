@@ -139,6 +139,85 @@ func TestLSMCompressionTransparent(t *testing.T) {
 	}
 }
 
+// TestLSMColdCompression drives the cold-only compression policy through the public
+// CompressionMode option. Cold-only leaves the hot shallow levels raw and compresses only
+// the cold deep levels (perf/05 F4d), so it must stay invisible to reads exactly like the
+// heat-tiered mode, and still shrink the settled file below the uncompressed baseline because
+// the bulk of the data settles in the cold levels it does compress. The same workload is
+// loaded three ways, settled, and checkpointed; cold-only reads must match the plain database
+// key for key, and the cold-only file must land between the plain file (larger) and the
+// fully heat-tiered file (no larger than cold-only, since it also compresses the hot levels).
+func TestLSMColdCompression(t *testing.T) {
+	const n = 4000
+	orig := func(i int) string { return fmt.Sprintf("payload-field-value-shared-prefix-%06d", i) }
+
+	write := func(fs *vfs.Mem, mode engine.CompressionMode) {
+		opts := Options{PageSize: 4096, Engine: format.EngineLSM, MemtableSize: 64 * 1024, CompressionMode: mode}
+		d, err := Open(fs, "test.kv", opts)
+		if err != nil {
+			t.Fatalf("open (mode=%d): %v", mode, err)
+		}
+		const batch = 100
+		for lo := 0; lo < n; lo += batch {
+			if err := d.Update(func(txn *Txn) error {
+				for i := lo; i < lo+batch; i++ {
+					txn.Set([]byte(fmt.Sprintf("key%06d", i)), []byte(orig(i)))
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+		}
+		settleLSM(t, d)
+		if err := d.Checkpoint(); err != nil {
+			t.Fatalf("checkpoint: %v", err)
+		}
+		if err := d.Close(); err != nil {
+			t.Fatalf("close: %v", err)
+		}
+	}
+
+	plainFS := vfs.NewMem()
+	write(plainFS, engine.CompressOff)
+	coldFS := vfs.NewMem()
+	write(coldFS, engine.CompressColdOnly)
+	tieredFS := vfs.NewMem()
+	write(tieredFS, engine.CompressHeatTiered)
+
+	// Reopen the cold-only database with bare options and check every key reads back, proving
+	// the deep compressed levels decode from their self-describing frames with no policy hint.
+	d2, err := Open(coldFS, "test.kv", Options{})
+	if err != nil {
+		t.Fatalf("reopen cold-only db: %v", err)
+	}
+	defer d2.Close()
+	for i := 0; i < n; i++ {
+		k := fmt.Sprintf("key%06d", i)
+		v, ok := txnGet(t, d2, k)
+		if !ok || v != orig(i) {
+			t.Fatalf("after reopen key %s = %q,%v, want %q", k, v, ok, orig(i))
+		}
+	}
+
+	// Size ordering is a stable invariant of the policy: off compresses nothing, cold-only a
+	// subset of the levels, heat-tiered all of them, on the same compressible data. So
+	// tiered <= cold-only <= plain always holds (with equality when the data is shallow enough
+	// that no level cold-only touches exists). Heat-tiered always reaches the hot levels this
+	// workload does populate, so it strictly shrinks the file, proving compression engages.
+	plainSize := fileSize(t, plainFS, "test.kv")
+	coldSize := fileSize(t, coldFS, "test.kv")
+	tieredSize := fileSize(t, tieredFS, "test.kv")
+	if tieredSize >= plainSize {
+		t.Fatalf("heat-tiered did not shrink the file: plain %d, tiered %d", plainSize, tieredSize)
+	}
+	if coldSize > plainSize {
+		t.Fatalf("cold-only file larger than plain: plain %d, cold-only %d", plainSize, coldSize)
+	}
+	if tieredSize > coldSize {
+		t.Fatalf("heat-tiered file larger than cold-only: tiered %d, cold-only %d", tieredSize, coldSize)
+	}
+}
+
 // TestLSMCompressionPersistsAndDecodesWithoutOption is the load-bearing persistence test:
 // a database written with compression on is settled, checkpointed, closed, and reopened with
 // a plain Options{} that does not set Compression at all. Every key must still read back.

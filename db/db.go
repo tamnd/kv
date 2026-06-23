@@ -109,6 +109,13 @@ type Options struct {
 	// space-bound or write-heavy workloads on storage slower than the CPU. The B-tree core
 	// ignores it.
 	Compression bool
+	// CompressionMode selects which levels the LSM core compresses, refining the on/off
+	// Compression bool. The zero value defers to that bool (off, or heat-tiered when the
+	// bool is set). engine.CompressColdOnly leaves the hot levels (L0, L1) raw and
+	// compresses only the cold deep levels where the bulk of the data settles, so the file
+	// shrinks toward sub-1.0x without putting decompress CPU on the hot read path (perf/05
+	// F4d). When set it overrides Compression. The B-tree core ignores it.
+	CompressionMode engine.CompressionMode
 	// disableAutoCompaction turns off the LSM core's background compaction scheduler so
 	// compaction runs only on an explicit Maintain. It is unexported: production always
 	// self-schedules compaction, and only an in-package test that drives compaction by hand
@@ -229,6 +236,20 @@ func (o Options) sync() wal.Sync {
 	return o.Sync
 }
 
+// compressionMode resolves the on/off Compression bool and the finer CompressionMode into a
+// single mode for the engine. An explicit CompressionMode wins; otherwise the bool maps to
+// heat-tiered when set and off when not, so a caller that only flips Compression keeps the
+// behaviour it had before this knob existed.
+func (o Options) compressionMode() engine.CompressionMode {
+	if o.CompressionMode != engine.CompressDefault {
+		return o.CompressionMode
+	}
+	if o.Compression {
+		return engine.CompressHeatTiered
+	}
+	return engine.CompressOff
+}
+
 // DB is an open database: a pager over the main file, a WAL sidecar, and a storage
 // core, with a monotonic commit-version counter. It is safe for concurrent readers
 // and serializes writers through its mutex (group commit and MVCC concurrency are
@@ -266,7 +287,7 @@ type DB struct {
 	rangeIndex      bool
 	filter          engine.FilterKind
 	bufferedInserts bool
-	compression     bool
+	compression     engine.CompressionMode
 	noAutoCompact   bool
 
 	// readReplica makes this a read-only follower (spec 18 §4): user writes are refused
@@ -394,7 +415,7 @@ func create(fs vfs.FS, path string, opts Options) (*DB, error) {
 		return nil, err
 	}
 	d := &DB{fs: fs, path: path, pgr: pgr, wal: w, eng: eng, orc: newOracle(0), crypto: enc,
-		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, bufferedInserts: opts.BufferedInserts, compression: opts.Compression, noAutoCompact: opts.disableAutoCompaction, now: opts.clock(), logger: opts.Logger, slowOp: opts.SlowOpThreshold, tracer: opts.Tracer, readReplica: opts.ReadReplica, archive: opts.WALArchive}
+		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, bufferedInserts: opts.BufferedInserts, compression: opts.compressionMode(), noAutoCompact: opts.disableAutoCompaction, now: opts.clock(), logger: opts.Logger, slowOp: opts.SlowOpThreshold, tracer: opts.Tracer, readReplica: opts.ReadReplica, archive: opts.WALArchive}
 	d.ccond = sync.NewCond(&d.cmu)
 	if err := d.openEngine(opts.Merge); err != nil {
 		w.Close()
@@ -423,7 +444,7 @@ func openExisting(fs vfs.FS, path string, opts Options) (*DB, error) {
 		return nil, err
 	}
 	d := &DB{fs: fs, path: path, pgr: pgr, eng: eng, crypto: enc,
-		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, bufferedInserts: opts.BufferedInserts, compression: opts.Compression, noAutoCompact: opts.disableAutoCompaction, now: opts.clock(), logger: opts.Logger, slowOp: opts.SlowOpThreshold, tracer: opts.Tracer, readReplica: opts.ReadReplica, archive: opts.WALArchive}
+		merge: opts.Merge, maxRetries: opts.maxRetries(), syncMode: opts.sync(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, bufferedInserts: opts.BufferedInserts, compression: opts.compressionMode(), noAutoCompact: opts.disableAutoCompaction, now: opts.clock(), logger: opts.Logger, slowOp: opts.SlowOpThreshold, tracer: opts.Tracer, readReplica: opts.ReadReplica, archive: opts.WALArchive}
 	d.ccond = sync.NewCond(&d.cmu)
 	if err := d.openEngine(opts.Merge); err != nil {
 		pgr.Close()
@@ -515,7 +536,7 @@ func (d *DB) openEngine(merge func(existing, operand []byte) []byte) error {
 			RangeIndex:      d.rangeIndex,
 			Filter:          d.filter,
 			BufferedInserts: d.bufferedInserts,
-			Compression:     d.compression,
+			CompressionMode: d.compression,
 
 			DisableAutoCompaction: d.noAutoCompact,
 		},

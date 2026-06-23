@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/tamnd/kv/engine"
 	"github.com/tamnd/kv/format"
 	"github.com/tamnd/kv/pager"
 )
@@ -70,25 +71,42 @@ func TestCodecToleratesTrailingPadding(t *testing.T) {
 	}
 }
 
-// TestCodecForLevel pins the heat-tiering policy: compression off picks the identity codec
-// everywhere, and on it puts the hot shallow levels on the fast codec and the cold deep
-// levels on the high codec.
+// TestCodecForLevel pins each compression policy. Off (and the default sentinel) pick the
+// identity codec everywhere. Heat-tiered puts the hot shallow levels on the fast codec and
+// the cold deep levels on the high codec. Cold-only leaves the hot shallow levels raw and
+// puts only the cold deep levels on the high codec, keeping decompress off the hot read path
+// (perf/05 F4d).
 func TestCodecForLevel(t *testing.T) {
-	off := &LSM{}
-	for _, lvl := range []int{0, 1, 2, 9} {
-		if off.codecForLevel(lvl) != codecNone {
-			t.Fatalf("compression off: level %d should be codecNone", lvl)
+	for _, mode := range []engine.CompressionMode{engine.CompressDefault, engine.CompressOff} {
+		off := &LSM{compress: mode}
+		for _, lvl := range []int{0, 1, 2, 9} {
+			if off.codecForLevel(lvl) != codecNone {
+				t.Fatalf("mode %d: level %d should be codecNone", mode, lvl)
+			}
 		}
 	}
-	on := &LSM{compress: true}
+
+	tiered := &LSM{compress: engine.CompressHeatTiered}
 	for _, lvl := range []int{0, 1} {
-		if on.codecForLevel(lvl) != codecFast {
-			t.Fatalf("compression on: hot level %d should be codecFast", lvl)
+		if tiered.codecForLevel(lvl) != codecFast {
+			t.Fatalf("heat-tiered: hot level %d should be codecFast", lvl)
 		}
 	}
 	for _, lvl := range []int{2, 5, 9} {
-		if on.codecForLevel(lvl) != codecHigh {
-			t.Fatalf("compression on: cold level %d should be codecHigh", lvl)
+		if tiered.codecForLevel(lvl) != codecHigh {
+			t.Fatalf("heat-tiered: cold level %d should be codecHigh", lvl)
+		}
+	}
+
+	cold := &LSM{compress: engine.CompressColdOnly}
+	for _, lvl := range []int{0, 1} {
+		if cold.codecForLevel(lvl) != codecNone {
+			t.Fatalf("cold-only: hot level %d should be codecNone", lvl)
+		}
+	}
+	for _, lvl := range []int{2, 5, 9} {
+		if cold.codecForLevel(lvl) != codecHigh {
+			t.Fatalf("cold-only: cold level %d should be codecHigh", lvl)
 		}
 	}
 }

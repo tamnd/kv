@@ -99,6 +99,27 @@ const (
 	FilterRibbon                   // the opt-in Ribbon filter
 )
 
+// CompressionMode selects which levels the LSM core compresses and with which codec (spec
+// 13 §3.1). The zero value defers to the legacy Compression bool so old call sites keep
+// their meaning. When set explicitly it overrides that bool. The B-tree core ignores it.
+type CompressionMode uint8
+
+const (
+	// CompressDefault, the zero value, follows the Compression bool: off when false,
+	// heat-tiered when true. It exists so a caller that only flips the bool is unaffected.
+	CompressDefault CompressionMode = iota
+	// CompressOff writes every level's data pages raw, the same as Compression false.
+	CompressOff
+	// CompressHeatTiered compresses every level: the fast codec on the hot shallow levels
+	// (L0, L1) and the higher-ratio codec on the cold deep ones. It matches Compression true.
+	CompressHeatTiered
+	// CompressColdOnly leaves the hot shallow levels (L0, L1) raw and compresses only the
+	// cold deep levels with the higher-ratio codec. The bulk of the data, which settles in
+	// the deep levels, still shrinks toward sub-1.0x space, while the often-read and
+	// often-rewritten hot levels pay no decompress CPU on the read path (perf/05 F4d).
+	CompressColdOnly
+)
+
 // EngineOptions carries engine-specific tunables that travel from the header and
 // configuration into a core at Open (spec 04 §5, spec 22). Fields are populated
 // per engine; unset fields take engine defaults.
@@ -112,12 +133,13 @@ type EngineOptions struct {
 	BufferedInserts bool    // Bε buffered-insert mode
 
 	// LSM knobs.
-	MemtableSize      int        // bytes before a memtable is flushed
-	LevelSizeRatio    int        // size multiplier between levels
-	ValueSepThreshold int        // value size above which WiscKey separates to vLog
-	RangeIndex        bool       // build the REMIX ordered index for scan-heavy workloads
-	Filter            FilterKind // per-segment membership filter: Bloom (default) or Ribbon
-	Compression       bool       // heat-tiered block compression on the LSM data pages (spec 13)
+	MemtableSize      int             // bytes before a memtable is flushed
+	LevelSizeRatio    int             // size multiplier between levels
+	ValueSepThreshold int             // value size above which WiscKey separates to vLog
+	RangeIndex        bool            // build the REMIX ordered index for scan-heavy workloads
+	Filter            FilterKind      // per-segment membership filter: Bloom (default) or Ribbon
+	Compression       bool            // heat-tiered block compression on the LSM data pages (spec 13)
+	CompressionMode   CompressionMode // which levels to compress; overrides Compression when set
 
 	// DisableAutoCompaction turns off the LSM core's background compaction scheduler, so
 	// compaction runs only when the host calls Maintain. Off by default (the engine

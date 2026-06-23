@@ -110,12 +110,15 @@ type LSM struct {
 	// that reaches the same false-positive rate in less space on the deep cold levels. It
 	// is read from the options at Open. See ribbon.go.
 	filterKind filterKind
-	// compress turns on heat-tiered block compression of the segment data pages (spec 13):
-	// a flush and a compaction pick a codec by the level they write to, cheap and fast on
-	// the hot shallow levels, higher-ratio on the cold deep ones. It is read from the
-	// options at Open and is off by default, so an unconfigured segment writes raw cell
-	// pages byte-identical to before this knob existed. See codec.go and codecForLevel.
-	compress bool
+	// compress selects which levels get heat-tiered block compression of their segment data
+	// pages (spec 13): a flush and a compaction pick a codec by the level they write to. It
+	// is read from the options at Open and is engine.CompressDefault by default, which with
+	// no Compression bool set leaves every level raw, byte-identical to before this knob
+	// existed. CompressHeatTiered compresses every level (fast on hot, high on cold);
+	// CompressColdOnly leaves the hot levels raw and compresses only the cold deep ones, so
+	// the bulk of the data shrinks without putting decompress CPU on the hot read path
+	// (perf/05 F4d). See codec.go and codecForLevel.
+	compress engine.CompressionMode
 	// vlogHeadRecorded is the value-log head the MANIFEST last recorded, so a flush or GC
 	// emits a manifestVLogHead edit only when the head actually moves: a flush moves it off
 	// NoPage when the first value separates, the GC moves it forward when it frees the old
@@ -209,8 +212,17 @@ func (l *LSM) Open(env *engine.Env) error {
 	if env != nil && env.Options.Filter == engine.FilterRibbon {
 		l.filterKind = filterRibbon
 	}
-	if env != nil && env.Options.Compression {
-		l.compress = true
+	if env != nil {
+		// CompressionMode, when set, wins; otherwise the legacy Compression bool maps
+		// onto the equivalent mode so old call sites keep their heat-tiered behaviour.
+		switch {
+		case env.Options.CompressionMode != engine.CompressDefault:
+			l.compress = env.Options.CompressionMode
+		case env.Options.Compression:
+			l.compress = engine.CompressHeatTiered
+		default:
+			l.compress = engine.CompressOff
+		}
 	}
 	if env != nil && env.Options.DisableAutoCompaction {
 		l.autoCompact = false
@@ -226,20 +238,29 @@ func (l *LSM) Open(env *engine.Env) error {
 }
 
 // codecForLevel picks the block codec for a segment written to level, heat-tiering by
-// depth (spec 13 §3.1): with compression off every level writes raw pages, and with it on
-// the hot shallow levels take the fast codec, whose decompress cost is negligible against
-// the I/O it saves on data that is read and rewritten often, while the cold deep levels
-// take the higher-ratio codec, whose extra CPU is paid rarely because those pages are
-// written once and read seldom. The boundary at level 2 keeps L0 and L1, where compaction
-// churns, on the cheap codec.
+// depth (spec 13 §3.1). With compression off every level writes raw pages. Heat-tiered
+// gives the hot shallow levels (L0, L1) the fast codec, whose decompress cost is negligible
+// against the I/O it saves on data that is read and rewritten often, while the cold deep
+// levels take the higher-ratio codec, whose extra CPU is paid rarely because those pages are
+// written once and read seldom. Cold-only goes further: it leaves L0 and L1 raw so the hot
+// read path pays no decompress at all, and compresses only the cold deep levels, where the
+// bulk of the data settles, with the higher-ratio codec (perf/05 F4d). The boundary at
+// level 2 keeps L0 and L1, where compaction churns, off the high codec in both modes.
 func (l *LSM) codecForLevel(level int) codecID {
-	if !l.compress {
+	switch l.compress {
+	case engine.CompressHeatTiered:
+		if level <= 1 {
+			return codecFast
+		}
+		return codecHigh
+	case engine.CompressColdOnly:
+		if level <= 1 {
+			return codecNone
+		}
+		return codecHigh
+	default: // CompressOff / CompressDefault
 		return codecNone
 	}
-	if level <= 1 {
-		return codecFast
-	}
-	return codecHigh
 }
 
 // Close implements engine.Engine. It stops the background flusher and waits for any
