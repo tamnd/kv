@@ -917,6 +917,20 @@ func (d *DB) snapshotGet(version uint64, key []byte) ([]byte, bool, error) {
 	defer endSpan(span)
 	sh := d.rl.RLock()
 	defer d.rl.RUnlock(sh)
+	// Readerless fast path: an engine that resolves a point read off its shared immutable
+	// state needs no per-call reader (perf/10 R3). The NewReader path below heap-allocates the
+	// reader and, in the B-tree, folds through the streaming resolver that allocates a result
+	// slice for one key; GetAt does neither. Fall back to NewReader when the engine declines.
+	if pr, ok := d.eng.(engine.PointReader); ok {
+		v, err := pr.GetAt(engine.Snapshot{Version: version, Clock: d.now}, key)
+		if err == engine.ErrNotFound {
+			return nil, false, nil
+		}
+		if err != nil {
+			return nil, false, err
+		}
+		return v, true, nil
+	}
 	rd, err := d.eng.NewReader(engine.Snapshot{Version: version, Clock: d.now})
 	if err != nil {
 		return nil, false, err

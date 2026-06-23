@@ -120,6 +120,23 @@ type ZeroCopyReader interface {
 	GetZeroCopy(userKey []byte) (value []byte, err error)
 }
 
+// PointReader is an optional Engine capability: a point read at a snapshot that does not
+// allocate a per-read Reader. The ordinary point read goes NewReader -> Reader.Get -> Close;
+// the reader escapes through the Reader interface and so heap-allocates, and an engine that
+// folds point and range reads through one streaming resolver also allocates that resolver's
+// result slice even though a point read resolves exactly one key. For a host whose hot path is
+// nothing but Get, both are pure per-call garbage. An engine implements this when it can resolve
+// a point read straight off its shared, immutable internal state with no per-read object.
+//
+// The host (db.snapshotGet) uses it when the engine implements it and falls back to the
+// NewReader path otherwise, so it is purely an optimization an engine may decline.
+type PointReader interface {
+	// GetAt returns the value for userKey visible at snap, or ErrNotFound. The value is
+	// copied and caller-owned, exactly as Reader.Get's: GetAt is equivalent to
+	// NewReader(snap).Get(userKey) then Close, without allocating the reader.
+	GetAt(snap Snapshot, userKey []byte) (value []byte, err error)
+}
+
 // BulkLoader is an optional engine capability: population of an empty engine from a
 // stream of cells already in ascending internal-key order, building the on-disk
 // structure bottom-up instead of inserting one cell at a time (spec 15 §6). The host

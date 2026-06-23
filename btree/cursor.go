@@ -80,6 +80,31 @@ func (r *reader) GetZeroCopy(userKey []byte) ([]byte, error) {
 	return val, nil
 }
 
+// GetAt implements engine.PointReader: the same point resolution as Get, but without
+// allocating a reader. db.Get's hot path is NewReader -> Get -> Close per call; NewReader
+// heap-allocates the &reader because it escapes through engine.Reader, and Get folds the group
+// through resolveStream, which allocates an ops slice and a one-element result slice for what is
+// a single key. GetAt resolves straight off the tree with the same stack-backed gather Get and
+// GetZeroCopy use, folds through resolvePoint (no result slice), and copies the value out once
+// for the caller-owned contract. The descent reads the shared, immutable decoded nodes and
+// retains nothing, so it needs no per-call reader object; the only allocation left is the one
+// value copy Get's contract requires. The result is identical to NewReader(snap).Get(userKey).
+func (t *BTree) GetAt(snap engine.Snapshot, userKey []byte) ([]byte, error) {
+	var scratch [8]entry
+	group, err := t.gatherPoint(userKey, scratch[:0])
+	if err != nil {
+		return nil, err
+	}
+	val, ok := resolvePoint(group, snap, t.merge, t.rangeDels)
+	if !ok {
+		return nil, engine.ErrNotFound
+	}
+	// resolvePoint hands back a value aliased to the immutable decoded leaf (or Fold's buffer);
+	// Get's contract is a caller-owned copy, so copy once here, the same single copy the
+	// reader's Get makes. This is the only heap allocation on the path.
+	return append([]byte(nil), val...), nil
+}
+
 // resolvePoint folds one user key's version group to its MVCC-visible value at snap,
 // returning the value with no caller-owned copy. The group gathered for a point read holds
 // only entries for userKey (gatherPoint stops at the user-key boundary), so unlike
