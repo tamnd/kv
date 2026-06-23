@@ -57,6 +57,13 @@ const (
 	// SyncNormal fdatasyncs at checkpoint and periodically, not every commit. The
 	// WAL-mode default: crash-consistent, may lose the most recent commits.
 	SyncNormal
+	// SyncBarrier issues a write-ordering barrier on the WAL on every commit
+	// (group-batched) rather than a full drive-cache flush. Every acked commit
+	// survives a process or kernel crash, but a power loss can still lose the most
+	// recent ones. It is the "durable on crash, not on power loss" middle ground:
+	// most of SyncOff's throughput while still crash-safe, which is what most
+	// applications actually want. Backed by vfs.SyncBarrier (perf/06 F2).
+	SyncBarrier
 	// SyncFull fdatasyncs the WAL on every commit (group-batched). Every acked
 	// commit survives power loss.
 	SyncFull
@@ -419,8 +426,10 @@ func (w *WAL) AppendCommit(version uint64) (uint64, error) {
 }
 
 // Sync flushes the log per the configured sync level. After it returns at
-// SyncFull/SyncExtra every frame appended so far is durable: a crash will redo it. At
-// SyncOff/SyncNormal it is a no-op, since those levels defer durability to checkpoint.
+// SyncBarrier/SyncFull/SyncExtra every frame appended so far is durable: a crash will
+// redo it (SyncBarrier survives a process or kernel crash but not necessarily a power
+// loss). At SyncOff/SyncNormal it is a no-op, since those levels defer durability to
+// checkpoint.
 // One Sync covers every batch a group-commit leader appended, so N commits share one
 // fsync instead of paying N in series.
 func (w *WAL) Sync() error { return w.sync() }
@@ -447,6 +456,10 @@ func (w *WAL) sync() error {
 	case SyncOff, SyncNormal:
 		// NORMAL defers the per-commit sync; durability is finalized at checkpoint.
 		return nil
+	case SyncBarrier:
+		// Crash-durable per commit via the cheaper ordering barrier, not a full flush.
+		w.syncs++
+		return w.file.Sync(vfs.SyncBarrier)
 	case SyncFull:
 		w.syncs++
 		return w.file.Sync(vfs.SyncData)

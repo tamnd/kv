@@ -105,9 +105,15 @@ func (o *osFile) ReadAt(p []byte, off int64) (int, error)  { return o.f.ReadAt(p
 func (o *osFile) WriteAt(p []byte, off int64) (int, error) { return o.f.WriteAt(p, off) }
 
 func (o *osFile) Sync(mode SyncMode) error {
-	// Go's os.File.Sync issues fsync (F_FULLFSYNC on macOS). We do not expose a
-	// weaker fdatasync separately here; SyncData maps to the same call, which is
-	// the safe default. A faster-but-weaker path is a documented future knob.
+	if mode == SyncBarrier {
+		// The cheaper ordering barrier: durable on crash, not guaranteed on power
+		// loss. Platform-specific (F_BARRIERFSYNC on macOS, fdatasync on Linux).
+		return barrierSync(o.f)
+	}
+	// SyncData and SyncFull both go through os.File.Sync, which issues F_FULLFSYNC on
+	// macOS: the bytes reach stable media and survive power loss. That full flush is
+	// correct for the FULL durability level; the cheaper barrier is reached only via
+	// SyncBarrier above.
 	return o.f.Sync()
 }
 

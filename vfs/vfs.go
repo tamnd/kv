@@ -32,6 +32,14 @@ const (
 	// SyncFull flushes data and metadata (fsync / F_FULLFSYNC). Used when the file
 	// size itself must be durable, e.g. after growth at checkpoint.
 	SyncFull
+	// SyncBarrier issues a write-ordering barrier rather than a full drive-cache
+	// flush: data written before it is durable across a process or kernel crash and
+	// is ordered ahead of later writes, but unlike SyncFull a power loss can still
+	// lose it because the bytes are not guaranteed onto stable media before the call
+	// returns. On macOS this is fcntl(F_BARRIERFSYNC); on Linux fdatasync; on other
+	// platforms it falls back to a full fsync, which is stronger. It backs the WAL's
+	// intermediate "durable on crash, not on power loss" level (perf/06 F2).
+	SyncBarrier
 )
 
 // LockLevel is a rung on the journal-mode locking ladder (SQLite-style). WAL

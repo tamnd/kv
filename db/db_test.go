@@ -216,6 +216,49 @@ func TestSyncNormalLosesUncheckpointed(t *testing.T) {
 	}
 }
 
+// TestSyncBarrierSurvivesCrashWithoutCheckpoint pins the intermediate durability
+// level (perf/06 F2): at SyncBarrier every commit issues a per-commit barrier sync,
+// so committed data survives a crash even with no checkpoint, unlike SyncNormal
+// which defers the sync and loses the uncheckpointed tail. Each serial commit must
+// advance the fsync counter, and the data must replay from the WAL after the crash.
+func TestSyncBarrierSurvivesCrashWithoutCheckpoint(t *testing.T) {
+	fs := vfs.NewMem()
+	d, err := Open(fs, "test.kv", Options{PageSize: 4096, Sync: wal.SyncBarrier, AutoCheckpoint: -1})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	const n = 8
+	var prev uint64
+	for i := range n {
+		key := fmt.Sprintf("k%02d", i)
+		if _, err := d.Write(func(b *engine.WriteBatch) { b.Set([]byte(key), []byte("v")) }); err != nil {
+			t.Fatalf("write %q: %v", key, err)
+		}
+		// A serial committer is its own group, so each commit forces one barrier sync.
+		if got := d.Stats().Syncs; got <= prev {
+			t.Fatalf("commit %d did not sync: syncs stayed at %d", i, got)
+		} else {
+			prev = got
+		}
+	}
+
+	// No checkpoint ran, so the main file holds none of the engine pages; only the
+	// per-commit barrier synced WAL is durable across the crash.
+	fs.Crash()
+
+	d2, err := Open(fs, "test.kv", Options{})
+	if err != nil {
+		t.Fatalf("reopen after crash: %v", err)
+	}
+	defer d2.Close()
+	for i := range n {
+		key := fmt.Sprintf("k%02d", i)
+		if v, ok := get(t, d2, key); !ok || v != "v" {
+			t.Fatalf("%s = %q,%v after SyncBarrier crash, want v (replayed from WAL)", key, v, ok)
+		}
+	}
+}
+
 // TestRecoverLargeBatchWithSplits redoes a batch large enough to split the B-tree
 // across many pages, proving recovery drives the same split path normal writes do.
 func TestRecoverLargeBatchWithSplits(t *testing.T) {

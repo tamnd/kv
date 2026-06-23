@@ -88,6 +88,35 @@ func TestMemContract(t *testing.T) {
 	runFSContract(t, NewMem(), "test.kv")
 }
 
+// TestOSBarrierSync exercises the SyncBarrier level on the real OS backend: on
+// macOS it issues fcntl(F_BARRIERFSYNC), on Linux fdatasync, both against a real
+// fd. The contract is that the barrier flushes the bytes durably enough to read
+// back and never reports an error on a regular file; the readback after the
+// barrier proves the write reached the file and the call returned cleanly.
+func TestOSBarrierSync(t *testing.T) {
+	dir := t.TempDir()
+	f, err := NewOS().Open(filepath.Join(dir, "barrier.kv"), OpenReadWrite|OpenCreate)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer f.Close()
+
+	want := []byte("barrier durable")
+	if _, err := f.WriteAt(want, 0); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := f.Sync(SyncBarrier); err != nil {
+		t.Fatalf("barrier sync: %v", err)
+	}
+	got := make([]byte, len(want))
+	if _, err := f.ReadAt(got, 0); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("after barrier got %q, want %q", got, want)
+	}
+}
+
 func TestMemCrashRevertsUnsyncedWrites(t *testing.T) {
 	fs := NewMem()
 	f, _ := fs.Open("db.kv", OpenReadWrite|OpenCreate)

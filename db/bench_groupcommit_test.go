@@ -55,3 +55,45 @@ func BenchmarkConcurrentWriteFull(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkSyncLevels measures single-writer per-commit durability cost across the three
+// levels that actually sync on commit, on the real OS filesystem so the syscall cost is in
+// the number. SyncFull pays a full F_FULLFSYNC per commit (the platform's most expensive
+// barrier), SyncBarrier pays the cheaper F_BARRIERFSYNC / fdatasync ordering barrier, and
+// SyncOff pays nothing. The point of the slice (perf/06 F2) is that SyncBarrier sits far
+// closer to SyncOff than to SyncFull while still surviving a process crash; running all
+// three side by side shows that gap. Single writer so there is no group batching to mask
+// the per-commit cost.
+func BenchmarkSyncLevels(b *testing.B) {
+	levels := []struct {
+		name string
+		mode wal.Sync
+	}{
+		{"full", wal.SyncFull},
+		{"barrier", wal.SyncBarrier},
+		{"off", wal.SyncOff},
+	}
+	for _, lvl := range levels {
+		b.Run(lvl.name, func(b *testing.B) {
+			fs := vfs.NewOS()
+			path := filepath.Join(b.TempDir(), "bench.kv")
+			d, err := Open(fs, path, Options{PageSize: 4096, Sync: lvl.mode, AutoCheckpoint: -1})
+			if err != nil {
+				b.Fatalf("open: %v", err)
+			}
+			defer d.Close()
+
+			b.ResetTimer()
+			for i := range b.N {
+				key := fmt.Sprintf("k%012d", i)
+				if _, err := d.Write(func(wb *engine.WriteBatch) {
+					wb.Set([]byte(key), []byte("v"))
+				}); err != nil {
+					b.Fatalf("write: %v", err)
+				}
+			}
+			b.StopTimer()
+			b.ReportMetric(float64(d.Stats().Syncs)/float64(b.N), "fsyncs/op")
+		})
+	}
+}
