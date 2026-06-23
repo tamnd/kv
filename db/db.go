@@ -929,6 +929,56 @@ func (d *DB) snapshotGet(version uint64, key []byte) ([]byte, bool, error) {
 	return v, true, nil
 }
 
+// snapshotGetZeroCopy is snapshotGet for the zero-copy read: it serves the value through
+// the engine's ZeroCopyReader when the reader implements it, and falls back to the copying
+// Get otherwise. The capability's contract is that the value stays valid after the reader is
+// closed (it is backed by an immutable internal node, not the reader's transient state), so
+// returning it past rd.Close and the read lock is sound; an engine that cannot promise that
+// simply does not implement the capability and takes the copying path here.
+func (d *DB) snapshotGetZeroCopy(version uint64, key []byte) ([]byte, bool, error) {
+	_, span := d.startSpan(context.Background(), "kv.get")
+	defer endSpan(span)
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	rd, err := d.eng.NewReader(engine.Snapshot{Version: version, Clock: d.now})
+	if err != nil {
+		return nil, false, err
+	}
+	defer rd.Close()
+	var v []byte
+	if zc, ok := rd.(engine.ZeroCopyReader); ok {
+		v, err = zc.GetZeroCopy(key)
+	} else {
+		v, err = rd.Get(key)
+	}
+	if err == engine.ErrNotFound {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return v, true, nil
+}
+
+// GetZeroCopy reads userKey at the latest committed snapshot and returns the value aliased
+// to immutable engine storage instead of a fresh copy, for read paths hot enough that the
+// per-read copy and allocation matter. The returned value is READ-ONLY: it may be shared
+// with the engine's cache and with other concurrent readers, so a caller that modifies it
+// corrupts that shared copy. It stays valid for reading after this returns. A caller that
+// needs an owned, mutable, or long-retained value should use Get, which copies. When the
+// engine does not support zero-copy reads this transparently falls back to Get's copy, so it
+// is always safe to call; it just may not save the copy.
+func (d *DB) GetZeroCopy(userKey []byte) ([]byte, error) {
+	v, ok, err := d.snapshotGetZeroCopy(d.Version(), userKey)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, engine.ErrNotFound
+	}
+	return v, nil
+}
+
 // Version reports the latest committed version, the snapshot a reader sees the
 // newest data at. It is zero on a fresh database with no commits.
 func (d *DB) Version() uint64 {

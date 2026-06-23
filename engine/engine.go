@@ -92,6 +92,34 @@ type Reader interface {
 	Close() error
 }
 
+// ZeroCopyReader is an optional Reader capability: a point read that returns the value
+// aliased to immutable engine-internal storage rather than a fresh caller-owned copy. The
+// ordinary Get copies the resolved value out so the caller owns bytes it may keep and
+// mutate; for a read that only inspects the value and discards it, that copy is pure
+// overhead on the hottest path. An engine implements this only when it can hand back a value
+// that stays valid and never mutates under the caller.
+//
+// The contract on the returned value is narrower than Get's, and a caller opts into it
+// knowingly:
+//
+//   - It is READ-ONLY. The bytes may be shared with the engine's internal cache and with
+//     other concurrent readers, so the caller must not modify them. Modifying them corrupts
+//     the shared copy for every other reader.
+//   - It stays valid for reading after the reader is closed. The value is backed by an
+//     immutable, separately allocated node the engine never mutates in place (a writer
+//     replaces such a node wholesale rather than editing it), so a reference keeps exactly
+//     the read bytes alive. A caller that needs to keep the value past a read it might mutate
+//     must copy it itself.
+//
+// The host (db.GetZeroCopy) uses this when the engine's reader implements it and falls back
+// to Get otherwise, so it is purely an optimization an engine may decline.
+type ZeroCopyReader interface {
+	// GetZeroCopy returns the value for userKey visible at the reader's snapshot, aliased
+	// to immutable internal storage, or ErrNotFound. It resolves MVCC versions exactly as
+	// Get does; the only difference is the returned value is not copied and is read-only.
+	GetZeroCopy(userKey []byte) (value []byte, err error)
+}
+
 // BulkLoader is an optional engine capability: population of an empty engine from a
 // stream of cells already in ascending internal-key order, building the on-disk
 // structure bottom-up instead of inserting one cell at a time (spec 15 §6). The host
