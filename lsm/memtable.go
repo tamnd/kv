@@ -1,6 +1,10 @@
 package lsm
 
-import "github.com/tamnd/kv/format"
+import (
+	"sync"
+
+	"github.com/tamnd/kv/format"
+)
 
 // memtable is one in-memory sorted run: the active write target of the LSM core
 // (spec 06 §2). Writes land here first, as pure in-memory inserts, because
@@ -16,7 +20,14 @@ import "github.com/tamnd/kv/format"
 // ordinary cell (so it shadows and sorts like any other) and is additionally
 // recorded here as an interval.
 type memtable struct {
-	sl        *skiplist
+	sl *skiplist
+	// rdmu guards rangeDels against the parallel group apply, where several workers insert
+	// into one active memtable at once and a range-delete marker on each would append to the
+	// same slice concurrently. The skip list itself is lock-free, so the common point write
+	// takes no lock here; only a range-delete marker does. A reader gathering the live set
+	// runs under the engine's l.mu, which the apply holds for its duration, so this guards
+	// worker against worker, not worker against reader.
+	rdmu      sync.Mutex
 	rangeDels []format.RangeDel
 }
 
@@ -33,11 +44,13 @@ func newMemtable(arenaCap int) *memtable {
 func (m *memtable) set(internalKey, value []byte) {
 	m.sl.insert(internalKey, value)
 	if format.KindOf(internalKey) == format.KindRangeBegin {
+		m.rdmu.Lock()
 		m.rangeDels = append(m.rangeDels, format.RangeDel{
 			Lo:      append([]byte(nil), format.UserKey(internalKey)...),
 			Hi:      append([]byte(nil), value...),
 			Version: format.Version(internalKey),
 		})
+		m.rdmu.Unlock()
 	}
 }
 

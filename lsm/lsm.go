@@ -35,6 +35,7 @@ package lsm
 import (
 	"bytes"
 	"context"
+	"runtime"
 	"sort"
 	"sync"
 
@@ -297,6 +298,101 @@ func (l *LSM) Apply(batch *engine.WriteBatch, commitVersion uint64) error {
 		l.memMaxLSN = l.pendingLSN
 	}
 	return nil
+}
+
+// parallelApplyMinEntries is the group size below which ApplyGroup inserts on the calling
+// goroutine. Spreading the inserts costs a flatten, a few goroutines, and a join; below this
+// many entries the serial insert is faster than paying for them. The number is small because
+// the per-insert cost (a CompareInternal-heavy skip-list descent plus a key/value copy) is
+// high, so even a few dozen entries amortize the fan-out.
+const parallelApplyMinEntries = 64
+
+// ApplyGroup installs every batch of a group-commit group into the active memtable, spreading
+// the inserts across cores when the group is large enough to be worth it (perf/03 W1, perf/07).
+// It is equivalent to Apply per batch in version order, with one difference the seam documents:
+// the seal that rolls a full memtable is taken once, before the group, rather than between its
+// batches, so a single group may push the memtable a little past its cap and seal at the next
+// group boundary. The cap is a soft target, so a bounded overshoot of one group's bytes is fine.
+//
+// The lock is held for the whole apply. That keeps the active memtable from being swapped under
+// the workers and keeps a reader (which captures the memtables under l.mu.RLock) excluded for the
+// apply, exactly as a single Apply did; the win is that the apply now finishes in less wall-clock
+// because it runs on several cores, so the exclusion window is shorter. The workers insert through
+// the lock-free skip list, which makes their concurrent inserts safe without any lock of their own;
+// they share the active memtable only, and every entry across the group carries a distinct internal
+// key (versions differ across batches), so no two workers ever insert the same key.
+func (l *LSM) ApplyGroup(batches []*engine.WriteBatch, versions []uint64) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.flushErr != nil {
+		return l.flushErr
+	}
+	if l.mem.count() > 0 && l.mem.size() >= l.memtableCap {
+		if err := l.sealForFlushLocked(); err != nil {
+			return err
+		}
+	}
+	total := 0
+	for _, b := range batches {
+		total += len(b.Entries())
+	}
+	mem := l.mem
+	if total < parallelApplyMinEntries {
+		for _, b := range batches {
+			for _, e := range b.Entries() {
+				mem.set(e.InternalKey, e.Value)
+			}
+		}
+	} else {
+		applyEntriesParallel(mem, batches, total)
+	}
+	if l.pendingLSN > l.memMaxLSN {
+		l.memMaxLSN = l.pendingLSN
+	}
+	return nil
+}
+
+// applyEntriesParallel inserts every batch's entries into mem across GOMAXPROCS workers. It
+// flattens the group's entries into one slice so each worker takes a contiguous, equal share,
+// then waits for all of them. The flatten is one allocation per group, amortized over many
+// inserts; the inserts themselves, the CompareInternal-heavy skip-list descents that dominate
+// apply CPU, are what spread across cores. The skip list is lock-free, so the workers need no
+// lock to share mem.
+func applyEntriesParallel(mem *memtable, batches []*engine.WriteBatch, total int) {
+	flat := make([]engine.BatchEntry, 0, total)
+	for _, b := range batches {
+		flat = append(flat, b.Entries()...)
+	}
+	workers := runtime.GOMAXPROCS(0)
+	if workers > total {
+		workers = total
+	}
+	if workers < 2 {
+		for _, e := range flat {
+			mem.set(e.InternalKey, e.Value)
+		}
+		return
+	}
+	chunk := (total + workers - 1) / workers
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		lo := w * chunk
+		if lo >= total {
+			break
+		}
+		hi := lo + chunk
+		if hi > total {
+			hi = total
+		}
+		wg.Add(1)
+		go func(part []engine.BatchEntry) {
+			defer wg.Done()
+			for _, e := range part {
+				mem.set(e.InternalKey, e.Value)
+			}
+		}(flat[lo:hi])
+	}
+	wg.Wait()
 }
 
 // NoteLSN records the WAL commit LSN of the batch the host is about to Apply, the

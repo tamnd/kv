@@ -110,6 +110,26 @@ type BulkLoader interface {
 	BulkLoad(next func() (internalKey, value []byte, ok bool)) error
 }
 
+// GroupApplier is an optional engine capability: applying a whole group-commit group's
+// batches in one call so the engine can spread the inserts across cores instead of
+// taking them one batch at a time on the leader's goroutine (perf/03 W1, perf/07). The
+// host (db group commit) uses it when the engine implements it, and falls back to a Apply
+// per batch otherwise. Every batch is already durable in the WAL by the time this is
+// called, the same precondition as Apply.
+//
+// The batches are independent: each carries a distinct commit version, so no two entries
+// across the group share an internal key, and insert order does not affect the result.
+// versions[i] is the commit version of batches[i], the same value Apply would receive. An
+// engine that tracks a durable mark folds it through the usual NoteLSN call the host makes
+// once before this, with the group's largest commit LSN.
+type GroupApplier interface {
+	// ApplyGroup installs every batch's mutations, concurrently when the group is large
+	// enough to be worth it. It is equivalent to calling Apply on each batch in version
+	// order, except an engine that seals or rolls a structure on a size threshold may take
+	// that boundary once for the whole group rather than between its batches.
+	ApplyGroup(batches []*WriteBatch, versions []uint64) error
+}
+
 // Cursor is the low-level iterator primitive both cores expose (spec 04 §2.3).
 // The rich caller-facing iterator (spec 11) is built on top of it above the
 // seam.
