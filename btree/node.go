@@ -252,6 +252,50 @@ func leafSlotSearch(p []byte, n int, ik []byte) (idx int, found, ok bool) {
 	return lo, false, true
 }
 
+// interiorChildInPlace finds the child subtree that covers userKey by walking the interior
+// page's separator cells directly, without decoding the node into an interior struct. It is the
+// interior analog of leafSlotSearch: the hot insert descent routes through it so each interior
+// level allocates nothing, instead of the loadInterior path that builds an interior with a fresh
+// copy of every separator just to binary-search them (perf/11 W2). The cells are variable-length
+// and packed with no offset array, so this is a forward scan rather than a binary search; an
+// interior holds at most a few hundred small separators, and a scan that copies nothing beats a
+// binary search that allocates every separator. It returns the same child loadInterior's
+// childFor would: the child of the first separator strictly greater than userKey, or the
+// rightmost child when userKey is at least every separator. ok=false signals a malformed page so
+// the caller falls back to the decode path, the same contract leafInsertInPlace uses. The Bε
+// message buffer that may follow the pivot cells does not affect routing and is never read here.
+func interiorChildInPlace(p []byte, userKey []byte) (child format.PageNo, ok bool) {
+	if len(p) < nodeHeaderSize {
+		return 0, false
+	}
+	n := int(format.DecodeCommonHeader(p).CellCount)
+	off := nodeHeaderSize
+	for i := 0; i < n; i++ {
+		// cell: [4-byte child][uvarint separator length][separator bytes]
+		if off+4 > len(p) {
+			return 0, false
+		}
+		c := binary.BigEndian.Uint32(p[off:])
+		off += 4
+		slen, m := format.Uvarint(p[off:])
+		if m <= 0 {
+			return 0, false
+		}
+		off += m
+		end := off + int(slen)
+		if end < off || end > len(p) {
+			return 0, false
+		}
+		sep := p[off:end]
+		off = end
+		if format.CompareUser(userKey, sep) < 0 {
+			return c, true
+		}
+	}
+	// userKey is at least every separator: route to the rightmost child in the header pointer.
+	return binary.BigEndian.Uint32(p[format.CommonHeaderSize:nodeHeaderSize]), true
+}
+
 // leafInsertInPlace inserts (ik, value) into the slotted leaf page directly, the hot
 // path's whole point: instead of decoding the leaf, inserting into a slice, and
 // re-encoding every cell, it appends one cell body into the free gap and splices one
