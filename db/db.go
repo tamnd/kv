@@ -281,11 +281,14 @@ type DB struct {
 	fs   vfs.FS
 	path string
 
-	// mu serializes the single committing writer against itself and against the
+	// rl serializes the single committing writer against itself and against the
 	// engine reads (spec 10 §5.1): a commit takes it exclusively for log+apply, a
 	// read takes it shared. The version state lives in the lock-light oracle, not
-	// here, so it is consulted off this lock.
-	mu  sync.RWMutex
+	// here, so it is consulted off this lock. It is a distributed RWMutex (rlatch),
+	// so a read takes only its P's stripe and reads scale across cores instead of
+	// serializing on one RWMutex reader count (perf/10 R1); the contract is the same
+	// as a sync.RWMutex.
+	rl  *rlatch
 	pgr *pager.Pager
 	wal *wal.WAL
 	eng engine.Engine
@@ -474,7 +477,7 @@ func create(fs vfs.FS, path string, opts Options) (*DB, error) {
 		return nil, err
 	}
 	chdr := pgr.Header()
-	d := &DB{fs: fs, path: path, pgr: pgr, wal: w, eng: eng, orc: newOracle(0), crypto: enc,
+	d := &DB{rl: newRlatch(), fs: fs, path: path, pgr: pgr, wal: w, eng: eng, orc: newOracle(0), crypto: enc,
 		merge: opts.Merge, maxRetries: opts.maxRetries(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, bufferedInserts: opts.BufferedInserts, compression: opts.compressionMode(), noAutoCompact: opts.disableAutoCompaction, fillFactor: opts.FillFactor, maxInlineValue: opts.MaxInlineValue, levelRatio: opts.LevelRatio, valueSepThresh: opts.ValueSepThreshold, now: opts.clock(), logger: opts.Logger, slowOp: opts.SlowOpThreshold, tracer: opts.Tracer, readReplica: opts.ReadReplica, archive: opts.WALArchive,
 		fullPageWrites: chdr.FullPageWritesOff == 0,
 		autoVacuumMode: chdr.AutoVacuumMode,
@@ -509,7 +512,7 @@ func openExisting(fs vfs.FS, path string, opts Options) (*DB, error) {
 		return nil, err
 	}
 	hdr := pgr.Header()
-	d := &DB{fs: fs, path: path, pgr: pgr, eng: eng, crypto: enc,
+	d := &DB{rl: newRlatch(), fs: fs, path: path, pgr: pgr, eng: eng, crypto: enc,
 		merge: opts.Merge, maxRetries: opts.maxRetries(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, bufferedInserts: opts.BufferedInserts, compression: opts.compressionMode(), noAutoCompact: opts.disableAutoCompaction, fillFactor: opts.FillFactor, maxInlineValue: opts.MaxInlineValue, levelRatio: opts.LevelRatio, valueSepThresh: opts.ValueSepThreshold, now: opts.clock(), logger: opts.Logger, slowOp: opts.SlowOpThreshold, tracer: opts.Tracer, readReplica: opts.ReadReplica, archive: opts.WALArchive,
 		fullPageWrites: hdr.FullPageWritesOff == 0,
 		autoVacuumMode: hdr.AutoVacuumMode,
@@ -717,18 +720,18 @@ func (d *DB) Write(fn func(b *engine.WriteBatch)) (uint64, error) {
 // without the capability, Load falls back to a chunked sequence of ordinary commits,
 // which is slower, accepts any order, and is durable per chunk like a WriteBatch.
 func (d *DB) Load(next func() (key, value []byte, ok bool)) (uint64, error) {
-	d.mu.Lock()
+	d.rl.lock()
 	if d.fatal != nil {
-		d.mu.Unlock()
+		d.rl.unlock()
 		return 0, d.fatal
 	}
 	bl, ok := d.eng.(engine.BulkLoader)
 	if ok && d.orc.lastCommitted() == 0 {
 		v, err := d.loadFast(bl, next)
-		d.mu.Unlock()
+		d.rl.unlock()
 		return v, err
 	}
-	d.mu.Unlock()
+	d.rl.unlock()
 	return d.loadBatched(next)
 }
 
@@ -912,8 +915,8 @@ const batchKeysLinearMax = 16
 func (d *DB) snapshotGet(version uint64, key []byte) ([]byte, bool, error) {
 	_, span := d.startSpan(context.Background(), "kv.get")
 	defer endSpan(span)
-	d.mu.RLock()
-	defer d.mu.RUnlock()
+	sh := d.rl.rlock()
+	defer d.rl.runlock(sh)
 	rd, err := d.eng.NewReader(engine.Snapshot{Version: version, Clock: d.now})
 	if err != nil {
 		return nil, false, err
@@ -938,8 +941,8 @@ func (d *DB) snapshotGet(version uint64, key []byte) ([]byte, bool, error) {
 func (d *DB) snapshotGetZeroCopy(version uint64, key []byte) ([]byte, bool, error) {
 	_, span := d.startSpan(context.Background(), "kv.get")
 	defer endSpan(span)
-	d.mu.RLock()
-	defer d.mu.RUnlock()
+	sh := d.rl.rlock()
+	defer d.rl.runlock(sh)
 	rd, err := d.eng.NewReader(engine.Snapshot{Version: version, Clock: d.now})
 	if err != nil {
 		return nil, false, err
@@ -1015,8 +1018,8 @@ func (d *DB) Get(userKey []byte) ([]byte, error) {
 // is true when the budget ran out before the work was done and Maintain should be
 // called again.
 func (d *DB) Maintain(maxPages int) (engine.MaintReport, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.rl.lock()
+	defer d.rl.unlock()
 	budget := engine.MaintBudget{MaxPages: maxPages, Watermark: d.orc.readMark(), Now: d.now()}
 	// Trace the maintenance round (compaction, version GC) so a span backend can see how
 	// much of a request's latency is background work serialized behind the writer lock
@@ -1036,8 +1039,8 @@ func (d *DB) Maintain(maxPages int) (engine.MaintReport, error) {
 // commit or mid checkpoint. It returns ErrUnsupported when the engine has no verifier,
 // so the CLI can say so plainly rather than reporting a silent pass.
 func (d *DB) Verify() (*engine.VerifyReport, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.rl.lock()
+	defer d.rl.unlock()
 	v, ok := d.eng.(engine.Verifier)
 	if !ok {
 		return nil, ErrUnsupported
@@ -1109,8 +1112,8 @@ type Stats struct {
 // Stats gathers a Stats snapshot under a read lock, so it is consistent against a
 // concurrent commit without blocking one for long (spec 09 §4).
 func (d *DB) Stats() Stats {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
+	sh := d.rl.rlock()
+	defer d.rl.runlock(sh)
 
 	es := d.eng.Stats()
 	// LSN is the next frame number to assign, so the last frame written is LSN-1, and a
@@ -1191,9 +1194,9 @@ func (d *DB) SetSyncMode(s wal.Sync) { d.wal.SetSync(s) }
 // AutoCheckpointFrames returns the WAL backlog threshold at which the background
 // checkpointer fires, 0 when auto-checkpointing is disabled (spec 22 §3).
 func (d *DB) AutoCheckpointFrames() int {
-	d.mu.RLock()
+	sh := d.rl.rlock()
 	t := d.ckptThreshold
-	d.mu.RUnlock()
+	d.rl.runlock(sh)
 	return t
 }
 
@@ -1201,9 +1204,9 @@ func (d *DB) AutoCheckpointFrames() int {
 // frames. Zero or negative disables auto-checkpointing (spec 22 §3). The change takes
 // effect on the next commit; the background worker goroutine (if any) continues running.
 func (d *DB) SetAutoCheckpointFrames(n int) {
-	d.mu.Lock()
+	d.rl.lock()
 	d.ckptThreshold = n
-	d.mu.Unlock()
+	d.rl.unlock()
 }
 
 // CacheFrames returns the buffer pool capacity in frames (pages). Multiply by PageSize
@@ -1366,9 +1369,9 @@ func (d *DB) CheckpointMode(m CheckpointMode) error {
 	d.ckptMu.Lock()
 	defer d.ckptMu.Unlock()
 
-	d.mu.Lock()
+	d.rl.lock()
 	foldedLSN, lastCommitVersion, resetWAL := d.prepareCheckpointLocked()
-	d.mu.Unlock()
+	d.rl.unlock()
 
 	// Page writeback and fsync run without d.mu. The pager's own shard locks and
 	// ckptGate provide the necessary mutual exclusion for the I/O, so foreground
@@ -1379,8 +1382,8 @@ func (d *DB) CheckpointMode(m CheckpointMode) error {
 		return err
 	}
 
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.rl.lock()
+	defer d.rl.unlock()
 	if err := d.finalizeCheckpointLocked(foldedLSN, resetWAL); err != nil {
 		return err
 	}
@@ -1533,8 +1536,8 @@ func (d *DB) noteLSN(lsn uint64) {
 // it after large deletes, or periodically with a small budget, the kv analog of
 // SQLite's "PRAGMA incremental_vacuum(N)".
 func (d *DB) Vacuum(budget int) (int, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.rl.lock()
+	defer d.rl.unlock()
 	if err := d.checkpointLocked(); err != nil {
 		return 0, err
 	}
@@ -1544,20 +1547,20 @@ func (d *DB) Vacuum(budget int) (int, error) {
 // ApplicationID reports the application-defined file tag stored in the header (spec 22 §2).
 // It is a free-form identifier an application stamps so a tool can recognize its own files.
 func (d *DB) ApplicationID() uint32 {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.rl.lock()
+	defer d.rl.unlock()
 	return d.pgr.Header().ApplicationID
 }
 
 func (d *DB) FullPageWrites() bool {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.rl.lock()
+	defer d.rl.unlock()
 	return d.fullPageWrites
 }
 
 func (d *DB) AutoVacuumMode() uint8 {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.rl.lock()
+	defer d.rl.unlock()
 	return d.autoVacuumMode
 }
 
@@ -1569,8 +1572,8 @@ func (d *DB) CommitLingerUs() uint32 { return d.lingerUs.Load() }
 // plus all committed data) and fsyncs, so the tag is durable even across a crash and the
 // header never desyncs from the WAL.
 func (d *DB) SetApplicationID(id uint32) error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.rl.lock()
+	defer d.rl.unlock()
 	d.pgr.Header().ApplicationID = id
 	return d.checkpointLocked()
 }
@@ -1578,8 +1581,8 @@ func (d *DB) SetApplicationID(id uint32) error {
 // UserVersion reports the application-defined schema/version counter stored in the header
 // (spec 22 §2), the kv analog of SQLite's user_version. kv never interprets it.
 func (d *DB) UserVersion() uint32 {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.rl.lock()
+	defer d.rl.unlock()
 	return d.pgr.Header().UserVersion
 }
 
@@ -1587,8 +1590,8 @@ func (d *DB) UserVersion() uint32 {
 // it durably (spec 22 §2). Like SetApplicationID it is a persistent-runtime setting folded
 // into the main file by a checkpoint.
 func (d *DB) SetUserVersion(v uint32) error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.rl.lock()
+	defer d.rl.unlock()
 	d.pgr.Header().UserVersion = v
 	return d.checkpointLocked()
 }
@@ -1628,8 +1631,8 @@ func (d *DB) runAutoVacuumLocked() {
 // The change takes effect immediately on the next checkpoint; it is persisted in
 // the file header so it survives re-open.
 func (d *DB) SetFullPageWrites(on bool) error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.rl.lock()
+	defer d.rl.unlock()
 	d.fullPageWrites = on
 	if on {
 		d.pgr.Header().FullPageWritesOff = 0
@@ -1645,8 +1648,8 @@ func (d *DB) SetFullPageWrites(on bool) error {
 // TruncateTail(0) after every checkpoint. The mode is persisted in the file
 // header so it survives re-open.
 func (d *DB) SetAutoVacuumMode(mode uint8) error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.rl.lock()
+	defer d.rl.unlock()
 	if mode > 2 {
 		return fmt.Errorf("kv: invalid auto_vacuum mode %d", mode)
 	}
@@ -1661,8 +1664,8 @@ func (d *DB) SetAutoVacuumMode(mode uint8) error {
 // immediately visible to the commit path and is persisted in the file header.
 func (d *DB) SetCommitLingerUs(us uint32) error {
 	d.lingerUs.Store(us)
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.rl.lock()
+	defer d.rl.unlock()
 	d.pgr.Header().CommitLingerUs = us
 	return d.checkpointLocked()
 }
@@ -1682,8 +1685,8 @@ func (d *DB) SetCommitLingerUs(us uint32) error {
 // The database must have been created with an encryption key; otherwise it returns
 // ErrNotEncrypted.
 func (d *DB) RotateEncryptionKey() error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.rl.lock()
+	defer d.rl.unlock()
 	if d.crypto == nil {
 		return ErrNotEncrypted
 	}
@@ -1732,8 +1735,8 @@ func (d *DB) Close() error {
 		d.logClosed()
 	})
 
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.rl.lock()
+	defer d.rl.unlock()
 	var firstErr error
 	if d.wal != nil {
 		if err := d.wal.Close(); err != nil {

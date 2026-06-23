@@ -89,10 +89,10 @@ func (t *Txn) NewIterator(opts engine.IterOptions) (*Iterator, error) {
 		// takes: an engine reader may snapshot mutable engine state (the LSM segment
 		// list) at construction and must not race a flush or compaction. The streaming
 		// path keeps the reader open afterward and reacquires the lock per pull.
-		t.db.mu.RLock()
+		sh := t.db.rl.rlock()
 		rd, err := t.db.eng.NewReader(engine.Snapshot{Version: t.readVersion, Clock: t.db.now})
 		if err != nil {
-			t.db.mu.RUnlock()
+			t.db.rl.runlock(sh)
 			return nil, err
 		}
 		sf, ok := rd.(forwardScanner)
@@ -100,7 +100,7 @@ func (t *Txn) NewIterator(opts engine.IterOptions) (*Iterator, error) {
 		if !streamable {
 			rd.Close()
 		}
-		t.db.mu.RUnlock()
+		t.db.rl.runlock(sh)
 		if streamable {
 			return &Iterator{
 				pos:      -1,
@@ -134,9 +134,9 @@ func (it *Iterator) pullOne() {
 		it.drained = true
 		return
 	}
-	it.db.mu.RLock()
+	sh := it.db.rl.rlock()
 	k, v, ok, err := it.stream.ScanForward(it.after, it.lower, it.upper, it.keysOnly)
-	it.db.mu.RUnlock()
+	it.db.rl.runlock(sh)
 	if err != nil {
 		it.err = err
 		it.drained = true
@@ -182,8 +182,8 @@ func (it *Iterator) drainAll() {
 // at version, by walking the engine cursor ascending. It takes the shared read lock
 // so it never reads a page mid-commit. KeysOnly skips value materialization.
 func (d *DB) rangeSnapshot(version uint64, lower, upper []byte, keysOnly bool) ([]iterItem, error) {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
+	sh := d.rl.rlock()
+	defer d.rl.runlock(sh)
 	rd, err := d.eng.NewReader(engine.Snapshot{Version: version, Clock: d.now})
 	if err != nil {
 		return nil, err
