@@ -222,8 +222,11 @@ func (t *BTree) insertOne(ik, value []byte) error {
 		return t.storeLeaf(pgno, l)
 	}
 
-	// The leaf overflowed: split it, keeping version groups intact.
-	sp := l.splitPoint()
+	// The leaf overflowed: split it, keeping version groups intact. The split point is
+	// biased by where the new cell landed, so a sequential (append or prepend) load seals
+	// full leaves instead of half-full ones (spec 05 F3a); a random insert still splits at
+	// the balanced midpoint.
+	sp := l.splitPointBiased(l.search(ik))
 	if sp == 0 {
 		sp = len(l.keys) / 2
 		if sp == 0 {
