@@ -25,7 +25,7 @@ func (p *Pager) Get(pgno uint32, intent Intent) (*Frame, error) {
 	// while a reader holds the read lock and is mid-pin.
 	sh.mu.RLock()
 	if fr, ok := sh.index[pgno]; ok {
-		p.cacheHits.Add(1)
+		sh.cacheHits.Add(1)
 		if intent == Write {
 			// The caller is about to mutate the page bytes, so any decoded view cached
 			// against the old bytes is now stale. Drop it before the writer can touch the
@@ -49,7 +49,7 @@ func (p *Pager) Get(pgno uint32, intent Intent) (*Frame, error) {
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
 	if fr, ok := sh.index[pgno]; ok {
-		p.cacheHits.Add(1)
+		sh.cacheHits.Add(1)
 		if intent == Write {
 			fr.clearDecoded()
 			fr.writePinned.Store(true)
@@ -64,8 +64,9 @@ func (p *Pager) Get(pgno uint32, intent Intent) (*Frame, error) {
 	}
 	// Read the page from disk if it is within the materialized file; a freshly
 	// allocated page beyond the on-disk size reads as zeroes. Either way a physical
-	// read was issued, so it counts toward read amplification.
-	p.pageReads.Add(1)
+	// read was issued, so it counts toward read amplification. The counter lives on the
+	// shard we already hold exclusively, so the increment lands on a line this core owns.
+	sh.pageReads.Add(1)
 	off := int64(pgno-1) * int64(p.pageSize)
 	if sc := p.cryptoScheme(); sc != nil && pgno != 1 {
 		// Encrypted data page: read the ciphertext envelope into the shard's staging
