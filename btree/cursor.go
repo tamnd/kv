@@ -54,6 +54,62 @@ func (r *reader) Get(userKey []byte) ([]byte, error) {
 	return res[0].val, nil
 }
 
+// GetZeroCopy implements engine.ZeroCopyReader: the same resolution as Get, returning the
+// value aliased to the decoded leaf rather than copied out. It is sound here because a
+// decoded node is immutable and separately allocated: unmarshalLeaf copies every key and
+// value out of the page into the node's own byte slices, and a writer that changes a page
+// replaces the cached decoded node wholesale (clearDecoded then decode a private copy)
+// rather than editing it, so a value this resolves keeps the read bytes alive and never
+// changes under the caller. The single difference from Get is that resolvePoint hands back
+// Fold's value with no defensive copy, which for the common single-version Set is the
+// decoded leaf's own slice and for a merge is Fold's freshly built buffer; both satisfy the
+// read-only ZeroCopyReader contract. Multi-version, tombstone, merge, and range-delete
+// groups resolve identically to Get, just without the trailing copy.
+func (r *reader) GetZeroCopy(userKey []byte) ([]byte, error) {
+	// Same stack-backed group gather as Get (#136): the array stays on this frame and the
+	// group does not escape, since resolvePoint reads it and retains nothing.
+	var scratch [8]entry
+	group, err := r.t.gatherPoint(userKey, scratch[:0])
+	if err != nil {
+		return nil, err
+	}
+	val, ok := resolvePoint(group, r.snap, r.t.merge, r.t.rangeDels)
+	if !ok {
+		return nil, engine.ErrNotFound
+	}
+	return val, nil
+}
+
+// resolvePoint folds one user key's version group to its MVCC-visible value at snap,
+// returning the value with no caller-owned copy. The group gathered for a point read holds
+// only entries for userKey (gatherPoint stops at the user-key boundary), so unlike
+// resolveStream it does not loop over distinct user keys: it collects the ops once and folds
+// them once. The returned value aliases whatever Fold returns -- the decoded leaf's slice for
+// a Set base, Fold's built buffer for a merge -- so the caller must treat it as read-only.
+// ok is false when the group folds to absent (tombstoned, range-deleted, or nothing visible
+// at the snapshot), the same not-found resolveStream would skip.
+func resolvePoint(entries []entry, snap engine.Snapshot, merge func(existing, operand []byte) []byte, rangeDels []format.RangeDel) ([]byte, bool) {
+	if len(entries) == 0 {
+		return nil, false
+	}
+	tc := snap.TTLClock()
+	uk := format.UserKey(entries[0].ik)
+	// A point group is almost always a handful of versions, so collect the ops in a small
+	// stack array and only spill to the heap for a key with an unusually deep version chain.
+	// Fold reads the slice and never retains it, so the backing array does not escape.
+	var obuf [8]format.Op
+	ops := obuf[:0]
+	for k := range entries {
+		op, ok := format.OpFromCell(entries[k].ik, entries[k].val, tc.For(format.KindOf(entries[k].ik)))
+		if !ok {
+			continue // range markers resolve through rangeDels, not as ops
+		}
+		ops = append(ops, op)
+	}
+	rd := format.NewestCoveringRangeDel(rangeDels, uk, snap.Version)
+	return format.Fold(ops, snap.Version, rd, merge)
+}
+
 // gatherPoint descends from the root to the leaf covering userKey and returns the
 // key's whole version group in ascending internal-key order (newest first). On the way
 // down, in Bε mode, it picks up any buffered messages for the key from the interior
