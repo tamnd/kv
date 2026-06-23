@@ -1,5 +1,4 @@
 {
-  "label": "Apple Silicon developer machine, macOS 15.7.8, 2026-06-21. Not the NVMe reference machine; read these for tradeoff direction and honesty targets.",
   "results": [
     {
       "workload": "bulk-load",
@@ -9,7 +8,7 @@
         "goos": "darwin",
         "goarch": "arm64",
         "num_cpu": 10,
-        "key_count": 20000,
+        "key_count": 50000,
         "key_len": 24,
         "val_len": 64,
         "distribution": "sequential",
@@ -19,10 +18,10 @@
         "concurrency": 1,
         "cache_bytes": 0
       },
-      "ops": 20000,
-      "duration_ns": 1046755459,
+      "ops": 50000,
+      "duration_ns": 2576442708,
       "dropped": 0,
-      "throughput_ops_per_sec": 19106.659371145444,
+      "throughput_ops_per_sec": 19406.602694772595,
       "read_latency": {
         "count": 0,
         "mean_ns": 0,
@@ -34,26 +33,26 @@
         "max_ns": 0
       },
       "write_latency": {
-        "count": 20000,
-        "mean_ns": 52332,
-        "p50_ns": 50714,
-        "p90_ns": 60884,
-        "p99_ns": 96125,
-        "p999_ns": 106242,
-        "min_ns": 37465,
-        "max_ns": 106242
+        "count": 50000,
+        "mean_ns": 51520,
+        "p50_ns": 50518,
+        "p90_ns": 58102,
+        "p99_ns": 64275,
+        "p999_ns": 121517,
+        "min_ns": 37996,
+        "max_ns": 121517
       },
       "amplification": {
         "space": 1,
-        "write_factor": 3.3846488636363636,
+        "write_factor": 2.315516818181818,
         "read_ios_per_op": -1
       },
       "gc": {
-        "num_gc": 144,
-        "total_pause_ns": 8600130,
-        "max_pause_ns": 3875834,
-        "heap_inuse_bytes": 15310848,
-        "total_alloc_bytes": 1213651920
+        "num_gc": 78,
+        "total_pause_ns": 6708120,
+        "max_pause_ns": 235209,
+        "heap_inuse_bytes": 15966208,
+        "total_alloc_bytes": 690181576
       }
     },
     {
@@ -64,7 +63,7 @@
         "goos": "darwin",
         "goarch": "arm64",
         "num_cpu": 10,
-        "key_count": 20000,
+        "key_count": 50000,
         "key_len": 24,
         "val_len": 64,
         "distribution": "uniform",
@@ -74,10 +73,10 @@
         "concurrency": 1,
         "cache_bytes": 0
       },
-      "ops": 20000,
-      "duration_ns": 67082132750,
+      "ops": 50000,
+      "duration_ns": 362944833833,
       "dropped": 0,
-      "throughput_ops_per_sec": 298.14198177829996,
+      "throughput_ops_per_sec": 137.76198292164216,
       "read_latency": {
         "count": 0,
         "mean_ns": 0,
@@ -89,26 +88,26 @@
         "max_ns": 0
       },
       "write_latency": {
-        "count": 20000,
-        "mean_ns": 3353232,
-        "p50_ns": 3058792,
-        "p90_ns": 4000500,
-        "p99_ns": 4944875,
-        "p999_ns": 23991083,
-        "min_ns": 2023834,
-        "max_ns": 34072416
+        "count": 50000,
+        "mean_ns": 7258203,
+        "p50_ns": 7965375,
+        "p90_ns": 10838375,
+        "p99_ns": 12119125,
+        "p999_ns": 18187542,
+        "min_ns": 3036875,
+        "max_ns": 466118000
       },
       "amplification": {
         "space": 1,
-        "write_factor": 4.569230681818182,
+        "write_factor": 4.613210454545454,
         "read_ios_per_op": -1
       },
       "gc": {
-        "num_gc": 126,
-        "total_pause_ns": 27154336,
-        "max_pause_ns": 4487917,
-        "heap_inuse_bytes": 16203776,
-        "total_alloc_bytes": 1106669016
+        "num_gc": 49172,
+        "total_pause_ns": 2101274518,
+        "max_pause_ns": 193209,
+        "heap_inuse_bytes": 17391616,
+        "total_alloc_bytes": 502139766544
       }
     },
     {
@@ -119,7 +118,7 @@
         "goos": "darwin",
         "goarch": "arm64",
         "num_cpu": 10,
-        "key_count": 20000,
+        "key_count": 50000,
         "key_len": 24,
         "val_len": 64,
         "distribution": "zipfian",
@@ -129,41 +128,41 @@
         "concurrency": 1,
         "cache_bytes": 0
       },
-      "ops": 20000,
-      "duration_ns": 36637965542,
+      "ops": 50000,
+      "duration_ns": 86182165125,
       "dropped": 0,
-      "throughput_ops_per_sec": 545.8818388011464,
+      "throughput_ops_per_sec": 580.1664407882906,
       "read_latency": {
-        "count": 9973,
-        "mean_ns": 24733,
-        "p50_ns": 11917,
-        "p90_ns": 24959,
-        "p99_ns": 59292,
-        "p999_ns": 385500,
-        "min_ns": 3416,
-        "max_ns": 17230583
+        "count": 24992,
+        "mean_ns": 55899,
+        "p50_ns": 8542,
+        "p90_ns": 22375,
+        "p99_ns": 1877791,
+        "p999_ns": 7103500,
+        "min_ns": 375,
+        "max_ns": 22652625
       },
       "write_latency": {
-        "count": 10027,
-        "mean_ns": 3627560,
-        "p50_ns": 3371458,
-        "p90_ns": 4099917,
-        "p99_ns": 7952416,
-        "p999_ns": 16089000,
-        "min_ns": 2053625,
-        "max_ns": 28117625
+        "count": 25008,
+        "mean_ns": 3388800,
+        "p50_ns": 3014125,
+        "p90_ns": 3964584,
+        "p99_ns": 10927125,
+        "p999_ns": 25983208,
+        "min_ns": 1797208,
+        "max_ns": 35619000
       },
       "amplification": {
         "space": 1,
-        "write_factor": 4.154976136363636,
-        "read_ios_per_op": 0
+        "write_factor": 3.4149204545454546,
+        "read_ios_per_op": 11.802216709346991
       },
       "gc": {
-        "num_gc": 99,
-        "total_pause_ns": 17461291,
-        "max_pause_ns": 3631000,
-        "heap_inuse_bytes": 18014208,
-        "total_alloc_bytes": 864298856
+        "num_gc": 1029,
+        "total_pause_ns": 46645589,
+        "max_pause_ns": 177584,
+        "heap_inuse_bytes": 30007296,
+        "total_alloc_bytes": 14258668144
       }
     },
     {
@@ -174,7 +173,7 @@
         "goos": "darwin",
         "goarch": "arm64",
         "num_cpu": 10,
-        "key_count": 20000,
+        "key_count": 50000,
         "key_len": 24,
         "val_len": 64,
         "distribution": "zipfian",
@@ -184,41 +183,41 @@
         "concurrency": 1,
         "cache_bytes": 0
       },
-      "ops": 20000,
-      "duration_ns": 3342100708,
+      "ops": 50000,
+      "duration_ns": 9406884834,
       "dropped": 0,
-      "throughput_ops_per_sec": 5984.260124814887,
+      "throughput_ops_per_sec": 5315.255887823916,
       "read_latency": {
-        "count": 19000,
-        "mean_ns": 10868,
-        "p50_ns": 8166,
-        "p90_ns": 14916,
-        "p99_ns": 40500,
-        "p999_ns": 145875,
-        "min_ns": 2875,
-        "max_ns": 10962916
+        "count": 47460,
+        "mean_ns": 9000,
+        "p50_ns": 3208,
+        "p90_ns": 7625,
+        "p99_ns": 20417,
+        "p999_ns": 62584,
+        "min_ns": 333,
+        "max_ns": 17074875
       },
       "write_latency": {
-        "count": 1000,
-        "mean_ns": 3129883,
-        "p50_ns": 2958125,
-        "p90_ns": 3869209,
-        "p99_ns": 4051209,
-        "p999_ns": 5741458,
-        "min_ns": 2217084,
-        "max_ns": 6938250
+        "count": 2540,
+        "mean_ns": 3529165,
+        "p50_ns": 3768625,
+        "p90_ns": 3992250,
+        "p99_ns": 4638084,
+        "p999_ns": 21123416,
+        "min_ns": 2439542,
+        "max_ns": 28118541
       },
       "amplification": {
         "space": 1,
-        "write_factor": 3.4358488636363638,
+        "write_factor": 2.665538636363636,
         "read_ios_per_op": 0
       },
       "gc": {
-        "num_gc": 49,
-        "total_pause_ns": 6342125,
-        "max_pause_ns": 3159375,
-        "heap_inuse_bytes": 11468800,
-        "total_alloc_bytes": 428806440
+        "num_gc": 42,
+        "total_pause_ns": 2620325,
+        "max_pause_ns": 233917,
+        "heap_inuse_bytes": 38715392,
+        "total_alloc_bytes": 748108656
       }
     },
     {
@@ -229,7 +228,7 @@
         "goos": "darwin",
         "goarch": "arm64",
         "num_cpu": 10,
-        "key_count": 20000,
+        "key_count": 50000,
         "key_len": 24,
         "val_len": 64,
         "distribution": "zipfian",
@@ -239,19 +238,19 @@
         "concurrency": 1,
         "cache_bytes": 0
       },
-      "ops": 20000,
-      "duration_ns": 80281250,
+      "ops": 50000,
+      "duration_ns": 64464541,
       "dropped": 0,
-      "throughput_ops_per_sec": 249124.1728298949,
+      "throughput_ops_per_sec": 775620.197156139,
       "read_latency": {
-        "count": 20000,
-        "mean_ns": 3913,
-        "p50_ns": 3375,
-        "p90_ns": 4125,
-        "p99_ns": 10333,
-        "p999_ns": 85167,
-        "min_ns": 2750,
-        "max_ns": 181125
+        "count": 50000,
+        "mean_ns": 1171,
+        "p50_ns": 459,
+        "p90_ns": 833,
+        "p99_ns": 1500,
+        "p999_ns": 4166,
+        "min_ns": 291,
+        "max_ns": 17347666
       },
       "write_latency": {
         "count": 0,
@@ -265,15 +264,15 @@
       },
       "amplification": {
         "space": 1,
-        "write_factor": 3.3846488636363636,
+        "write_factor": 2.315516818181818,
         "read_ios_per_op": 0
       },
       "gc": {
-        "num_gc": 31,
-        "total_pause_ns": 1441084,
-        "max_pause_ns": 2980582,
-        "heap_inuse_bytes": 14450688,
-        "total_alloc_bytes": 272839400
+        "num_gc": 8,
+        "total_pause_ns": 345045,
+        "max_pause_ns": 233917,
+        "heap_inuse_bytes": 43859968,
+        "total_alloc_bytes": 101519112
       }
     },
     {
@@ -284,7 +283,7 @@
         "goos": "darwin",
         "goarch": "arm64",
         "num_cpu": 10,
-        "key_count": 20000,
+        "key_count": 50000,
         "key_len": 24,
         "val_len": 64,
         "distribution": "zipfian",
@@ -294,41 +293,41 @@
         "concurrency": 1,
         "cache_bytes": 0
       },
-      "ops": 20000,
-      "duration_ns": 3116242625,
+      "ops": 50000,
+      "duration_ns": 8722878958,
       "dropped": 0,
-      "throughput_ops_per_sec": 6417.985505862208,
+      "throughput_ops_per_sec": 5732.05248413353,
       "read_latency": {
-        "count": 19015,
-        "mean_ns": 6558,
-        "p50_ns": 4625,
-        "p90_ns": 9125,
-        "p99_ns": 26417,
-        "p999_ns": 125709,
-        "min_ns": 2791,
-        "max_ns": 10065500
+        "count": 47471,
+        "mean_ns": 6873,
+        "p50_ns": 1625,
+        "p90_ns": 5875,
+        "p99_ns": 13750,
+        "p999_ns": 37416,
+        "min_ns": 417,
+        "max_ns": 17520250
       },
       "write_latency": {
-        "count": 985,
-        "mean_ns": 3033635,
-        "p50_ns": 2944791,
-        "p90_ns": 3802834,
-        "p99_ns": 4037666,
-        "p999_ns": 6647000,
-        "min_ns": 2205667,
-        "max_ns": 6647000
+        "count": 2529,
+        "mean_ns": 3313927,
+        "p50_ns": 3019083,
+        "p90_ns": 3951208,
+        "p99_ns": 4226917,
+        "p999_ns": 10307208,
+        "min_ns": 2556000,
+        "max_ns": 36241875
       },
       "amplification": {
         "space": 1,
-        "write_factor": 3.4963579545454544,
+        "write_factor": 2.376025909090909,
         "read_ios_per_op": 0
       },
       "gc": {
-        "num_gc": 48,
-        "total_pause_ns": 5382247,
-        "max_pause_ns": 2811458,
-        "heap_inuse_bytes": 11223040,
-        "total_alloc_bytes": 421966352
+        "num_gc": 29,
+        "total_pause_ns": 1881166,
+        "max_pause_ns": 228458,
+        "heap_inuse_bytes": 29310976,
+        "total_alloc_bytes": 498748432
       }
     },
     {
@@ -339,7 +338,7 @@
         "goos": "darwin",
         "goarch": "arm64",
         "num_cpu": 10,
-        "key_count": 20000,
+        "key_count": 50000,
         "key_len": 24,
         "val_len": 64,
         "distribution": "zipfian",
@@ -349,19 +348,19 @@
         "concurrency": 1,
         "cache_bytes": 0
       },
-      "ops": 20000,
-      "duration_ns": 100807112209,
+      "ops": 50000,
+      "duration_ns": 30060110250,
       "dropped": 0,
-      "throughput_ops_per_sec": 198.39869987084515,
+      "throughput_ops_per_sec": 1663.3338861423504,
       "read_latency": {
-        "count": 20000,
-        "mean_ns": 5039127,
-        "p50_ns": 4813917,
-        "p90_ns": 6197459,
-        "p99_ns": 8330292,
-        "p999_ns": 13639083,
-        "min_ns": 3473666,
-        "max_ns": 33774542
+        "count": 50000,
+        "mean_ns": 601047,
+        "p50_ns": 20750,
+        "p90_ns": 1633458,
+        "p99_ns": 9301584,
+        "p999_ns": 11392875,
+        "min_ns": 10250,
+        "max_ns": 28240166
       },
       "write_latency": {
         "count": 0,
@@ -375,15 +374,15 @@
       },
       "amplification": {
         "space": 1,
-        "write_factor": 3.3846488636363636,
+        "write_factor": 2.315516818181818,
         "read_ios_per_op": 0
       },
       "gc": {
-        "num_gc": 39518,
-        "total_pause_ns": 1986594237,
-        "max_pause_ns": 190541,
-        "heap_inuse_bytes": 25337856,
-        "total_alloc_bytes": 507349611232
+        "num_gc": 2787,
+        "total_pause_ns": 104856336,
+        "max_pause_ns": 260625,
+        "heap_inuse_bytes": 35799040,
+        "total_alloc_bytes": 60560450600
       }
     },
     {
@@ -394,7 +393,7 @@
         "goos": "darwin",
         "goarch": "arm64",
         "num_cpu": 10,
-        "key_count": 20000,
+        "key_count": 50000,
         "key_len": 24,
         "val_len": 64,
         "distribution": "zipfian",
@@ -404,41 +403,41 @@
         "concurrency": 1,
         "cache_bytes": 0
       },
-      "ops": 20000,
-      "duration_ns": 66938971625,
+      "ops": 50000,
+      "duration_ns": 318115109667,
       "dropped": 0,
-      "throughput_ops_per_sec": 298.7796124512094,
+      "throughput_ops_per_sec": 157.1758098895068,
       "read_latency": {
-        "count": 20000,
-        "mean_ns": 3346155,
-        "p50_ns": 3034208,
-        "p90_ns": 3996042,
-        "p99_ns": 5100000,
-        "p999_ns": 16000167,
-        "min_ns": 1971750,
-        "max_ns": 32049167
+        "count": 50000,
+        "mean_ns": 6361324,
+        "p50_ns": 4075708,
+        "p90_ns": 10065708,
+        "p99_ns": 15220542,
+        "p999_ns": 23276792,
+        "min_ns": 1437875,
+        "max_ns": 124559709
       },
       "write_latency": {
-        "count": 20000,
-        "mean_ns": 3346155,
-        "p50_ns": 3034208,
-        "p90_ns": 3996042,
-        "p99_ns": 5100000,
-        "p999_ns": 16000167,
-        "min_ns": 1971750,
-        "max_ns": 32049167
+        "count": 50000,
+        "mean_ns": 6361324,
+        "p50_ns": 4075708,
+        "p90_ns": 10065708,
+        "p99_ns": 15220542,
+        "p999_ns": 23276792,
+        "min_ns": 1437875,
+        "max_ns": 124559709
       },
       "amplification": {
         "space": 1,
-        "write_factor": 5.0253761363636364,
-        "read_ios_per_op": 0
+        "write_factor": 3.469844090909091,
+        "read_ios_per_op": 5.37996
       },
       "gc": {
-        "num_gc": 202,
-        "total_pause_ns": 58572666,
-        "max_pause_ns": 3875834,
-        "heap_inuse_bytes": 13828096,
-        "total_alloc_bytes": 1770538784
+        "num_gc": 52252,
+        "total_pause_ns": 2442571495,
+        "max_pause_ns": 181208,
+        "heap_inuse_bytes": 20963328,
+        "total_alloc_bytes": 553021068480
       }
     },
     {
@@ -449,7 +448,7 @@
         "goos": "darwin",
         "goarch": "arm64",
         "num_cpu": 10,
-        "key_count": 20000,
+        "key_count": 50000,
         "key_len": 24,
         "val_len": 64,
         "distribution": "sequential",
@@ -459,10 +458,10 @@
         "concurrency": 1,
         "cache_bytes": 0
       },
-      "ops": 20000,
-      "duration_ns": 846053459,
+      "ops": 50000,
+      "duration_ns": 1833868542,
       "dropped": 0,
-      "throughput_ops_per_sec": 23639.168172232483,
+      "throughput_ops_per_sec": 27264.76781452964,
       "read_latency": {
         "count": 0,
         "mean_ns": 0,
@@ -474,26 +473,26 @@
         "max_ns": 0
       },
       "write_latency": {
-        "count": 20000,
-        "mean_ns": 42291,
-        "p50_ns": 40847,
-        "p90_ns": 50251,
-        "p99_ns": 53464,
-        "p999_ns": 65596,
-        "min_ns": 28513,
-        "max_ns": 65596
+        "count": 50000,
+        "mean_ns": 36673,
+        "p50_ns": 39468,
+        "p90_ns": 40217,
+        "p99_ns": 40604,
+        "p999_ns": 41424,
+        "min_ns": 28654,
+        "max_ns": 41424
       },
       "amplification": {
         "space": 1,
-        "write_factor": 1.136477840909091,
+        "write_factor": 1.1351138636363636,
         "read_ios_per_op": -1
       },
       "gc": {
-        "num_gc": 3,
-        "total_pause_ns": 269125,
-        "max_pause_ns": 599166,
-        "heap_inuse_bytes": 17113088,
-        "total_alloc_bytes": 30324408
+        "num_gc": 5,
+        "total_pause_ns": 169960,
+        "max_pause_ns": 670791,
+        "heap_inuse_bytes": 18300928,
+        "total_alloc_bytes": 51515968
       }
     },
     {
@@ -504,7 +503,7 @@
         "goos": "darwin",
         "goarch": "arm64",
         "num_cpu": 10,
-        "key_count": 20000,
+        "key_count": 50000,
         "key_len": 24,
         "val_len": 64,
         "distribution": "uniform",
@@ -514,10 +513,10 @@
         "concurrency": 1,
         "cache_bytes": 0
       },
-      "ops": 20000,
-      "duration_ns": 65239917125,
+      "ops": 50000,
+      "duration_ns": 185957438458,
       "dropped": 0,
-      "throughput_ops_per_sec": 306.56078182441433,
+      "throughput_ops_per_sec": 268.8787306096008,
       "read_latency": {
         "count": 0,
         "mean_ns": 0,
@@ -529,26 +528,26 @@
         "max_ns": 0
       },
       "write_latency": {
-        "count": 20000,
-        "mean_ns": 3260817,
-        "p50_ns": 3041583,
-        "p90_ns": 4000208,
-        "p99_ns": 4592291,
-        "p999_ns": 7084333,
-        "min_ns": 1305500,
-        "max_ns": 25384667
+        "count": 50000,
+        "mean_ns": 3718033,
+        "p50_ns": 3955250,
+        "p90_ns": 4075500,
+        "p99_ns": 4979750,
+        "p999_ns": 10205791,
+        "min_ns": 1679292,
+        "max_ns": 14178208
       },
       "amplification": {
         "space": 1,
-        "write_factor": 3.1841011363636365,
+        "write_factor": 3.1883222727272726,
         "read_ios_per_op": -1
       },
       "gc": {
-        "num_gc": 4,
-        "total_pause_ns": 7165459,
-        "max_pause_ns": 4162251,
-        "heap_inuse_bytes": 27574272,
-        "total_alloc_bytes": 47533496
+        "num_gc": 3,
+        "total_pause_ns": 3741252,
+        "max_pause_ns": 3607459,
+        "heap_inuse_bytes": 33071104,
+        "total_alloc_bytes": 61041528
       }
     },
     {
@@ -559,7 +558,7 @@
         "goos": "darwin",
         "goarch": "arm64",
         "num_cpu": 10,
-        "key_count": 20000,
+        "key_count": 50000,
         "key_len": 24,
         "val_len": 64,
         "distribution": "zipfian",
@@ -569,41 +568,41 @@
         "concurrency": 1,
         "cache_bytes": 0
       },
-      "ops": 20000,
-      "duration_ns": 34171451041,
+      "ops": 50000,
+      "duration_ns": 110220003417,
       "dropped": 0,
-      "throughput_ops_per_sec": 585.2838960804843,
+      "throughput_ops_per_sec": 453.63816412555246,
       "read_latency": {
-        "count": 9973,
-        "mean_ns": 49967,
-        "p50_ns": 12583,
-        "p90_ns": 137958,
-        "p99_ns": 461667,
-        "p999_ns": 842042,
-        "min_ns": 500,
-        "max_ns": 2669167
+        "count": 24992,
+        "mean_ns": 127367,
+        "p50_ns": 24375,
+        "p90_ns": 368916,
+        "p99_ns": 1313625,
+        "p999_ns": 1836708,
+        "min_ns": 1041,
+        "max_ns": 2655667
       },
       "write_latency": {
-        "count": 10027,
-        "mean_ns": 3356725,
-        "p50_ns": 3058541,
-        "p90_ns": 4009625,
-        "p99_ns": 5055417,
-        "p999_ns": 7201208,
-        "min_ns": 1987875,
-        "max_ns": 10530375
+        "count": 25008,
+        "mean_ns": 4278157,
+        "p50_ns": 4009625,
+        "p90_ns": 4968709,
+        "p99_ns": 7285875,
+        "p999_ns": 15481125,
+        "min_ns": 3223542,
+        "max_ns": 425943917
       },
       "amplification": {
         "space": 1,
-        "write_factor": 2.161966477272727,
+        "write_factor": 2.1602422727272725,
         "read_ios_per_op": 0
       },
       "gc": {
-        "num_gc": 98,
-        "total_pause_ns": 14215703,
-        "max_pause_ns": 4487917,
-        "heap_inuse_bytes": 15990784,
-        "total_alloc_bytes": 1283611096
+        "num_gc": 176,
+        "total_pause_ns": 21558503,
+        "max_pause_ns": 3823333,
+        "heap_inuse_bytes": 31834112,
+        "total_alloc_bytes": 3309847928
       }
     },
     {
@@ -614,7 +613,7 @@
         "goos": "darwin",
         "goarch": "arm64",
         "num_cpu": 10,
-        "key_count": 20000,
+        "key_count": 50000,
         "key_len": 24,
         "val_len": 64,
         "distribution": "zipfian",
@@ -624,41 +623,41 @@
         "concurrency": 1,
         "cache_bytes": 0
       },
-      "ops": 20000,
-      "duration_ns": 3405896542,
+      "ops": 50000,
+      "duration_ns": 10978340958,
       "dropped": 0,
-      "throughput_ops_per_sec": 5872.168973240644,
+      "throughput_ops_per_sec": 4554.422220195723,
       "read_latency": {
-        "count": 19000,
-        "mean_ns": 6179,
-        "p50_ns": 2834,
-        "p90_ns": 15667,
-        "p99_ns": 40042,
-        "p999_ns": 103709,
-        "min_ns": 333,
-        "max_ns": 299083
+        "count": 47460,
+        "mean_ns": 10521,
+        "p50_ns": 5500,
+        "p90_ns": 24291,
+        "p99_ns": 79500,
+        "p999_ns": 143000,
+        "min_ns": 375,
+        "max_ns": 625209
       },
       "write_latency": {
-        "count": 1000,
-        "mean_ns": 3282804,
-        "p50_ns": 3032875,
-        "p90_ns": 3946834,
-        "p99_ns": 4361458,
-        "p999_ns": 6046291,
-        "min_ns": 2297917,
-        "max_ns": 6906125
+        "count": 2540,
+        "mean_ns": 4118600,
+        "p50_ns": 3941542,
+        "p90_ns": 4672000,
+        "p99_ns": 6296041,
+        "p999_ns": 18108916,
+        "min_ns": 3266709,
+        "max_ns": 24445125
       },
       "amplification": {
         "space": 1,
-        "write_factor": 1.2387505681818183,
+        "write_factor": 1.2390229545454545,
         "read_ios_per_op": 0
       },
       "gc": {
-        "num_gc": 10,
-        "total_pause_ns": 754000,
-        "max_pause_ns": 4487917,
-        "heap_inuse_bytes": 17833984,
-        "total_alloc_bytes": 131946312
+        "num_gc": 20,
+        "total_pause_ns": 1869835,
+        "max_pause_ns": 3823333,
+        "heap_inuse_bytes": 28819456,
+        "total_alloc_bytes": 346406392
       }
     },
     {
@@ -669,7 +668,7 @@
         "goos": "darwin",
         "goarch": "arm64",
         "num_cpu": 10,
-        "key_count": 20000,
+        "key_count": 50000,
         "key_len": 24,
         "val_len": 64,
         "distribution": "zipfian",
@@ -679,19 +678,19 @@
         "concurrency": 1,
         "cache_bytes": 0
       },
-      "ops": 20000,
-      "duration_ns": 16117500,
+      "ops": 50000,
+      "duration_ns": 54954334,
       "dropped": 0,
-      "throughput_ops_per_sec": 1240887.2343725765,
+      "throughput_ops_per_sec": 909846.3462408625,
       "read_latency": {
-        "count": 20000,
-        "mean_ns": 679,
-        "p50_ns": 542,
-        "p90_ns": 959,
-        "p99_ns": 2458,
-        "p999_ns": 8625,
+        "count": 50000,
+        "mean_ns": 942,
+        "p50_ns": 750,
+        "p90_ns": 1541,
+        "p99_ns": 3875,
+        "p999_ns": 9125,
         "min_ns": 333,
-        "max_ns": 103666
+        "max_ns": 75375
       },
       "write_latency": {
         "count": 0,
@@ -705,15 +704,15 @@
       },
       "amplification": {
         "space": 1,
-        "write_factor": 1.136477840909091,
+        "write_factor": 1.1351138636363636,
         "read_ios_per_op": 0
       },
       "gc": {
         "num_gc": 1,
-        "total_pause_ns": 48916,
-        "max_pause_ns": 4487917,
-        "heap_inuse_bytes": 14639104,
-        "total_alloc_bytes": 11218968
+        "total_pause_ns": 45208,
+        "max_pause_ns": 3823333,
+        "heap_inuse_bytes": 26386432,
+        "total_alloc_bytes": 20414104
       }
     },
     {
@@ -724,7 +723,7 @@
         "goos": "darwin",
         "goarch": "arm64",
         "num_cpu": 10,
-        "key_count": 20000,
+        "key_count": 50000,
         "key_len": 24,
         "val_len": 64,
         "distribution": "zipfian",
@@ -734,41 +733,41 @@
         "concurrency": 1,
         "cache_bytes": 0
       },
-      "ops": 20000,
-      "duration_ns": 3494749667,
+      "ops": 50000,
+      "duration_ns": 10635885125,
       "dropped": 0,
-      "throughput_ops_per_sec": 5722.8705646229055,
+      "throughput_ops_per_sec": 4701.06619358584,
       "read_latency": {
-        "count": 19015,
-        "mean_ns": 1666,
-        "p50_ns": 1000,
-        "p90_ns": 3459,
-        "p99_ns": 10542,
-        "p999_ns": 25791,
-        "min_ns": 291,
-        "max_ns": 55750
+        "count": 47471,
+        "mean_ns": 3695,
+        "p50_ns": 2125,
+        "p90_ns": 8500,
+        "p99_ns": 17791,
+        "p999_ns": 30750,
+        "min_ns": 500,
+        "max_ns": 165834
       },
       "write_latency": {
-        "count": 985,
-        "mean_ns": 3511174,
-        "p50_ns": 3786959,
-        "p90_ns": 4038791,
-        "p99_ns": 4215584,
-        "p999_ns": 6920291,
-        "min_ns": 2184625,
-        "max_ns": 6920291
+        "count": 2529,
+        "mean_ns": 4129887,
+        "p50_ns": 3945167,
+        "p90_ns": 4169833,
+        "p99_ns": 8626958,
+        "p999_ns": 26978750,
+        "min_ns": 3521083,
+        "max_ns": 30921833
       },
       "amplification": {
         "space": 1,
-        "write_factor": 1.2372164772727272,
+        "write_factor": 1.2385729545454545,
         "read_ios_per_op": 0
       },
       "gc": {
-        "num_gc": 1,
-        "total_pause_ns": 49458,
-        "max_pause_ns": 4487917,
-        "heap_inuse_bytes": 21790720,
-        "total_alloc_bytes": 12014752
+        "num_gc": 2,
+        "total_pause_ns": 194833,
+        "max_pause_ns": 3823333,
+        "heap_inuse_bytes": 21397504,
+        "total_alloc_bytes": 21408248
       }
     },
     {
@@ -779,7 +778,7 @@
         "goos": "darwin",
         "goarch": "arm64",
         "num_cpu": 10,
-        "key_count": 20000,
+        "key_count": 50000,
         "key_len": 24,
         "val_len": 64,
         "distribution": "zipfian",
@@ -789,19 +788,19 @@
         "concurrency": 1,
         "cache_bytes": 0
       },
-      "ops": 20000,
-      "duration_ns": 46641024625,
+      "ops": 50000,
+      "duration_ns": 72971809875,
       "dropped": 0,
-      "throughput_ops_per_sec": 428.807046174535,
+      "throughput_ops_per_sec": 685.1961063546253,
       "read_latency": {
-        "count": 20000,
-        "mean_ns": 2331431,
-        "p50_ns": 2224334,
-        "p90_ns": 2591917,
-        "p99_ns": 3753917,
-        "p999_ns": 7640625,
-        "min_ns": 1936500,
-        "max_ns": 17993666
+        "count": 50000,
+        "mean_ns": 1459200,
+        "p50_ns": 40791,
+        "p90_ns": 3989958,
+        "p99_ns": 22342916,
+        "p999_ns": 32275209,
+        "min_ns": 16625,
+        "max_ns": 89156250
       },
       "write_latency": {
         "count": 0,
@@ -815,15 +814,15 @@
       },
       "amplification": {
         "space": 1,
-        "write_factor": 1.136477840909091,
+        "write_factor": 1.1351138636363636,
         "read_ios_per_op": 0
       },
       "gc": {
-        "num_gc": 19894,
-        "total_pause_ns": 732958837,
-        "max_pause_ns": 174626,
-        "heap_inuse_bytes": 26976256,
-        "total_alloc_bytes": 302091267912
+        "num_gc": 4101,
+        "total_pause_ns": 281179180,
+        "max_pause_ns": 284333,
+        "heap_inuse_bytes": 34971648,
+        "total_alloc_bytes": 78429959336
       }
     },
     {
@@ -834,7 +833,7 @@
         "goos": "darwin",
         "goarch": "arm64",
         "num_cpu": 10,
-        "key_count": 20000,
+        "key_count": 50000,
         "key_len": 24,
         "val_len": 64,
         "distribution": "zipfian",
@@ -844,41 +843,41 @@
         "concurrency": 1,
         "cache_bytes": 0
       },
-      "ops": 20000,
-      "duration_ns": 69850293208,
+      "ops": 50000,
+      "duration_ns": 184980954000,
       "dropped": 0,
-      "throughput_ops_per_sec": 286.3266434751256,
+      "throughput_ops_per_sec": 270.29809782470903,
       "read_latency": {
-        "count": 20000,
-        "mean_ns": 3491420,
-        "p50_ns": 3155000,
-        "p90_ns": 4115334,
-        "p99_ns": 5330250,
-        "p999_ns": 7898292,
-        "min_ns": 2023083,
-        "max_ns": 20648875
+        "count": 50000,
+        "mean_ns": 3698405,
+        "p50_ns": 3875250,
+        "p90_ns": 4951333,
+        "p99_ns": 7080291,
+        "p999_ns": 9871792,
+        "min_ns": 1377542,
+        "max_ns": 14158125
       },
       "write_latency": {
-        "count": 20000,
-        "mean_ns": 3491420,
-        "p50_ns": 3155000,
-        "p90_ns": 4115334,
-        "p99_ns": 5330250,
-        "p999_ns": 7898292,
-        "min_ns": 2023083,
-        "max_ns": 20648875
+        "count": 50000,
+        "mean_ns": 3698405,
+        "p50_ns": 3875250,
+        "p90_ns": 4951333,
+        "p99_ns": 7080291,
+        "p999_ns": 9871792,
+        "min_ns": 1377542,
+        "max_ns": 14158125
       },
       "amplification": {
         "space": 1,
-        "write_factor": 3.1841011363636365,
+        "write_factor": 3.1883222727272726,
         "read_ios_per_op": 0
       },
       "gc": {
-        "num_gc": 392,
-        "total_pause_ns": 30869615,
-        "max_pause_ns": 599166,
-        "heap_inuse_bytes": 32194560,
-        "total_alloc_bytes": 5511721672
+        "num_gc": 697,
+        "total_pause_ns": 68385154,
+        "max_pause_ns": 670791,
+        "heap_inuse_bytes": 29704192,
+        "total_alloc_bytes": 14466198632
       }
     }
   ]
