@@ -137,6 +137,16 @@ type shard struct {
 	frames  []*Frame          // frames owned by this shard, pinned or free
 	hand    int               // CLOCK hand into frames
 	scratch []byte            // pageSize crypto staging buffer, lazily allocated
+
+	// pageReads and cacheHits count this shard's traffic for the read-amplification and
+	// cache-hit observability the spec asks for (spec 19, spec 21 §1). They live on the
+	// shard, not on the Pager, so a Get increments a counter on the same cache line it
+	// already holds the lock on rather than a single process-global line every reader on
+	// every core must take turns owning. A read that touches three nodes spreads its three
+	// increments across the (up to three) shards that own them, so the counter traffic no
+	// longer ping-pongs one line. IOStats sums them on the cold path.
+	pageReads atomic.Uint64
+	cacheHits atomic.Uint64
 }
 
 // Pager owns the buffer pool and the main file.
@@ -178,13 +188,11 @@ type Pager struct {
 	dbSize uint32   // page count (high-water mark); pages are 1-based; under metaMu
 	free   []uint32 // in-memory freelist, persisted to trunk pages at checkpoint; under metaMu
 
-	// pageReads and cacheHits count the buffer pool's traffic for the read-amplification
-	// and cache-hit-ratio observability the spec asks for (spec 19, spec 21 §1). pageReads
-	// is the number of physical page reads issued against the main file to satisfy a Get
-	// miss; cacheHits is the number of Gets served from a resident frame. They are atomics
-	// so a Stats reader can sample them without taking a pager lock off the hot path.
-	pageReads atomic.Uint64
-	cacheHits atomic.Uint64
+	// The buffer pool's read-amplification and cache-hit counters live per shard, not here:
+	// see shard.pageReads / shard.cacheHits and IOStats, which sums them. A process-global
+	// counter incremented by every reader on every core is a single cache line every core
+	// must own in turn, the same ping-pong the per-frame pin counter has; moving it onto the
+	// shard the Get already locks keeps the increment on a line the core is already touching.
 
 	// pageImageLogger, when non-nil, is called for each dirty page before Checkpoint
 	// overwrites it. It logs the page's current on-disk content as a WAL pre-image so
@@ -237,10 +245,17 @@ type IOStats struct {
 	CacheHits uint64
 }
 
-// IOStats samples the pager's cumulative I/O counters. It is lock-free and cheap, safe to
-// poll from a Stats path while the pager serves reads.
+// IOStats samples the pager's cumulative I/O counters by summing the per-shard counters.
+// It is lock-free and cheap (a walk over at most maxShards counters), safe to poll from a
+// Stats path while the pager serves reads; the per-shard loads need not be consistent with
+// one another, since the counters are monotonic and the sum is an observability figure.
 func (p *Pager) IOStats() IOStats {
-	return IOStats{PageReads: p.pageReads.Load(), CacheHits: p.cacheHits.Load()}
+	var st IOStats
+	for _, sh := range p.shards {
+		st.PageReads += sh.pageReads.Load()
+		st.CacheHits += sh.cacheHits.Load()
+	}
+	return st
 }
 
 // Create initializes a fresh database file and returns an open pager.
