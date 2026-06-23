@@ -95,7 +95,7 @@ func TestConcurrentReadWrite(t *testing.T) {
 // read-only snapshot) which provides the isolation guarantee (spec 10 §2).
 func TestConcurrentScanVsWrite(t *testing.T) {
 	const (
-		writers   = 4
+		writers    = 4
 		writesEach = 100
 	)
 	d := openMem(t, Options{AutoCheckpoint: 32})
@@ -169,9 +169,9 @@ func TestConcurrentScanVsWrite(t *testing.T) {
 // and no pinned version leaked (spec 23 §6: maintenance-vs-foreground races).
 func TestMaintenanceDuringWrites(t *testing.T) {
 	const (
-		writers   = 4
-		opsEach   = 150
-		keySpace  = 50
+		writers  = 4
+		opsEach  = 150
+		keySpace = 50
 	)
 	d := openMem(t, Options{AutoCheckpoint: 0}) // disable auto; test drives it manually
 
