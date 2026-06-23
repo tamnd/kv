@@ -341,10 +341,18 @@ func (l *LSM) Apply(batch *engine.WriteBatch, commitVersion uint64) error {
 
 // parallelApplyMinEntries is the group size below which ApplyGroup inserts on the calling
 // goroutine. Spreading the inserts costs a flatten, a few goroutines, and a join; below this
-// many entries the serial insert is faster than paying for them. The number is small because
-// the per-insert cost (a CompareInternal-heavy skip-list descent plus a key/value copy) is
-// high, so even a few dozen entries amortize the fan-out.
-const parallelApplyMinEntries = 64
+// many entries the serial insert is faster than paying for them.
+//
+// The threshold is high because a remeasurement (perf/09 N4) showed the fan-out far more
+// expensive than the first cut assumed. Per-entry apply cost, serial vs fanned across 8 cores:
+// at a 64-entry group the fanned path is 61% slower (219 vs 353 ns/op), it stays a net loss
+// through 128, breaks even near 256-512, and only turns a small reliable win past ~1024 (225 vs
+// 217), growing to ~15% at 8192. The fanned path also allocates the flatten slice and the worker
+// closures (~48-70 B/op) the serial path does not. So the old 64 floor put every group from 64
+// to ~512 entries into a slower, allocating path. 1024 is the floor where fan-out stops costing
+// more than it saves, keeping the common group on the clean zero-alloc serial insert and fanning
+// out only for the genuinely large bulk groups where parallel apply pays off.
+const parallelApplyMinEntries = 1024
 
 // ApplyGroup installs every batch of a group-commit group into the active memtable, spreading
 // the inserts across cores when the group is large enough to be worth it (perf/03 W1, perf/07).
