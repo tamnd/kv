@@ -1,0 +1,10 @@
+title       = "kv"
+baseURL     = "https://kv.tamnd.com/"
+description = "kv is an embeddable ordered key/value database for Go. One file on disk, zero external dependencies, full ACID transactions, and a choice of B-tree or LSM storage behind a single API. It feels like SQLite, for keys and values."
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/kv"

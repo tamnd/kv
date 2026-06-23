@@ -14,10 +14,6 @@ import (
 	"github.com/tamnd/kv"
 )
 
-// version is the build identity printed in the shell banner. It is "dev" until a release
-// stamps it; the value is cosmetic and does not affect file compatibility.
-const version = "dev"
-
 // runShell opens the interactive REPL on path, the sqlite3-shell analog reached by
 // invoking `kv <file>` with no subcommand (spec 16 §5). Bare data commands operate on the
 // open file with auto-commit per statement; dot-commands are meta-operations. It returns a
@@ -69,7 +65,7 @@ type shell struct {
 // or .exit is run.
 func (sh *shell) run() int {
 	if sh.interactive {
-		fmt.Fprintf(sh.errOut, "kv %s  engine=%s  %s\n", version, sh.db.Stats().Engine, sh.path)
+		fmt.Fprintf(sh.errOut, "kv %s  engine=%s  %s\n", Version, sh.db.Stats().Engine, sh.path)
 		fmt.Fprintln(sh.errOut, `Enter ".help" for commands, ".exit" to quit.`)
 	}
 	for {
