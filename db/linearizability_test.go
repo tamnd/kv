@@ -58,6 +58,15 @@ func TestLinearizableSI(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 
+	// Hold an open snapshot at the seed version for the entire test. The auto-GC
+	// worker (slice 24) runs after every auto-checkpoint and collects versions below
+	// OldestReadable. Without this pin, GC can collect the seed's version before
+	// verifySnapshotReads runs its post-hoc snapshotGet calls, making "w0" entries
+	// disappear and failing the check. Keeping this Begin(false) alive registers the
+	// seed version as a live reader, bounding GC above it for the duration.
+	pinSnap := d.Begin(false)
+	defer pinSnap.Discard()
+
 	var mu sync.Mutex
 	var history []txnRecord
 	var counter int64 // unique per-write value source
