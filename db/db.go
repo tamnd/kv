@@ -51,7 +51,10 @@ type Options struct {
 	// digest. Ignored when opening an existing file (its header's choice wins).
 	Checksum format.ChecksumAlgo
 	// Sync is the WAL durability level (spec 07 §6). Zero is SyncFull, the safe
-	// default: every acked commit survives a crash.
+	// default: every acked commit survives a crash. SyncBarrier is the cheaper
+	// middle ground, durable on a process or kernel crash but not guaranteed on
+	// power loss, for callers that want most of SyncOff's throughput while staying
+	// crash-safe (perf/06 F2).
 	Sync wal.Sync
 	// Merge folds an existing value and a merge operand into a new value during read
 	// resolution (spec 15). If nil, a merge operand behaves as a plain set.
