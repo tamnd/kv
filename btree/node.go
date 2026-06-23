@@ -530,3 +530,32 @@ func (l *leaf) splitPoint() int {
 	}
 	return 0
 }
+
+// splitPointBiased chooses where to divide an oversized leaf given where the cell that
+// overflowed it was inserted. A balanced midpoint split is the right call for a random
+// insert, but it is the wrong call for a sequential one: under monotonically increasing
+// keys every overflow inserts at the right end, and a midpoint split leaves the left leaf
+// half full forever, so an append-only load wastes about half its leaf space (spec 05
+// F3a, the classic B+tree sequential-insert problem). When the overflowing cell is the
+// rightmost and forms its own user-key group, this keeps it alone on the right so the
+// left leaf seals nearly full; the symmetric prepend case keeps it alone on the left.
+// Both biased cuts are group-clean by construction (the lone cell is its own group), and
+// the leaf they leave behind is a subset of the pre-insert leaf, which fit, so neither
+// can overflow. Any other insert falls back to the balanced split, so a non-sequential
+// workload is unchanged. insertedAt is the index the new cell landed at in l.keys.
+func (l *leaf) splitPointBiased(insertedAt int) int {
+	n := len(l.keys)
+	// Append: the new cell is the rightmost and starts a new group (its user key differs
+	// from the cell before it). Seal everything before it into a full left leaf.
+	if insertedAt == n-1 && n >= 2 &&
+		format.CompareUser(format.UserKey(l.keys[n-1]), format.UserKey(l.keys[n-2])) != 0 {
+		return n - 1
+	}
+	// Prepend: the new cell is the leftmost and starts a new group. Seal everything after
+	// it into a full right leaf, leaving the new cell alone on the left.
+	if insertedAt == 0 && n >= 2 &&
+		format.CompareUser(format.UserKey(l.keys[1]), format.UserKey(l.keys[0])) != 0 {
+		return 1
+	}
+	return l.splitPoint()
+}
