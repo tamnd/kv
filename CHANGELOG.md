@@ -1,0 +1,159 @@
+# Changelog
+
+All notable changes to this project are documented here.
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+
+---
+
+## [0.1.0] — 2026-06-23
+
+First public release. The library, CLI, and server are feature-complete and the on-disk
+format is fixed. The 0.x series keeps the API broadly stable while the surface settles
+toward a 1.0 commitment; the file format written by 0.1.0 is forward-compatible.
+
+This first release lands the full M0–M8 build: the two-engine core, MVCC transactions,
+the WAL and crash recovery, the CLI, the HTTP/binary server, encryption, replication,
+and the hardening campaign that closed it out. The sections below summarize each
+milestone that shipped into this release.
+
+### M8 — Hardening
+
+- File-format fuzzing: feeds mutated `.kv` bytes through `Open` via a mem-VFS.
+  Found and fixed a real B-tree decoder panic on type-confused pages (bounds-checked
+  `nodeReader` + page-type guard in `loadLeaf`/`loadInterior`).
+- Operation fuzzing vs model oracle: drives a randomized program of ops against the real
+  DB and a Go-map oracle. Found and fixed a range-delete persistence bug where two
+  `DeleteRange` calls sharing the same `lo` key in one transaction could collide on the
+  marker-cell key, resurrecting the narrower range after checkpoint/reopen.
+- WAL recovery fuzzing: feeds mutated WAL bytes into the recovery path. Hardened a
+  checkpoint-frame over-read (`payload<8` torn tail).
+- LSM compaction fuzzing: exercises flush + compaction + checkpoint + reopen cycles.
+- Concurrency stress: 6 tests — `TestConcurrentReadWrite`, `TestConcurrentScanVsWrite`,
+  `TestMaintenanceDuringWrites`, `TestMaintenanceDuringWritesLSM`,
+  `TestConcurrentTransactionConflicts`, `TestSoak` (5 s, 727k writes, zero errors).
+- Runtime engineering: pooled flate decompression reader via `flate.Resetter`
+  (eliminates per-page inflate-state alloc on the read/compaction path); pooled
+  `bytes.Buffer` on the compression side; 64-byte cache-line pad between
+  `oracle.appliedVersion` (written under mutex) and `oracle.appliedPub` (lock-free
+  atomic) to prevent cross-core false sharing.
+- Durability pragmas: `full_page_writes` (page pre-image logging before checkpoint
+  writes, now fully wired through `FramePageImage`), `auto_vacuum` (`TruncateTail` after
+  checkpoint), `commit_linger_us` (group-commit leader sleep window). New header fields
+  at offsets 108–113.
+- `kv watch`: streams committed changes under a prefix as JSONL, powered by `Subscribe`.
+- `kv import` / `kv export`: CSV, TSV, and JSONL interchange formats.
+- Public engine-tuning options: `WithMemtableSize`, `WithCompression`,
+  `WithColdCompression`, `WithFilter`, `WithRangeIndex`, `WithValueSeparation`.
+- Runtime PRAGMAs: `synchronous`, `wal_autocheckpoint`, `cache_size` (live, no reopen).
+- Benchmark acceptance results updated to reflect Phase 3 perf campaign.
+- `kv.Version` constant added to the public package.
+- Comprehensive README: quick start, full API reference, engine guide, durability table,
+  isolation table, encryption, replication, server, CLI, pragma examples, configuration
+  reference, error types, performance notes, and the stability statement.
+- Documentation site at [kv.tamnd.com](https://kv.tamnd.com): getting-started, guides,
+  and the full reference, built with the tago-doks theme and deployed to Cloudflare Pages
+  and GitHub Pages.
+
+### M7 — Server (v0.9)
+
+- `kv serve`: HTTP/JSON + pure-Go binary protocol, single binary, zero external
+  dependencies.
+- HTTP: unary CRUD, streaming NDJSON scan, SSE watch, `/metrics`, `/healthz`.
+- Binary: unary ops, streaming scan/watch, interactive multi-statement transactions.
+- Auth: token, mTLS, JWT/OIDC (`JWTAuthenticator`, `StaticKeySet`, `RemoteKeySet`).
+- Per-prefix ACL (`Identity.Grants`), rate/connection limits, graceful shutdown.
+- TLS and mTLS transport.
+
+### M6 — Operability (v0.8)
+
+- Encryption at rest: AES-256-GCM page and WAL envelope, online key rotation via
+  `db.RotateEncryptionKey`.
+- Observability: Prometheus metrics, per-op counters, commit-latency histogram,
+  engine-internal signals (LSM level stats, compaction backlog), reader-age metric,
+  structured logging, slow-op log, tracing hooks (`Tracer`/`Span` seam for
+  OpenTelemetry or any tracer).
+- Physical backup: `db.Backup` / `kv.RestoreBackup` + `kv backup` / `kv restore`.
+- WAL shipping: `WithWALArchive` sink on the primary, `WithReadReplica` + `ApplyWAL` on
+  the follower.
+- Point-in-time recovery: `WALArchive` + `ApplyWALUntil`.
+- `db.Subscribe`: Badger-style change-feed callback (blocked goroutine, buffered channel,
+  `ErrSubscriberLagged` on slow consumer).
+
+### M5 — Engine maturity (v0.7)
+
+- Ribbon filter option (`WithFilter(Ribbon)`): cache-efficient replacement for Bloom.
+- Bε write buffers on the B-tree: interior-node pivot buffers defer child pages until
+  the node's buffer fills, batching random writes into sequential I/O.
+- Heat-tiered block compression: fast DEFLATE on hot LSM levels, high DEFLATE on cold.
+  Codec self-described per page; LZ4/Zstd drop in without format change.
+- Benchmark suite: YCSB-A/B/C/D workloads + recovery + durability sweep + out-of-cache
+  regime; JSON report with regression compare; pprof profiling integration.
+- Performance Phase 1: sharded buffer pool (2.42x read throughput at 8 readers),
+  group-commit (one shared fsync/leader: 4.1x fillrandom at 8 writers, 14.2x at 32),
+  lock-free read snapshot (oracle mutex contention 3.73%→0 at 32 readers), recycled
+  conflict maps.
+- Performance Phase 2: leaf binary search, decoded-node cache on buffer frame,
+  single-fetch B-tree descent, lock-free cache-hit pin, zero-copy value on the read
+  path, streaming iterators, LSM background flush + auto-compaction, immutable
+  segment-list snapshot, slotted-page in-place B-tree edits, pooled WAL frame + fused
+  batch encode, chunked arena, lock-free skiplist, parallel group apply, lock-free LSM
+  read snapshot of the active memtable.
+- Performance Phase 3: biased B-tree leaf split for sequential inserts, lazy TTL clock,
+  F_BARRIERFSYNC intermediate sync level, cold-only compression policy, auto version GC
+  after checkpoint, checkpoint I/O off the foreground write lock.
+
+### M4 — LSM core (v0.6)
+
+- Single-file segment model (SQLite4 lsm1 page-range extents), MANIFEST, embedded
+  freelist.
+- Arena skip-list memtable, seal/flush, L0..Ln levels, leveled compaction.
+- Bloom filters + Monkey bit allocation; filter skipping on the read path.
+- LSM `RecoverFinished`: MANIFEST replay, orphaned-compaction reclamation.
+- Fluid leveled compaction policy (tiered/lazy-leveling default), lazy-leveling
+  (tiered largest level).
+- WiscKey value separation: vLog flush, value deref on reads, GC.
+- REMIX range index for the scan path.
+- Engine-equivalence-under-crash: both engines pass the same conformance + crash suites.
+
+### M3 — Library API + CLI (v0.5)
+
+- Merge operators, TTL (`SetWithTTL`), bulk-load builder (`WriteBatch`), long-lived
+  `Snapshot`, typed errors, `Subscribe`.
+- Full CLI: `get`/`set`/`del`/`scan`/`count`/`dump`/`load`/`checkpoint`/`vacuum`/
+  `pragma`/`check`/`info`/`stats`/`serve` + interactive shell; exit codes 0–8.
+- Checkpointing: passive/full/truncate modes, auto-checkpoint, freelist reuse,
+  incremental/full vacuum.
+- Verifier: corruption-class tests for all 6 B-tree fault classes.
+- Crash-injection harness: `vfs.Mem.CrashAfterSync(n)` proves the durable-prefix
+  property at every sync boundary.
+- `db.ErrFatalSync` write fence (fsyncgate): poisons the DB on sync failure; maps to
+  public `ErrNeedsRecovery`.
+- Interrupted-checkpoint crash test.
+- Change-feed `Subscribe` + `ErrSubscriberLagged` + `ErrClosed`.
+
+### M2 — MVCC, transactions, iterators (v0.4)
+
+- Versioned internal keys end-to-end; watermark oracle (Badger lineage).
+- `View`/`Update` / explicit `Begin`/`Commit`; conflict retry.
+- Cursor protocol: forward/reverse, bounds/prefix, range-delete visibility.
+- Version GC tied to the readMark.
+- Serializable isolation: read-set validation at commit.
+
+### M1 — Pager, B-tree, WAL, crash recovery (v0.3)
+
+- Pager + 2Q buffer pool (sharded, arena-backed, OLC on the B-link tree).
+- B-tree core: in-place B-link B+tree, search/insert/split/delete, OLC.
+- WAL: frame format, write-ahead rule, group commit, four `Sync` levels, full-page
+  images, `fdatasync` group batching.
+- Crash recovery: durable-tail scan, logical redo, page-LSN idempotency.
+
+### M0 — Skeleton and seam (v0.2)
+
+- Module (`github.com/tamnd/kv`), zero external dependencies, cross-compile
+  (`CGO_ENABLED=0`), CI.
+- File format: header (magic, version, page size, engine kind, freelist root,
+  application_id, user_version), slotted pages, encoding primitives, round-trip + CRC
+  tests.
+- Engine SPI (`engine.Engine`, `engine.Txn`, `engine.Iterator`, `VerifyReport`).
+- Model engine oracle (conformance harness from day one).
+- VFS seam: `osfs` backend + fault-injecting `vfs.Mem` (sync counting, crash injection).

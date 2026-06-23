@@ -42,6 +42,11 @@ const (
 	LSM = format.EngineLSM
 )
 
+// Version is the current release of the kv library. It follows semantic versioning.
+// The 0.x series is the pre-1.0 line: the API is broadly stable and the on-disk
+// format is fixed, but the surface may still change before the 1.0 commitment.
+const Version = "0.1.0"
+
 // Sync is the WAL durability level (spec 07 §6). SyncFull, the default, makes every
 // acked commit survive a crash.
 type Sync = wal.Sync
