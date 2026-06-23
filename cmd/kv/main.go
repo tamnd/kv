@@ -65,6 +65,7 @@ func commands() []command {
 		{"info", "print a human summary of the database", cmdInfo},
 		{"stats", "print space and durability accounting as JSON", cmdStats},
 		{"metrics", "print observability metrics in Prometheus text format", cmdMetrics},
+		{"watch", "stream committed changes as JSONL (change feed)", cmdWatch},
 		{"serve", "serve the database over HTTP/JSON", cmdServe},
 	}
 }
