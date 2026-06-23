@@ -176,19 +176,26 @@ func (t *BTree) insertOne(ik, value []byte) error {
 	var path []format.PageNo
 	pgno := t.root()
 	for {
-		typ, err := t.typeOf(pgno)
+		child, isLeaf, ok, err := t.routeInterior(pgno, uk)
 		if err != nil {
 			return err
 		}
-		if typ == format.PageBTreeLeaf {
+		if isLeaf {
 			break
 		}
-		in, err := t.loadInterior(pgno)
-		if err != nil {
-			return err
+		if !ok {
+			// The in-place router could not read the page (malformed or an unexpected type):
+			// fall back to the decode path, which re-reads it and returns the precise error.
+			in, err := t.loadInterior(pgno)
+			if err != nil {
+				return err
+			}
+			path = append(path, pgno)
+			pgno = in.children[in.childFor(uk)]
+			continue
 		}
 		path = append(path, pgno)
-		pgno = in.children[in.childFor(uk)]
+		pgno = child
 	}
 
 	// Fast path: edit the slotted leaf in place under a write pin, appending one cell
@@ -312,6 +319,36 @@ func (t *BTree) loadLeaf(pgno format.PageNo) (*leaf, error) {
 	l, err := unmarshalLeaf(data)
 	t.pgr.Unpin(fr, false)
 	return l, err
+}
+
+// routeInterior pins pgno once, classifies it, and for an interior node returns the child that
+// covers userKey using the in-place router. It folds the descent's separate typeOf and
+// loadInterior reads into one pinned Get and decodes nothing, so an insert descent touches each
+// interior level with a single Get and no per-level allocation (perf/11 W2). isLeaf reports that
+// pgno is a leaf so the descent stops; ok=false means the page was malformed or not a btree node
+// and the caller falls back to the decode path, which reproduces the exact error.
+func (t *BTree) routeInterior(pgno format.PageNo, userKey []byte) (child format.PageNo, isLeaf, ok bool, err error) {
+	fr, err := t.pgr.Get(pgno, pager.Read)
+	if err != nil {
+		return 0, false, false, err
+	}
+	data := fr.Data()
+	if len(data) < format.CommonHeaderSize {
+		t.pgr.Unpin(fr, false)
+		return 0, false, false, nil
+	}
+	switch format.DecodeCommonHeader(data).Type {
+	case format.PageBTreeLeaf:
+		t.pgr.Unpin(fr, false)
+		return 0, true, true, nil
+	case format.PageBTreeInterior:
+		child, ok = interiorChildInPlace(data, userKey)
+		t.pgr.Unpin(fr, false)
+		return child, false, ok, nil
+	default:
+		t.pgr.Unpin(fr, false)
+		return 0, false, false, nil
+	}
 }
 
 func (t *BTree) loadInterior(pgno format.PageNo) (*interior, error) {
