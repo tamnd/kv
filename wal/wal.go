@@ -16,6 +16,7 @@ package wal
 
 import (
 	"encoding/binary"
+	"sync"
 	"sync/atomic"
 
 	"github.com/tamnd/kv/crypto"
@@ -104,13 +105,29 @@ type WAL struct {
 	pageSize int
 	syncMode atomic.Int32 // stores a Sync value; updated by SetSync
 
-	salt    uint64
-	lsn     uint64 // next LSN to assign
+	// appendMu serializes the two append sequences that would otherwise race:
+	// the foreground group committer (running under the db lock) and the
+	// background checkpoint's full_page_writes page-image logging, which slice 95
+	// moved off the db lock when it pushed page writeback into the pager. The WAL
+	// tail is single-writer by contract, so every append routine mutates the plain
+	// fields below without atomics; this mutex is what keeps that contract true
+	// when a checkpoint and a commit overlap. It covers only the WAL-append
+	// section (frame appends plus the following sync), not the slow page
+	// writeback, so checkpoint I/O still runs concurrently with later commits.
+	appendMu sync.Mutex
+
+	salt uint64
+	// lsn is the next LSN to assign and syncs counts fsyncs for observability. Both are
+	// atomic because a checkpoint's full_page_writes page-image logging advances them off
+	// d.mu (under appendMu) while Stats and maybeCheckpoint read them holding only d.mu;
+	// the writes still happen single-writer under appendMu, the atomics just make the
+	// concurrent reads race-free.
+	lsn     atomic.Uint64
 	lastSum uint64 // running chained checksum
 	tailOff int64  // next append offset
 	grew    bool   // whether the file has grown since the last sync (for SyncExtra)
 	batchN  uint32 // frames appended in the open (uncommitted) batch
-	syncs   uint64 // count of fsyncs performed, for observability
+	syncs   atomic.Uint64
 
 	// Reusable append-path scratch (perf/02 Finding 6). The WAL is single-writer by
 	// contract (the db serializes every append through the single-flight committer, the
@@ -153,10 +170,10 @@ func Create(fs vfs.FS, path string, opts Options) (*WAL, error) {
 		path:     path,
 		pageSize: opts.PageSize,
 		salt:     opts.Salt,
-		lsn:      1,
 		tailOff:  headerSize,
 		crypto:   opts.Encryption,
 	}
+	w.lsn.Store(1)
 	w.syncMode.Store(int32(opts.Sync))
 	if err := w.writeHeader(); err != nil {
 		f.Close()
@@ -214,11 +231,11 @@ func Open(fs vfs.FS, path string, opts Options) (*WAL, RecoverResult, error) {
 		path:     path,
 		pageSize: opts.PageSize,
 		salt:     res.Salt,
-		lsn:      res.DurableLSN + 1,
 		lastSum:  res.DurableSum,
 		tailOff:  res.DurableEndOff,
 		crypto:   opts.Encryption,
 	}
+	w.lsn.Store(res.DurableLSN + 1)
 	w.syncMode.Store(int32(opts.Sync))
 	return w, res, nil
 }
@@ -256,7 +273,7 @@ func (w *WAL) headerChecksum() uint64 {
 func (w *WAL) SetScheme(s *crypto.Scheme) { w.crypto = s }
 
 // LSN reports the next LSN that will be assigned.
-func (w *WAL) LSN() uint64 { return w.lsn }
+func (w *WAL) LSN() uint64 { return w.lsn.Load() }
 
 // ResumeFrom raises the next LSN to at least minNext when reopening a generation the
 // last checkpoint left empty. After a checkpoint folds and empties the log, the
@@ -268,8 +285,8 @@ func (w *WAL) LSN() uint64 { return w.lsn }
 // always lands past the marker. It only ever raises the counter, so a generation that
 // already carries post-checkpoint frames keeps the position recovery gave it.
 func (w *WAL) ResumeFrom(minNext uint64) {
-	if minNext > w.lsn {
-		w.lsn = minNext
+	if minNext > w.lsn.Load() {
+		w.lsn.Store(minNext)
 	}
 }
 
@@ -277,7 +294,7 @@ func (w *WAL) ResumeFrom(minNext uint64) {
 func (w *WAL) Salt() uint64 { return w.salt }
 
 // Syncs reports how many fsyncs the WAL has performed (observability).
-func (w *WAL) Syncs() uint64 { return w.syncs }
+func (w *WAL) Syncs() uint64 { return w.syncs.Load() }
 
 // appendFrame encodes one frame, appends it to the file, and advances the chain.
 // It does not sync; callers batch the sync at the commit boundary.
@@ -286,10 +303,11 @@ func (w *WAL) appendFrame(ft FrameType, version uint64, payload []byte) error {
 	if cap(w.frameScratch) < need {
 		w.frameScratch = make([]byte, need)
 	}
+	lsn := w.lsn.Load()
 	frame := w.frameScratch[:need]
 	frame[0] = byte(ft)
 	binary.BigEndian.PutUint32(frame[1:5], uint32(len(payload)))
-	binary.BigEndian.PutUint64(frame[5:13], w.lsn)
+	binary.BigEndian.PutUint64(frame[5:13], lsn)
 	binary.BigEndian.PutUint64(frame[13:21], version)
 	binary.BigEndian.PutUint64(frame[21:29], w.salt)
 	copy(frame[frameHeaderSize:], payload)
@@ -307,7 +325,7 @@ func (w *WAL) appendFrame(ft FrameType, version uint64, payload []byte) error {
 	}
 	w.tailOff += int64(len(frame))
 	w.lastSum = sum
-	w.lsn++
+	w.lsn.Store(lsn + 1)
 	w.grew = true
 	return nil
 }
@@ -326,9 +344,10 @@ func (w *WAL) appendFrameAppend(ft FrameType, version uint64, encode func(dst []
 	frame := encode(w.frameScratch[:frameHeaderSize])
 	w.frameScratch = frame[:cap(frame)]
 	payload := frame[frameHeaderSize:]
+	lsn := w.lsn.Load()
 	frame[0] = byte(ft)
 	binary.BigEndian.PutUint32(frame[1:5], uint32(len(payload)))
-	binary.BigEndian.PutUint64(frame[5:13], w.lsn)
+	binary.BigEndian.PutUint64(frame[5:13], lsn)
 	binary.BigEndian.PutUint64(frame[13:21], version)
 	binary.BigEndian.PutUint64(frame[21:29], w.salt)
 	sum := w.chainSum(w.lastSum, frame[0:29], payload)
@@ -338,7 +357,7 @@ func (w *WAL) appendFrameAppend(ft FrameType, version uint64, encode func(dst []
 	}
 	w.tailOff += int64(len(frame))
 	w.lastSum = sum
-	w.lsn++
+	w.lsn.Store(lsn + 1)
 	w.grew = true
 	return nil
 }
@@ -377,7 +396,7 @@ func (w *WAL) LogBatch(version uint64, encoded []byte) error {
 		// Seal under the LSN this frame will take. appendFrame writes w.lsn into the
 		// frame header and increments it, so sealing with the current w.lsn binds the
 		// ciphertext to the same LSN recovery will open it under.
-		sealed, err := w.crypto.SealWAL(nil, encoded, w.lsn)
+		sealed, err := w.crypto.SealWAL(nil, encoded, w.lsn.Load())
 		if err != nil {
 			return err
 		}
@@ -416,7 +435,7 @@ func (w *WAL) LogBatchAppend(version uint64, encode func(dst []byte) []byte) err
 // returned LSN is the commit frame's LSN, which the caller records as the checkpoint
 // boundary once the batch is folded into the main file.
 func (w *WAL) AppendCommit(version uint64) (uint64, error) {
-	commitLSN := w.lsn
+	commitLSN := w.lsn.Load()
 	var p [4]byte
 	binary.BigEndian.PutUint32(p[:], w.batchN)
 	if err := w.appendFrame(FrameCommit, version, p[:]); err != nil {
@@ -435,11 +454,22 @@ func (w *WAL) AppendCommit(version uint64) (uint64, error) {
 // fsync instead of paying N in series.
 func (w *WAL) Sync() error { return w.sync() }
 
+// AppendLock and AppendUnlock bracket an append sequence that must not interleave
+// with another writer's. The foreground group committer holds it across its frame
+// appends and the following Sync; the background checkpoint holds it across its
+// full_page_writes page-image logging and flush. Both run off-and-on against the same
+// single-writer tail, so this is the lock that makes "single writer" true when a
+// checkpoint and a commit overlap. The slow page writeback sits outside the bracket,
+// so it stays concurrent with later commits.
+func (w *WAL) AppendLock()   { w.appendMu.Lock() }
+func (w *WAL) AppendUnlock() { w.appendMu.Unlock() }
+
 // LogPageImage appends a FramePageImage record for pgno carrying the page's current
 // on-disk content. The checkpoint path calls this before overwriting each page so that
 // recovery can restore the pre-image if a crash leaves the main file in a mixed state
 // (spec 07 §5, full_page_writes). The frame is written immediately; no commit is needed
-// and it does not advance the commit LSN.
+// and it does not advance the commit LSN. The caller holds AppendLock across the whole
+// page-image run so these frames do not interleave with a foreground commit's frames.
 func (w *WAL) LogPageImage(pgno uint32, data []byte) error {
 	payload := make([]byte, 4+len(data))
 	binary.BigEndian.PutUint32(payload[:4], pgno)
@@ -478,13 +508,13 @@ func (w *WAL) sync() error {
 		return nil
 	case SyncBarrier:
 		// Crash-durable per commit via the cheaper ordering barrier, not a full flush.
-		w.syncs++
+		w.syncs.Add(1)
 		return w.file.Sync(vfs.SyncBarrier)
 	case SyncFull:
-		w.syncs++
+		w.syncs.Add(1)
 		return w.file.Sync(vfs.SyncData)
 	case SyncExtra:
-		w.syncs++
+		w.syncs.Add(1)
 		mode := vfs.SyncData
 		if w.grew {
 			mode = vfs.SyncFull
@@ -498,7 +528,7 @@ func (w *WAL) sync() error {
 // Flush forces a sync regardless of level, used by NORMAL at checkpoint to finalize
 // the deferred durability backlog (spec 07 §8).
 func (w *WAL) Flush() error {
-	w.syncs++
+	w.syncs.Add(1)
 	w.grew = false
 	return w.file.Sync(vfs.SyncFull)
 }
@@ -521,7 +551,7 @@ func (w *WAL) Checkpointed(foldedLSN uint64) error {
 	// frames chain from the new header checksum.
 	w.salt = nextSalt(w.salt, foldedLSN)
 	w.tailOff = headerSize
-	w.lsn = foldedLSN + 1
+	w.lsn.Store(foldedLSN + 1)
 	if err := w.writeHeader(); err != nil {
 		return err
 	}

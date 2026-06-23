@@ -390,6 +390,15 @@ type DB struct {
 	ckptErrMu sync.Mutex
 	ckptErr   error
 
+	// ckptMu serializes whole checkpoint folds so two CheckpointMode calls (the
+	// background worker and an explicit Checkpoint, say) never run at once. Without it
+	// one fold's lock-free page-image logging (off d.mu since slice 95) would race the
+	// other's prepare/finalize reads of the WAL tail, and two folds resetting the same
+	// WAL generation is wasteful besides. It wraps the whole CheckpointMode body and is
+	// always taken before d.mu; checkpointLocked does not take it (it holds d.mu
+	// throughout, which already excludes a concurrent CheckpointMode).
+	ckptMu sync.Mutex
+
 	// fullPageWrites controls whether the checkpoint path logs a full pre-image of each
 	// dirty page to the WAL before overwriting it on disk (spec 07 §5). When true (the
 	// default), recovery can restore partially-written pages after an interrupted
@@ -1302,6 +1311,11 @@ func (d *DB) CheckpointMode(m CheckpointMode) error {
 	_, span := d.startSpan(context.Background(), "kv.checkpoint")
 	defer endSpan(span)
 
+	// Serialize whole folds: a second checkpoint must not enter prepare/finalize while
+	// this one's lock-free page-image logging is appending to the WAL tail off d.mu.
+	d.ckptMu.Lock()
+	defer d.ckptMu.Unlock()
+
 	d.mu.Lock()
 	foldedLSN, lastCommitVersion, resetWAL := d.prepareCheckpointLocked()
 	d.mu.Unlock()
@@ -1534,9 +1548,12 @@ func (d *DB) SetUserVersion(v uint32) error {
 // SetFullPageWrites changes the setting. The caller must ensure d.wal is valid.
 func (d *DB) syncPageImageLogger() {
 	if d.fullPageWrites {
-		d.pgr.SetPageImageLogger(d.wal.LogPageImage, d.wal.Flush)
+		// AppendLock/AppendUnlock bracket the page-image run so it cannot interleave
+		// with a foreground commit appending to the same WAL tail off d.mu (the
+		// CheckpointMode lock-free path released d.mu before logging images).
+		d.pgr.SetPageImageLogger(d.wal.LogPageImage, d.wal.Flush, d.wal.AppendLock, d.wal.AppendUnlock)
 	} else {
-		d.pgr.SetPageImageLogger(nil, nil)
+		d.pgr.SetPageImageLogger(nil, nil, nil, nil)
 	}
 }
 

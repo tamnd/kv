@@ -195,6 +195,12 @@ type Pager struct {
 	// before any pages are written to disk. It must make the logged images durable (WAL
 	// sync) so they are present for recovery even if the checkpoint is interrupted.
 	pageImageFlusher func() error
+	// pageImageLock and pageImageUnlock, when non-nil, bracket the page-image logging
+	// run so it cannot interleave with a foreground commit appending to the same
+	// single-writer WAL tail off the host write lock. They wrap only the log-and-flush
+	// section, not the slow page writeback that follows, so writeback stays concurrent.
+	pageImageLock   func()
+	pageImageUnlock func()
 }
 
 // shardFor returns the shard that owns pgno. The mapping is a fixed mask over the page
@@ -205,10 +211,15 @@ func (p *Pager) shardFor(pgno uint32) *shard { return p.shards[pgno&p.shardMask]
 // pre-images to the WAL before overwriting each page on disk (spec 07 §5,
 // full_page_writes). logger is called for each dirty page with its current on-disk
 // content; flusher is called after all images are logged to make them durable before
-// any page is written. Both must be non-nil together; pass nil, nil to disable.
-func (p *Pager) SetPageImageLogger(logger func(pgno uint32, data []byte) error, flusher func() error) {
+// any page is written. lock and unlock bracket that whole log-and-flush run so it does
+// not interleave with a foreground commit appending to the same WAL tail off the host
+// write lock; pass them as the WAL's AppendLock/AppendUnlock. All four must be non-nil
+// together; pass nils to disable.
+func (p *Pager) SetPageImageLogger(logger func(pgno uint32, data []byte) error, flusher func() error, lock, unlock func()) {
 	p.pageImageLogger = logger
 	p.pageImageFlusher = flusher
+	p.pageImageLock = lock
+	p.pageImageUnlock = unlock
 }
 
 // cryptoScheme loads the live encryption scheme, or nil for an unencrypted file.

@@ -399,6 +399,30 @@ func (p *Pager) lockAllShards() func() {
 	}
 }
 
+// logPageImagesLocked logs a pre-image for every dirty page that the checkpoint is about
+// to overwrite, then flushes them to the WAL so they are durable before any page is
+// written. The caller brackets it with the WAL append lock. All images are logged first
+// and flushed once, so recovery always finds a valid pre-image for a page a crash left
+// partially written (spec 07 §5). Write-pinned frames are skipped: a concurrent commit is
+// still writing them and finalizeCheckpointLocked re-checkpoints them under d.mu.
+func (p *Pager) logPageImagesLocked() error {
+	imgBuf := make([]byte, p.pageSize)
+	for _, sh := range p.shards {
+		for _, fr := range sh.frames {
+			if fr.pgno != 0 && fr.dirty && !fr.writePinned.Load() {
+				off := int64(fr.pgno-1) * int64(p.pageSize)
+				n, _ := p.file.ReadAt(imgBuf, off)
+				if n == p.pageSize {
+					if err := p.pageImageLogger(fr.pgno, imgBuf); err != nil {
+						return err
+					}
+				}
+			}
+		}
+	}
+	return p.pageImageFlusher()
+}
+
 // Checkpoint writes every dirty frame to the main file, persists the freelist and
 // header, and fsyncs. After it returns, the main file is a consistent image of
 // all committed work and contains no torn pages. checkpointLSN is recorded in the
@@ -425,21 +449,21 @@ func (p *Pager) Checkpoint(checkpointLSN, lastCommitVersion uint64) error {
 	// guarantees that recovery always finds a valid pre-image for any page that a
 	// crash left partially written (spec 07 §5).
 	if p.pageImageLogger != nil {
-		imgBuf := make([]byte, p.pageSize)
-		for _, sh := range p.shards {
-			for _, fr := range sh.frames {
-				if fr.pgno != 0 && fr.dirty && !fr.writePinned.Load() {
-					off := int64(fr.pgno-1) * int64(p.pageSize)
-					n, _ := p.file.ReadAt(imgBuf, off)
-					if n == p.pageSize {
-						if err := p.pageImageLogger(fr.pgno, imgBuf); err != nil {
-							return err
-						}
-					}
-				}
-			}
+		// Hold the WAL append lock across the whole log-and-flush run so these
+		// page-image frames do not interleave with a foreground commit's frames on the
+		// same single-writer tail. CheckpointMode released d.mu before calling here, so
+		// without this a commit could be appending concurrently (spec 07 §5). The lock
+		// does not cover the writeBack below, so commits resume the moment the images
+		// are durable. checkpointLocked still holds d.mu here, so the lock is
+		// uncontended on that path; it is never held by this goroutine already.
+		if p.pageImageLock != nil {
+			p.pageImageLock()
 		}
-		if err := p.pageImageFlusher(); err != nil {
+		err := p.logPageImagesLocked()
+		if p.pageImageUnlock != nil {
+			p.pageImageUnlock()
+		}
+		if err != nil {
 			return err
 		}
 	}
