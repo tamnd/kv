@@ -403,6 +403,43 @@ func resolveStream(entries []entry, snap engine.Snapshot, merge func(existing, o
 	return out
 }
 
+// resolveOne folds one already-gathered version group -- newest-first by CompareInternal,
+// every cell the same user key -- to its snapshot-visible value. It is the single-group
+// form of resolveStream the stateful cursor uses, which gathers exactly one group per step:
+// resolveStream allocates a fresh ops list and a one-element result slice on every call,
+// and resolveOne removes both. It writes the op list through opsScratch (the cursor's reused
+// []format.Op, regrown in place and handed back so the next step reuses the same backing
+// array), and returns the resolved key and value directly instead of in a slice. The fold
+// itself is format.Fold, the one resolver resolveStream and the oracle share, so the result
+// is identical to resolveStream(group, ...)[0]; only the per-step allocation differs.
+//
+// The returned key, and value when keysOnly is false, are freshly allocated and caller-owned,
+// the same ownership resolveStream gives, so the host may retain and mutate them. found is
+// false when the group folds to absent (a tombstone or a covering range delete).
+func resolveOne(group []entry, snap engine.Snapshot, merge func(existing, operand []byte) []byte, rangeDels []format.RangeDel, opsScratch *[]format.Op, keysOnly bool) (uk, val []byte, found bool) {
+	tc := snap.TTLClock()
+	user := format.UserKey(group[0].ik)
+	ops := (*opsScratch)[:0]
+	for _, e := range group {
+		op, ok := format.OpFromCell(e.ik, e.val, tc.For(format.KindOf(e.ik)))
+		if !ok {
+			continue // range markers resolve through rangeDels, not as ops
+		}
+		ops = append(ops, op)
+	}
+	*opsScratch = ops // keep the regrown backing array for the next step
+	rd := format.NewestCoveringRangeDel(rangeDels, user, snap.Version)
+	v, ok := format.Fold(ops, snap.Version, rd, merge)
+	if !ok {
+		return nil, nil, false
+	}
+	uk = append([]byte(nil), user...)
+	if !keysOnly {
+		val = append([]byte(nil), v...)
+	}
+	return uk, val, true
+}
+
 // NewForwardCursor returns a stateful forward scan cursor over [lower, upper) at the
 // reader's snapshot (engine.ForwardCursorer, impl 150). It is the O(1)-per-step counterpart
 // to ScanForward: the host prefers it on a streamable (unbuffered) tree, where every version
@@ -442,9 +479,10 @@ type scanCursor struct {
 	upper     []byte
 	rangeDels []format.RangeDel
 	started   bool
-	leaf      *leaf   // the leaf currently positioned in (immutable); nil once exhausted
-	idx       int     // index in leaf.keys of the next cell to consider
-	group     []entry // reused scratch for one user key's version group
+	leaf      *leaf       // the leaf currently positioned in (immutable); nil once exhausted
+	idx       int         // index in leaf.keys of the next cell to consider
+	group     []entry     // reused scratch for one user key's version group
+	ops       []format.Op // reused scratch for the group's ops the fold consumes
 }
 
 // NextEntry implements engine.StreamCursor. The host calls it under the engine read lock, one
@@ -492,13 +530,9 @@ func (c *scanCursor) NextEntry(keysOnly bool) (uk, val []byte, ok bool, err erro
 				j++
 			}
 			c.idx = j
-			res := resolveStream(c.group, c.snap, t.merge, c.rangeDels)
-			if len(res) > 0 {
-				v := res[0].val
-				if keysOnly {
-					v = nil
-				}
-				return res[0].uk, v, true, nil
+			uk, v, found := resolveOne(c.group, c.snap, t.merge, c.rangeDels, &c.ops, keysOnly)
+			if found {
+				return uk, v, true, nil
 			}
 			// Folded to absent (tombstone or covering range delete): skip and keep going.
 		}
