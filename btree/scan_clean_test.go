@@ -149,6 +149,105 @@ func TestScanMultiVersionDisengagesFastPath(t *testing.T) {
 	}
 }
 
+// TestNextBatchMatchesNextEntryClean pins the two clean-leaf scan paths together. NextBatch fills
+// from a clean leaf in one tight loop (slice 163) while NextEntry resolves one cell per step() call
+// (slice 159); both must emit byte-for-byte the same visible entries over the same tree, snapshot,
+// and bounds, or a future edit could let the batch fill and the per-entry step drift apart on the
+// clean path. It drives several bound shapes through a small batch cap so the fill crosses leaf
+// boundaries inside one NextBatch call, the case the fast path's own leaf-advance handles.
+func TestNextBatchMatchesNextEntryClean(t *testing.T) {
+	bt := newBTree(t, 512, 16) // small page so the keys span several leaves
+
+	const n = 300
+	b := engine.NewWriteBatch(10)
+	for i := 0; i < n; i++ {
+		b.Set([]byte(fmt.Sprintf("k%04d", i)), []byte(fmt.Sprintf("v%04d", i)))
+	}
+	if err := bt.Apply(b, 10); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	snap := engine.Snapshot{Version: 100}
+	cases := []struct{ lo, hi []byte }{
+		{nil, nil},
+		{[]byte("k0050"), []byte("k0200")},
+		{[]byte("k0123"), nil},
+		{nil, []byte("k0099")},
+		{[]byte("k0299"), nil}, // last key only
+		{[]byte("k9999"), nil}, // empty range past the end
+	}
+	for _, c := range cases {
+		name := fmt.Sprintf("[%s,%s)", c.lo, c.hi)
+		t.Run(name, func(t *testing.T) {
+			entries := scanAllEntriesBounds(t, bt, snap, c.lo, c.hi)
+			batch := scanAllBatchBounds(t, bt, snap, c.lo, c.hi, 7)
+			if len(entries) != len(batch) {
+				t.Fatalf("NextEntry scanned %d, NextBatch %d", len(entries), len(batch))
+			}
+			for i := range entries {
+				if string(entries[i].Key) != string(batch[i].Key) || string(entries[i].Value) != string(batch[i].Value) {
+					t.Fatalf("entry %d: NextEntry (%q,%q) != NextBatch (%q,%q)",
+						i, entries[i].Key, entries[i].Value, batch[i].Key, batch[i].Value)
+				}
+			}
+		})
+	}
+}
+
+// scanAllEntriesBounds drives the per-entry NextEntry (step) path over [lo, hi) at snap, copying
+// each key and value out so they outlive the cursor.
+func scanAllEntriesBounds(t *testing.T, bt *BTree, snap engine.Snapshot, lo, hi []byte) []engine.KV {
+	t.Helper()
+	cur, err := bt.NewSnapshotForwardCursor(snap, lo, hi)
+	if err != nil {
+		t.Fatalf("snapshot cursor: %v", err)
+	}
+	var out []engine.KV
+	for {
+		k, v, ok, err := cur.NextEntry(false)
+		if err != nil {
+			t.Fatalf("next entry: %v", err)
+		}
+		if !ok {
+			break
+		}
+		out = append(out, engine.KV{
+			Key:   append([]byte(nil), k...),
+			Value: append([]byte(nil), v...),
+		})
+	}
+	return out
+}
+
+// scanAllBatchBounds drives the zero-copy NextBatch fill over [lo, hi) at snap with the given batch
+// cap, copying each entry out so the views do not outlive the cursor.
+func scanAllBatchBounds(t *testing.T, bt *BTree, snap engine.Snapshot, lo, hi []byte, batchCap int) []engine.KV {
+	t.Helper()
+	cur, err := bt.NewSnapshotForwardCursor(snap, lo, hi)
+	if err != nil {
+		t.Fatalf("snapshot cursor: %v", err)
+	}
+	bc := cur.(engine.BatchCursor)
+	var out []engine.KV
+	dst := make([]engine.KV, batchCap)
+	for {
+		n, err := bc.NextBatch(dst, false)
+		if err != nil {
+			t.Fatalf("next batch: %v", err)
+		}
+		for i := 0; i < n; i++ {
+			out = append(out, engine.KV{
+				Key:   append([]byte(nil), dst[i].Key...),
+				Value: append([]byte(nil), dst[i].Value...),
+			})
+		}
+		if n < len(dst) {
+			break
+		}
+	}
+	return out
+}
+
 // iterAll walks the general NewIter cursor over [nil, nil) at snap and returns every visible
 // key and value. NewIter materializes and resolves the range up front, the path the clean-range
 // fast path optimizes; this drives it the way db.NewIterator and a reverse scan do.

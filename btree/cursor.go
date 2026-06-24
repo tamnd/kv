@@ -741,6 +741,53 @@ func (c *scanCursor) NextBatch(dst []engine.KV, keysOnly bool) (n int, err error
 		return 0, err
 	}
 	for n < len(dst) {
+		// Clean-leaf batch fast path: when positioned on a clean leaf (all distinct single-version
+		// Sets, no range delete in force), fill straight from its cell arrays in one tight loop with
+		// no per-cell step() call. step already skips the fold on a clean leaf (slice 159), but it
+		// returns one entry per call, so NextBatch crosses a non-inlined call boundary per cell that
+		// forces the leaf slices and idx to reload from the cursor on every cell. Pulling the fill
+		// into this frame keeps keys, vals, and idx in registers across the whole leaf. The output is
+		// identical to looping step(keysOnly, true): a cell at or below the snapshot emits its own
+		// value (zero-copy view), a newer one is skipped, and crossing upper exhausts the range.
+		if c.leaf != nil && c.leafClean {
+			keys := c.leaf.keys
+			vals := c.leaf.vals
+			i := c.idx
+			for i < len(keys) && n < len(dst) {
+				ik := keys[i]
+				guk := format.UserKey(ik)
+				if c.upper != nil && format.CompareUser(guk, c.upper) >= 0 {
+					c.idx = i
+					c.leaf = nil // crossed the upper bound: range exhausted
+					return n, nil
+				}
+				if format.Version(ik) <= c.snap.Version {
+					if keysOnly {
+						dst[n] = engine.KV{Key: guk}
+					} else {
+						dst[n] = engine.KV{Key: guk, Value: vals[i]}
+					}
+					n++
+				}
+				i++
+			}
+			c.idx = i
+			if n >= len(dst) {
+				return n, nil
+			}
+			// Current leaf filled within budget: follow the B-link to the next leaf, or finish. The
+			// next leaf's cleanliness is recomputed by loadLeafAt, so a dirty leaf falls to step below.
+			next := c.leaf.next
+			if next == format.NoPage {
+				c.leaf = nil
+				return n, nil
+			}
+			if err := c.loadLeafAt(next); err != nil {
+				return n, err
+			}
+			c.idx = 0
+			continue
+		}
 		uk, v, ok, err := c.step(keysOnly, true)
 		if err != nil {
 			return n, err
