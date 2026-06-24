@@ -119,28 +119,14 @@ func (t *BTree) gcVersions(w, sweepNow uint64, maxPages int) (engine.MaintReport
 // cell above w is kept as a verbatim tombstone; one at or below w folds with the rest of
 // the history. A sweepNow of zero disables the sweep, which is what recovery passes.
 // leafIsCleanSets reports whether l holds exactly one plain Set per user key with no range
-// delete in force, the case gcCollapseLeaf can skip without building a copy. It scans the
-// decoded cells once with no allocation: every cell must be KindSet (so no tombstone, TTL, or
-// range marker), the user keys must be strictly ascending (so every version group has size
-// one), and rangeDels must be empty (so no key can fold to absent). See gcCollapseLeaf for why
-// these together mean the pass would make no change.
+// delete in force, the case gcCollapseLeaf can skip without building a copy and the scan fast
+// path can emit without folding: every cell must be KindSet (so no tombstone, TTL, or range
+// marker), the user keys must be strictly ascending (so every version group has size one), and
+// rangeDels must be empty (so no key can fold to absent). The leaf-intrinsic part (the cell scan)
+// is cached on the leaf and computed once; the rangeDels check is cursor- or pass-specific and is
+// applied here. See gcCollapseLeaf for why these together mean the pass would make no change.
 func leafIsCleanSets(l *leaf, rangeDels []format.RangeDel) bool {
-	if len(rangeDels) != 0 {
-		return false
-	}
-	var prev []byte
-	for i := range l.keys {
-		ik := l.keys[i]
-		if format.KindOf(ik) != format.KindSet {
-			return false
-		}
-		uk := format.UserKey(ik)
-		if i > 0 && format.CompareUser(prev, uk) >= 0 {
-			return false
-		}
-		prev = uk
-	}
-	return true
+	return len(rangeDels) == 0 && l.intrinsicCleanSets()
 }
 
 func gcCollapseLeaf(l *leaf, w, sweepNow uint64, rangeDels []format.RangeDel, merge func(existing, operand []byte) []byte) (*leaf, bool, int64) {

@@ -46,6 +46,57 @@ type leaf struct {
 	keys [][]byte // internal keys, ascending by format.CompareInternal
 	vals [][]byte // inline values, parallel to keys (overflow is deferred)
 	next format.PageNo
+
+	// cleanState caches the leaf-intrinsic "clean Sets" predicate (every cell a plain Set with
+	// strictly ascending distinct user keys, so every version group has size one), computed once
+	// and reused. The scan fast path and the GC fast path both ask this per leaf, and on a short
+	// scan op recomputing it walked the whole leaf with a key compare per cell, which a CPU profile
+	// showed costing as much as the read itself. A decoded leaf is immutable and shared across
+	// readers (viewLeaf hands back one cached decode), so the value is computed lazily and stored
+	// atomically the same way interior.childRefs caches its swizzles: 0 unknown, 1 clean, 2 dirty.
+	// The result is deterministic, so a concurrent double-compute is harmless and the store is
+	// idempotent.
+	cleanState atomic.Int32
+}
+
+const (
+	leafCleanUnknown int32 = 0
+	leafCleanClean   int32 = 1
+	leafCleanDirty   int32 = 2
+)
+
+// intrinsicCleanSets reports the leaf-only part of the clean-Sets predicate: every cell a plain
+// Set and the user keys strictly ascending and distinct, so each version group has exactly one
+// member. It excludes the range-delete check, which is not a property of the leaf and which callers
+// apply separately. The answer is cached on first computation since the leaf is immutable.
+func (l *leaf) intrinsicCleanSets() bool {
+	switch l.cleanState.Load() {
+	case leafCleanClean:
+		return true
+	case leafCleanDirty:
+		return false
+	}
+	clean := true
+	var prev []byte
+	for i := range l.keys {
+		ik := l.keys[i]
+		if format.KindOf(ik) != format.KindSet {
+			clean = false
+			break
+		}
+		uk := format.UserKey(ik)
+		if i > 0 && format.CompareUser(prev, uk) >= 0 {
+			clean = false
+			break
+		}
+		prev = uk
+	}
+	if clean {
+		l.cleanState.Store(leafCleanClean)
+	} else {
+		l.cleanState.Store(leafCleanDirty)
+	}
+	return clean
 }
 
 // interior is the decoded form of a B-tree interior page. It holds n separators and
