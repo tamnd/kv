@@ -882,7 +882,21 @@ func (r *reader) Get(userKey []byte) ([]byte, error) {
 	// every older version is shadowed. Once a base is in hand, deeper (older) sources
 	// cannot change the answer, so they need never be read.
 	resolved := func() bool {
-		sort.SliceStable(ops, func(i, j int) bool { return ops[i].Version > ops[j].Version })
+		// ops is small (a key's visible versions plus any path messages) and carries no two
+		// ops at the same version (a committed version lives in exactly one source as it
+		// migrates down), so an in-place insertion sort puts it newest-first without the
+		// reflection machinery sort.SliceStable allocates on every call -- its Swapper and a
+		// temporary -- which the common single-version read pays for nothing. This mirrors the
+		// B-tree point read's gatherPoint, which sorts its group the same way for the same reason.
+		for i := 1; i < len(ops); i++ {
+			o := ops[i]
+			j := i - 1
+			for j >= 0 && ops[j].Version < o.Version {
+				ops[j+1] = ops[j]
+				j--
+			}
+			ops[j+1] = o
+		}
 		for _, op := range ops {
 			if op.Version > r.snap.Version {
 				continue // not visible at this snapshot
@@ -917,10 +931,29 @@ func (r *reader) Get(userKey []byte) ([]byte, error) {
 	// deferred release, so the segment probes read only stable, still-allocated pages (perf/03 R3).
 	l.mu.RLock()
 	v := l.acquireVersionLocked()
-	rd = format.NewestCoveringRangeDel(l.liveRangeDels(flattenSegments(v.levels)), userKey, r.snap.Version)
 	mergeFn := l.merge
 	memSnap := l.mem
 	immSnap := append([]*immMem(nil), l.imm...)
+	// Newest covering range delete <= snap, found in place over the referenced version's live
+	// sources. This is the fold form of NewestCoveringRangeDel(liveRangeDels(flattenSegments(...)))
+	// without its two allocations: the flat segment slice and the gathered range-delete slice. Each
+	// source is scanned by the same NewestCoveringRangeDel and the newest covering version wins, so
+	// the result is identical, and an engine with no range deletes (the common case) scans only nil
+	// lists and allocates nothing. The segment lists are immutable past open, so reading them off the
+	// referenced version under the lock is safe (perf).
+	rd = format.NewestCoveringRangeDel(memSnap.liveDels(), userKey, r.snap.Version)
+	for _, e := range immSnap {
+		if d := format.NewestCoveringRangeDel(e.mem.liveDels(), userKey, r.snap.Version); d > rd {
+			rd = d
+		}
+	}
+	for _, lvl := range v.levels {
+		for _, seg := range lvl {
+			if d := format.NewestCoveringRangeDel(seg.rangeDels, userKey, r.snap.Version); d > rd {
+				rd = d
+			}
+		}
+	}
 	l.mu.RUnlock()
 	defer l.releaseVersion(v)
 
