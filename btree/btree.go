@@ -433,47 +433,59 @@ func (t *BTree) viewLeaf(pgno format.PageNo) (*leaf, error) {
 // the frame-cached decode on a hit and caches a fresh decode on a miss, and the returned
 // node is shared and immutable.
 func (t *BTree) viewNode(pgno format.PageNo) (format.PageType, *leaf, *interior, error) {
-	// ViewDecoded gives the cached decode pin-free on a hit, so the read-only descent does
+	typ, l, in, _, err := t.viewNodeRef(pgno)
+	return typ, l, in, err
+}
+
+// viewNodeRef is viewNode that also returns the decoded box, so a caller swizzling tree
+// edges (gatherPoint, perf/12 F2) can cache the box on the parent and reach this node next
+// time without the pager shard lock and map. The box is the same immutable node returned as
+// the decoded value; on a decode miss it is the box SetDecoded just installed. It is nil only
+// when err is non-nil or the node failed to decode.
+func (t *BTree) viewNodeRef(pgno format.PageNo) (format.PageType, *leaf, *interior, *pager.DecodedNode, error) {
+	// ViewDecodedRef gives the cached decode pin-free on a hit, so the read-only descent does
 	// not pin every node it passes through and ping-pong the hot upper nodes' pin counters
-	// (perf/09 N1). A hit returns the immutable decoded node and no frame; a miss returns a
-	// pinned frame to decode and cache.
-	d, fr, err := t.pgr.ViewDecoded(pgno)
+	// (perf/09 N1). A hit returns the immutable decoded node's box and no frame; a miss returns
+	// a pinned frame to decode and cache.
+	box, fr, err := t.pgr.ViewDecodedRef(pgno)
 	if err != nil {
-		return 0, nil, nil, err
+		return 0, nil, nil, nil, err
 	}
-	if d != nil {
-		switch n := d.(type) {
+	if box != nil {
+		switch n := box.Value().(type) {
 		case *leaf:
-			return format.PageBTreeLeaf, n, nil, nil
+			return format.PageBTreeLeaf, n, nil, box, nil
 		case *interior:
-			return format.PageBTreeInterior, nil, n, nil
+			return format.PageBTreeInterior, nil, n, box, nil
 		default:
-			return 0, nil, nil, format.ErrCorrupt
+			return 0, nil, nil, nil, format.ErrCorrupt
 		}
 	}
 	data := t.nodeBytes(fr)
 	if len(data) < format.CommonHeaderSize {
 		t.pgr.Unpin(fr, false)
-		return 0, nil, nil, format.ErrCorrupt
+		return 0, nil, nil, nil, format.ErrCorrupt
 	}
 	switch typ := format.DecodeCommonHeader(data).Type; typ {
 	case format.PageBTreeLeaf:
 		l, err := unmarshalLeaf(data)
+		var nb *pager.DecodedNode
 		if err == nil {
-			fr.SetDecoded(l)
+			nb = fr.SetDecoded(l)
 		}
 		t.pgr.Unpin(fr, false)
-		return format.PageBTreeLeaf, l, nil, err
+		return format.PageBTreeLeaf, l, nil, nb, err
 	case format.PageBTreeInterior:
 		in, err := unmarshalInterior(data)
+		var nb *pager.DecodedNode
 		if err == nil {
-			fr.SetDecoded(in)
+			nb = fr.SetDecoded(in)
 		}
 		t.pgr.Unpin(fr, false)
-		return format.PageBTreeInterior, nil, in, err
+		return format.PageBTreeInterior, nil, in, nb, err
 	default:
 		t.pgr.Unpin(fr, false)
-		return typ, nil, nil, format.ErrCorrupt
+		return typ, nil, nil, nil, format.ErrCorrupt
 	}
 }
 

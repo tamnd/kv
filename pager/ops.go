@@ -128,6 +128,21 @@ func (p *Pager) getMiss(sh *shard, pgno uint32, intent Intent) (*Frame, error) {
 // cached view), so it keeps the real pin and pays nothing the steady state cannot afford.
 // Exactly one of the returned decoded value and frame is non-nil when err is nil.
 func (p *Pager) ViewDecoded(pgno uint32) (any, *Frame, error) {
+	box, fr, err := p.ViewDecodedRef(pgno)
+	if err != nil || box == nil {
+		return nil, fr, err
+	}
+	return box.v, nil, nil
+}
+
+// ViewDecodedRef is ViewDecoded but, on a hit, returns the decoded box rather than just its
+// value. A caller swizzling tree edges keeps the box pointer in the parent node and reaches
+// this node again through box.Live()+box.Value() with no shard lock and no resident-page map
+// lookup (perf/12 F2); the box's dead flag, set by clearDecoded when the page is written,
+// evicted, or rebound, is what makes that safe. The hit and miss contracts are identical to
+// ViewDecoded: on a hit box != nil and frame == nil and the caller does not Unpin; on a miss
+// box == nil and a pinned frame is returned to decode and Unpin.
+func (p *Pager) ViewDecodedRef(pgno uint32) (*DecodedNode, *Frame, error) {
 	if pgno == 0 {
 		return nil, nil, fmt.Errorf("pager: page 0 is the null page")
 	}
@@ -145,7 +160,7 @@ func (p *Pager) ViewDecoded(pgno uint32) (any, *Frame, error) {
 				fr.ref.Store(true)
 			}
 			sh.rl.RUnlock(s)
-			return b.v, nil, nil
+			return b, nil, nil
 		}
 		// Resident but not decoded yet: pin it so the caller can decode from the bytes and
 		// cache the result. This is the cold path, so the pin cost is irrelevant.

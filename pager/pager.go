@@ -46,17 +46,38 @@ type Frame struct {
 	dirty       bool
 	ref         atomic.Bool // CLOCK reference bit
 	slot        int         // index into the pool, -1 if not pooled
-	decoded     atomic.Pointer[decodedNode]
+	decoded     atomic.Pointer[DecodedNode]
 	writePinned atomic.Bool // true between a write-intent Get and its Unpin
 }
 
-// decodedNode boxes a caller-supplied decoded view of the frame's page so the
+// DecodedNode boxes a caller-supplied decoded view of the frame's page so the
 // engine can cache the structure it unmarshals from the bytes (a B-tree node, say)
 // and reuse it on the next read of the same resident page instead of decoding the
 // bytes again. The pager treats the value as opaque; it only guarantees the box is
 // cleared before the page's bytes can change or the frame is rebound to another
 // page, so a non-nil Decoded always describes the bytes currently in the frame.
-type decodedNode struct{ v any }
+//
+// dead is set true at the instant the box stops describing its page, which is every
+// point the pager calls clearDecoded (a write-intent pin, an eviction, a rebind) or
+// replaces the box in SetDecoded. It lets a caller that cached the box pointer (a
+// swizzled tree edge, perf/12 F2) check validity with one atomic load instead of
+// going back through the shard lock and the resident-page map. The box value v is
+// immutable for the box's whole life, so a caller holding the pointer keeps reading
+// a consistent snapshot of the page even after dead flips; dead only signals that a
+// fresh resolve is needed for the page's current bytes, never that v changed.
+type DecodedNode struct {
+	v    any
+	dead atomic.Bool
+}
+
+// Value returns the boxed decoded view. It is immutable and shared, so the caller
+// must not mutate it (the SetDecoded contract).
+func (d *DecodedNode) Value() any { return d.v }
+
+// Live reports whether the box still describes its page's current bytes. A false
+// result means the page was written, evicted, or rebound since the box was made, so
+// a caller that swizzled this pointer must resolve the page through the pager again.
+func (d *DecodedNode) Live() bool { return !d.dead.Load() }
 
 // PageNo returns the frame's page number.
 func (f *Frame) PageNo() uint32 { return f.pgno }
@@ -77,17 +98,31 @@ func (f *Frame) Decoded() any {
 	return nil
 }
 
-// SetDecoded caches v as the decoded view of the frame's current bytes. The engine
-// calls it after unmarshaling a page it just read so the next read of the same
-// resident page can skip the decode. v must be treated as immutable by every reader
-// that retrieves it, since they all share the one instance; a writer that mutates the
-// page decodes its own private copy and never calls this.
-func (f *Frame) SetDecoded(v any) { f.decoded.Store(&decodedNode{v: v}) }
+// SetDecoded caches v as the decoded view of the frame's current bytes and returns the
+// box holding it. The engine calls it after unmarshaling a page it just read so the next
+// read of the same resident page can skip the decode, and the returned box is what a
+// caller swizzles into a parent edge to reach this node again without the shard lock. v
+// must be treated as immutable by every reader that retrieves it, since they all share the
+// one instance; a writer that mutates the page decodes its own private copy and never
+// calls this. Any box this replaces is marked dead so a swizzle still pointing at the old
+// one resolves afresh.
+func (f *Frame) SetDecoded(v any) *DecodedNode {
+	b := &DecodedNode{v: v}
+	if old := f.decoded.Swap(b); old != nil {
+		old.dead.Store(true)
+	}
+	return b
+}
 
 // clearDecoded drops any cached decoded view. The pager calls it at every point the
 // frame's bytes may change (a write-intent pin) or the frame stops representing its
-// page (rebind or free), which is what keeps a cached view honest.
-func (f *Frame) clearDecoded() { f.decoded.Store(nil) }
+// page (rebind or free), which is what keeps a cached view honest. The dropped box is
+// marked dead so a caller that swizzled its pointer sees the page is no longer current.
+func (f *Frame) clearDecoded() {
+	if old := f.decoded.Swap(nil); old != nil {
+		old.dead.Store(true)
+	}
+}
 
 // Options configure a pager at open.
 type Options struct {

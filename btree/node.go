@@ -2,8 +2,10 @@ package btree
 
 import (
 	"encoding/binary"
+	"sync/atomic"
 
 	"github.com/tamnd/kv/format"
+	"github.com/tamnd/kv/pager"
 )
 
 // nodeHeaderSize is the fixed node header: the 8-byte common header (spec 02 §3.1)
@@ -62,6 +64,16 @@ type interior struct {
 	children []format.PageNo // n+1 child pages
 	msgKeys  [][]byte        // Bε buffered message internal keys, ascending by CompareInternal
 	msgVals  [][]byte        // buffered message values, parallel to msgKeys
+	// childRefs is the swizzle cache: childRefs[i] holds the decoded box of child i once a
+	// descent has resolved it, so the next descent reaches the child by following the pointer
+	// instead of going back through the pager's shard lock and resident-page map (perf/12 F2).
+	// It is parallel to children and populated lazily by the read descent. A slot is valid only
+	// while its box reports Live(); a write, eviction, or rebind of the child marks the box dead
+	// and the descent falls back to the pager and re-swizzles. The slots are atomic because
+	// concurrent readers of this shared immutable node may each store a freshly resolved box
+	// (always the same box for a given resident child, so the store is idempotent). It is only
+	// set on interiors decoded by unmarshalInterior, the only nodes the read descent traverses.
+	childRefs []atomic.Pointer[pager.DecodedNode]
 }
 
 // cellBodySize reports the encoded length of one leaf cell body: the key length
@@ -455,6 +467,10 @@ func unmarshalInterior(p []byte) (*interior, error) {
 			in.msgVals = append(in.msgVals, val)
 		}
 	}
+	// Size the swizzle cache to the child count once, here at decode, so the read descent only
+	// ever loads and stores slots and never grows the slice. Slots start nil (no child resolved
+	// yet) and fill in as descents pass through (perf/12 F2).
+	in.childRefs = make([]atomic.Pointer[pager.DecodedNode], len(in.children))
 	return in, nil
 }
 
