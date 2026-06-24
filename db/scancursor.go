@@ -85,37 +85,46 @@ func (t *Txn) NewScanCursor(opts engine.IterOptions) (*ScanCursor, error) {
 	// zero-copy batch. A write transaction must overlay its buffered writes and a reverse scan must
 	// walk backward, so both take the Iterator fallback; so does an engine without a BatchCursor.
 	if len(t.ops) == 0 && !opts.Reverse {
-		sh := t.db.rl.RLock()
-		rd, err := t.db.eng.NewReader(engine.Snapshot{Version: t.readVersion, Clock: t.db.now})
-		if err != nil {
-			t.db.rl.RUnlock(sh)
-			return nil, err
-		}
-		if fc, ok := rd.(engine.ForwardCursorer); ok {
-			cur, err := fc.NewForwardCursor(lower, upper)
+		snap := engine.Snapshot{Version: t.readVersion, Clock: t.db.now}
+		// Prefer the reader-free path. An engine that can open a forward cursor straight from a
+		// snapshot saves the per-op allocation the ForwardCursorer path spends on a reader it makes
+		// only to call NewForwardCursor on and then discards; the txn holds the snapshot open for
+		// the cursor's life, so the reader pinned nothing the snapshot did not.
+		if scf, ok := t.db.eng.(engine.SnapshotForwardCursorer); ok {
+			sh := t.db.rl.RLock()
+			cur, err := scf.NewSnapshotForwardCursor(snap, lower, upper)
 			if err != nil {
-				rd.Close()
 				t.db.rl.RUnlock(sh)
 				return nil, err
 			}
+			t.db.rl.RUnlock(sh)
 			if bc, ok := cur.(engine.BatchCursor); ok {
-				t.db.rl.RUnlock(sh)
-				bufp := scanBufPool.Get().(*[]engine.KV)
-				return &ScanCursor{
-					txn:      t,
-					rd:       rd,
-					bc:       bc,
-					keysOnly: opts.KeysOnly,
-					lower:    lower,
-					buf:      *bufp,
-					bufp:     bufp,
-					pos:      -1,
-				}, nil
+				return newScanCursorOver(t, nil, bc, opts.KeysOnly, lower), nil
 			}
+			// Cursor is not zero-copy batchable: fall through to the Iterator below.
+		} else {
+			sh := t.db.rl.RLock()
+			rd, err := t.db.eng.NewReader(snap)
+			if err != nil {
+				t.db.rl.RUnlock(sh)
+				return nil, err
+			}
+			if fc, ok := rd.(engine.ForwardCursorer); ok {
+				cur, err := fc.NewForwardCursor(lower, upper)
+				if err != nil {
+					rd.Close()
+					t.db.rl.RUnlock(sh)
+					return nil, err
+				}
+				if bc, ok := cur.(engine.BatchCursor); ok {
+					t.db.rl.RUnlock(sh)
+					return newScanCursorOver(t, rd, bc, opts.KeysOnly, lower), nil
+				}
+			}
+			// Reader has no zero-copy batch: drop it and fall back to the Iterator, which builds its own.
+			rd.Close()
+			t.db.rl.RUnlock(sh)
 		}
-		// Reader has no zero-copy batch: drop it and fall back to the Iterator, which builds its own.
-		rd.Close()
-		t.db.rl.RUnlock(sh)
 	}
 
 	it, err := t.NewIterator(opts)
@@ -123,6 +132,24 @@ func (t *Txn) NewScanCursor(opts engine.IterOptions) (*ScanCursor, error) {
 		return nil, err
 	}
 	return &ScanCursor{txn: t, keysOnly: opts.KeysOnly, lower: lower, iter: it, pos: -1}, nil
+}
+
+// newScanCursorOver wraps an engine batch cursor in a zero-copy ScanCursor, borrowing the view
+// buffer from scanBufPool. rd is the engine reader to close at Close on the ForwardCursorer path, or
+// nil on the reader-free SnapshotForwardCursorer path where there is no reader to release. It is the
+// single construction point for the fast-path cursor so both paths stay identical past this call.
+func newScanCursorOver(t *Txn, rd engine.Reader, bc engine.BatchCursor, keysOnly bool, lower []byte) *ScanCursor {
+	bufp := scanBufPool.Get().(*[]engine.KV)
+	return &ScanCursor{
+		txn:      t,
+		rd:       rd,
+		bc:       bc,
+		keysOnly: keysOnly,
+		lower:    lower,
+		buf:      *bufp,
+		bufp:     bufp,
+		pos:      -1,
+	}
 }
 
 // Next advances to the next entry and reports whether the cursor is positioned on one. The first
