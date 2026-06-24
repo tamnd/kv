@@ -914,8 +914,15 @@ const batchKeysLinearMax = 16
 // taking the shared read lock so it never observes a page mid-commit. It returns
 // the value and whether the key is present at that snapshot (spec 10 §3).
 func (d *DB) snapshotGet(version uint64, key []byte) ([]byte, bool, error) {
-	_, span := d.startSpan(context.Background(), "kv.get")
-	defer endSpan(span)
+	// Gate the span on the tracer being set so the disabled path (the common case) registers
+	// no defer and makes no startSpan call: a deferred endSpan on every point read cost about
+	// 7% of a cache-resident read in the profile, all of it pure overhead when tracing is off
+	// (perf/12 F2). defer is function-scoped, so this still ends at function return when a
+	// tracer is configured.
+	if d.tracer != nil {
+		_, span := d.startSpan(context.Background(), "kv.get")
+		defer endSpan(span)
+	}
 	sh := d.rl.RLock()
 	defer d.rl.RUnlock(sh)
 	// Readerless fast path: an engine that resolves a point read off its shared immutable
@@ -954,8 +961,12 @@ func (d *DB) snapshotGet(version uint64, key []byte) ([]byte, bool, error) {
 // returning it past rd.Close and the read lock is sound; an engine that cannot promise that
 // simply does not implement the capability and takes the copying path here.
 func (d *DB) snapshotGetZeroCopy(version uint64, key []byte) ([]byte, bool, error) {
-	_, span := d.startSpan(context.Background(), "kv.get")
-	defer endSpan(span)
+	// Gate the span on the tracer being set, the same as snapshotGet: no defer and no
+	// startSpan call on the disabled path (perf/12 F2).
+	if d.tracer != nil {
+		_, span := d.startSpan(context.Background(), "kv.get")
+		defer endSpan(span)
+	}
 	sh := d.rl.RLock()
 	defer d.rl.RUnlock(sh)
 	rd, err := d.eng.NewReader(engine.Snapshot{Version: version, Clock: d.now})
