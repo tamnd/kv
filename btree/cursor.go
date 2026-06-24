@@ -511,6 +511,7 @@ type scanCursor struct {
 	rangeDels []format.RangeDel
 	started   bool
 	leaf      *leaf       // the leaf currently positioned in (immutable); nil once exhausted
+	leafClean bool        // the current leaf is all distinct single-version Sets with no range delete in force, so a cell resolves to itself with no fold (set whenever leaf is)
 	idx       int         // index in leaf.keys of the next cell to consider
 	group     []entry     // reused scratch for one user key's version group
 	ops       []format.Op // reused scratch for the group's ops the fold consumes
@@ -520,6 +521,22 @@ var (
 	_ engine.StreamCursor = (*scanCursor)(nil)
 	_ engine.BatchCursor  = (*scanCursor)(nil)
 )
+
+// loadLeafAt views the leaf at pgno into the cursor and records whether it is a clean
+// single-version leaf. The cleanliness flag (computed once per leaf, the same shape slice 157
+// uses to skip a GC rebuild) lets step emit each cell without folding its version group when the
+// whole leaf is distinct single-version Sets and no range delete is in force at the snapshot. The
+// predicate fails fast on the first non-Set or non-ascending cell, so a leaf that needs the fold
+// pays at most a short prefix scan before falling through to the general path.
+func (c *scanCursor) loadLeafAt(pgno format.PageNo) error {
+	l, err := c.t.viewLeaf(pgno)
+	if err != nil {
+		return err
+	}
+	c.leaf = l
+	c.leafClean = leafIsCleanSets(l, c.rangeDels)
+	return nil
+}
 
 // ensureStarted performs the one-time descent that positions the cursor at the first cell of its
 // range. It is split out of the step loop so both NextEntry and NextBatch pay the descent once, on
@@ -540,8 +557,7 @@ func (c *scanCursor) ensureStarted() error {
 	if err != nil {
 		return err
 	}
-	c.leaf, err = t.viewLeaf(pgno)
-	if err != nil {
+	if err := c.loadLeafAt(pgno); err != nil {
 		return err
 	}
 	// Start at the first cell whose user key is >= lower; that cell is always a group
@@ -569,6 +585,35 @@ func (c *scanCursor) step(keysOnly, zeroCopy bool) (uk, val []byte, ok bool, err
 				c.leaf = nil // crossed the upper bound: range exhausted
 				return nil, nil, false, nil
 			}
+			// Clean-leaf fast path: when the whole leaf is distinct single-version Sets with no
+			// range delete in force (leafClean), every group has size one and folds to itself, so
+			// resolving a cell is just the snapshot-version visibility check. Emit the cell with no
+			// group gather, OpFromCell, or Fold. This is the scan twin of the single-version
+			// point-read fast path and of slice 157's GC clean-leaf skip; it removes the per-key
+			// fold that profiling named as the readseq overhead bbolt does not pay. The result is
+			// identical to resolveOne on a clean leaf: a Set with version <= snap folds to its own
+			// value, and one with a newer version is invisible and skipped.
+			if c.leafClean {
+				ik := c.leaf.keys[c.idx]
+				v := c.leaf.vals[c.idx]
+				c.idx++
+				if format.Version(ik) > c.snap.Version {
+					continue // newer than the snapshot: not visible, skip
+				}
+				if zeroCopy {
+					// Views aliased to the immutable decoded leaf, the NextBatch contract.
+					if keysOnly {
+						return guk, nil, true, nil
+					}
+					return guk, v, true, nil
+				}
+				// NextEntry's caller-owned contract: copy the key and value out.
+				uk = append([]byte(nil), guk...)
+				if !keysOnly {
+					val = append([]byte(nil), v...)
+				}
+				return uk, val, true, nil
+			}
 			// A user key's whole version group is contiguous in this one leaf (splitPoint
 			// never cuts a group), so gather it here and fold it in isolation.
 			c.group = c.group[:0]
@@ -595,8 +640,7 @@ func (c *scanCursor) step(keysOnly, zeroCopy bool) (uk, val []byte, ok bool, err
 			c.leaf = nil
 			return nil, nil, false, nil
 		}
-		c.leaf, err = t.viewLeaf(next)
-		if err != nil {
+		if err := c.loadLeafAt(next); err != nil {
 			return nil, nil, false, err
 		}
 		c.idx = 0
