@@ -128,6 +128,34 @@ func checkScan(t *testing.T, txn *Txn, work map[string]string, lo, hi []byte, re
 				lo, hi, reverse, i, got[i], want[i])
 		}
 	}
+
+	// The zero-copy ScanCursor is a forward-only fast path; cross-check it against the same model on
+	// the forward scans, so the fuzzer exercises its leaf-crossing, refill, and version fold against
+	// every program the Iterator check sees. Its views are transient, so copy each before advancing.
+	if reverse {
+		return
+	}
+	sc, err := txn.NewScanCursor(engine.IterOptions{Lower: lo, Upper: hi})
+	if err != nil {
+		t.Fatalf("NewScanCursor: %v", err)
+	}
+	defer sc.Close()
+	var scgot [][2]string
+	for sc.Next() {
+		scgot = append(scgot, [2]string{string(sc.Key()), string(sc.Value())})
+	}
+	if err := sc.Error(); err != nil {
+		t.Fatalf("scan cursor [%s,%s): %v", lo, hi, err)
+	}
+	if len(scgot) != len(want) {
+		t.Fatalf("scan cursor [%s,%s): got %d rows, model has %d\n got=%v\nwant=%v",
+			lo, hi, len(scgot), len(want), scgot, want)
+	}
+	for i := range want {
+		if scgot[i] != want[i] {
+			t.Fatalf("scan cursor [%s,%s) row %d: got %v, model has %v", lo, hi, i, scgot[i], want[i])
+		}
+	}
 }
 
 // checkGet asserts a point read returns exactly what the model holds for the key, value or clean

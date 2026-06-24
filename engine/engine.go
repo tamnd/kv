@@ -165,6 +165,39 @@ type ForwardCursorer interface {
 	NewForwardCursor(lower, upper []byte) (StreamCursor, error)
 }
 
+// BatchCursor is an optional StreamCursor extension for a zero-copy forward scan: it fills a run of
+// resolved, snapshot-visible entries whose key and value bytes ALIAS the engine's immutable
+// internal storage rather than being copied out. NextEntry copies every key and value onto the
+// heap, which on a dense scan is the dominant cost once the descent is amortized: a CPU profile of
+// a full B-tree scan spends nearly half its time in allocation and the GC it feeds, two allocations
+// per key for the key and value copies. A consumer that reads each entry and advances past it,
+// keeping nothing, pays that copy for no benefit. NextBatch removes it.
+//
+// The contract on each filled entry is therefore narrower than NextEntry's, and a caller opts into
+// it knowingly. The bytes are READ-ONLY and TRANSIENT:
+//
+//   - Read-only: they may be shared with the engine's cache and other readers, so a caller that
+//     modifies them corrupts the shared copy. A caller that needs to mutate or retain an entry past
+//     the next call must copy it.
+//   - Transient: they stay valid only until the next NextBatch call on this cursor. That call
+//     recycles dst and the cursor advances off the nodes the previous batch's views aliased, so a
+//     view read after the next call may read recycled or collected bytes. A consumer reads each
+//     filled entry before the call that overwrites it, exactly the read-then-advance shape a scan
+//     already has.
+//
+// The aliasing is sound for the same reason ZeroCopyReader's is: a decoded node is immutable and
+// separately allocated, and a writer replaces it wholesale rather than editing it, so a view keeps
+// the read bytes alive and unchanged for as long as the slice references the node. The cursor stays
+// single-consumer and valid only while its reader is open, exactly as StreamCursor requires.
+type BatchCursor interface {
+	// NextBatch fills dst[0:n] with the next up-to-len(dst) entries in ascending order and
+	// returns n, the number filled, each key and value a zero-copy view valid until the next
+	// call. n == len(dst) means the batch filled and the range may hold more; 0 <= n < len(dst)
+	// means the range was exhausted and no further call is needed. keysOnly drops every value. A
+	// non-nil error reports a read fault mid-fill; entries already written to dst[0:n] are valid.
+	NextBatch(dst []KV, keysOnly bool) (n int, err error)
+}
+
 // BulkLoader is an optional engine capability: population of an empty engine from a
 // stream of cells already in ascending internal-key order, building the on-disk
 // structure bottom-up instead of inserting one cell at a time (spec 15 §6). The host
