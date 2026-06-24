@@ -719,6 +719,11 @@ func (l *LSM) NewReader(snap engine.Snapshot) (engine.Reader, error) {
 	return &reader{l: l, snap: snap}, nil
 }
 
+// The LSM core resolves a point read straight off its shared, immutable internal state,
+// so it serves the host's hot Get path through engine.PointReader and skips the reader
+// allocation NewReader would make.
+var _ engine.PointReader = (*LSM)(nil)
+
 // resolved is one user key and its MVCC-resolved value at a snapshot.
 type resolved struct {
 	uk  []byte
@@ -849,19 +854,25 @@ type scanState struct {
 	upper     []byte
 }
 
-// Get resolves one user key without materializing the whole keyspace: it gathers
-// the key's version group from the memtable, seeking its skip list, and from each
-// segment, seeking its block index, then folds that group with the range deletes
-// that cover the key. Only the pages that may hold the key are read, so a point read
-// no longer scans every source. The range and iteration path still folds the full
-// snapshot until the streaming heap-merge lands.
+// Get resolves one user key at the reader's snapshot. It delegates to GetAt, the same
+// fold without a per-call object: a reader already holds its snapshot, so the point read
+// is the engine-level GetAt with the reader's snapshot passed in.
 func (r *reader) Get(userKey []byte) ([]byte, error) {
-	l := r.l
+	return r.l.GetAt(r.snap, userKey)
+}
 
+// GetAt implements engine.PointReader: it resolves one user key at snap without
+// materializing the whole keyspace and without allocating a per-read reader. It gathers
+// the key's version group from the memtable, seeking its skip list, and from each
+// segment, seeking its block index, then folds that group with the range deletes that
+// cover the key. Only the pages that may hold the key are read, so a point read no longer
+// scans every source. The host (db.snapshotGet) calls this straight off *LSM when the
+// engine is the LSM core, skipping the NewReader heap allocation the Reader path pays.
+func (l *LSM) GetAt(snap engine.Snapshot, userKey []byte) ([]byte, error) {
 	var ops []format.Op
 	var matErr error
 	var rd uint64
-	tc := r.snap.TTLClock()
+	tc := snap.TTLClock()
 	collect := func(ik, val []byte) bool {
 		// A point Get always wants the value, so keysOnly is false: a separated value is
 		// dereferenced through the vLog here.
@@ -898,7 +909,7 @@ func (r *reader) Get(userKey []byte) ([]byte, error) {
 			ops[j+1] = o
 		}
 		for _, op := range ops {
-			if op.Version > r.snap.Version {
+			if op.Version > snap.Version {
 				continue // not visible at this snapshot
 			}
 			if rd > op.Version {
@@ -941,15 +952,15 @@ func (r *reader) Get(userKey []byte) ([]byte, error) {
 	// the result is identical, and an engine with no range deletes (the common case) scans only nil
 	// lists and allocates nothing. The segment lists are immutable past open, so reading them off the
 	// referenced version under the lock is safe (perf).
-	rd = format.NewestCoveringRangeDel(memSnap.liveDels(), userKey, r.snap.Version)
+	rd = format.NewestCoveringRangeDel(memSnap.liveDels(), userKey, snap.Version)
 	for _, e := range immSnap {
-		if d := format.NewestCoveringRangeDel(e.mem.liveDels(), userKey, r.snap.Version); d > rd {
+		if d := format.NewestCoveringRangeDel(e.mem.liveDels(), userKey, snap.Version); d > rd {
 			rd = d
 		}
 	}
 	for _, lvl := range v.levels {
 		for _, seg := range lvl {
-			if d := format.NewestCoveringRangeDel(seg.rangeDels, userKey, r.snap.Version); d > rd {
+			if d := format.NewestCoveringRangeDel(seg.rangeDels, userKey, snap.Version); d > rd {
 				rd = d
 			}
 		}
@@ -1007,7 +1018,7 @@ func (r *reader) Get(userKey []byte) ([]byte, error) {
 
 	// ops is sorted newest-first by the final resolved() call, the order Fold expects;
 	// the covering range delete folds in as a synthetic delete at rd.
-	val, ok := format.Fold(ops, r.snap.Version, rd, mergeFn)
+	val, ok := format.Fold(ops, snap.Version, rd, mergeFn)
 	if !ok {
 		return nil, engine.ErrNotFound
 	}
