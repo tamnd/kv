@@ -32,6 +32,7 @@ type Iterator struct {
 	db      *DB
 	rd      engine.Reader
 	stream  forwardScanner
+	scursor engine.StreamCursor // stateful forward cursor, when the reader provides one; preferred over stream
 	lower   []byte
 	upper   []byte
 	after   []byte // exclusive cursor: the last key pulled from stream, nil before the first pull
@@ -97,7 +98,22 @@ func (t *Txn) NewIterator(opts engine.IterOptions) (*Iterator, error) {
 		}
 		sf, ok := rd.(forwardScanner)
 		streamable := ok && sf.StreamForward()
-		if !streamable {
+		var scursor engine.StreamCursor
+		if streamable {
+			// A reader that can hold its scan position (the B-tree's ForwardCursorer)
+			// builds the stateful cursor here, under the same read lock, so the cursor
+			// snapshots any engine state it depends on (the range-delete set) atomically
+			// against a concurrent writer. A reader without it keeps the stateless stream.
+			if fc, ok := rd.(engine.ForwardCursorer); ok {
+				c, err := fc.NewForwardCursor(lower, upper)
+				if err != nil {
+					rd.Close()
+					t.db.rl.RUnlock(sh)
+					return nil, err
+				}
+				scursor = c
+			}
+		} else {
 			rd.Close()
 		}
 		t.db.rl.RUnlock(sh)
@@ -108,6 +124,7 @@ func (t *Txn) NewIterator(opts engine.IterOptions) (*Iterator, error) {
 				db:       t.db,
 				rd:       rd,
 				stream:   sf,
+				scursor:  scursor,
 				lower:    lower,
 				upper:    upper,
 			}, nil
@@ -135,7 +152,19 @@ func (it *Iterator) pullOne() {
 		return
 	}
 	sh := it.db.rl.RLock()
-	k, v, ok, err := it.stream.ScanForward(it.after, it.lower, it.upper, it.keysOnly)
+	var (
+		k, v []byte
+		ok   bool
+		err  error
+	)
+	if it.scursor != nil {
+		// Stateful cursor: holds its leaf and index across calls, so a step within a
+		// leaf is a slice advance and only a leaf boundary resolves a page. after is
+		// unused, the cursor tracks its own position.
+		k, v, ok, err = it.scursor.NextEntry(it.keysOnly)
+	} else {
+		k, v, ok, err = it.stream.ScanForward(it.after, it.lower, it.upper, it.keysOnly)
+	}
 	it.db.rl.RUnlock(sh)
 	if err != nil {
 		it.err = err
@@ -424,6 +453,7 @@ func (it *Iterator) Close() error {
 		it.rd = nil
 	}
 	it.stream = nil
+	it.scursor = nil
 	it.drained = true
 	it.items = nil
 	it.pos = -1
