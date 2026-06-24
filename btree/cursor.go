@@ -260,8 +260,61 @@ func (r *reader) NewIter(opts engine.IterOptions) (engine.Cursor, error) {
 	if err != nil {
 		return nil, err
 	}
-	view := resolveStream(entries, r.snap, r.t.merge, r.t.rangeDels)
+	// Clean-range fast path: when the materialized range is all distinct single-version Sets
+	// with no range delete in force, every group folds to its own value, so the view is each
+	// cell that is visible at the snapshot with no per-key OpFromCell or Fold. This is the
+	// NewIterator twin of the forward-cursor clean-leaf fast path (slice 159); it is gated to
+	// this materialized-range path and never touches the point-read Get fold above it.
+	var view []resolvedKV
+	if entriesCleanSets(entries, r.t.rangeDels) {
+		view = resolveCleanStream(entries, r.snap)
+	} else {
+		view = resolveStream(entries, r.snap, r.t.merge, r.t.rangeDels)
+	}
 	return &cursor{view: view, pos: -1, reverse: opts.Reverse}, nil
+}
+
+// entriesCleanSets reports whether a materialized entry stream is the clean shape that resolves
+// without folding: no range delete in force, every cell a plain Set, and strictly ascending user
+// keys so every version group has size one. It is the []entry form of leafIsCleanSets and fails
+// fast on the first non-Set or non-ascending cell, so a stream that needs the fold pays only a
+// short prefix scan.
+func entriesCleanSets(entries []entry, rangeDels []format.RangeDel) bool {
+	if len(rangeDels) != 0 {
+		return false
+	}
+	var prev []byte
+	for i := range entries {
+		ik := entries[i].ik
+		if format.KindOf(ik) != format.KindSet {
+			return false
+		}
+		uk := format.UserKey(ik)
+		if i > 0 && format.CompareUser(prev, uk) >= 0 {
+			return false
+		}
+		prev = uk
+	}
+	return true
+}
+
+// resolveCleanStream builds the snapshot view of a clean entry stream (one validated by
+// entriesCleanSets) with no fold: each cell visible at the snapshot becomes one resolved entry,
+// and a cell newer than the snapshot is skipped exactly as Fold would skip it. The returned keys
+// and values are freshly allocated and caller-owned, the same ownership resolveStream gives.
+func resolveCleanStream(entries []entry, snap engine.Snapshot) []resolvedKV {
+	out := make([]resolvedKV, 0, len(entries))
+	for i := range entries {
+		if format.Version(entries[i].ik) > snap.Version {
+			continue // newer than the snapshot: not visible
+		}
+		uk := format.UserKey(entries[i].ik)
+		out = append(out, resolvedKV{
+			uk:  append([]byte(nil), uk...),
+			val: append([]byte(nil), entries[i].val...),
+		})
+	}
+	return out
 }
 
 func (r *reader) Close() error { return nil }
