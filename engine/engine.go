@@ -165,6 +165,19 @@ type ForwardCursorer interface {
 	NewForwardCursor(lower, upper []byte) (StreamCursor, error)
 }
 
+// SnapshotForwardCursorer is the optional engine capability that opens a forward StreamCursor over
+// [lower, upper) directly at a snapshot, without first allocating a Reader to hang it off. The
+// ForwardCursorer path makes a Reader only to call NewForwardCursor on it and then throws it away
+// (the host keeps the read snapshot open for the cursor's life, so the Reader pins nothing the
+// snapshot does not), which on a short scan is one heap allocation per op spent on an object that is
+// immediately discarded. The host prefers this when the engine implements it, falling back to
+// NewReader plus ForwardCursorer otherwise. The returned cursor is valid only while the host keeps
+// the passed snapshot open, exactly the lifetime contract StreamCursor states, sourced from the
+// host's open transaction rather than an open Reader.
+type SnapshotForwardCursorer interface {
+	NewSnapshotForwardCursor(snap Snapshot, lower, upper []byte) (StreamCursor, error)
+}
+
 // BatchCursor is an optional StreamCursor extension for a zero-copy forward scan: it fills a run of
 // resolved, snapshot-visible entries whose key and value bytes ALIAS the engine's immutable
 // internal storage rather than being copied out. NextEntry copies every key and value onto the

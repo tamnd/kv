@@ -536,14 +536,32 @@ func resolveOneZeroCopy(group []entry, snap engine.Snapshot, merge func(existing
 // adds afterward has version > snap and is invisible, so the captured set is the stable, correct
 // one for the whole scan and the per-step fold needs no further synchronization on it.
 func (r *reader) NewForwardCursor(lower, upper []byte) (engine.StreamCursor, error) {
+	return r.t.newScanCursor(r.snap, lower, upper), nil
+}
+
+// NewSnapshotForwardCursor implements engine.SnapshotForwardCursorer: it builds the same forward
+// scan cursor NewForwardCursor does, but straight from a snapshot, so the scan fast path does not
+// allocate a throwaway reader to hang it off. The cursor copies the snapshot and the tree's
+// range-delete set by value, exactly as the reader path does, so the two are identical once
+// constructed; the snapshot's life is the host's to hold, the same as for any StreamCursor.
+func (t *BTree) NewSnapshotForwardCursor(snap engine.Snapshot, lower, upper []byte) (engine.StreamCursor, error) {
+	return t.newScanCursor(snap, lower, upper), nil
+}
+
+// newScanCursor is the single construction point for the forward scan cursor, shared by the reader
+// path and the reader-free snapshot path so they cannot drift. It snapshots the tree's range-delete
+// set into the cursor (an empty set, the post-load shape, copies to nil with no allocation).
+func (t *BTree) newScanCursor(snap engine.Snapshot, lower, upper []byte) *scanCursor {
 	return &scanCursor{
-		t:         r.t,
-		snap:      r.snap,
+		t:         t,
+		snap:      snap,
 		lower:     lower,
 		upper:     upper,
-		rangeDels: append([]format.RangeDel(nil), r.t.rangeDels...),
-	}, nil
+		rangeDels: append([]format.RangeDel(nil), t.rangeDels...),
+	}
 }
+
+var _ engine.SnapshotForwardCursorer = (*BTree)(nil)
 
 // scanCursor is the stateful forward scan cursor NewForwardCursor returns. It holds the
 // immutable decoded leaf it is positioned in and the index of the next cell to consider, so a
