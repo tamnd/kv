@@ -118,7 +118,50 @@ func (t *BTree) gcVersions(w, sweepNow uint64, maxPages int) (engine.MaintReport
 // version changes nothing observable while reclaiming the framed value bytes. A swept
 // cell above w is kept as a verbatim tombstone; one at or below w folds with the rest of
 // the history. A sweepNow of zero disables the sweep, which is what recovery passes.
+// leafIsCleanSets reports whether l holds exactly one plain Set per user key with no range
+// delete in force, the case gcCollapseLeaf can skip without building a copy. It scans the
+// decoded cells once with no allocation: every cell must be KindSet (so no tombstone, TTL, or
+// range marker), the user keys must be strictly ascending (so every version group has size
+// one), and rangeDels must be empty (so no key can fold to absent). See gcCollapseLeaf for why
+// these together mean the pass would make no change.
+func leafIsCleanSets(l *leaf, rangeDels []format.RangeDel) bool {
+	if len(rangeDels) != 0 {
+		return false
+	}
+	var prev []byte
+	for i := range l.keys {
+		ik := l.keys[i]
+		if format.KindOf(ik) != format.KindSet {
+			return false
+		}
+		uk := format.UserKey(ik)
+		if i > 0 && format.CompareUser(prev, uk) >= 0 {
+			return false
+		}
+		prev = uk
+	}
+	return true
+}
+
 func gcCollapseLeaf(l *leaf, w, sweepNow uint64, rangeDels []format.RangeDel, merge func(existing, operand []byte) []byte) (*leaf, bool, int64) {
+	// Clean-leaf fast path: a leaf that holds one plain Set per user key, with no range
+	// delete anywhere, has nothing for this pass to do, and the steady-state tree is almost
+	// all such leaves. Without this, every background drain still builds a full fresh copy of
+	// the leaf (an out.keys/out.vals append and an EncodeInternalKey per cell) only to fold
+	// each one-element group back to itself and discard the copy when changed stays false,
+	// which the read-window CPU profile showed dominating the post-load reads. The early-out
+	// proves the no-work case in one allocation-free scan instead.
+	//
+	// Soundness: with rangeDels empty no key can fold to absent, so a lone Set group folds to
+	// itself unchanged whether its version is above or below w (above w is kept verbatim;
+	// below w Fold returns the set's own value). KindSet excludes tombstones (which would drop
+	// below w), KindSetWithTTL (which the sweep may rewrite), and range markers (handled out of
+	// band). Distinct, strictly ascending user keys guarantee every group has size one, so no
+	// multi-version history exists to collapse. Any of these absent, the general path runs.
+	if leafIsCleanSets(l, rangeDels) {
+		return l, false, 0
+	}
+
 	out := &leaf{next: l.next}
 	changed := false
 	var swept int64

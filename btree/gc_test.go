@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/tamnd/kv/engine"
+	"github.com/tamnd/kv/format"
 )
 
 // countCells returns the total number of cells (every version of every key, markers
@@ -111,6 +112,100 @@ func TestGCDropsRangeMarker(t *testing.T) {
 		}
 		if !covered && err != nil {
 			t.Fatalf("uncovered k%02d: %v", i, err)
+		}
+	}
+}
+
+// TestGCCleanLeafFastPath checks the clean-leaf fast path: a tree of one plain Set per
+// key with no range delete has nothing for version GC to do, so a Maintain pass must
+// reclaim nothing, compact no pages, and leave every read intact. This is the common
+// steady-state shape the background drain repeatedly revisits, so skipping the per-cell
+// rebuild on it is the point of the slice.
+func TestGCCleanLeafFastPath(t *testing.T) {
+	bt := newBTree(t, 512, 16)
+
+	const n = 80 // enough distinct keys to span several leaves at page size 512
+	b := engine.NewWriteBatch(10)
+	for i := 0; i < n; i++ {
+		b.Set([]byte(fmt.Sprintf("k%03d", i)), []byte(fmt.Sprintf("v%03d", i)))
+	}
+	if err := bt.Apply(b, 10); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	before := countCells(t, bt)
+	if before != n {
+		t.Fatalf("before GC: %d cells, want %d", before, n)
+	}
+
+	// Watermark well above the only version: the slow path would fold every group, the
+	// fast path skips them. Either way nothing is collectable.
+	rep, err := bt.Maintain(context.Background(), engine.MaintBudget{Watermark: 100})
+	if err != nil {
+		t.Fatalf("maintain: %v", err)
+	}
+	if rep.BytesReclaimed != 0 || rep.PagesCompacted != 0 || rep.More {
+		t.Fatalf("clean tree maintain report = %+v, want zero reclaim and a finished pass", rep)
+	}
+	if got := countCells(t, bt); got != before {
+		t.Fatalf("after GC: %d cells, want %d unchanged", got, before)
+	}
+
+	rd, _ := bt.NewReader(engine.Snapshot{Version: 100})
+	defer rd.Close()
+	for i := 0; i < n; i++ {
+		got, err := rd.Get([]byte(fmt.Sprintf("k%03d", i)))
+		if err != nil {
+			t.Fatalf("get k%03d: %v", i, err)
+		}
+		if want := fmt.Sprintf("v%03d", i); string(got) != want {
+			t.Fatalf("k%03d = %q, want %q", i, got, want)
+		}
+	}
+}
+
+// TestLeafIsCleanSets pins the predicate that gates the fast path: only a leaf of strictly
+// ascending distinct user keys, every cell a plain Set, with no range delete in force,
+// may skip the collapse. Every other shape (a multi-version group, a tombstone, a TTL set,
+// a range marker, or any non-empty range-delete set) must fall through to the general path
+// because it could change the leaf.
+func TestLeafIsCleanSets(t *testing.T) {
+	ik := func(uk string, v uint64, k format.Kind) []byte {
+		return format.EncodeInternalKey([]byte(uk), v, k)
+	}
+	mk := func(keys ...[]byte) *leaf {
+		l := &leaf{}
+		for _, k := range keys {
+			l.keys = append(l.keys, k)
+			l.vals = append(l.vals, []byte("v"))
+		}
+		return l
+	}
+
+	clean := mk(ik("a", 1, format.KindSet), ik("b", 1, format.KindSet), ik("c", 2, format.KindSet))
+	if !leafIsCleanSets(clean, nil) {
+		t.Fatalf("distinct single-version sets should be clean")
+	}
+	if leafIsCleanSets(clean, []format.RangeDel{{}}) {
+		t.Fatalf("a non-empty range-delete set must defeat the fast path")
+	}
+
+	// Two versions of the same user key: a real collapse candidate. Cells are newest-first
+	// within a group, so the higher version sorts ahead.
+	multi := mk(ik("a", 2, format.KindSet), ik("a", 1, format.KindSet), ik("b", 1, format.KindSet))
+	if leafIsCleanSets(multi, nil) {
+		t.Fatalf("a multi-version group is not clean")
+	}
+
+	cases := map[string]*leaf{
+		"tombstone":   mk(ik("a", 1, format.KindSet), ik("b", 1, format.KindDelete)),
+		"ttl":         mk(ik("a", 1, format.KindSet), ik("b", 1, format.KindSetWithTTL)),
+		"range begin": mk(ik("a", 1, format.KindSet), ik("b", 1, format.KindRangeBegin)),
+		"range end":   mk(ik("a", 1, format.KindSet), ik("b", 1, format.KindRangeEnd)),
+	}
+	for name, l := range cases {
+		if leafIsCleanSets(l, nil) {
+			t.Fatalf("%s leaf must not be clean", name)
 		}
 	}
 }
