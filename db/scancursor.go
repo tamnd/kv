@@ -1,6 +1,8 @@
 package db
 
 import (
+	"sync"
+
 	"github.com/tamnd/kv/engine"
 	"github.com/tamnd/kv/format"
 )
@@ -13,6 +15,17 @@ const (
 	scanBatchInitial = 8
 	scanBatchMax     = 256
 )
+
+// scanBufPool recycles the per-cursor view buffer across scans. Every scan op is a fresh cursor, and
+// a short bounded scan (the kvbench readseq shape reads ~50 keys then closes) used to grow its buffer
+// geometrically from scanBatchInitial, allocating a new []engine.KV at 8, 16, 32, ... within that one
+// op and throwing it away at Close. That per-op allocation, multiplied over every scan, fed the GC
+// machinery that a read-window profile showed dominating the op. The pool hands each cursor one
+// max-sized buffer and takes it back at Close, so a scan does no buffer allocation in steady state.
+// It holds *[]engine.KV (not []engine.KV) so Get/Put move the slice header by pointer with no boxing
+// allocation of their own. The buffer carries only view headers aliasing engine storage; Close clears
+// it before returning it so a recycled buffer never pins a decoded leaf alive past the cursor.
+var scanBufPool = sync.Pool{New: func() any { s := make([]engine.KV, scanBatchMax); return &s }}
 
 // ScanCursor is a forward-only, zero-copy scan over a read snapshot. It is the fast path for a
 // dense ascending scan: where the general Iterator copies every key and value onto the heap and
@@ -35,10 +48,11 @@ type ScanCursor struct {
 	keysOnly bool
 	lower    []byte
 
-	buf     []engine.KV // reused view buffer; entries alias engine storage, valid until the next refill
-	batchN  int         // current fill size, grown geometrically toward scanBatchMax
-	n       int         // number of valid entries in buf
-	pos     int         // index of the current entry in buf
+	buf     []engine.KV  // reused view buffer (cap scanBatchMax) borrowed from scanBufPool; entries alias engine storage, valid until the next refill
+	bufp    *[]engine.KV // the pool handle for buf, returned at Close; nil on the Iterator fallback path
+	batchN  int          // current fill size, grown geometrically toward scanBatchMax
+	n       int          // number of valid entries in buf
+	pos     int          // index of the current entry in buf
 	drained bool
 	err     error
 
@@ -86,12 +100,15 @@ func (t *Txn) NewScanCursor(opts engine.IterOptions) (*ScanCursor, error) {
 			}
 			if bc, ok := cur.(engine.BatchCursor); ok {
 				t.db.rl.RUnlock(sh)
+				bufp := scanBufPool.Get().(*[]engine.KV)
 				return &ScanCursor{
 					txn:      t,
 					rd:       rd,
 					bc:       bc,
 					keysOnly: opts.KeysOnly,
 					lower:    lower,
+					buf:      *bufp,
+					bufp:     bufp,
 					pos:      -1,
 				}, nil
 			}
@@ -139,9 +156,8 @@ func (s *ScanCursor) refill() {
 	if s.batchN == 0 {
 		s.batchN = scanBatchInitial
 	}
-	if cap(s.buf) < s.batchN {
-		s.buf = make([]engine.KV, s.batchN)
-	}
+	// buf is a pooled buffer of cap scanBatchMax, and batchN never exceeds that cap, so the slice
+	// reuses the same backing array on every refill with no allocation.
 	dst := s.buf[:s.batchN]
 	sh := s.txn.db.rl.RLock()
 	n, err := s.bc.NextBatch(dst, s.keysOnly)
@@ -204,8 +220,17 @@ func (s *ScanCursor) Error() error {
 	return s.err
 }
 
-// Close releases the cursor's reader. After Close the view bytes from Key/Value are invalid.
+// Close releases the cursor's reader and returns its pooled view buffer. After Close the view bytes
+// from Key/Value are invalid, which is why the buffer can be recycled here: the consumer has
+// finished with every entry it referenced. The buffer is cleared before it goes back so a recycled
+// slot never keeps a decoded leaf reachable past the cursor that aliased it.
 func (s *ScanCursor) Close() error {
+	if s.bufp != nil {
+		clear(*s.bufp)
+		scanBufPool.Put(s.bufp)
+		s.bufp = nil
+		s.buf = nil
+	}
 	if s.iter != nil {
 		return s.iter.Close()
 	}
