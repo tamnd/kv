@@ -138,6 +138,19 @@ type WAL struct {
 	chainScratch []byte
 	plainScratch []byte // reusable batch-encode buffer for the encrypted append path
 
+	// appendBuf coalesces a commit group's frames into one WriteAt. A CPU profile of the
+	// write path showed it is syscall-bound: at conc=1 every commit appended a kv-batch
+	// frame and a commit frame with a separate WriteAt each, so two write() syscalls per
+	// commit, and the group committer already batches the fsync but not these writes. The
+	// append routines now copy each frame into this buffer and the group's single Sync (or a
+	// checkpoint Flush) does one WriteAt for the whole run before it fsyncs. The buffer is
+	// drained at every sync/flush, so a frame lives here only between its append and the
+	// group boundary, which is exactly the window in which it is not yet committed; nothing
+	// reads an uncommitted frame, so durability is unchanged. bufBase is the file offset the
+	// buffered bytes start at: when appendBuf is non-empty, bufBase+len(appendBuf)==tailOff.
+	appendBuf []byte
+	bufBase   int64
+
 	crypto *crypto.Scheme // encrypts kv-batch payloads when set; nil for a cleartext log
 }
 
@@ -318,15 +331,40 @@ func (w *WAL) appendFrame(ft FrameType, version uint64, payload []byte) error {
 	sum := w.chainSum(w.lastSum, frame[0:29], payload)
 	binary.BigEndian.PutUint64(frame[29:37], sum)
 
-	// WriteAt copies frame into the file's own storage (both the os and mem backends do),
-	// so reusing w.frameScratch on the next frame is safe.
-	if _, err := w.file.WriteAt(frame, w.tailOff); err != nil {
-		return err
-	}
-	w.tailOff += int64(len(frame))
+	// Buffer the frame rather than writing it now; the group's Sync flushes the whole run
+	// in one WriteAt. Copying into appendBuf frees w.frameScratch for the next frame, the
+	// same guarantee the old per-frame WriteAt gave.
+	w.bufferFrame(frame)
 	w.lastSum = sum
 	w.lsn.Store(lsn + 1)
 	w.grew = true
+	return nil
+}
+
+// bufferFrame appends an encoded frame to the coalescing buffer and advances the logical
+// tail. The bytes reach the file at the next flushBuf, which the commit boundary's Sync (or
+// a checkpoint Flush) always runs. Single-writer under appendMu like the rest of the append
+// path.
+func (w *WAL) bufferFrame(frame []byte) {
+	if len(w.appendBuf) == 0 {
+		w.bufBase = w.tailOff
+	}
+	w.appendBuf = append(w.appendBuf, frame...)
+	w.tailOff += int64(len(frame))
+}
+
+// flushBuf writes the buffered frames to the file in one WriteAt and empties the buffer,
+// keeping its capacity for reuse. It is the only place buffered frames reach the file, and
+// every sync/flush path calls it before any fsync, so a fsync still covers every frame
+// appended since the last flush. A no-op when the buffer is empty.
+func (w *WAL) flushBuf() error {
+	if len(w.appendBuf) == 0 {
+		return nil
+	}
+	if _, err := w.file.WriteAt(w.appendBuf, w.bufBase); err != nil {
+		return err
+	}
+	w.appendBuf = w.appendBuf[:0]
 	return nil
 }
 
@@ -352,10 +390,7 @@ func (w *WAL) appendFrameAppend(ft FrameType, version uint64, encode func(dst []
 	binary.BigEndian.PutUint64(frame[21:29], w.salt)
 	sum := w.chainSum(w.lastSum, frame[0:29], payload)
 	binary.BigEndian.PutUint64(frame[29:37], sum)
-	if _, err := w.file.WriteAt(frame, w.tailOff); err != nil {
-		return err
-	}
-	w.tailOff += int64(len(frame))
+	w.bufferFrame(frame)
 	w.lastSum = sum
 	w.lsn.Store(lsn + 1)
 	w.grew = true
@@ -502,6 +537,13 @@ func (w *WAL) SyncMode() Sync { return Sync(w.syncMode.Load()) }
 // and non-retryable (fsyncgate, spec 07 §6): the caller must treat it as a failed
 // commit and stop writing until the database is reopened and recovered.
 func (w *WAL) sync() error {
+	// Push the group's buffered frames to the file first, so a frame is in the OS at the same
+	// point it used to be: written by every commit, fsynced only by the durable levels. This
+	// runs even for SyncOff/SyncNormal, which do no fsync but must still land the bytes so a
+	// process crash redoes them, the durability NORMAL already promised.
+	if err := w.flushBuf(); err != nil {
+		return err
+	}
 	switch Sync(w.syncMode.Load()) {
 	case SyncOff, SyncNormal:
 		// NORMAL defers the per-commit sync; durability is finalized at checkpoint.
@@ -528,6 +570,9 @@ func (w *WAL) sync() error {
 // Flush forces a sync regardless of level, used by NORMAL at checkpoint to finalize
 // the deferred durability backlog (spec 07 §8).
 func (w *WAL) Flush() error {
+	if err := w.flushBuf(); err != nil {
+		return err
+	}
 	w.syncs.Add(1)
 	w.grew = false
 	return w.file.Sync(vfs.SyncFull)
@@ -592,8 +637,17 @@ func nextSalt(prev, foldedLSN uint64) uint64 {
 }
 
 // Close releases the file. It does not sync; the caller checkpoints first for a
-// clean shutdown.
-func (w *WAL) Close() error { return w.file.Close() }
+// clean shutdown. It does drain any frames still in the coalescing buffer so a frame that
+// was appended and committed but not yet flushed (it cannot happen in the normal flow,
+// since every group ends in a Sync that flushes, but a future caller might) still reaches
+// the file before the descriptor goes away.
+func (w *WAL) Close() error {
+	if err := w.flushBuf(); err != nil {
+		w.file.Close()
+		return err
+	}
+	return w.file.Close()
+}
 
 // Path reports the WAL file path.
 func (w *WAL) Path() string { return w.path }
