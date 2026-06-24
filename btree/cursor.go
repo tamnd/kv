@@ -101,8 +101,13 @@ func (t *BTree) GetAt(snap engine.Snapshot, userKey []byte) ([]byte, error) {
 	}
 	// resolvePoint hands back a value aliased to the immutable decoded leaf (or Fold's buffer);
 	// Get's contract is a caller-owned copy, so copy once here, the same single copy the
-	// reader's Get makes. This is the only heap allocation on the path.
-	return append([]byte(nil), val...), nil
+	// reader's Get makes. This is the only heap allocation on the path. make+copy goes straight
+	// to one mallocgc plus a memmove; append([]byte(nil), val...) would route the same allocation
+	// through runtime.growslice first, which recomputes the rounded capacity on every read for no
+	// gain when the exact length is already known (perf/12 F2).
+	out := make([]byte, len(val))
+	copy(out, val)
+	return out, nil
 }
 
 // resolvePoint folds one user key's version group to its MVCC-visible value at snap,

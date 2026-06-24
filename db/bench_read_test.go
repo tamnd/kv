@@ -268,6 +268,38 @@ func BenchmarkGetLargeValue(b *testing.B) {
 // though no folded cell carried a TTL; the lazy resolver skips that call entirely (perf/01
 // F6), so this isolates that one clock read from the descent and lock costs the parallel
 // BenchmarkConcurrentGet is dominated by.
+// BenchmarkPointReadClean measures the cache-resident point read in isolation: a single
+// goroutine, keys pre-built before the timer starts so the timed loop is only Get and its
+// returned-value copy, no fmt.Sprintf in the hot path. This is the benchmark for the F2
+// descent slices (perf/12), where the lever is a few nanoseconds and a per-iteration Sprintf
+// would bury it. ReportAllocs tracks the one allocation Get's contract requires (the
+// caller-owned value copy); the descent itself allocates nothing.
+func BenchmarkPointReadClean(b *testing.B) {
+	const keys = 10000
+	fs := vfs.NewMem()
+	d, err := Open(fs, "bench.kv", Options{PageSize: 4096, Sync: wal.SyncOff})
+	if err != nil {
+		b.Fatalf("open: %v", err)
+	}
+	defer d.Close()
+	keyset := make([][]byte, keys)
+	for i := range keys {
+		keyset[i] = []byte(fmt.Sprintf("k%08d", i))
+		if _, err := d.Write(func(wb *engine.WriteBatch) {
+			wb.Set(keyset[i], []byte("value-payload"))
+		}); err != nil {
+			b.Fatalf("seed: %v", err)
+		}
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := range b.N {
+		if _, err := d.Get(keyset[i%keys]); err != nil {
+			b.Fatalf("get: %v", err)
+		}
+	}
+}
+
 func BenchmarkPointReadNoTTLClock(b *testing.B) {
 	const keys = 10000
 	fs := vfs.NewMem()
