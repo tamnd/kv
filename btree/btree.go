@@ -21,6 +21,7 @@ package btree
 import (
 	"errors"
 	"fmt"
+	"sync/atomic"
 
 	"github.com/tamnd/kv/engine"
 	"github.com/tamnd/kv/format"
@@ -63,6 +64,23 @@ type BTree struct {
 	// at Open. When off, interior buffers stay empty and the engine behaves exactly as
 	// the in-place tree always has.
 	buffered bool
+
+	// rootRef caches the decoded root box so the point-read descent skips the pager shard
+	// latch and decode-cache map for the root, the one node the interior swizzle cannot reach
+	// from a parent (perf/12 F2, impl 149). It is valid only while its pgno still matches the
+	// header's engine-root (a grow or collapse moves the root page) and its box is still Live
+	// (an in-place rewrite or eviction of the root page deads the box). Both guards are checked
+	// on every read; either miss re-resolves through viewNodeRef and refreshes this. Concurrent
+	// readers share the handle, so the slot is atomic and the rootEdge it holds is immutable.
+	rootRef atomic.Pointer[rootEdge]
+}
+
+// rootEdge is the tree handle's swizzle of the root: the decoded root box and the page
+// number it was resolved from, so a stale cache (after a grow or collapse) is caught by a
+// page-number mismatch without touching the pager.
+type rootEdge struct {
+	pgno format.PageNo
+	box  *pager.DecodedNode
 }
 
 // New returns a B-tree core bound to pgr. Call Open to finish wiring it to the
