@@ -150,10 +150,37 @@ func resolvePoint(entries []entry, snap engine.Snapshot, merge func(existing, op
 // slice the versions are appended into, so the common shallow group is gathered without
 // a heap allocation; it grows on its own only for an unusually deep chain.
 func (t *BTree) gatherPoint(userKey []byte, group []entry) ([]entry, error) {
-	// Resolve the root the slow way: it has no parent to swizzle the edge onto.
-	typ, l, in, _, err := t.viewNodeRef(t.root())
-	if err != nil {
-		return nil, err
+	// Resolve the root. The interior swizzle caches every child edge on its parent, but the
+	// root has no parent, so cache its decoded box on the tree handle instead and skip the
+	// pager shard latch + map for it too (impl 149). The cache is valid only while the root
+	// page number still matches the header (a grow or collapse moves the root) and the box is
+	// still Live (an in-place rewrite or eviction deads it); either miss re-resolves and
+	// refreshes the cache.
+	rp := t.root()
+	var (
+		typ format.PageType
+		l   *leaf
+		in  *interior
+		err error
+	)
+	resolved := false
+	if re := t.rootRef.Load(); re != nil && re.pgno == rp && re.box.Live() {
+		switch n := re.box.Value().(type) {
+		case *leaf:
+			typ, l, resolved = format.PageBTreeLeaf, n, true
+		case *interior:
+			typ, in, resolved = format.PageBTreeInterior, n, true
+		}
+	}
+	if !resolved {
+		var box *pager.DecodedNode
+		typ, l, in, box, err = t.viewNodeRef(rp)
+		if err != nil {
+			return nil, err
+		}
+		if box != nil {
+			t.rootRef.Store(&rootEdge{pgno: rp, box: box})
+		}
 	}
 	for {
 		if typ == format.PageBTreeLeaf {
