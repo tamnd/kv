@@ -440,6 +440,37 @@ func resolveOne(group []entry, snap engine.Snapshot, merge func(existing, operan
 	return uk, val, true
 }
 
+// resolveOneZeroCopy folds a version group exactly as resolveOne does but returns the key and value
+// aliased to the immutable decoded leaf (or Fold's buffer) rather than copying them onto the heap.
+// user is a slice into the decoded leaf's key bytes and v is whatever Fold returns: the decoded
+// leaf's own value slice for a single-version Set base, Fold's freshly built buffer for a merge.
+// A decoded leaf is immutable and a writer replaces it wholesale, so both stay valid read-only
+// bytes for as long as the caller's slice references them, which is the zero-copy BatchCursor
+// contract (valid and unmodified until the next NextBatch call recycles the buffer). This is the
+// scan counterpart of resolvePoint, which gives GetZeroCopy the same aliasing on the point path.
+func resolveOneZeroCopy(group []entry, snap engine.Snapshot, merge func(existing, operand []byte) []byte, rangeDels []format.RangeDel, opsScratch *[]format.Op, keysOnly bool) (uk, val []byte, found bool) {
+	tc := snap.TTLClock()
+	user := format.UserKey(group[0].ik)
+	ops := (*opsScratch)[:0]
+	for _, e := range group {
+		op, ok := format.OpFromCell(e.ik, e.val, tc.For(format.KindOf(e.ik)))
+		if !ok {
+			continue // range markers resolve through rangeDels, not as ops
+		}
+		ops = append(ops, op)
+	}
+	*opsScratch = ops // keep the regrown backing array for the next step
+	rd := format.NewestCoveringRangeDel(rangeDels, user, snap.Version)
+	v, ok := format.Fold(ops, snap.Version, rd, merge)
+	if !ok {
+		return nil, nil, false
+	}
+	if keysOnly {
+		return user, nil, true
+	}
+	return user, v, true
+}
+
 // NewForwardCursor returns a stateful forward scan cursor over [lower, upper) at the
 // reader's snapshot (engine.ForwardCursorer, impl 150). It is the O(1)-per-step counterpart
 // to ScanForward: the host prefers it on a streamable (unbuffered) tree, where every version
@@ -485,35 +516,52 @@ type scanCursor struct {
 	ops       []format.Op // reused scratch for the group's ops the fold consumes
 }
 
-// NextEntry implements engine.StreamCursor. The host calls it under the engine read lock, one
-// entry per call, so the lock spans a single step and is released between steps exactly as the
-// stateless ScanForward contract requires.
-func (c *scanCursor) NextEntry(keysOnly bool) (uk, val []byte, ok bool, err error) {
-	t := c.t
-	if !c.started {
-		c.started = true
-		var pgno format.PageNo
-		if c.lower != nil {
-			pgno, err = t.leafCovering(c.lower)
-		} else {
-			pgno, err = t.leftmostLeaf()
-		}
-		if err != nil {
-			return nil, nil, false, err
-		}
-		c.leaf, err = t.viewLeaf(pgno)
-		if err != nil {
-			return nil, nil, false, err
-		}
-		// Start at the first cell whose user key is >= lower; that cell is always a group
-		// boundary (a group is one user key and the search lands on its newest version), so
-		// later steps stay group-aligned by always advancing past the whole group.
-		if c.lower != nil {
-			c.idx = sort.Search(len(c.leaf.keys), func(j int) bool {
-				return format.CompareUser(format.UserKey(c.leaf.keys[j]), c.lower) >= 0
-			})
-		}
+var (
+	_ engine.StreamCursor = (*scanCursor)(nil)
+	_ engine.BatchCursor  = (*scanCursor)(nil)
+)
+
+// ensureStarted performs the one-time descent that positions the cursor at the first cell of its
+// range. It is split out of the step loop so both NextEntry and NextBatch pay the descent once, on
+// the first call, and every later call walks the held leaf chain.
+func (c *scanCursor) ensureStarted() error {
+	if c.started {
+		return nil
 	}
+	c.started = true
+	t := c.t
+	var pgno format.PageNo
+	var err error
+	if c.lower != nil {
+		pgno, err = t.leafCovering(c.lower)
+	} else {
+		pgno, err = t.leftmostLeaf()
+	}
+	if err != nil {
+		return err
+	}
+	c.leaf, err = t.viewLeaf(pgno)
+	if err != nil {
+		return err
+	}
+	// Start at the first cell whose user key is >= lower; that cell is always a group
+	// boundary (a group is one user key and the search lands on its newest version), so
+	// later steps stay group-aligned by always advancing past the whole group.
+	if c.lower != nil {
+		c.idx = sort.Search(len(c.leaf.keys), func(j int) bool {
+			return format.CompareUser(format.UserKey(c.leaf.keys[j]), c.lower) >= 0
+		})
+	}
+	return nil
+}
+
+// step advances to and returns the next version-resolved, snapshot-visible entry, or ok=false when
+// the range is exhausted. It assumes ensureStarted has run. zeroCopy chooses how the value group
+// is resolved: false copies the key and value onto the heap for NextEntry's caller-owned contract,
+// true returns views aliased to the immutable decoded leaf for NextBatch's zero-copy contract. A
+// step within a leaf is a slice advance over the held copy; only a leaf boundary follows the B-link.
+func (c *scanCursor) step(keysOnly, zeroCopy bool) (uk, val []byte, ok bool, err error) {
+	t := c.t
 	for c.leaf != nil {
 		for c.idx < len(c.leaf.keys) {
 			guk := format.UserKey(c.leaf.keys[c.idx])
@@ -530,9 +578,14 @@ func (c *scanCursor) NextEntry(keysOnly bool) (uk, val []byte, ok bool, err erro
 				j++
 			}
 			c.idx = j
-			uk, v, found := resolveOne(c.group, c.snap, t.merge, c.rangeDels, &c.ops, keysOnly)
+			var found bool
+			if zeroCopy {
+				uk, val, found = resolveOneZeroCopy(c.group, c.snap, t.merge, c.rangeDels, &c.ops, keysOnly)
+			} else {
+				uk, val, found = resolveOne(c.group, c.snap, t.merge, c.rangeDels, &c.ops, keysOnly)
+			}
 			if found {
-				return uk, v, true, nil
+				return uk, val, true, nil
 			}
 			// Folded to absent (tombstone or covering range delete): skip and keep going.
 		}
@@ -549,6 +602,41 @@ func (c *scanCursor) NextEntry(keysOnly bool) (uk, val []byte, ok bool, err erro
 		c.idx = 0
 	}
 	return nil, nil, false, nil
+}
+
+// NextEntry implements engine.StreamCursor. The host calls it under the engine read lock, one entry
+// per call, so the lock spans a single step and is released between steps exactly as the stateless
+// ScanForward contract requires. Each returned key and value is a fresh caller-owned copy.
+func (c *scanCursor) NextEntry(keysOnly bool) (uk, val []byte, ok bool, err error) {
+	if err = c.ensureStarted(); err != nil {
+		return nil, nil, false, err
+	}
+	return c.step(keysOnly, false)
+}
+
+// NextBatch implements engine.BatchCursor. It fills dst with up to len(dst) resolved entries in one
+// call, each key and value a zero-copy view into the immutable decoded leaf rather than a heap copy,
+// valid until the next call. The fill crosses leaf boundaries freely up to the batch cap. A short
+// fill (n < len(dst)) means the range was exhausted, the only way step returns ok=false, so the
+// host marks the scan drained on a short fill with no probe call. The views into a leaf the fill
+// crossed off stay alive because each dst slot references that leaf's decoded byte arrays directly,
+// so they outlive the cursor's own leaf pointer until dst is recycled by the next call.
+func (c *scanCursor) NextBatch(dst []engine.KV, keysOnly bool) (n int, err error) {
+	if err = c.ensureStarted(); err != nil {
+		return 0, err
+	}
+	for n < len(dst) {
+		uk, v, ok, err := c.step(keysOnly, true)
+		if err != nil {
+			return n, err
+		}
+		if !ok {
+			return n, nil
+		}
+		dst[n] = engine.KV{Key: uk, Value: v}
+		n++
+	}
+	return n, nil
 }
 
 // leafCovering descends from the root to the leaf whose range covers userKey.
