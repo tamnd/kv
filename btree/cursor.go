@@ -6,6 +6,7 @@ import (
 
 	"github.com/tamnd/kv/engine"
 	"github.com/tamnd/kv/format"
+	"github.com/tamnd/kv/pager"
 )
 
 // NewReader implements engine.Engine: a consistent read view at a snapshot
@@ -149,12 +150,12 @@ func resolvePoint(entries []entry, snap engine.Snapshot, merge func(existing, op
 // slice the versions are appended into, so the common shallow group is gathered without
 // a heap allocation; it grows on its own only for an unusually deep chain.
 func (t *BTree) gatherPoint(userKey []byte, group []entry) ([]entry, error) {
-	pgno := t.root()
+	// Resolve the root the slow way: it has no parent to swizzle the edge onto.
+	typ, l, in, _, err := t.viewNodeRef(t.root())
+	if err != nil {
+		return nil, err
+	}
 	for {
-		typ, l, in, err := t.viewNode(pgno)
-		if err != nil {
-			return nil, err
-		}
 		if typ == format.PageBTreeLeaf {
 			// A user key's versions are contiguous in the leaf (cells sort by user
 			// key first), so binary-search to the lower bound of the group and walk
@@ -177,7 +178,33 @@ func (t *BTree) gatherPoint(userKey []byte, group []entry) ([]entry, error) {
 				group = append(group, entry{ik: in.msgKeys[i], val: in.msgVals[i]})
 			}
 		}
-		pgno = in.children[in.childFor(userKey)]
+		idx := in.childFor(userKey)
+		// Swizzle: follow the child edge the parent cached on its last descent, skipping
+		// the pager shard RLatch and the decode-cache map for warm interiors (perf/12 F2,
+		// ~19% of the read). A point read never overlaps a structural write (db.rl is held
+		// exclusive by every mutator and shared across the whole descent), and frame eviction
+		// preserves page content, so any box still Live is the correct, current decode of the
+		// child. A nil (never resolved) or dead (page changed or frame rebound) box falls back
+		// to viewNodeRef, which re-resolves the child and refreshes the cached edge.
+		if box := in.childRefs[idx].Load(); box != nil && box.Live() {
+			switch n := box.Value().(type) {
+			case *leaf:
+				typ, l, in = format.PageBTreeLeaf, n, nil
+				continue
+			case *interior:
+				typ, l, in = format.PageBTreeInterior, nil, n
+				continue
+			}
+		}
+		parent := in
+		var box *pager.DecodedNode
+		typ, l, in, box, err = t.viewNodeRef(parent.children[idx])
+		if err != nil {
+			return nil, err
+		}
+		if box != nil {
+			parent.childRefs[idx].Store(box)
+		}
 	}
 	// Sort the combined group by internal key. A version group is small (a few versions
 	// plus any buffered messages on the path), so an in-place insertion sort beats
