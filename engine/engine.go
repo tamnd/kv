@@ -137,6 +137,34 @@ type PointReader interface {
 	GetAt(snap Snapshot, userKey []byte) (value []byte, err error)
 }
 
+// StreamCursor is a stateful forward scan cursor an engine reader may provide as a faster
+// alternative to the stateless forward scan the host otherwise drives. The stateless scan
+// re-descends the engine's index from the start on every entry; a StreamCursor retains its
+// position, so it pays the descent once at the start and again only when it crosses a node
+// boundary, and every entry in between advances in O(1) within the node it already holds.
+// The host drives it one entry per call under the engine read lock, the same per-step lock
+// contract the stateless scan uses, so a writer is never blocked behind a slow consumer.
+//
+// The cursor is single-consumer: the host drives one cursor sequentially and never shares it
+// across goroutines. It is valid only while the reader that produced it is open, and that open
+// reader (and the read snapshot it holds) is what keeps every node the cursor may still reach
+// alive under it: the snapshot's read mark holds those pages against reclamation, so the cursor
+// can follow a node-to-node link recorded earlier without re-validating the target.
+type StreamCursor interface {
+	// NextEntry returns the next version-resolved, snapshot-visible user key and value in
+	// ascending order within the cursor's range, or ok=false when the range is exhausted.
+	// keysOnly drops the value. The returned key and value are freshly allocated and caller-owned.
+	NextEntry(keysOnly bool) (key, val []byte, ok bool, err error)
+}
+
+// ForwardCursorer is the optional Reader capability that produces a StreamCursor over
+// [lower, upper) (nil bounds unbounded). The host prefers it over the stateless forward scan
+// when the reader is streamable and implements it; an engine that cannot retain a scan position
+// simply does not implement it and the host falls back to the stateless scan.
+type ForwardCursorer interface {
+	NewForwardCursor(lower, upper []byte) (StreamCursor, error)
+}
+
 // BulkLoader is an optional engine capability: population of an empty engine from a
 // stream of cells already in ascending internal-key order, building the on-disk
 // structure bottom-up instead of inserting one cell at a time (spec 15 §6). The host

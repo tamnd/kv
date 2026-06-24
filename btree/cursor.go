@@ -403,6 +403,120 @@ func resolveStream(entries []entry, snap engine.Snapshot, merge func(existing, o
 	return out
 }
 
+// NewForwardCursor returns a stateful forward scan cursor over [lower, upper) at the
+// reader's snapshot (engine.ForwardCursorer, impl 150). It is the O(1)-per-step counterpart
+// to ScanForward: the host prefers it on a streamable (unbuffered) tree, where every version
+// lives in the leaf chain so a leaf-chain walk sees everything. A buffered tree reports
+// StreamForward false and never reaches this, so the cursor does not handle interior messages.
+//
+// The range-delete set is snapshotted into the cursor once, here, under the read lock the host
+// holds while it builds the cursor. A covering marker visible at this snapshot has version <=
+// snap and cannot be dropped while this read snapshot's mark is held, and any marker a writer
+// adds afterward has version > snap and is invisible, so the captured set is the stable, correct
+// one for the whole scan and the per-step fold needs no further synchronization on it.
+func (r *reader) NewForwardCursor(lower, upper []byte) (engine.StreamCursor, error) {
+	return &scanCursor{
+		t:         r.t,
+		snap:      r.snap,
+		lower:     lower,
+		upper:     upper,
+		rangeDels: append([]format.RangeDel(nil), r.t.rangeDels...),
+	}, nil
+}
+
+// scanCursor is the stateful forward scan cursor NewForwardCursor returns. It holds the
+// immutable decoded leaf it is positioned in and the index of the next cell to consider, so a
+// step within a leaf is a slice advance with no pager work, and only a leaf boundary resolves a
+// new page by following the B-link right pointer. Correctness under concurrent writers rests on
+// three facts established in spec 04 / impl 150: the host keeps the read snapshot open for the
+// cursor's life, so the snapshot's read mark holds every page the cursor may still reach against
+// free and pgno reuse; a decoded leaf is immutable and separately allocated, so the held leaf
+// stays valid bytes even after its frame is evicted or its page rewritten; and a split only
+// re-homes the upper half of a leaf into a new right page, so the leaf copy the cursor already
+// holds still carries every key it had and its recorded next still reaches the correct sibling
+// (the split's new page holds only keys the cursor has already passed through its own copy).
+type scanCursor struct {
+	t         *BTree
+	snap      engine.Snapshot
+	lower     []byte
+	upper     []byte
+	rangeDels []format.RangeDel
+	started   bool
+	leaf      *leaf   // the leaf currently positioned in (immutable); nil once exhausted
+	idx       int     // index in leaf.keys of the next cell to consider
+	group     []entry // reused scratch for one user key's version group
+}
+
+// NextEntry implements engine.StreamCursor. The host calls it under the engine read lock, one
+// entry per call, so the lock spans a single step and is released between steps exactly as the
+// stateless ScanForward contract requires.
+func (c *scanCursor) NextEntry(keysOnly bool) (uk, val []byte, ok bool, err error) {
+	t := c.t
+	if !c.started {
+		c.started = true
+		var pgno format.PageNo
+		if c.lower != nil {
+			pgno, err = t.leafCovering(c.lower)
+		} else {
+			pgno, err = t.leftmostLeaf()
+		}
+		if err != nil {
+			return nil, nil, false, err
+		}
+		c.leaf, err = t.viewLeaf(pgno)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		// Start at the first cell whose user key is >= lower; that cell is always a group
+		// boundary (a group is one user key and the search lands on its newest version), so
+		// later steps stay group-aligned by always advancing past the whole group.
+		if c.lower != nil {
+			c.idx = sort.Search(len(c.leaf.keys), func(j int) bool {
+				return format.CompareUser(format.UserKey(c.leaf.keys[j]), c.lower) >= 0
+			})
+		}
+	}
+	for c.leaf != nil {
+		for c.idx < len(c.leaf.keys) {
+			guk := format.UserKey(c.leaf.keys[c.idx])
+			if c.upper != nil && format.CompareUser(guk, c.upper) >= 0 {
+				c.leaf = nil // crossed the upper bound: range exhausted
+				return nil, nil, false, nil
+			}
+			// A user key's whole version group is contiguous in this one leaf (splitPoint
+			// never cuts a group), so gather it here and fold it in isolation.
+			c.group = c.group[:0]
+			j := c.idx
+			for j < len(c.leaf.keys) && format.CompareUser(format.UserKey(c.leaf.keys[j]), guk) == 0 {
+				c.group = append(c.group, entry{ik: c.leaf.keys[j], val: c.leaf.vals[j]})
+				j++
+			}
+			c.idx = j
+			res := resolveStream(c.group, c.snap, t.merge, c.rangeDels)
+			if len(res) > 0 {
+				v := res[0].val
+				if keysOnly {
+					v = nil
+				}
+				return res[0].uk, v, true, nil
+			}
+			// Folded to absent (tombstone or covering range delete): skip and keep going.
+		}
+		// Leaf exhausted: follow the B-link right pointer to the next leaf, or finish.
+		next := c.leaf.next
+		if next == format.NoPage {
+			c.leaf = nil
+			return nil, nil, false, nil
+		}
+		c.leaf, err = t.viewLeaf(next)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		c.idx = 0
+	}
+	return nil, nil, false, nil
+}
+
 // leafCovering descends from the root to the leaf whose range covers userKey.
 func (t *BTree) leafCovering(userKey []byte) (format.PageNo, error) {
 	pgno := t.root()
