@@ -1016,6 +1016,18 @@ func (l *LSM) GetAt(snap engine.Snapshot, userKey []byte) ([]byte, error) {
 		}
 	}
 
+	// Fast path for the dominant point-read shape: a key with exactly one gathered version
+	// that is a visible set no range delete shadows. Fold would walk newest-first, take that
+	// set as the base, and return its value; the value materializeOp produced is already a
+	// fresh, owned, caller-safe copy (an inline value is copied out of its source, a separated
+	// value comes back freshly built from the vLog), so returning it directly is byte-identical
+	// to the fold result and skips the redundant final copy Fold's caller would otherwise make.
+	// The guard mirrors the fold exactly: a single op, kind set, visible at the snapshot, and a
+	// covering range delete (rd, zero when none) older than the set so it cannot shadow it.
+	if len(ops) == 1 && ops[0].Kind == format.KindSet && ops[0].Version <= snap.Version && rd < ops[0].Version {
+		return ops[0].Value, nil
+	}
+
 	// ops is sorted newest-first by the final resolved() call, the order Fold expects;
 	// the covering range delete folds in as a synthetic delete at rd.
 	val, ok := format.Fold(ops, snap.Version, rd, mergeFn)
