@@ -688,7 +688,18 @@ func newEngine(kind format.EngineKind, pgr *pager.Pager) (engine.Engine, error) 
 // than each paying its own (spec 06 F3). The batch is built inside the leader's prepare
 // step so it is stamped at the version the commit is actually assigned.
 func (d *DB) Write(fn func(b *engine.WriteBatch)) (uint64, error) {
-	return d.submitCommit(&commitReq{
+	// The batch is pooled: it is built in prepare and consumed entirely within the group
+	// commit (the WAL frame, the engine apply, and the change-feed publish each copy what
+	// they keep), so it is dead once submitCommit returns this request's outcome and goes
+	// back to the pool. The committed batch is parked on req.b by appendGroupLocked, so it
+	// is read back from there rather than through a variable the prepare closure would have
+	// to capture and mutate, which would heap-escape a cell per commit and give back one of
+	// the allocations the pool just removed. prepare runs on whichever goroutine leads the
+	// group, possibly not this one; the same cmu publication that makes the result safe to
+	// read here orders that write of req.b before this read (spec 06 F3). req.b stays nil
+	// when the write is empty, read-only, or fenced before it commits, and ReleaseWriteBatch
+	// ignores nil; the empty write hands its own unused batch back inside prepare.
+	req := &commitReq{
 		prepare: func() (*engine.WriteBatch, uint64, bool, error) {
 			if d.readReplica {
 				return nil, 0, false, ErrReadOnlyTxn
@@ -696,16 +707,20 @@ func (d *DB) Write(fn func(b *engine.WriteBatch)) (uint64, error) {
 			// Under the leader's write lock the next version is stable between this peek
 			// and the formal commit, so the batch is built at it before it is reserved.
 			v := d.orc.peekNext()
-			b := engine.NewWriteBatch(v)
+			b := engine.AcquireWriteBatch(v)
 			fn(b)
 			if b.Len() == 0 {
 				// An empty write consumes no version; report the last committed one.
+				engine.ReleaseWriteBatch(b)
 				return nil, v - 1, true, nil
 			}
 			got := d.orc.commit(batchKeys(b))
 			return b, got, false, nil
 		},
-	})
+	}
+	v, err := d.submitCommit(req)
+	engine.ReleaseWriteBatch(req.b)
+	return v, err
 }
 
 // Load bulk-populates the database from key/value pairs delivered in ascending key

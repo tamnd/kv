@@ -2,6 +2,7 @@ package engine
 
 import (
 	"bytes"
+	"sync"
 
 	"github.com/tamnd/kv/format"
 )
@@ -30,6 +31,43 @@ type WriteBatch struct {
 // NewWriteBatch returns an empty batch for the given commit version.
 func NewWriteBatch(version uint64) *WriteBatch {
 	return &WriteBatch{version: version}
+}
+
+// writeBatchPool recycles the batch struct and its entries backing array across commits.
+// A blind write builds a fresh batch for every Write, so without a pool the commit hot
+// path allocates the WriteBatch header and grows a new entries slice on each call; the
+// pool reuses both.
+var writeBatchPool = sync.Pool{New: func() any { return &WriteBatch{} }}
+
+// AcquireWriteBatch returns a batch for the given commit version drawn from a pool, so the
+// commit hot path reuses the batch struct and its entries backing array instead of
+// allocating both on every Write. The batch is the caller's until it hands it to
+// ReleaseWriteBatch, and it must not be released while anything still reads its entries.
+// Every consumer in the commit pipeline copies what it keeps (the WAL frame copies the
+// encoded bytes, the B-tree leaf copies into its page, the LSM skiplist copies into its
+// arena, the change feed clones each key and value into a Change), so a released batch
+// never aliases live engine or feed state. This is for the internal blind-write path whose
+// batch never escapes the commit; a batch handed to an external owner must not be pooled.
+func AcquireWriteBatch(version uint64) *WriteBatch {
+	b := writeBatchPool.Get().(*WriteBatch)
+	b.version = version
+	b.size = 0
+	return b
+}
+
+// ReleaseWriteBatch returns b to the pool. b must not be used after this call. The entries
+// are cleared to their zero value first so a pooled-but-idle batch does not pin the key and
+// value byte slices of the commit it last held; the backing array's capacity is kept for
+// reuse.
+func ReleaseWriteBatch(b *WriteBatch) {
+	if b == nil {
+		return
+	}
+	for i := range b.entries {
+		b.entries[i] = BatchEntry{}
+	}
+	b.entries = b.entries[:0]
+	writeBatchPool.Put(b)
 }
 
 // Version reports the commit version stamped on every entry.
