@@ -256,6 +256,53 @@ func TestBoundedEqualsClippedWithRangeDels(t *testing.T) {
 	checkBoundedEqualsClipped(t, tr, rng, versions, nkeys)
 }
 
+// TestCleanFoldSkip drives the clean fold-skip path (paged.go cellsCleanSets /
+// foldCleanResolved): a keyspace of distinct single-version Sets, where every bounded read
+// takes the no-fold path, must still resolve exactly the full read clipped to its bound. It
+// also pins the future-version skip by writing two version generations of distinct keys and
+// reading at the older snapshot, where the newer keys are clean but invisible and the clean
+// path must drop them just as the fold would.
+func TestCleanFoldSkip(t *testing.T) {
+	tr := newTreeSmall(t)
+	tr.SetMergeFunc(concatMerge)
+	keyOf := func(i int) []byte { return []byte(fmt.Sprintf("key%04d", i)) }
+
+	// Version 1: keys 0..149, each written exactly once. Version 2: keys 150..299, each
+	// once. Every user key is distinct across the whole tree, so every range is clean.
+	b1 := engine.NewWriteBatch(1)
+	for i := 0; i < 150; i++ {
+		b1.Set(keyOf(i), []byte(fmt.Sprintf("v1-%04d", i)))
+	}
+	tr.NoteLSN(1)
+	if err := tr.Apply(b1, 1); err != nil {
+		t.Fatalf("apply v1: %v", err)
+	}
+	b2 := engine.NewWriteBatch(2)
+	for i := 150; i < 300; i++ {
+		b2.Set(keyOf(i), []byte(fmt.Sprintf("v2-%04d", i)))
+	}
+	tr.NoteLSN(2)
+	if err := tr.Apply(b2, 2); err != nil {
+		t.Fatalf("apply v2: %v", err)
+	}
+	if tr.hasRangeDel.Load() {
+		t.Fatal("hasRangeDel set on a Set-only workload")
+	}
+
+	rng := rand.New(rand.NewSource(11))
+	checkBoundedEqualsClipped(t, tr, rng, []uint64{1, 2}, 300)
+
+	// At snapshot 1 the version-2 keys are clean but newer than the snapshot, so the clean
+	// path must skip them and the read must end at key0149.
+	full1 := readForward(t, tr, 1, engine.IterOptions{})
+	if len(full1) != 150 {
+		t.Fatalf("v1 full read returned %d keys, want 150 (version-2 keys must be invisible)", len(full1))
+	}
+	if !bytes.Equal(full1[len(full1)-1].k, keyOf(149)) {
+		t.Fatalf("v1 full read last key = %q, want %q", full1[len(full1)-1].k, keyOf(149))
+	}
+}
+
 // TestReverseIsForwardReversed checks the reverse iterator returns the bounded view in
 // descending order: the bound is by user key and the reverse flag only flips the walk, so a
 // reverse read must equal the forward bounded read reversed.

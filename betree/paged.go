@@ -325,8 +325,63 @@ func (t *Tree) gatherRange(snap engine.Snapshot, lower, upper []byte) ([]resolve
 	sort.Slice(cells, func(i, j int) bool {
 		return format.CompareInternal(cells[i].key, cells[j].key) < 0
 	})
+	// Clean fold-skip (doc 04, decision D5): when the collected range is all distinct
+	// single-version plain Sets, every version group has size one and folds to its own
+	// value, so the snapshot view is just the cells visible at snap with no per-key
+	// OpFromCell and no Fold. This is the readseq lever: a dense ordered scan over freshly
+	// written keys never overwritten skips the MVCC machinery entirely. The bounded path
+	// has already excluded range deletes, which is the other thing the fold is needed for,
+	// so the predicate only checks the cells themselves. A range with any overwrite,
+	// delete, merge, or TTL set falls to the general fold below.
+	if cellsCleanSets(cells) {
+		return foldCleanResolved(cells, snap), nil
+	}
 	// No range delete is in play on this path, so the fold needs no interval set.
 	return t.foldResolved(cells, snap, nil), nil
+}
+
+// cellsCleanSets reports whether a run of cells, already sorted by internal key, is the
+// clean shape that resolves without folding: every cell a plain Set and strictly ascending
+// user keys, so every version group has size one. It is the betree twin of the btree's
+// entriesCleanSets and fails fast on the first non-Set or non-ascending cell, so a run that
+// needs the fold pays only a short prefix scan. A TTL set (its own kind) is not a plain Set,
+// so a range holding one folds, which is where the expiry check lives.
+func cellsCleanSets(cells []record) bool {
+	var prev []byte
+	for i := range cells {
+		if format.KindOf(cells[i].key) != format.KindSet {
+			return false
+		}
+		uk := format.UserKey(cells[i].key)
+		if i > 0 && format.CompareUser(prev, uk) >= 0 {
+			return false
+		}
+		prev = uk
+	}
+	return true
+}
+
+// foldCleanResolved builds the snapshot view of a clean cell run (one validated by
+// cellsCleanSets) with no fold: each cell visible at the snapshot becomes one resolved pair,
+// and a cell newer than the snapshot is skipped exactly as Fold would skip it. The keys and
+// values are copied out, the same caller-owned ownership the general fold gives, so a
+// returned pair never aliases a mutable tail slot or a page a later writer rewrites. (True
+// zero-copy hand-back of slices that point into the page for the transaction lifetime waits
+// for M6's off-heap arena, where a page lives in stable memory a reader can borrow without a
+// decode copy; on this substrate the decode already copies, so the saving here is the
+// removed fold, not the removed copy.)
+func foldCleanResolved(cells []record, snap engine.Snapshot) []resolved {
+	out := make([]resolved, 0, len(cells))
+	for i := range cells {
+		if format.Version(cells[i].key) > snap.Version {
+			continue // newer than the snapshot: not visible
+		}
+		out = append(out, resolved{
+			uk:  append([]byte(nil), format.UserKey(cells[i].key)...),
+			val: append([]byte(nil), cells[i].val...),
+		})
+	}
+	return out
 }
 
 // foldResolved turns a run of cells, already sorted by internal key, into the MVCC-resolved
