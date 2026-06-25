@@ -49,24 +49,40 @@ if err != nil {
 
 ### 3. Read it back
 
+For a single key, `Get` is the shortest path:
+
 ```go
-err = db.View(func(txn *kv.Txn) error {
-	v, err := txn.Get([]byte("user:1"))
-	if err != nil {
-		return err
-	}
-	fmt.Printf("user:1 = %s\n", v)
-	return nil
-})
+v, err := db.Get([]byte("user:1"))
+if err != nil {
+	log.Fatal(err)
+}
+fmt.Printf("user:1 = %s\n", v)
 ```
 
-`View` runs a read-only transaction at a consistent snapshot. A missing key returns `kv.ErrNotFound`, which you match with `errors.Is`:
+A missing key returns `kv.ErrNotFound`, which you match with `errors.Is`:
 
 ```go
-v, err := txn.Get([]byte("absent"))
+v, err := db.Get([]byte("absent"))
 if errors.Is(err, kv.ErrNotFound) {
 	// not there
 }
+```
+
+When several reads have to agree on one state, do them inside a `View` instead, which runs a read-only transaction at a consistent snapshot. Nothing another writer commits while the closure runs changes what it reads:
+
+```go
+err = db.View(func(txn *kv.Txn) error {
+	a, err := txn.Get([]byte("user:1"))
+	if err != nil {
+		return err
+	}
+	b, err := txn.Get([]byte("user:2"))
+	if err != nil {
+		return err
+	}
+	fmt.Printf("%s and %s\n", a, b)
+	return nil
+})
 ```
 
 ### 4. Scan a prefix
@@ -122,7 +138,7 @@ Run `kv app.kv` with no subcommand and you drop into an interactive shell on the
 
 ```
 $ kv app.kv
-kv 0.1.0  engine=btree  app.kv
+kv 0.2.0  engine=btree  app.kv
 kv> scan --prefix user:
 user:1	alice
 user:2	bob

@@ -5,6 +5,33 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.2.0] — 2026-06-25
+
+A performance and ergonomics release. Drop-in over 0.1.0: the on-disk format is unchanged
+and the API is purely additive, so an existing database and existing code both carry
+forward untouched.
+
+### Added
+
+- `db.Get(key)` reads one key at the latest committed state without opening a transaction
+  and returns a copy the caller owns. It is the lightest path for a single-key read that
+  does not need to agree with other reads; use `View` or `Snapshot` when several reads must
+  see one consistent version.
+
+### Changed
+
+- Tightened the read, scan, and write hot paths across the engine and transaction layers:
+  lower per-operation overhead on point reads and iteration, and fewer cycles per page
+  touched in the buffer pool, which also helps the out-of-cache regime.
+
+### Fixed
+
+- The B-tree interior-node decoder now verifies its checksum trailer on the path that
+  previously skipped it, so a corrupt interior page returns `ErrCorrupt` instead of going
+  unnoticed.
+
+---
+
 ## [0.1.0] — 2026-06-23
 
 First public release. The library, CLI, and server are feature-complete and the on-disk

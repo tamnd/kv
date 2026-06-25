@@ -15,6 +15,23 @@ func (db *DB) Close() error
 
 `Open` creates the file if absent and runs crash recovery if present. `Close` flushes, stops background work, and releases the file. The package-level `Version` constant holds the library version as a string.
 
+## Single-key reads
+
+```go
+func (db *DB) Get(key []byte) ([]byte, error)
+```
+
+`Get` returns a copy of the newest committed value for `key`, or `ErrNotFound` if the key is absent or tombstoned. It reads at the latest committed state through the engine's point-read path, with no transaction to open and discard, so it is the lightest way to read one key and the right call when a read does not need to agree with other reads. The bytes are yours to keep; they are not tied to a transaction lifetime.
+
+Reach for a transaction instead when several reads must see one consistent state: two back-to-back `Get` calls can land on either side of a concurrent commit, while reads inside a `View` or against a `Snapshot` all see the same version. The example below is correct only if a counter and its label never need to move together; if they do, read both inside one `View`.
+
+```go
+v, err := db.Get([]byte("user:1"))
+if errors.Is(err, kv.ErrNotFound) {
+	// not there
+}
+```
+
 ## Transactions
 
 ```go
