@@ -4,6 +4,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/tamnd/kv/engine"
 	"github.com/tamnd/kv/format"
 )
 
@@ -188,6 +189,28 @@ func (o *oracle) commit(writes []string) uint64 {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return o.recordCommitLocked(writes)
+}
+
+// commitWriteSet is commit for a blind batch that records its write set straight from
+// the batch entries instead of a pre-deduped []string. It builds the (pooled) write-set
+// map by inserting each entry's user key, which dedups inherently, so the recorded set
+// has the same membership a deduped slice would and the same conflict semantics, without
+// the throwaway slice and its quadratic dedup scan the slice form paid on every commit.
+// Like commit it runs no conflict detection (a blind Write has no read snapshot) but
+// still records the set so a concurrent transaction that read before this commit
+// conflicts against it.
+func (o *oracle) commitWriteSet(entries []engine.BatchEntry) uint64 {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	v := o.nextVersion
+	o.nextVersion++
+	set := o.takeWriteSet(len(entries))
+	for i := range entries {
+		set[string(format.UserKey(entries[i].InternalKey))] = struct{}{}
+	}
+	o.commits = append(o.commits, commitRecord{version: v, writes: set})
+	o.trimLocked()
+	return v
 }
 
 // recordCommitLocked assigns the next version, stores the write set for future
