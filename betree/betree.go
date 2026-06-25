@@ -82,44 +82,33 @@ func (t *Tree) Open(env *engine.Env) error {
 	if t.pgr.Header().EngineRoot != format.NoPage {
 		return nil
 	}
-	return t.rewriteRun(nil, nil)
+	return t.emptyRoot()
 }
 
 // Close implements engine.Engine. It does not flush; the host checkpoints first, and
 // the run already lives on the pager. There is nothing to release.
 func (t *Tree) Close() error { return nil }
 
-// Apply implements engine.Engine. It merges the batch into the run by internal key
-// and rewrites the run. The batch is already durable in the WAL by the time Apply is
-// called, so a crash mid-Apply is harmless: recovery re-derives the identical Apply
-// from the WAL, and because the internal key carries the commit version the merge is
-// idempotent in content. Range-delete markers flow through as ordinary cells (kind
-// range-begin, value = the interval end) and reads rebuild the interval set from
-// them, so there is no separate marker bookkeeping. The whole-run rewrite is M0's
-// slow base; the incremental insert slice replaces it under this same method.
+// Apply implements engine.Engine. It routes each batch entry to its leaf and inserts
+// it, descending the tree per cell rather than rewriting the whole run. The batch is
+// already durable in the WAL by the time Apply is called, so a crash mid-Apply is
+// harmless: recovery re-derives the identical Apply from the WAL, and because the
+// internal key carries the commit version each insert overwrites the identical cell
+// rather than duplicating it, so the replay is idempotent in content. Range-delete
+// markers flow through as ordinary cells (kind range-begin, value = the interval end)
+// and reads rebuild the interval set from them, so there is no separate marker
+// bookkeeping. The per-cell descent is M0's logarithmic base; the buffered-message
+// push that defers the leaf touch is M1, under this same method.
 func (t *Tree) Apply(batch *engine.WriteBatch, commitVersion uint64) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	cells, oldPages, err := t.loadRun()
-	if err != nil {
-		return err
-	}
-	merged := make(map[string][]byte, len(cells)+len(batch.Entries()))
-	for _, c := range cells {
-		merged[string(c.key)] = c.val
-	}
 	for _, e := range batch.Entries() {
-		merged[string(e.InternalKey)] = append([]byte(nil), e.Value...)
+		if err := t.insertOne(e.InternalKey, e.Value); err != nil {
+			return err
+		}
 	}
-	next := make([]record, 0, len(merged))
-	for k, v := range merged {
-		next = append(next, record{key: []byte(k), val: v})
-	}
-	sort.Slice(next, func(i, j int) bool {
-		return format.CompareInternal(next[i].key, next[j].key) < 0
-	})
-	return t.rewriteRun(next, oldPages)
+	return nil
 }
 
 // Maintain implements engine.Engine. The skeleton has no background work; version

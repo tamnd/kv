@@ -3,6 +3,7 @@ package betree
 import (
 	"encoding/binary"
 	"errors"
+	"sort"
 
 	"github.com/tamnd/kv/format"
 )
@@ -504,18 +505,67 @@ func decodeInterior(src []byte) (*interior, error) {
 	return &interior{leftmost: leftmost, pivots: pivots, buffer: buffer}, nil
 }
 
-// route returns the child page that owns target: the child to the right of the
-// last pivot whose key is <= target, or the leftmost child when target sorts below
-// every pivot. The pivots are in ascending internal-key order, so this is the
-// standard separator-key descent that keeps point-read latency at the B-tree floor.
-func (in *interior) route(target []byte) format.PageNo {
-	child := in.leftmost
-	for _, p := range in.pivots {
-		if format.CompareInternal(target, p.key) >= 0 {
-			child = p.child
+// childIndex returns the child slot that owns target: the number of pivots whose
+// key is <= target. Slot 0 is the leftmost child; slot i+1 is pivots[i].child. The
+// pivots are in ascending internal-key order, so this is a binary search, the
+// standard separator descent that keeps point-read latency at the B-tree floor. The
+// index it returns is also the pivot index a split below this child inserts at,
+// which is what lets the write path reuse the descent decision when it propagates a
+// split upward.
+func (in *interior) childIndex(target []byte) int {
+	lo, hi := 0, len(in.pivots)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if format.CompareInternal(target, in.pivots[mid].key) >= 0 {
+			lo = mid + 1
 		} else {
-			break
+			hi = mid
 		}
 	}
-	return child
+	return lo
+}
+
+// childPage maps a child slot from childIndex back to its page: slot 0 is the
+// leftmost child, slot i+1 is pivots[i].child.
+func (in *interior) childPage(idx int) format.PageNo {
+	if idx == 0 {
+		return in.leftmost
+	}
+	return in.pivots[idx-1].child
+}
+
+// route returns the child page that owns target. It is childPage(childIndex(target)),
+// kept as a named helper because the read-side descent only wants the page, not the
+// slot index the write side threads through a split.
+func (in *interior) route(target []byte) format.PageNo {
+	return in.childPage(in.childIndex(target))
+}
+
+// insertPivotAt splices a new (separator, child) pivot into the node at pivot index
+// p, the slot childIndex returned for the key that descended into the child that
+// just split. The new child sits to the right of the split child, so its separator
+// is the new child's smallest key and it takes pivot slot p, shifting the rest right.
+func (in *interior) insertPivotAt(p int, sep []byte, child format.PageNo) {
+	in.pivots = append(in.pivots, pivot{})
+	copy(in.pivots[p+1:], in.pivots[p:])
+	in.pivots[p] = pivot{key: append([]byte(nil), sep...), child: child}
+}
+
+// insertRecord splices key/val into the leaf in ascending internal-key order,
+// replacing the value when the internal key already exists. Replacement is what
+// makes a replayed Apply idempotent: re-applying a committed batch overwrites the
+// identical cell rather than duplicating it, because the commit version is baked
+// into the internal key. The decoded leaf is the unit of mutation in M0; the
+// in-place page splice that avoids the decode is a later milestone's concern.
+func (l *leaf) insertRecord(key, val []byte) {
+	i := sort.Search(len(l.records), func(i int) bool {
+		return format.CompareInternal(l.records[i].key, key) >= 0
+	})
+	if i < len(l.records) && format.CompareInternal(l.records[i].key, key) == 0 {
+		l.records[i].val = append([]byte(nil), val...)
+		return
+	}
+	l.records = append(l.records, record{})
+	copy(l.records[i+1:], l.records[i:])
+	l.records[i] = record{key: append([]byte(nil), key...), val: append([]byte(nil), val...)}
 }
