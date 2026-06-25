@@ -133,6 +133,20 @@ type Tree struct {
 	// bounded path. It is atomic because a lock-free reader reads it while a writer under
 	// wmu may set it, the same reason the gen seqlock alone cannot launder the tail map.
 	hasRangeDel atomic.Bool
+
+	// locator is the resident learned point index (M4, learned.go): a small spline model of
+	// the leaf run that a point read consults to skip the interior descent. It is published
+	// through an atomic pointer so a lock-free reader loads a whole consistent model and a
+	// rebuild swaps a fresh one in without touching the one a reader holds; a nil pointer (a
+	// run too small to model, or one not yet built) means the read simply descends. The model
+	// is a hint, never the authority: the read verifies the predicted leaf and falls back to
+	// the descent, so a stale or absent model costs locality, never an answer (D6, doc 03).
+	locator atomic.Pointer[leafLocator]
+
+	// locRebuildCount counts rollovers since the model was last built, the amortization clock
+	// for maybeRebuildLocator. It is single-writer state guarded by wmu, since only a rollover
+	// (under wmu) touches it.
+	locRebuildCount uint64
 }
 
 // New returns a Bε-tree core bound to pgr. Call Open to materialize the root and
@@ -163,7 +177,18 @@ func (t *Tree) Open(env *engine.Env) error {
 		// Detect any range-delete marker already persisted in the run or the buffers so a
 		// reopened database that holds one takes the correct full-gather path from the
 		// first read. Markers written this session set the flag on the write path instead.
-		return t.initRangeDelFlag()
+		if err := t.initRangeDelFlag(); err != nil {
+			return err
+		}
+		// Build the resident learned point index over the run a reopen inherits, so a
+		// read-mostly workload over an existing database gets the model from its first read
+		// rather than waiting for a rollover to build one. A build error here is not fatal:
+		// the model only accelerates reads, so a failure leaves the locator nil and reads
+		// descend. Open runs before any concurrent use, so this needs no latch.
+		if loc, err := t.buildLeafLocator(); err == nil {
+			t.locator.Store(loc)
+		}
+		return nil
 	}
 	return t.emptyRoot()
 }

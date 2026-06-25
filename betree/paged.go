@@ -455,10 +455,11 @@ func (t *Tree) collectRange(lower, upper []byte) ([]record, error) {
 	if lower == nil {
 		start, err = t.leftmostLeaf()
 	} else {
-		// Route to the leaf holding lower's newest version. (lower, MaxVersion) is the
-		// smallest internal key for user key lower, so no record at or above lower sits in an
-		// earlier leaf, and the right-sibling walk from here covers the rest of the range.
-		start, err = t.leafForKey(format.EncodeInternalKey(lower, format.MaxVersion, format.KindSet))
+		// Route to the leaf holding lower's newest version, using the resident learned index to
+		// skip the interior descent when it can. (lower, MaxVersion) is the smallest internal
+		// key for user key lower, so no record at or above lower sits in an earlier leaf, and
+		// the right-sibling walk from here covers the rest of the range.
+		start, err = t.startLeafFor(lower)
 	}
 	if err != nil {
 		return nil, err
@@ -594,6 +595,38 @@ func inHalfOpen(uk, lower, upper []byte) bool {
 		return false
 	}
 	return true
+}
+
+// startLeafFor returns the leaf to begin the bounded right-sibling walk at for user key lower,
+// using the resident learned locator (learned.go) to skip the interior descent when it can and
+// falling back to the leafForKey descent otherwise. The locator predicts a leaf whose smallest
+// key is at or before lower; a right-sibling walk from any such live leaf is correct, because
+// the run only grows (a split keeps the left piece's page and smallest key and chains right, no
+// leaf is freed or merged), so the walk filters keys below lower and stops past upper and a
+// too-far-left start only adds a few leaf decodes. The prediction is verified against the live
+// leaf before it is trusted: if the predicted page is no longer a leaf, or its smallest key is
+// not at or before lower, the read takes leafForKey, the proven descent. So the model can never
+// make a read wrong, only faster, and a miss is descent speed. The verifying viewLeaf decodes
+// the same leaf the walk decodes next, which is a cached-box hit, so the check is not an extra
+// page fetch.
+func (t *Tree) startLeafFor(lower []byte) (format.PageNo, error) {
+	// (lower, MaxVersion) is the smallest internal key for user key lower, so it sorts at or
+	// before every version of lower and before any larger user key. The locator and the verify
+	// both compare against this internal key, not the bare user key, because a user key whose
+	// versions straddle a leaf boundary must start at the leaf holding its newest version (the
+	// one the descent reaches), and a user-key comparison would accept the next leaf and walk
+	// past that newest version.
+	lik := format.EncodeInternalKey(lower, format.MaxVersion, format.KindSet)
+	if loc := t.locator.Load(); loc != nil {
+		if pg := loc.locate(lik); pg != format.NoPage {
+			lf, err := t.viewLeaf(pg)
+			if err == nil && len(lf.records) > 0 &&
+				format.CompareInternal(lf.records[0].key, lik) <= 0 {
+				return pg, nil
+			}
+		}
+	}
+	return t.leafForKey(lik)
 }
 
 // leafForKey descends from the root to the leaf whose key range covers the internal key ik,
