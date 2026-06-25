@@ -89,22 +89,25 @@ func (t *Tree) Open(env *engine.Env) error {
 // the run already lives on the pager. There is nothing to release.
 func (t *Tree) Close() error { return nil }
 
-// Apply implements engine.Engine. It routes each batch entry to its leaf and inserts
-// it, descending the tree per cell rather than rewriting the whole run. The batch is
-// already durable in the WAL by the time Apply is called, so a crash mid-Apply is
-// harmless: recovery re-derives the identical Apply from the WAL, and because the
-// internal key carries the commit version each insert overwrites the identical cell
-// rather than duplicating it, so the replay is idempotent in content. Range-delete
-// markers flow through as ordinary cells (kind range-begin, value = the interval end)
-// and reads rebuild the interval set from them, so there is no separate marker
-// bookkeeping. The per-cell descent is M0's logarithmic base; the buffered-message
-// push that defers the leaf touch is M1, under this same method.
+// Apply implements engine.Engine. It turns each batch entry into a Bε message and
+// pushes it into the highest owning node's buffer, where it rests until a flush
+// carries it down, instead of descending to its leaf per cell (M1, doc 02 sections 1
+// and 2). The batch is already durable in the WAL by the time Apply is called, so a
+// crash mid-Apply is harmless: recovery re-derives the identical Apply from the WAL,
+// and because the internal key carries the commit version each message overwrites the
+// identical cell rather than duplicating it, so the replay is idempotent in content.
+// Range-delete markers flow through as ordinary messages (kind range-begin, value =
+// the interval end) and reads rebuild the interval set from them, so there is no
+// separate marker bookkeeping. A buffered message and the leaf record it will become
+// fold to the same answer, so the read path resolves the buffered tree identically to
+// the unbuffered one it replaces (paged.go gathers buffers and leaf records into one
+// fold).
 func (t *Tree) Apply(batch *engine.WriteBatch, commitVersion uint64) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	for _, e := range batch.Entries() {
-		if err := t.insertOne(e.InternalKey, e.Value); err != nil {
+		if err := t.insert(e.InternalKey, e.Value); err != nil {
 			return err
 		}
 	}
