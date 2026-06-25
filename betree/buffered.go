@@ -26,8 +26,8 @@ package betree
 // keeps each flush fat). Splits during a flush are handled by draining the buffer
 // empty first so a split always sees a bufferless node, which keeps the split logic
 // the same shape as M0's. The in-memory mutable hot tail that absorbs overwrite
-// churn before it ever becomes a message (doc 02 section 3) is the next M1 slice;
-// this slice is the on-disk buffered tree the tail rolls over into.
+// churn before it ever becomes a message (doc 02 section 3, tail.go) rolls its sealed
+// runs over into this on-disk buffered tree through applyToTree.
 
 import (
 	"github.com/tamnd/kv/format"
@@ -43,31 +43,36 @@ type childSplit struct {
 	page format.PageNo
 }
 
-// insert routes one message into the tree. A leaf root takes the message directly
-// into its records (M0's path, reused), growing an interior root when it overflows.
-// An interior root takes the message into its buffer through pushDown, which flushes
-// and may split the root, in which case a new root is grown over the pieces. This is
-// the per-message primitive Apply drives.
-func (t *Tree) insert(key, val []byte) error {
+// applyToTree merges one sorted, internal-key-deduplicated run of messages into the
+// tree from the root and grows the root if it splits. It is the path the hot tail's
+// rollover takes into the on-disk tree, and a one-message run is the same path a
+// single insert takes, differing only in run length. A leaf root has no buffer, so
+// each message merges straight into the leaf through M0's insertOne, which splits and
+// grows an interior root exactly as before; once an interior root exists the run
+// pushes into its buffer through pushDown, which flushes and may split the root, in
+// which case a new root is grown over the pieces. The run must be sorted by internal
+// key and free of exact-internal-key duplicates; the tail seal guarantees both.
+func (t *Tree) applyToTree(msgs []message) error {
+	if len(msgs) == 0 {
+		return nil
+	}
 	root := t.root()
 	typ, err := t.pageType(root)
 	if err != nil {
 		return err
 	}
 	if typ == format.PageBTreeLeaf {
-		// A leaf root has no buffer to push into, so the message merges straight into
-		// the leaf, splitting and growing an interior root exactly as M0 did. Once an
-		// interior root exists, every later message buffers at it.
-		return t.insertOne(key, val)
+		// A leaf root has nowhere to buffer, so merge each message into the leaf on the
+		// proven M0 path. The first message that overflows it grows an interior root; the
+		// rest of this run then descends that root, and the next rollover buffers at it.
+		for _, m := range msgs {
+			if err := t.insertOne(m.key, m.val); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
-
-	m := message{
-		kind: byte(format.KindOf(key)),
-		seq:  format.Version(key),
-		key:  append([]byte(nil), key...),
-		val:  append([]byte(nil), val...),
-	}
-	splits, err := t.pushDown(root, []message{m})
+	splits, err := t.pushDown(root, msgs)
 	if err != nil {
 		return err
 	}

@@ -113,6 +113,13 @@ func TestReopenMultiLevel(t *testing.T) {
 	if err := tr.Apply(b, 9); err != nil {
 		t.Fatalf("apply: %v", err)
 	}
+	// Drain the hot tail onto pages so the whole key space is in the tree spine, not
+	// resting in the heap: the depth check below asserts the on-disk spine is
+	// multi-level, and the direct checkpoint that follows has no logical WAL to replay a
+	// tail-resident write from.
+	if err := tr.Flush(); err != nil {
+		t.Fatalf("flush tail: %v", err)
+	}
 	if d := tr.depth(t); d < 3 {
 		t.Fatalf("pre-reopen depth = %d, want >= 3", d)
 	}
