@@ -21,6 +21,14 @@ type EngineKind byte
 const (
 	EngineBTree EngineKind = 1
 	EngineLSM   EngineKind = 2
+	// EngineBeta selects the unified Bε-tree core, the re-founded engine the 2059
+	// redesign builds (notes/Spec/2059/redesign). It is a new selector value, not a
+	// reuse of an old one, so an old file never claims to be a Bε file: existing
+	// databases carry 1 or 2 and open on their old cores unchanged, and only a file
+	// the new core creates records 3. The new on-disk node layout and the format
+	// major-version bump arrive in the later M0 PRs; this constant is the seam that
+	// lets the core be selected and oracle-tested alongside the shipped cores first.
+	EngineBeta EngineKind = 3
 )
 
 // String renders an EngineKind.
@@ -30,6 +38,8 @@ func (e EngineKind) String() string {
 		return "btree"
 	case EngineLSM:
 		return "lsm"
+	case EngineBeta:
+		return "betree"
 	default:
 		return "engine?"
 	}

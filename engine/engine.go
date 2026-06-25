@@ -33,6 +33,7 @@ type Kind = format.EngineKind
 const (
 	BTree = format.EngineBTree
 	LSM   = format.EngineLSM
+	Beta  = format.EngineBeta
 )
 
 // Engine is the top-level handle for an opened core (spec 04 §2.1).
