@@ -27,13 +27,18 @@ import (
 // decoding the run and folding with the shared format helpers, so it answers the
 // conformance oracle identically to the skeleton it replaces.
 
-// loadRun walks the leaf run from the engine root along right-sibling links,
-// decoding each leaf, and returns every cell in run order together with the page
-// numbers the run occupies. The caller holds at least a read latch, so a writer
-// cannot rewrite the run mid-walk. The cycle guard turns a corrupt sibling loop
-// into an error rather than a hang.
+// loadRun walks the leaf run from its head along right-sibling links, decoding each
+// leaf, and returns every cell in run order together with the page numbers the run
+// occupies. The head is the leftmost leaf: the root may now be an interior node, so
+// the walk descends the leftmost spine to the first leaf before following siblings.
+// The caller holds at least a read latch, so a writer cannot rewrite the run
+// mid-walk. The cycle guard turns a corrupt sibling loop into an error rather than a
+// hang.
 func (t *Tree) loadRun() (cells []record, pages []format.PageNo, err error) {
-	pgno := t.pgr.Header().EngineRoot
+	pgno, err := t.leftmostLeaf()
+	if err != nil {
+		return nil, nil, err
+	}
 	seen := map[format.PageNo]bool{}
 	for pgno != format.NoPage {
 		if seen[pgno] {
@@ -66,74 +71,6 @@ func (t *Tree) readLeaf(pgno format.PageNo) (*leaf, error) {
 		return nil, derr
 	}
 	return lf, nil
-}
-
-// rewriteRun packs cells into a fresh chain of generation-2 leaf pages, links the
-// siblings, installs the first page as the new engine root, and frees the pages the
-// old run occupied. cells must be in ascending internal-key order. Every new page
-// is allocated before any old page is freed, so a reused page number can never
-// alias a page still live in the new run.
-func (t *Tree) rewriteRun(cells []record, oldPages []format.PageNo) error {
-	usable := t.pgr.UsablePageSize()
-
-	// Greedily group cells into leaf-sized runs. Growing the trial slice one cell at
-	// a time costs O(n^2) encode calls; M0 accepts that because the base is correct
-	// and the run is small, and the incremental-insert slice removes the rewrite.
-	var groups [][]record
-	i := 0
-	for i < len(cells) {
-		fit := i
-		for j := i + 1; j <= len(cells); j++ {
-			_, err := encodeLeaf(make([]byte, usable), &leaf{records: cells[i:j], bucketSize: defaultBucketSize})
-			if err == ErrPageFull {
-				break
-			}
-			if err != nil {
-				return err
-			}
-			fit = j
-		}
-		if fit == i {
-			return fmt.Errorf("betree: cell does not fit in a page (key %x, value %d bytes)", cells[i].key, len(cells[i].val))
-		}
-		groups = append(groups, cells[i:fit])
-		i = fit
-	}
-	if len(groups) == 0 {
-		groups = [][]record{nil} // an empty run is still one empty leaf, so the root is always valid
-	}
-
-	// Reserve every new page number first so the sibling links can point forward to
-	// pages not yet written.
-	pgnos := make([]format.PageNo, len(groups))
-	for k := range groups {
-		pgnos[k] = t.pgr.AllocateNumber()
-	}
-	for k, g := range groups {
-		lf := &leaf{records: g, bucketSize: defaultBucketSize}
-		if k > 0 {
-			lf.left = pgnos[k-1]
-		}
-		if k+1 < len(groups) {
-			lf.right = pgnos[k+1]
-		}
-		dst := make([]byte, usable)
-		if _, err := encodeLeaf(dst, lf); err != nil {
-			return err
-		}
-		fr, err := t.pgr.GetAllocated(pgnos[k])
-		if err != nil {
-			return err
-		}
-		copy(fr.Data(), dst)
-		t.pgr.Unpin(fr, true)
-	}
-
-	t.pgr.Header().EngineRoot = pgnos[0]
-	for _, old := range oldPages {
-		t.pgr.Free(old)
-	}
-	return nil
 }
 
 // snapshot returns the sorted, MVCC-resolved view at snap by decoding the run and
