@@ -93,15 +93,12 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Read one back at a consistent snapshot.
-	db.View(func(txn *kv.Txn) error {
-		v, err := txn.Get([]byte("user:1"))
-		if err != nil {
-			return err
-		}
-		fmt.Printf("user:1 = %s\n", v)
-		return nil
-	})
+	// Read one key back. Get skips the transaction for a lone read.
+	v, err := db.Get([]byte("user:1"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("user:1 = %s\n", v)
 
 	// Scan every key under a prefix.
 	db.View(func(txn *kv.Txn) error {

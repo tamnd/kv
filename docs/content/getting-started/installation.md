@@ -89,10 +89,10 @@ kv version
 ```
 
 ```
-kv 0.1.0
-  library  0.1.0
+kv 0.2.0
+  library  0.2.0
   commit   1a2b3c4
-  built    2026-06-23T09:00:00Z
+  built    2026-06-25T09:00:00Z
   go       go1.23.0 linux/amd64
 ```
 

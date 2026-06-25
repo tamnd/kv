@@ -95,7 +95,7 @@ Run `kv <db>` with no subcommand on an existing file to open an interactive sess
 
 ```
 $ kv app.kv
-kv 0.1.0  engine=btree  app.kv
+kv 0.2.0  engine=btree  app.kv
 kv> set user:1 alice
 kv> scan --prefix user:
 kv> .pragma synchronous

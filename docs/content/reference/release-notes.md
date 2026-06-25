@@ -10,6 +10,16 @@ The authoritative, full changelog lives in [CHANGELOG.md](https://github.com/tam
 
 kv follows semantic versioning. While the project is in its 0.x series, the API stays broadly stable as the surface settles toward a 1.0 commitment, and any breaking change is called out in the release notes. The on-disk format written by 0.1.0 is fixed and forward-compatible, so a database created now opens in later releases.
 
+## 0.2.0
+
+A performance and ergonomics release. It is a drop-in upgrade: the on-disk format is unchanged, so an existing database opens as-is, and the API is purely additive, so existing code keeps compiling.
+
+- **A faster hot path.** Reads, scans, and writes were tightened across the board, with most of the work in the engine's point-read and iteration paths and in the per-operation overhead the transaction layer adds. Cold-start and out-of-cache behavior also improved as the buffer pool spends fewer cycles per page touched.
+- **Single-key reads.** `db.Get(key)` reads one key at the latest committed state without opening a transaction, returning a copy you own. It is the lightest way to read a lone key, for when a read does not need to agree with other reads. Use a `View` or `Snapshot` when several reads must see one consistent version. See [single-key reads](/reference/library/#single-key-reads).
+- **Correctness fix.** The B-tree interior-node decoder now verifies its checksum trailer on the path it previously skipped, closing a gap where a corrupt interior page could go unnoticed instead of returning `ErrCorrupt`.
+
+Everything from 0.1.0 carries forward unchanged.
+
 ## 0.1.0
 
 The first public release. The library, CLI, and server are feature-complete and the on-disk format is fixed. It lands the full build from skeleton to hardening:

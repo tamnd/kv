@@ -36,6 +36,8 @@ db.Update(func(txn *kv.Txn) error {
 
 A `View` sees a stable snapshot of the database: nothing another writer does while the closure runs changes what it reads. An `Update` either commits every write together or, if it returns an error or hits a conflict, leaves the database untouched. When two `Update`s race and one would violate isolation, kv detects the conflict and retries the closure for you, up to a bound you control.
 
+For a single key that does not need to agree with any other read, `db.Get([]byte("user:1"))` skips the transaction entirely and hands back a copy you own. Reach for a `View` the moment two reads have to see the same version.
+
 The default isolation level is snapshot isolation, which is fast and correct for almost everything. When you need the strongest guarantee, open with `WithIsolation(kv.Serializable)` and kv validates read sets at commit, closing the one anomaly (write skew) that snapshot isolation permits. [The transactions guide](/guides/transactions/) goes deeper.
 
 ## Keys are ordered
