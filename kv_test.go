@@ -56,6 +56,63 @@ func TestNotFound(t *testing.T) {
 	}
 }
 
+// TestDBGet checks the top-level Get convenience: it returns the latest committed
+// value, matches what a View transaction reads, raises ErrNotFound for an absent key,
+// and hands back an owned copy the caller can mutate without disturbing stored data.
+func TestDBGet(t *testing.T) {
+	d := open(t)
+	if err := d.Update(func(txn *kv.Txn) error {
+		return txn.Set([]byte("k"), []byte("v1"))
+	}); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	got, err := d.Get([]byte("k"))
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if string(got) != "v1" {
+		t.Fatalf("get = %q, want v1", got)
+	}
+
+	// Get matches a View read of the same key at the same state.
+	var viaView []byte
+	if err := d.View(func(txn *kv.Txn) error {
+		v, err := txn.GetCopy([]byte("k"))
+		viaView = v
+		return err
+	}); err != nil {
+		t.Fatalf("view: %v", err)
+	}
+	if string(viaView) != string(got) {
+		t.Fatalf("Get %q != View %q", got, viaView)
+	}
+
+	// The returned slice is owned: mutating it must not change what a later read sees.
+	got[0] = 'X'
+	again, err := d.Get([]byte("k"))
+	if err != nil {
+		t.Fatalf("get again: %v", err)
+	}
+	if string(again) != "v1" {
+		t.Fatalf("after mutating the returned copy, get = %q, want v1", again)
+	}
+
+	// An update is visible to the next Get (each Get reads the latest committed state).
+	if err := d.Update(func(txn *kv.Txn) error {
+		return txn.Set([]byte("k"), []byte("v2"))
+	}); err != nil {
+		t.Fatalf("update 2: %v", err)
+	}
+	if got, err := d.Get([]byte("k")); err != nil || string(got) != "v2" {
+		t.Fatalf("get after overwrite = %q, %v, want v2, nil", got, err)
+	}
+
+	if _, err := d.Get([]byte("absent")); !errors.Is(err, kv.ErrNotFound) {
+		t.Fatalf("get absent err = %v, want ErrNotFound", err)
+	}
+}
+
 // TestReadOnlyTxnRejectsWrite checks a write on a View transaction surfaces ErrReadOnly.
 func TestReadOnlyTxnRejectsWrite(t *testing.T) {
 	d := open(t)
