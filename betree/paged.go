@@ -56,6 +56,60 @@ func (t *Tree) loadRun() (cells []record, pages []format.PageNo, err error) {
 	return cells, pages, nil
 }
 
+// collectBufferedMessages walks the interior nodes of the tree depth-first from the
+// root and returns every pending buffer message as a record, so a snapshot folds a
+// buffered write the same way it folds one that has already reached a leaf. This is
+// the read half of M1's correctness lever (buffered.go): a message resolves by the
+// commit version in its internal key, not by where it physically sits, so a message
+// in an interior buffer and the leaf record it will become produce the identical op.
+// The walk visits interior nodes only; leaves carry no buffer and loadRun covers
+// them. The caller holds the read latch, so the tree shape is fixed across the walk.
+// The cycle guard turns a corrupt child pointer into an error rather than a hang.
+func (t *Tree) collectBufferedMessages() ([]record, error) {
+	var out []record
+	seen := map[format.PageNo]bool{}
+	var visit func(pgno format.PageNo) error
+	visit = func(pgno format.PageNo) error {
+		if pgno == format.NoPage {
+			return nil
+		}
+		if seen[pgno] {
+			return fmt.Errorf("betree: interior buffer walk cycles at page %d", pgno)
+		}
+		seen[pgno] = true
+		typ, err := t.pageType(pgno)
+		if err != nil {
+			return err
+		}
+		if typ == format.PageBTreeLeaf {
+			return nil
+		}
+		in, err := t.loadInterior(pgno)
+		if err != nil {
+			return err
+		}
+		for _, m := range in.buffer {
+			out = append(out, record{
+				key: append([]byte(nil), m.key...),
+				val: append([]byte(nil), m.val...),
+			})
+		}
+		if err := visit(in.leftmost); err != nil {
+			return err
+		}
+		for _, p := range in.pivots {
+			if err := visit(p.child); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := visit(t.root()); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // readLeaf pins a leaf page for reading, decodes it with the generation-2 leaf
 // codec over the usable area, and unpins. decodeLeaf copies every key and value, so
 // the returned leaf owns its bytes and stays valid after the unpin and after the
@@ -89,6 +143,17 @@ func (t *Tree) snapshot(snap engine.Snapshot) ([]resolved, error) {
 	if err != nil {
 		return nil, err
 	}
+	// M1: a write may rest in an interior node's buffer instead of having reached its
+	// leaf, so the read must consult the buffers too. Resolution is by the commit
+	// version baked into the internal key, so a buffered message folds exactly like the
+	// leaf record it will become; gathering both into one run keeps the fold below
+	// bit-for-bit identical to M0's. The buffer walk is bounded by the same latch the
+	// leaf walk holds, so a writer cannot move a message between the two walks.
+	buffered, err := t.collectBufferedMessages()
+	if err != nil {
+		return nil, err
+	}
+	cells = append(cells, buffered...)
 	sort.Slice(cells, func(i, j int) bool {
 		return format.CompareInternal(cells[i].key, cells[j].key) < 0
 	})
