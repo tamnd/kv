@@ -62,6 +62,7 @@ func commands() []command {
 		{"ship", "stream the current WAL generation as a replication delta", cmdShip},
 		{"replay", "apply a shipped WAL delta onto a read-only follower", cmdReplay},
 		{"vacuum", "return trailing free pages to the OS; shrink the file", cmdVacuum},
+		{"migrate", "upgrade a v0.2.0 file to the generation-2 format", cmdMigrate},
 		{"pragma", "read or set a configuration knob (engine, application_id, ...)", cmdPragma},
 		{"check", "verify structural integrity; exit 4 on any violation", cmdCheck},
 		{"info", "print a human summary of the database", cmdInfo},
