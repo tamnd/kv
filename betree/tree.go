@@ -27,8 +27,8 @@ import (
 // root reports the page that roots the tree, and setRoot records a new root in the
 // header. The header field is the single source of truth for the run, the same way
 // the shipped btree roots itself, so a reopen finds the tree without a side file.
-func (t *Tree) root() format.PageNo      { return t.pgr.Header().EngineRoot }
-func (t *Tree) setRoot(p format.PageNo)  { t.pgr.Header().EngineRoot = p }
+func (t *Tree) root() format.PageNo     { return t.pgr.Header().EngineRoot }
+func (t *Tree) setRoot(p format.PageNo) { t.pgr.Header().EngineRoot = p }
 
 // emptyRoot materializes a fresh empty leaf and installs it as the root. Open calls
 // it on a fresh database so the tree always has a valid root leaf to descend to,
