@@ -156,7 +156,7 @@ func (t *Tree) leftmostLeaf() (format.PageNo, error) {
 		if typ == format.PageBTreeLeaf {
 			return pgno, nil
 		}
-		in, err := t.loadInterior(pgno)
+		in, err := t.viewInterior(pgno)
 		if err != nil {
 			return 0, err
 		}

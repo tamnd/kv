@@ -45,7 +45,7 @@ func (t *Tree) loadRun() (cells []record, pages []format.PageNo, err error) {
 			return nil, nil, fmt.Errorf("betree: leaf run cycles at page %d", pgno)
 		}
 		seen[pgno] = true
-		lf, derr := t.readLeaf(pgno)
+		lf, derr := t.viewLeaf(pgno)
 		if derr != nil {
 			return nil, nil, derr
 		}
@@ -84,7 +84,7 @@ func (t *Tree) collectBufferedMessages() ([]record, error) {
 		if typ == format.PageBTreeLeaf {
 			return nil
 		}
-		in, err := t.loadInterior(pgno)
+		in, err := t.viewInterior(pgno)
 		if err != nil {
 			return err
 		}
@@ -110,10 +110,71 @@ func (t *Tree) collectBufferedMessages() ([]record, error) {
 	return out, nil
 }
 
+// viewLeaf returns the decoded leaf at pgno for a read-only caller, reusing the
+// immutable decode cached on the frame when the page is resident and unchanged and
+// decoding only on a miss (spec 01 Finding 1: stop re-decoding a node already in the
+// buffer pool). It is the read path's counterpart to readLeaf: the returned *leaf is
+// shared and immutable, so a caller only reads its records and copies out, while the
+// write path keeps readLeaf, which decodes a private copy it is free to mutate. The
+// pager drops the cached view before any write-intent pin or frame rebind (Get with
+// Write intent calls clearDecoded), so a hit always describes the page's current bytes,
+// and the shared instance is exactly the immutable-content channel M2.3 needs to remove
+// the read latch: a reader pulls a published object, never raw frame bytes a writer is
+// mutating.
+func (t *Tree) viewLeaf(pgno format.PageNo) (*leaf, error) {
+	box, fr, err := t.pgr.ViewDecodedRef(pgno)
+	if err != nil {
+		return nil, err
+	}
+	if box != nil {
+		if l, ok := box.Value().(*leaf); ok {
+			return l, nil
+		}
+		// The cached node is not a leaf: a corrupt pointer led the walk to a page that is
+		// not the leaf it expected, the same type confusion decodeLeaf fails closed on.
+		return nil, ErrCorruptNode
+	}
+	l, derr := decodeLeaf(fr.Data()[:t.pgr.UsablePageSize()])
+	if derr == nil {
+		fr.SetDecoded(l)
+	}
+	t.pgr.Unpin(fr, false)
+	if derr != nil {
+		return nil, derr
+	}
+	return l, nil
+}
+
+// viewInterior is viewLeaf for an interior node: the read path's shared-immutable decode
+// of an interior page, cached on the frame and reused across reads, with the write path
+// keeping loadInterior for its private mutable copy. The returned *interior is read-only.
+func (t *Tree) viewInterior(pgno format.PageNo) (*interior, error) {
+	box, fr, err := t.pgr.ViewDecodedRef(pgno)
+	if err != nil {
+		return nil, err
+	}
+	if box != nil {
+		if in, ok := box.Value().(*interior); ok {
+			return in, nil
+		}
+		return nil, ErrCorruptNode
+	}
+	in, derr := decodeInterior(fr.Data()[:t.pgr.UsablePageSize()])
+	if derr == nil {
+		fr.SetDecoded(in)
+	}
+	t.pgr.Unpin(fr, false)
+	if derr != nil {
+		return nil, derr
+	}
+	return in, nil
+}
+
 // readLeaf pins a leaf page for reading, decodes it with the generation-2 leaf
 // codec over the usable area, and unpins. decodeLeaf copies every key and value, so
 // the returned leaf owns its bytes and stays valid after the unpin and after the
-// frame is later evicted or rebound.
+// frame is later evicted or rebound. The write path uses it for a private mutable
+// decode; the read path uses viewLeaf, which shares one immutable decode.
 func (t *Tree) readLeaf(pgno format.PageNo) (*leaf, error) {
 	fr, err := t.pgr.Get(pgno, pager.Read)
 	if err != nil {
