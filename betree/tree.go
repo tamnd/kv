@@ -24,11 +24,18 @@ import (
 	"github.com/tamnd/kv/pager"
 )
 
-// root reports the page that roots the tree, and setRoot records a new root in the
-// header. The header field is the single source of truth for the run, the same way
-// the shipped btree roots itself, so a reopen finds the tree without a side file.
-func (t *Tree) root() format.PageNo     { return t.pgr.Header().EngineRoot }
-func (t *Tree) setRoot(p format.PageNo) { t.pgr.Header().EngineRoot = p }
+// root reports the page that roots the tree, and setRoot records a new root. The pager
+// header's EngineRoot stays the durable source of truth so a reopen finds the tree
+// without a side file, the same way the shipped btree roots itself; setRoot writes it.
+// But a latch-free reader cannot read that header field while a writer's growRoot stores
+// into it without a data race, so setRoot also publishes the root into an atomic mirror
+// (Tree.rootPgno) that the read path loads. PageNo is an alias for uint32, so it crosses
+// the atomic word unchanged.
+func (t *Tree) root() format.PageNo { return format.PageNo(t.rootPgno.Load()) }
+func (t *Tree) setRoot(p format.PageNo) {
+	t.pgr.Header().EngineRoot = p
+	t.rootPgno.Store(uint32(p))
+}
 
 // emptyRoot materializes a fresh empty leaf and installs it as the root. Open calls
 // it on a fresh database so the tree always has a valid root leaf to descend to,
@@ -49,11 +56,20 @@ func (t *Tree) pageType(pgno format.PageNo) (format.PageType, error) {
 	if err != nil {
 		return 0, err
 	}
+	// Read the common header under fillGate so this raw byte read cannot race a writer's
+	// in-place rewrite of the same frame. pageType is on both paths: a writer calling it
+	// down its descent holds wmu and is the only mutator, but a latch-free reader reaching
+	// it through the snapshot gather has no such exclusion, so the gate is what keeps the
+	// header read clean against a concurrent writePage. The shared RLock lets every reader
+	// decode in parallel; only the writer's brief memcpy excludes them.
+	t.fillGate.RLock()
 	if len(fr.Data()) < format.CommonHeaderSize {
+		t.fillGate.RUnlock()
 		t.pgr.Unpin(fr, false)
 		return 0, ErrCorruptNode
 	}
 	typ := format.DecodeCommonHeader(fr.Data()).Type
+	t.fillGate.RUnlock()
 	t.pgr.Unpin(fr, false)
 	return typ, nil
 }
@@ -100,7 +116,20 @@ func (t *Tree) writePage(pgno format.PageNo, body []byte) error {
 	if err != nil {
 		return err
 	}
+	// The memcpy and the decoded-box clear run under fillGate.Lock, the exclusive side of
+	// the gate a cold reader takes shared for its decode-and-publish. Get already cleared
+	// the box when it took the write pin, which keeps a hot reader off stale bytes; the
+	// second clear here, after the new bytes land and under the same gate, closes the cold
+	// window where a reader could decode the old bytes and publish a box describing bytes
+	// this write just overwrote. With both the memcpy and the clear inside the gate, a cold
+	// reader serialized against this either decodes the new bytes or finds an empty box and
+	// cold-decodes them next; it never republishes a stale view. This narrow byte-level
+	// serialization is the one thing the optimistic gen protocol cannot launder on the
+	// pre-arena substrate; M6's off-heap arena removes it (doc 05 section 5).
+	t.fillGate.Lock()
 	copy(fr.Data(), body)
+	fr.ClearDecoded()
+	t.fillGate.Unlock()
 	t.pgr.Unpin(fr, true)
 	return nil
 }
@@ -116,7 +145,16 @@ func (t *Tree) storeLeafNew(lf *leaf) (format.PageNo, error) {
 	if err != nil {
 		return 0, err
 	}
+	// Same fillGate rule as writePage: every copy into a frame's bytes runs under the
+	// gate's write side so a latch-free reader's cold decode cannot race it. The page is
+	// freshly allocated and not yet linked into the tree, so no reader reaches it during
+	// this write, but holding to the one rule for every byte write is what lets the
+	// detector establish a happens-before for every write-versus-cold-read pair without a
+	// per-site reachability argument.
+	t.fillGate.Lock()
 	copy(fr.Data(), dst)
+	fr.ClearDecoded()
+	t.fillGate.Unlock()
 	t.pgr.Unpin(fr, true)
 	return pgno, nil
 }
@@ -132,7 +170,10 @@ func (t *Tree) storeInteriorNew(in *interior) (format.PageNo, error) {
 	if err != nil {
 		return 0, err
 	}
+	t.fillGate.Lock()
 	copy(fr.Data(), dst)
+	fr.ClearDecoded()
+	t.fillGate.Unlock()
 	t.pgr.Unpin(fr, true)
 	return pgno, nil
 }

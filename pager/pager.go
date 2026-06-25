@@ -124,6 +124,18 @@ func (f *Frame) clearDecoded() {
 	}
 }
 
+// ClearDecoded drops the cached decoded view for a write-intent caller that has just
+// finished rewriting the frame's bytes. Get(pgno, Write) already clears the view at the
+// start of the write, so a hot reader never reads a box that describes stale bytes. The
+// write-then-clear-again this exposes closes the symmetric window on the cold side: a
+// latch-free reader can decode the old bytes and call SetDecoded after the writer's
+// in-place memcpy, which would publish a view of bytes that no longer exist. A writer
+// that brackets its memcpy and this second clear under the same gate the cold reader
+// takes for its decode-and-publish leaves the box either nil (reader cold-decodes the
+// new bytes next) or holding a view of the new bytes, never a stale one. It is the
+// engine-visible counterpart of the internal clearDecoded the write-intent Get runs.
+func (f *Frame) ClearDecoded() { f.clearDecoded() }
+
 // Options configure a pager at open.
 type Options struct {
 	// PageSize is used only when creating a fresh database; an existing file's

@@ -65,6 +65,12 @@ const tailFlushBytes = 32 * 1024
 // rolls the tail over into the tree when the live bytes cross the budget. The caller
 // holds the write latch.
 func (t *Tree) tailPut(key, val []byte) error {
+	// The map edit runs under tailMu so a latch-free reader gathering the tail never reads
+	// the map while it is being written, which in Go is a hard panic, not a race the gen
+	// check could absorb after the fact. The caller holds wmu, so this is the only writer.
+	// The gate is released before any rollover: a rollover takes tailMu itself, and a Go
+	// RWMutex is not reentrant, so holding it across the call would self-deadlock.
+	t.tailMu.Lock()
 	if t.tail == nil {
 		t.tail = make(map[string]message)
 	}
@@ -94,7 +100,9 @@ func (t *Tree) tailPut(key, val []byte) error {
 		}
 		t.tailBytes += len(key) + len(val)
 	}
-	if t.tailBytes >= tailFlushBytes {
+	over := t.tailBytes >= tailFlushBytes
+	t.tailMu.Unlock()
+	if over {
 		return t.rollover()
 	}
 	return nil
@@ -108,24 +116,42 @@ func (t *Tree) tailPut(key, val []byte) error {
 // on a page, so the durable mark advances to the highest LSN the tail had seen. The
 // caller holds the write latch.
 func (t *Tree) rollover() error {
+	// Seal the tail under a read lock: snapshot the slots into a sorted run without yet
+	// emptying the map. The caller holds wmu, so no other writer competes; the read lock
+	// only fences a concurrent reader's tail gather.
+	t.tailMu.RLock()
 	if len(t.tail) == 0 {
+		t.tailMu.RUnlock()
 		return nil
 	}
 	sealed := make([]message, 0, len(t.tail))
 	for _, m := range t.tail {
 		sealed = append(sealed, m)
 	}
+	curLSN := t.curLSN
+	t.tailMu.RUnlock()
 	sort.Slice(sealed, func(i, j int) bool {
 		return format.CompareInternal(sealed[i].key, sealed[j].key) < 0
 	})
-	t.tail = make(map[string]message)
-	t.tailBytes = 0
+	// Push the sealed run into the tree BEFORE clearing the tail, not after. The two
+	// stores are not atomic to a latch-free reader, so the order decides what a reader
+	// caught in the window sees. Applying first leaves every message in both the tail and
+	// the tree across the window, which a reader folds idempotently because the tail slot
+	// and the tree record it became carry the identical internal key and value. Clearing
+	// first would open a window where a message lives in neither place and a reader would
+	// miss it. The gen seqlock makes the reader restart anyway, but the order keeps the
+	// invariant true even for the read that started before this rollover bumped gen.
 	if err := t.applyToTree(sealed); err != nil {
 		return err
 	}
-	// Everything the tail held is now on pages the checkpoint will fold, so the WAL up
-	// to the highest LSN the tail saw is redundant and the durable mark advances to it.
-	t.durableLSN = t.curLSN
+	// The run is on pages now, so empty the tail under the write lock and advance the
+	// durable mark: everything the tail held is on pages the checkpoint will fold, so the
+	// WAL up to the highest LSN the tail saw is redundant.
+	t.tailMu.Lock()
+	t.tail = make(map[string]message)
+	t.tailBytes = 0
+	t.durableLSN = curLSN
+	t.tailMu.Unlock()
 	return nil
 }
 
@@ -135,6 +161,11 @@ func (t *Tree) rollover() error {
 // interior buffers resolves identically whether a write is still in the tail or has
 // rolled into the tree. The caller holds at least the read latch.
 func (t *Tree) collectTailMessages() []record {
+	// Copy the slots out under the read lock so the map walk never overlaps a writer's map
+	// edit. The records are fresh copies, so they outlive the lock and the gen-validation
+	// the caller wraps this in decides whether the snapshot keeps them.
+	t.tailMu.RLock()
+	defer t.tailMu.RUnlock()
 	if len(t.tail) == 0 {
 		return nil
 	}
