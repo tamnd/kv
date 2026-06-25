@@ -214,7 +214,7 @@ func (t *Tree) readLeaf(pgno format.PageNo) (*leaf, error) {
 // epoch guard g is pinned for the span of each gather so a page a writer retires
 // mid-read is not freed under the reader; the betree frees no page yet, so today it
 // holds nothing alive, but the protocol is in place for the milestones that free.
-func (t *Tree) snapshot(snap engine.Snapshot, g *guard) ([]resolved, error) {
+func (t *Tree) snapshotRange(snap engine.Snapshot, g *guard, lower, upper []byte) ([]resolved, error) {
 	const maxOptimistic = 4
 	for attempt := 0; attempt < maxOptimistic; attempt++ {
 		g0 := t.gen.Load()
@@ -225,7 +225,7 @@ func (t *Tree) snapshot(snap engine.Snapshot, g *guard) ([]resolved, error) {
 			continue
 		}
 		g.pin()
-		view, err := t.gather(snap)
+		view, err := t.gatherRange(snap, lower, upper)
 		g.unpin()
 		if t.gen.Load() != g0 {
 			// A writer crossed this gather. Whatever it read may mix pre- and post-change
@@ -243,7 +243,7 @@ func (t *Tree) snapshot(snap engine.Snapshot, g *guard) ([]resolved, error) {
 	defer t.wmu.Unlock()
 	g.pin()
 	defer g.unpin()
-	return t.gather(snap)
+	return t.gatherRange(snap, lower, upper)
 }
 
 // gather builds the resolved view once, with no latch of its own: it reads the tree's
@@ -293,7 +293,49 @@ func (t *Tree) gather(snap engine.Snapshot) ([]resolved, error) {
 			})
 		}
 	}
+	return t.foldResolved(cells, snap, rangeDels), nil
+}
 
+// gatherRange is the bounded read of M3: it resolves only the user keys in the half-open
+// range [lower, upper) instead of the whole keyspace, so a point read folds one key's
+// version group and a short scan folds only the leaves its range overlaps, the readseq and
+// ycsb-scan lever from doc 04. A nil lower means unbounded below, a nil upper unbounded
+// above, so gatherRange(snap, nil, nil) is the full read.
+//
+// The fast bounded path is correct only where no range delete is in play, because a range
+// delete's coverage is not local to its marker: a marker below lower can cover keys inside
+// the range, and the bounded leaf walk would skip the leaf that marker sits in. So whenever
+// the tree may carry a range delete (the sticky hasRangeDel flag, set at Open and on any
+// range-begin write), gatherRange falls back to the full gather and clips its result to the
+// range. The workloads M3 targets issue no range deletes, so they take the bounded path; the
+// fallback keeps the conformance oracle, which does exercise range deletes, bit-for-bit
+// correct.
+func (t *Tree) gatherRange(snap engine.Snapshot, lower, upper []byte) ([]resolved, error) {
+	if t.hasRangeDel.Load() {
+		view, err := t.gather(snap)
+		if err != nil {
+			return nil, err
+		}
+		return clipRange(view, lower, upper), nil
+	}
+	cells, err := t.collectRange(lower, upper)
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(cells, func(i, j int) bool {
+		return format.CompareInternal(cells[i].key, cells[j].key) < 0
+	})
+	// No range delete is in play on this path, so the fold needs no interval set.
+	return t.foldResolved(cells, snap, nil), nil
+}
+
+// foldResolved turns a run of cells, already sorted by internal key, into the MVCC-resolved
+// (userKey, value) pairs visible at snap, with rangeDels applied. It is the shared fold
+// behind both the full gather and the bounded gatherRange: the same per-version-group fold
+// the shipped cores and the oracle use, so a divergence is always a real bug rather than a
+// resolution-policy difference. The output is ascending by user key, one pair per visible
+// key, which is the order the cursor and the point search expect.
+func (t *Tree) foldResolved(cells []record, snap engine.Snapshot, rangeDels []format.RangeDel) []resolved {
 	var out []resolved
 	tc := snap.TTLClock()
 	var i int
@@ -320,5 +362,166 @@ func (t *Tree) gather(snap engine.Snapshot) ([]resolved, error) {
 		}
 		out = append(out, resolved{uk: append([]byte(nil), uk...), val: append([]byte(nil), val...)})
 	}
-	return out, nil
+	return out
+}
+
+// clipRange drops the resolved pairs outside [lower, upper) from an already-ascending view.
+// It is the range-delete fallback's clip: the full gather resolves the whole keyspace, and
+// this trims it to the bounded reader's window so the caller sees the same shape it would
+// from the bounded path. A nil bound is unbounded on that side.
+func clipRange(view []resolved, lower, upper []byte) []resolved {
+	var out []resolved
+	for _, e := range view {
+		if lower != nil && bytes.Compare(e.uk, lower) < 0 {
+			continue
+		}
+		if upper != nil && bytes.Compare(e.uk, upper) >= 0 {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+// collectRange gathers every cell whose user key falls in [lower, upper) from the three
+// places a write may rest: the leaf run, the mutable tail, and the interior buffers. The
+// leaf walk is the bounded part that makes this cheap: it routes straight to the leaf that
+// would hold lower and follows right siblings only until a leaf's keys reach upper, so the
+// leaves entirely below or above the range are never touched. The run is globally sorted by
+// internal key, so once a record's user key reaches upper the walk is done. The tail and the
+// buffers are small and bounded by the rollover budget and the per-node page size, so they
+// are collected whole and filtered to the range rather than indexed. The caller holds the
+// epoch guard and the gen validation wraps the whole gather, so the three reads compose into
+// one consistent point in time. This path runs only when no range delete is in play, so a
+// missed marker below lower cannot change a result inside the range.
+func (t *Tree) collectRange(lower, upper []byte) ([]record, error) {
+	var start format.PageNo
+	var err error
+	if lower == nil {
+		start, err = t.leftmostLeaf()
+	} else {
+		// Route to the leaf holding lower's newest version. (lower, MaxVersion) is the
+		// smallest internal key for user key lower, so no record at or above lower sits in an
+		// earlier leaf, and the right-sibling walk from here covers the rest of the range.
+		start, err = t.leafForKey(format.EncodeInternalKey(lower, format.MaxVersion, format.KindSet))
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	var cells []record
+	seen := map[format.PageNo]bool{}
+	for pgno := start; pgno != format.NoPage; {
+		if seen[pgno] {
+			return nil, fmt.Errorf("betree: leaf run cycles at page %d", pgno)
+		}
+		seen[pgno] = true
+		lf, derr := t.viewLeaf(pgno)
+		if derr != nil {
+			return nil, derr
+		}
+		stop := false
+		for i := range lf.records {
+			uk := format.UserKey(lf.records[i].key)
+			if lower != nil && bytes.Compare(uk, lower) < 0 {
+				continue
+			}
+			if upper != nil && bytes.Compare(uk, upper) >= 0 {
+				// Sorted ascending by user key, so this leaf and every leaf to its right hold
+				// only keys at or above upper. The range is complete.
+				stop = true
+				break
+			}
+			cells = append(cells, lf.records[i])
+		}
+		if stop {
+			break
+		}
+		pgno = lf.right
+	}
+
+	for _, r := range t.collectTailMessages() {
+		if inHalfOpen(format.UserKey(r.key), lower, upper) {
+			cells = append(cells, r)
+		}
+	}
+	buffered, err := t.collectBufferedMessages()
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range buffered {
+		if inHalfOpen(format.UserKey(r.key), lower, upper) {
+			cells = append(cells, r)
+		}
+	}
+	return cells, nil
+}
+
+// inHalfOpen reports whether uk lies in [lower, upper), with a nil bound meaning unbounded
+// on that side.
+func inHalfOpen(uk, lower, upper []byte) bool {
+	if lower != nil && bytes.Compare(uk, lower) < 0 {
+		return false
+	}
+	if upper != nil && bytes.Compare(uk, upper) >= 0 {
+		return false
+	}
+	return true
+}
+
+// leafForKey descends from the root to the leaf whose key range covers the internal key ik,
+// routing at each interior the same way the write path's descent does but through the
+// read-path immutable views. It is the bounded gather's entry point: a scan starts its
+// right-sibling walk at the leaf this returns rather than at the head of the run. The cycle
+// guard turns a corrupt child pointer into an error rather than a hang.
+func (t *Tree) leafForKey(ik []byte) (format.PageNo, error) {
+	pgno := t.root()
+	seen := map[format.PageNo]bool{}
+	for {
+		if seen[pgno] {
+			return 0, fmt.Errorf("betree: interior spine cycles at page %d", pgno)
+		}
+		seen[pgno] = true
+		typ, err := t.pageType(pgno)
+		if err != nil {
+			return 0, err
+		}
+		if typ == format.PageBTreeLeaf {
+			return pgno, nil
+		}
+		in, err := t.viewInterior(pgno)
+		if err != nil {
+			return 0, err
+		}
+		pgno = in.route(ik)
+	}
+}
+
+// initRangeDelFlag sets the sticky hasRangeDel flag when the on-disk run or the interior
+// buffers already hold a range-begin marker, so a reopened database that carries a range
+// delete takes the correct full-gather path from its first read. It runs once at Open before
+// any concurrent use, so it needs no latch. Markers written after Open set the flag on the
+// write path (tail.go) instead, so the two together cover every range delete the tree holds.
+func (t *Tree) initRangeDelFlag() error {
+	cells, _, err := t.loadRun()
+	if err != nil {
+		return err
+	}
+	for _, c := range cells {
+		if format.KindOf(c.key) == format.KindRangeBegin {
+			t.hasRangeDel.Store(true)
+			return nil
+		}
+	}
+	buffered, err := t.collectBufferedMessages()
+	if err != nil {
+		return err
+	}
+	for _, c := range buffered {
+		if format.KindOf(c.key) == format.KindRangeBegin {
+			t.hasRangeDel.Store(true)
+			return nil
+		}
+	}
+	return nil
 }
