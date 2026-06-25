@@ -413,6 +413,18 @@ func (kdb *DB) View(fn func(txn *Txn) error) error {
 	return kdb.d.View(func(t *db.Txn) error { return fn(&Txn{t: t}) })
 }
 
+// Get returns an owned copy of the newest committed value of key, or ErrNotFound if
+// the key is absent or tombstoned. It reads at the latest committed snapshot through
+// the engine's point-read fast path, with no transaction to begin and discard and no
+// snapshot watermark to register, so it is the lightest way to read a single key and
+// the one to reach for when a read does not need to see a consistent snapshot across
+// several keys. For that, open a View or a Snapshot and read through it instead; a
+// sequence of Get calls can each observe a different commit.
+func (kdb *DB) Get(key []byte) ([]byte, error) {
+	v, err := kdb.d.Get(key)
+	return v, wrap(err)
+}
+
 // Update runs fn in a writable transaction, committing on a nil return and discarding
 // on an error. It retries fn against a fresh snapshot on a write-write or SSI conflict,
 // up to the configured bound, so fn must be re-runnable (spec 15 §2.1).
