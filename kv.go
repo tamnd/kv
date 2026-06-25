@@ -384,6 +384,19 @@ func Compact(path string, opts ...Option) error {
 	return wrap(db.Compact(vfs.NewOS(), path, c.opts))
 }
 
+// Migrate upgrades the generation-1 (v0.2.0) database at srcPath into a generation-2
+// Bε-tree database at dstPath, the one-way conversion off the old on-disk format the
+// 2059 redesign replaced the two-engine split with. It builds the new file beside the
+// destination, verifies it holds the source's live key space key-for-key, and only then
+// renames it into place, so the original is preserved until the rewrite is durable and
+// verified. Passing the same path for srcPath and dstPath upgrades a file in place. It is
+// offline: neither path may be open elsewhere while it runs, and it needs room on disk for
+// the rewritten copy. It refuses a source that is already generation 2, which has nothing
+// to upgrade. There is no downgrade; restore from a backup to go back.
+func Migrate(srcPath, dstPath string) error {
+	return wrap(db.Migrate(vfs.NewOS(), srcPath, dstPath))
+}
+
 // RestoreBackup reconstructs a database at path from a stream produced by DB.Backup, writing
 // the main file and its -wal sidecar so a subsequent Open reads the restored database (spec
 // 18 §2). It refuses to overwrite an existing file at either path: restore creates, it never
