@@ -143,12 +143,18 @@ func (t *Tree) snapshot(snap engine.Snapshot) ([]resolved, error) {
 	if err != nil {
 		return nil, err
 	}
-	// M1: a write may rest in an interior node's buffer instead of having reached its
-	// leaf, so the read must consult the buffers too. Resolution is by the commit
-	// version baked into the internal key, so a buffered message folds exactly like the
-	// leaf record it will become; gathering both into one run keeps the fold below
-	// bit-for-bit identical to M0's. The buffer walk is bounded by the same latch the
-	// leaf walk holds, so a writer cannot move a message between the two walks.
+	// M1: a write may rest in the mutable hot tail or in an interior node's buffer
+	// instead of having reached its leaf, so the read must consult both. Resolution is
+	// by the commit version baked into the internal key, so a tail slot and a buffered
+	// message each fold exactly like the leaf record they will become; gathering all
+	// three into one run keeps the fold below bit-for-bit identical to M0's. The tail
+	// gather and the buffer walk are bounded by the same latch the leaf walk holds, so a
+	// writer cannot move a message between the gathers and have it counted twice or zero
+	// times. The tail is newest, but order does not matter to the fold: it sorts by
+	// internal key and resolves by version, and an exact-internal-key write present in
+	// both the tail and the tree (a replay window) carries the identical value, so a
+	// duplicate folds idempotently.
+	cells = append(cells, t.collectTailMessages()...)
 	buffered, err := t.collectBufferedMessages()
 	if err != nil {
 		return nil, err

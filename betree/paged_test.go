@@ -67,6 +67,11 @@ func TestReopenAfterCheckpoint(t *testing.T) {
 	if err := tr.Apply(b, 7); err != nil {
 		t.Fatalf("apply: %v", err)
 	}
+	// Drain the hot tail onto pages: this test drives the pager directly with no logical
+	// WAL to replay, so a write left in the tail would be lost across the checkpoint.
+	if err := tr.Flush(); err != nil {
+		t.Fatalf("flush tail: %v", err)
+	}
 	if err := tr.pgr.Checkpoint(0, 0); err != nil {
 		t.Fatalf("checkpoint: %v", err)
 	}
@@ -118,6 +123,10 @@ func TestRangeDeleteReopen(t *testing.T) {
 	bd.DeleteRange([]byte("k03"), []byte("k07")) // covers k03..k06
 	if err := tr.Apply(bd, 10); err != nil {
 		t.Fatalf("apply range delete: %v", err)
+	}
+	// Drain the hot tail onto pages before the direct checkpoint (no logical WAL here).
+	if err := tr.Flush(); err != nil {
+		t.Fatalf("flush tail: %v", err)
 	}
 	if err := tr.pgr.Checkpoint(0, 0); err != nil {
 		t.Fatalf("checkpoint: %v", err)

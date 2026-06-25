@@ -1386,6 +1386,14 @@ func (d *DB) CheckpointMode(m CheckpointMode) error {
 	d.ckptMu.Lock()
 	defer d.ckptMu.Unlock()
 
+	// Roll an engine's in-memory tail onto pages before the fold captures its LSN, so
+	// the checkpoint folds those pages and a self-contained file (migration, close) does
+	// not strand a committed write in the heap. A no-op for cores that land every write
+	// on pages already.
+	if err := d.flushEngine(); err != nil {
+		return err
+	}
+
 	d.rl.Lock()
 	foldedLSN, lastCommitVersion, resetWAL := d.prepareCheckpointLocked()
 	d.rl.Unlock()
@@ -1539,6 +1547,22 @@ func (d *DB) noteLSN(lsn uint64) {
 	if n, ok := d.eng.(interface{ NoteLSN(uint64) }); ok {
 		n.NoteLSN(lsn)
 	}
+}
+
+// flushEngine drains an engine that holds committed writes in an in-memory region the
+// checkpoint's page fold would otherwise miss, so the fold that follows captures them.
+// The Bε-tree core's mutable hot tail is such a region: a write rests in the tail
+// until a rollover pushes it onto pages, and a checkpoint that must stand alone
+// without its WAL sidecar (migration, close) has to roll the tail first. An engine
+// that lands every applied write directly on pages (the B-tree core) does not
+// implement Flush and the call is a no-op; the LSM core deliberately lets its memtable
+// lag behind the WAL and does not implement it either, reaching durability through its
+// own DurableLSN mark instead.
+func (d *DB) flushEngine() error {
+	if f, ok := d.eng.(interface{ Flush() error }); ok {
+		return f.Flush()
+	}
+	return nil
 }
 
 // Vacuum runs one round of incremental vacuum (spec 09 §3.1): it folds the WAL with a

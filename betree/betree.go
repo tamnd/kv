@@ -56,6 +56,24 @@ type Tree struct {
 	// merge operand behave as a plain set. The library's merge registry and the
 	// conformance harness install it through SetMergeFunc.
 	merge func(existing, operand []byte) []byte
+
+	// tail is the mutable hot tail (tail.go): an in-memory ordered region keyed by
+	// internal key that absorbs writes before any becomes a tree message, overwriting a
+	// hot key's slot in place rather than appending a message. tailBytes tracks its live
+	// size against the rollover budget. Both are guarded by mu, the same write latch
+	// Apply and Flush take. A nil map is the empty tail; tailPut lazily allocates it.
+	tail      map[string]message
+	tailBytes int
+
+	// curLSN is the WAL commit LSN of the batch currently being applied, set by NoteLSN
+	// just before Apply; tailMinLSN is the low-water LSN of the current tail epoch (the
+	// LSN when the tail last went from empty to non-empty); durableLSN is the highest
+	// LSN whose effects have rolled over onto pages the checkpoint folds. The host reads
+	// durableLSN through DurableLSN to keep the WAL above the un-rolled tail, exactly as
+	// it does for the LSM memtable. All three are guarded by mu.
+	curLSN     uint64
+	tailMinLSN uint64
+	durableLSN uint64
 }
 
 // New returns a Bε-tree core bound to pgr. Call Open to materialize the root and
@@ -86,28 +104,77 @@ func (t *Tree) Open(env *engine.Env) error {
 }
 
 // Close implements engine.Engine. It does not flush; the host checkpoints first, and
+// once the tail is drained (Flush, run before the checkpoint that must stand alone)
 // the run already lives on the pager. There is nothing to release.
 func (t *Tree) Close() error { return nil }
 
-// Apply implements engine.Engine. It turns each batch entry into a Bε message and
-// pushes it into the highest owning node's buffer, where it rests until a flush
-// carries it down, instead of descending to its leaf per cell (M1, doc 02 sections 1
-// and 2). The batch is already durable in the WAL by the time Apply is called, so a
-// crash mid-Apply is harmless: recovery re-derives the identical Apply from the WAL,
-// and because the internal key carries the commit version each message overwrites the
-// identical cell rather than duplicating it, so the replay is idempotent in content.
-// Range-delete markers flow through as ordinary messages (kind range-begin, value =
-// the interval end) and reads rebuild the interval set from them, so there is no
-// separate marker bookkeeping. A buffered message and the leaf record it will become
-// fold to the same answer, so the read path resolves the buffered tree identically to
-// the unbuffered one it replaces (paged.go gathers buffers and leaf records into one
-// fold).
+// NoteLSN records the WAL commit LSN of the batch about to be applied. The host calls
+// it just before Apply on both the live commit and the redo path, the companion of
+// DurableLSN, exactly as it feeds the LSM core. It stamps the tail's view of "how far
+// the WAL has reached" so a rollover can advance the durable mark to the right point.
+// An engine with no logical-WAL host (the betree reopen tests drive the pager
+// directly) never sees a NoteLSN, leaving curLSN zero, and reaches durability through
+// Flush instead.
+func (t *Tree) NoteLSN(lsn uint64) {
+	t.mu.Lock()
+	t.curLSN = lsn
+	t.mu.Unlock()
+}
+
+// DurableLSN reports the highest WAL LSN whose effects have rolled over onto pages the
+// checkpoint folds, so the host never reclaims WAL that still backs an un-rolled tail
+// slot. It mirrors the LSM core's durable mark: when the tail is empty every applied
+// batch is on pages and the mark is the last rollover's LSN; when the tail holds
+// un-rolled writes the mark is held one below the tail epoch's low-water, since those
+// writes live only in the heap and the WAL until the next rollover. The host keeps the
+// WAL above this point and recovery replays it back through Apply, rebuilding the tail.
+func (t *Tree) DurableLSN() uint64 {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if len(t.tail) == 0 || t.tailMinLSN == 0 {
+		return t.durableLSN
+	}
+	if lim := t.tailMinLSN - 1; lim < t.durableLSN {
+		return lim
+	}
+	return t.durableLSN
+}
+
+// Flush drains the mutable hot tail into the tree, leaving every visible write on a
+// page the checkpoint can fold. The host calls it before a checkpoint that must stand
+// alone without its WAL sidecar (migration writes a self-contained file; the reopen
+// tests drive the pager directly with no logical WAL to replay), so the tail is never
+// the only home of a committed write across that boundary. It is a no-op on an empty
+// tail.
+func (t *Tree) Flush() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.rollover()
+}
+
+// Apply implements engine.Engine. Each batch entry lands first in the mutable hot
+// tail (tail.go), the in-memory region that absorbs writes before any becomes a tree
+// message: a hot key rewritten many times overwrites one slot rather than appending a
+// message per write, and the tail rolls over into the buffered tree in one batched
+// descent when it fills (M1.2, doc 02 section 3). Under the tail, a rollover pushes a
+// sealed run into the highest owning node's buffer, where messages rest until a flush
+// carries them down, instead of descending per cell (M1.1, doc 02 sections 1 and 2).
+// The batch is already durable in the WAL by the time Apply is called, so a crash
+// mid-Apply, or with a populated tail, is harmless: recovery replays the WAL through
+// Apply and rebuilds both the tail and the tree, and because the internal key carries
+// the commit version each message overwrites the identical cell rather than
+// duplicating it, so the replay is idempotent in content. Range-delete markers flow
+// through as ordinary messages (kind range-begin, value = the interval end) and reads
+// rebuild the interval set from them. A tail slot, a buffered message, and the leaf
+// record they become all fold to the same answer, so the read path resolves the tail
+// plus the buffered tree identically to the unbuffered one it replaces (paged.go
+// gathers the tail, the buffers, and the leaf records into one fold).
 func (t *Tree) Apply(batch *engine.WriteBatch, commitVersion uint64) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	for _, e := range batch.Entries() {
-		if err := t.insert(e.InternalKey, e.Value); err != nil {
+		if err := t.tailPut(e.InternalKey, e.Value); err != nil {
 			return err
 		}
 	}
