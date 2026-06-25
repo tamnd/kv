@@ -21,6 +21,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/tamnd/kv/betree"
 	"github.com/tamnd/kv/btree"
 	"github.com/tamnd/kv/crypto"
 	"github.com/tamnd/kv/engine"
@@ -674,6 +675,8 @@ func newEngine(kind format.EngineKind, pgr *pager.Pager) (engine.Engine, error) 
 		return btree.New(pgr), nil
 	case format.EngineLSM:
 		return lsm.New(pgr), nil
+	case format.EngineBeta:
+		return betree.New(pgr), nil
 	default:
 		return nil, fmt.Errorf("kv: unknown engine kind %d", kind)
 	}
