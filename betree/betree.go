@@ -6,20 +6,21 @@
 // start of milestone M0 from doc 08.
 //
 // What this file is, and is not, yet. M0 lands the new core as a correct, slow,
-// single-latched skeleton that implements the Engine SPI end to end and is verified
+// single-latched engine that implements the Engine SPI end to end and is verified
 // against the conformance oracle, so the later milestones have a known-correct base
-// to make fast without ever passing through an incorrect state. This skeleton keeps
-// its cells in one in-memory ordered store and resolves MVCC visibility with the
-// shared format fold, exactly as the model engine does, so it is correct by
-// construction against the same oracle the shipped cores answer to. It is not the
-// paged Bε node, the new on-disk format, or the migration path: those are the next
-// M0 PRs (doc 06), which replace the in-memory store under this same SPI. It is also
-// not buffered, not optimistically latched, and not off-heap: those are M1 through
-// M6. The point of landing it first is the alongside-then-flip plan from doc 08: the
-// new core sits behind the SPI next to the shipped cores, off the default path, and
-// the differential harness drives the shipped engine and this core through the same
-// operation stream so every divergence is caught against known-correct behavior
-// before any milestone makes the core fast.
+// to make fast without ever passing through an incorrect state. The cells now live
+// in a real chain of generation-2 leaf pages on the pager (paged.go and node.go);
+// reads decode the run and resolve MVCC visibility with the shared format fold,
+// exactly as the model engine does, so the core is correct by construction against
+// the same oracle the shipped cores answer to. It is not yet the interior-routed
+// logarithmic descent, the in-place leaf insert, or the migration path: those are
+// the next M0 slices (doc 06), which replace the whole-run rewrite under this same
+// SPI. It is also not buffered, not optimistically latched, and not off-heap: those
+// are M1 through M6. The point of landing the slow base first is the
+// alongside-then-flip plan from doc 08: the new core sits behind the SPI next to the
+// shipped cores, off the default path, and the differential harness drives the
+// shipped engine and this core through the same operation stream so every divergence
+// is caught against known-correct behavior before any milestone makes the core fast.
 //
 // The constraints the whole redesign builds under hold here: pure Go, zero
 // dependencies, CGO_ENABLED=0, GOWORK=off, no internal/ package directory.
@@ -36,37 +37,32 @@ import (
 	"github.com/tamnd/kv/pager"
 )
 
-// Tree is an opened Bε-tree core. In M0 it carries its cells in an in-memory
-// ordered store guarded by one RWMutex (the single-latched skeleton). The pager
-// handle is held but not yet used: M0's later PRs move the store onto paged Bε
-// nodes through it, and the SPI above does not change when they do.
+// Tree is an opened Bε-tree core. In M0 its cells live in a sorted run of
+// generation-2 leaf pages on the pager (paged.go), guarded by one RWMutex (the
+// single-latched base): writers take the write lock and rewrite the run, readers
+// take the read lock and decode it. The pager handle is the substrate the run is
+// built over, the same way the shipped btree builds over it.
 type Tree struct {
-	// pgr is the shared pager the later M0 PRs build the paged node layout over. The
-	// skeleton keeps it so New has the same shape db.newEngine calls for every core,
-	// and so the format/migration PRs do not have to rewire construction.
+	// pgr is the shared pager the leaf run lives on. New holds it so db.newEngine
+	// constructs this core the same way it constructs the others.
 	pgr *pager.Pager
 
+	// mu guards the run. Apply rewrites it under the write lock; reads decode it under
+	// the read lock. The single latch is the M0 base; M2 replaces it with optimistic
+	// lock coupling and epoch reclamation.
 	mu sync.RWMutex
-	// store maps string(internalKey) -> value. Keying by the full internal key
-	// (user_key || ^version || kind) makes every version of a user key sort together
-	// newest-first under format.CompareInternal, and makes re-applying the same
-	// committed batch (as recovery does) idempotent, since the key is identical.
-	store map[string][]byte
-	// rangeDels is the live set of range-delete intervals, extended on Apply and
-	// rebuilt at Open, so a read folds a range delete whose marker cell the read
-	// never visits (spec 11 §4), the same contract the shipped cores keep.
-	rangeDels []format.RangeDel
+
 	// merge folds an existing value and a merge operand into a new value. Nil makes a
 	// merge operand behave as a plain set. The library's merge registry and the
 	// conformance harness install it through SetMergeFunc.
 	merge func(existing, operand []byte) []byte
 }
 
-// New returns a Bε-tree core bound to pgr. Call Open to finish wiring it to the
-// shared substrate. The signature matches the other cores so db.newEngine
-// constructs it the same way.
+// New returns a Bε-tree core bound to pgr. Call Open to materialize the root and
+// finish wiring it to the shared substrate. The signature matches the other cores so
+// db.newEngine constructs it the same way.
 func New(pgr *pager.Pager) *Tree {
-	return &Tree{pgr: pgr, store: map[string][]byte{}}
+	return &Tree{pgr: pgr}
 }
 
 // Kind implements engine.Engine. It reports the new selector value so a file this
@@ -77,39 +73,53 @@ func (t *Tree) Kind() engine.Kind { return engine.Beta }
 // conformance harness and the library's merge registry call it.
 func (t *Tree) SetMergeFunc(f func(existing, operand []byte) []byte) { t.merge = f }
 
-// Open implements engine.Engine. The skeleton holds all of its state in memory, so
-// there is no root page to materialize; it records the merge resolver if the host
-// supplied one through the env and is otherwise ready. The paged M0 PRs grow this
-// into the real open path (materialize an empty root, read the header's engine-root
-// field) without changing the SPI.
+// Open implements engine.Engine. On a fresh database the engine root is the null
+// page, so Open materializes an empty root leaf and records it in the header; on an
+// existing database the root already names the run and reads load it lazily, so Open
+// has nothing to rebuild. It runs once at construction before any concurrent use, so
+// it does not take the latch.
 func (t *Tree) Open(env *engine.Env) error {
-	return nil
+	if t.pgr.Header().EngineRoot != format.NoPage {
+		return nil
+	}
+	return t.rewriteRun(nil, nil)
 }
 
-// Close implements engine.Engine. It does not flush; the host checkpoints first.
-// The in-memory skeleton has nothing to release.
+// Close implements engine.Engine. It does not flush; the host checkpoints first, and
+// the run already lives on the pager. There is nothing to release.
 func (t *Tree) Close() error { return nil }
 
-// Apply implements engine.Engine. It installs every entry's internal key into the
-// store and records any range-delete marker so reads can fold it. The batch is
-// already durable in the WAL by the time Apply is called, so a crash mid-Apply is
-// harmless: recovery re-derives the identical Apply from the WAL, and because the
-// internal key carries the commit version the re-apply is idempotent.
+// Apply implements engine.Engine. It merges the batch into the run by internal key
+// and rewrites the run. The batch is already durable in the WAL by the time Apply is
+// called, so a crash mid-Apply is harmless: recovery re-derives the identical Apply
+// from the WAL, and because the internal key carries the commit version the merge is
+// idempotent in content. Range-delete markers flow through as ordinary cells (kind
+// range-begin, value = the interval end) and reads rebuild the interval set from
+// them, so there is no separate marker bookkeeping. The whole-run rewrite is M0's
+// slow base; the incremental insert slice replaces it under this same method.
 func (t *Tree) Apply(batch *engine.WriteBatch, commitVersion uint64) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	for _, e := range batch.Entries() {
-		ik := string(e.InternalKey)
-		t.store[ik] = append([]byte(nil), e.Value...)
-		if format.KindOf(e.InternalKey) == format.KindRangeBegin {
-			t.rangeDels = append(t.rangeDels, format.RangeDel{
-				Lo:      append([]byte(nil), format.UserKey(e.InternalKey)...),
-				Hi:      append([]byte(nil), e.Value...),
-				Version: format.Version(e.InternalKey),
-			})
-		}
+
+	cells, oldPages, err := t.loadRun()
+	if err != nil {
+		return err
 	}
-	return nil
+	merged := make(map[string][]byte, len(cells)+len(batch.Entries()))
+	for _, c := range cells {
+		merged[string(c.key)] = c.val
+	}
+	for _, e := range batch.Entries() {
+		merged[string(e.InternalKey)] = append([]byte(nil), e.Value...)
+	}
+	next := make([]record, 0, len(merged))
+	for k, v := range merged {
+		next = append(next, record{key: []byte(k), val: v})
+	}
+	sort.Slice(next, func(i, j int) bool {
+		return format.CompareInternal(next[i].key, next[j].key) < 0
+	})
+	return t.rewriteRun(next, oldPages)
 }
 
 // Maintain implements engine.Engine. The skeleton has no background work; version
@@ -119,16 +129,20 @@ func (t *Tree) Maintain(ctx context.Context, budget engine.MaintBudget) (engine.
 	return engine.MaintReport{}, nil
 }
 
-// Stats implements engine.Engine with the in-memory footprint. The paged PRs
-// replace this with real space accounting.
+// Stats implements engine.Engine with the run's physical footprint: the number of
+// leaf pages times the page size. A run-walk error reports a zero footprint rather
+// than failing, since Stats has no error channel.
 func (t *Tree) Stats() engine.EngineStats {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	var bytesN int64
-	for k, v := range t.store {
-		bytesN += int64(len(k) + len(v))
+	_, pages, err := t.loadRun()
+	if err != nil {
+		return engine.EngineStats{}
 	}
-	return engine.EngineStats{PhysicalBytes: bytesN, Amplification: 1}
+	return engine.EngineStats{
+		PhysicalBytes: int64(len(pages)) * int64(t.pgr.PageSize()),
+		Amplification: 1,
+	}
 }
 
 // Reclaim implements engine.Engine. Nothing to reclaim in the in-memory skeleton.
@@ -149,54 +163,6 @@ type resolved struct {
 	val []byte
 }
 
-// snapshot returns the sorted, MVCC-resolved view at snap: for each user key, the
-// newest version <= snap.Version with tombstones removed, merges folded, and range
-// deletes applied. It uses the same format.Fold the shipped cores and the oracle
-// use, so a divergence is always a real bug, never a difference in resolution. The
-// skeleton resolves the whole store on every read, which is correct but slow; the
-// paged PRs replace this with a descent and a leaf walk.
-func (t *Tree) snapshot(snap engine.Snapshot) []resolved {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
-	iks := make([][]byte, 0, len(t.store))
-	for k := range t.store {
-		iks = append(iks, []byte(k))
-	}
-	sort.Slice(iks, func(i, j int) bool {
-		return format.CompareInternal(iks[i], iks[j]) < 0
-	})
-
-	var out []resolved
-	tc := snap.TTLClock()
-	var i int
-	for i < len(iks) {
-		uk := format.UserKey(iks[i])
-		// Gather this user key's version group (already newest-first under the sort),
-		// dropping range-delete markers, which resolve through rangeDels not as ops.
-		var ops []format.Op
-		j := i
-		for j < len(iks) && bytes.Equal(format.UserKey(iks[j]), uk) {
-			ik := iks[j]
-			j++
-			op, ok := format.OpFromCell(ik, t.store[string(ik)], tc.For(format.KindOf(ik)))
-			if !ok {
-				continue
-			}
-			ops = append(ops, op)
-		}
-		i = j
-
-		rd := format.NewestCoveringRangeDel(t.rangeDels, uk, snap.Version)
-		val, ok := format.Fold(ops, snap.Version, rd, t.merge)
-		if !ok {
-			continue
-		}
-		out = append(out, resolved{uk: append([]byte(nil), uk...), val: append([]byte(nil), val...)})
-	}
-	return out
-}
-
 // reader is a point/range read view at a fixed snapshot.
 type reader struct {
 	t    *Tree
@@ -204,7 +170,10 @@ type reader struct {
 }
 
 func (r *reader) Get(userKey []byte) ([]byte, error) {
-	view := r.t.snapshot(r.snap)
+	view, err := r.t.snapshot(r.snap)
+	if err != nil {
+		return nil, err
+	}
 	idx := sort.Search(len(view), func(i int) bool {
 		return bytes.Compare(view[i].uk, userKey) >= 0
 	})
@@ -215,7 +184,10 @@ func (r *reader) Get(userKey []byte) ([]byte, error) {
 }
 
 func (r *reader) NewIter(opts engine.IterOptions) (engine.Cursor, error) {
-	view := r.t.snapshot(r.snap)
+	view, err := r.t.snapshot(r.snap)
+	if err != nil {
+		return nil, err
+	}
 	lower, upper := opts.Lower, opts.Upper
 	if len(opts.Prefix) > 0 {
 		lower = opts.Prefix
