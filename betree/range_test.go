@@ -303,6 +303,103 @@ func TestCleanFoldSkip(t *testing.T) {
 	}
 }
 
+// TestBoundedBufferEqualsFullBuffer pins the interior-buffer band pruning (paged.go
+// collectBufferedRange) directly: for a spread of ranges, the messages the bounded walk
+// keeps must be exactly the messages the unpruned walk keeps once filtered to the same
+// range. It asserts the pruning math (descend only the child band overlapping [lower,
+// upper)) drops no in-range message, independent of the fold downstream. The workload uses
+// merges so the interior buffers actually carry messages at read time; the test fails loudly
+// if no buffer ever holds one, so it cannot silently degrade into a no-op.
+func TestBoundedBufferEqualsFullBuffer(t *testing.T) {
+	tr := newTreeSmall(t)
+	tr.SetMergeFunc(concatMerge)
+	rng := rand.New(rand.NewSource(7))
+	const nkeys = 5000
+	keyOf := func(i int) []byte { return []byte(fmt.Sprintf("key%06d", i)) }
+
+	// Resident interior buffers need writes that scatter across a wide, sparse keyspace: a
+	// message rests in a node's buffer until that child becomes the heaviest and the node
+	// overflows, so dense churn over a few hundred keys drains to leaves while a thin spread
+	// over thousands leaves messages parked in buffers all over the tree. This drives 200
+	// rounds of 40 random sets over 5000 keys at the small page, which leaves dozens of
+	// messages resident at read time (the guard below asserts the buffers are non-empty so a
+	// future change that drains them cannot turn this into a no-op).
+	ver := uint64(0)
+	for round := 0; round < 200; round++ {
+		ver++
+		b := engine.NewWriteBatch(ver)
+		used := map[int]bool{}
+		for n := 0; n < 40; n++ {
+			i := rng.Intn(nkeys)
+			if used[i] {
+				continue
+			}
+			used[i] = true
+			b.Set(keyOf(i), []byte(fmt.Sprintf("v%d", ver)))
+		}
+		tr.NoteLSN(ver)
+		if err := tr.Apply(b, ver); err != nil {
+			t.Fatalf("apply round %d: %v", round, err)
+		}
+	}
+
+	bag := func(rs []record) map[string]int {
+		m := map[string]int{}
+		for _, r := range rs {
+			m[string(r.key)+"\x00"+string(r.val)]++
+		}
+		return m
+	}
+	sameBag := func(a, b map[string]int) bool {
+		if len(a) != len(b) {
+			return false
+		}
+		for k, n := range a {
+			if b[k] != n {
+				return false
+			}
+		}
+		return true
+	}
+
+	fullBuf, err := tr.collectBufferedMessages()
+	if err != nil {
+		t.Fatalf("full buffer walk: %v", err)
+	}
+	if len(fullBuf) == 0 {
+		t.Fatal("no interior buffer messages present: test would not exercise the band pruning")
+	}
+
+	for trial := 0; trial < 60; trial++ {
+		a := rng.Intn(nkeys + 2)
+		b := rng.Intn(nkeys + 2)
+		if a > b {
+			a, b = b, a
+		}
+		var lower, upper []byte
+		if rng.Intn(4) != 0 {
+			lower = keyOf(a)
+		}
+		if rng.Intn(4) != 0 {
+			upper = keyOf(b)
+		}
+		gotBuf, err := tr.collectBufferedRange(lower, upper)
+		if err != nil {
+			t.Fatalf("bounded buffer walk [%q,%q): %v", lower, upper, err)
+		}
+		var wantBuf []record
+		for _, r := range fullBuf {
+			if inHalfOpen(format.UserKey(r.key), lower, upper) {
+				wantBuf = append(wantBuf, r)
+			}
+		}
+		if !sameBag(bag(gotBuf), bag(wantBuf)) {
+			t.Fatalf("bounded buffer [%q,%q): got %d msgs, want %d (full filtered)",
+				lower, upper, len(gotBuf), len(wantBuf))
+		}
+	}
+}
+
 // TestReverseIsForwardReversed checks the reverse iterator returns the bounded view in
 // descending order: the bound is by user key and the reverse flag only flips the walk, so a
 // reverse read must equal the forward bounded read reversed.
