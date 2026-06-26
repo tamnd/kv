@@ -38,6 +38,11 @@ var (
 	// decode path fails closed with this rather than reading past the slice, which
 	// is the property the migration-reader fuzz (M0) depends on.
 	ErrCorruptNode = errors.New("betree: corrupt node")
+	// errShardDirShape means a shard directory was handed to the encoder with a kind and split set
+	// that cannot be a valid directory: a hash directory carrying splits, or a range directory whose
+	// split count is not one less than its root count. It is a caller programming error rather than a
+	// page overflow, so it is distinct from ErrPageFull, which a caller would respond to with a split.
+	errShardDirShape = errors.New("betree: inconsistent shard directory shape")
 )
 
 // defaultBucketSize is the front-coding restart interval: a leaf bucket holds this

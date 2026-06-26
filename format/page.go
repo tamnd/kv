@@ -6,16 +6,17 @@ import "encoding/binary"
 type PageType byte
 
 const (
-	PageFree          PageType = 0x00 // on the freelist; contents undefined
-	PageHeaderMeta    PageType = 0x01 // page 1: header + engine root region
-	PageBTreeInterior PageType = 0x02 // B-tree interior node
-	PageBTreeLeaf     PageType = 0x03 // B-tree leaf node
-	PageOverflow      PageType = 0x04 // a link in an overflow chain
-	PageLSMBlock      PageType = 0x05 // an LSM segment data/index/filter block
-	PageLSMManifest   PageType = 0x06 // a page of the embedded MANIFEST
-	PageVLog          PageType = 0x07 // a value-log page (WiscKey)
-	PageFreelistTrunk PageType = 0x08 // a freelist trunk page
-	PagePointerMap    PageType = 0x09 // reverse child->parent pointers for vacuum
+	PageFree           PageType = 0x00 // on the freelist; contents undefined
+	PageHeaderMeta     PageType = 0x01 // page 1: header + engine root region
+	PageBTreeInterior  PageType = 0x02 // B-tree interior node
+	PageBTreeLeaf      PageType = 0x03 // B-tree leaf node
+	PageOverflow       PageType = 0x04 // a link in an overflow chain
+	PageLSMBlock       PageType = 0x05 // an LSM segment data/index/filter block
+	PageLSMManifest    PageType = 0x06 // a page of the embedded MANIFEST
+	PageVLog           PageType = 0x07 // a value-log page (WiscKey)
+	PageFreelistTrunk  PageType = 0x08 // a freelist trunk page
+	PagePointerMap     PageType = 0x09 // reverse child->parent pointers for vacuum
+	PageBetreeShardDir PageType = 0x0a // betree shard directory: per-shard sub-tree roots
 )
 
 // String renders a PageType for diagnostics.
@@ -41,6 +42,8 @@ func (t PageType) String() string {
 		return "freelist-trunk"
 	case PagePointerMap:
 		return "pointer-map"
+	case PageBetreeShardDir:
+		return "betree-shard-dir"
 	default:
 		return "reserved"
 	}
