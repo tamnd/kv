@@ -161,6 +161,10 @@ func (t *Tree) rollover() error {
 	t.tailBytes = 0
 	t.durableLSN = curLSN
 	t.tailMu.Unlock()
+	// The run just changed shape, so refresh the resident learned point index over it on its
+	// amortized schedule (learned.go). This runs under wmu inside the gen-odd write window, so
+	// readers either restart or pick up the freshly published model, never a half-built one.
+	t.maybeRebuildLocator()
 	return nil
 }
 

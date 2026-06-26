@@ -455,10 +455,11 @@ func (t *Tree) collectRange(lower, upper []byte) ([]record, error) {
 	if lower == nil {
 		start, err = t.leftmostLeaf()
 	} else {
-		// Route to the leaf holding lower's newest version. (lower, MaxVersion) is the
-		// smallest internal key for user key lower, so no record at or above lower sits in an
-		// earlier leaf, and the right-sibling walk from here covers the rest of the range.
-		start, err = t.leafForKey(format.EncodeInternalKey(lower, format.MaxVersion, format.KindSet))
+		// Route to the leaf holding lower's newest version, using the resident learned index to
+		// skip the interior descent when it can. (lower, MaxVersion) is the smallest internal
+		// key for user key lower, so no record at or above lower sits in an earlier leaf, and
+		// the right-sibling walk from here covers the rest of the range.
+		start, err = t.startLeafFor(lower)
 	}
 	if err != nil {
 		return nil, err
@@ -500,16 +501,88 @@ func (t *Tree) collectRange(lower, upper []byte) ([]record, error) {
 			cells = append(cells, r)
 		}
 	}
-	buffered, err := t.collectBufferedMessages()
+	buffered, err := t.collectBufferedRange(lower, upper)
 	if err != nil {
 		return nil, err
 	}
-	for _, r := range buffered {
-		if inHalfOpen(format.UserKey(r.key), lower, upper) {
-			cells = append(cells, r)
-		}
-	}
+	cells = append(cells, buffered...)
 	return cells, nil
+}
+
+// collectBufferedRange is the bounded twin of collectBufferedMessages: it walks the interior
+// tree but descends only into the children whose key span overlaps [lower, upper), so a short
+// scan never decodes the buffers of the subtrees its range cannot touch. At each interior node
+// it keeps the messages resting in that node's own buffer that fall in the range, then recurses
+// into the contiguous band of child slots from the one that owns lower to the one that owns
+// upper. A buffered message bound for a key in the range rests either in a node on that band
+// (its key routes it there) or higher up where this collects it directly, so pruning the
+// off-range subtrees drops no message the range needs. A nil lower or upper is unbounded on
+// that side, matching the leaf walk. The cycle guard turns a corrupt child pointer into an
+// error rather than a hang.
+func (t *Tree) collectBufferedRange(lower, upper []byte) ([]record, error) {
+	var lik, uik []byte
+	if lower != nil {
+		// (lower, MaxVersion) is the smallest internal key for user key lower, so the child that
+		// owns it is the leftmost child that can hold any record at or above lower.
+		lik = format.EncodeInternalKey(lower, format.MaxVersion, format.KindSet)
+	}
+	if upper != nil {
+		uik = format.EncodeInternalKey(upper, format.MaxVersion, format.KindSet)
+	}
+	var out []record
+	seen := map[format.PageNo]bool{}
+	var visit func(pgno format.PageNo) error
+	visit = func(pgno format.PageNo) error {
+		if pgno == format.NoPage {
+			return nil
+		}
+		if seen[pgno] {
+			return fmt.Errorf("betree: interior buffer walk cycles at page %d", pgno)
+		}
+		seen[pgno] = true
+		typ, err := t.pageType(pgno)
+		if err != nil {
+			return err
+		}
+		if typ == format.PageBTreeLeaf {
+			return nil
+		}
+		in, err := t.viewInterior(pgno)
+		if err != nil {
+			return err
+		}
+		for _, m := range in.buffer {
+			if inHalfOpen(format.UserKey(m.key), lower, upper) {
+				out = append(out, record{
+					key: append([]byte(nil), m.key...),
+					val: append([]byte(nil), m.val...),
+				})
+			}
+		}
+		// Descend only the contiguous child band whose spans overlap the range: from the child
+		// owning lower (slot 0 when lower is unbounded) to the child owning upper (the last slot
+		// when upper is unbounded). childIndex(uik) still owns keys below upper, since upper is
+		// exclusive and the child to its right starts at an internal key whose user key is upper,
+		// so the band includes it. Slots left of the lower slot hold only keys below the range.
+		loSlot := 0
+		if lik != nil {
+			loSlot = in.childIndex(lik)
+		}
+		hiSlot := len(in.pivots)
+		if uik != nil {
+			hiSlot = in.childIndex(uik)
+		}
+		for s := loSlot; s <= hiSlot; s++ {
+			if err := visit(in.childPage(s)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := visit(t.root()); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // inHalfOpen reports whether uk lies in [lower, upper), with a nil bound meaning unbounded
@@ -522,6 +595,38 @@ func inHalfOpen(uk, lower, upper []byte) bool {
 		return false
 	}
 	return true
+}
+
+// startLeafFor returns the leaf to begin the bounded right-sibling walk at for user key lower,
+// using the resident learned locator (learned.go) to skip the interior descent when it can and
+// falling back to the leafForKey descent otherwise. The locator predicts a leaf whose smallest
+// key is at or before lower; a right-sibling walk from any such live leaf is correct, because
+// the run only grows (a split keeps the left piece's page and smallest key and chains right, no
+// leaf is freed or merged), so the walk filters keys below lower and stops past upper and a
+// too-far-left start only adds a few leaf decodes. The prediction is verified against the live
+// leaf before it is trusted: if the predicted page is no longer a leaf, or its smallest key is
+// not at or before lower, the read takes leafForKey, the proven descent. So the model can never
+// make a read wrong, only faster, and a miss is descent speed. The verifying viewLeaf decodes
+// the same leaf the walk decodes next, which is a cached-box hit, so the check is not an extra
+// page fetch.
+func (t *Tree) startLeafFor(lower []byte) (format.PageNo, error) {
+	// (lower, MaxVersion) is the smallest internal key for user key lower, so it sorts at or
+	// before every version of lower and before any larger user key. The locator and the verify
+	// both compare against this internal key, not the bare user key, because a user key whose
+	// versions straddle a leaf boundary must start at the leaf holding its newest version (the
+	// one the descent reaches), and a user-key comparison would accept the next leaf and walk
+	// past that newest version.
+	lik := format.EncodeInternalKey(lower, format.MaxVersion, format.KindSet)
+	if loc := t.locator.Load(); loc != nil {
+		if pg := loc.locate(lik); pg != format.NoPage {
+			lf, err := t.viewLeaf(pg)
+			if err == nil && len(lf.records) > 0 &&
+				format.CompareInternal(lf.records[0].key, lik) <= 0 {
+				return pg, nil
+			}
+		}
+	}
+	return t.leafForKey(lik)
 }
 
 // leafForKey descends from the root to the leaf whose key range covers the internal key ik,
