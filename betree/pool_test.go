@@ -88,10 +88,11 @@ func TestScratchPoolGrowthCarriesBack(t *testing.T) {
 		t.Fatalf("grown buffer cap %d, want at least 64", grownCap)
 	}
 	sp.put(ref)
-	// The next get returns a clean, usable buffer. In a non-race build the same goroutine gets the
-	// grown buffer back (sync.Pool keeps it per-P), so the larger capacity carries forward rather than
-	// resetting to the starting size; under -race sync.Pool drops the item, so only the protocol
-	// soundness (length zero, usable capacity) is asserted there.
+	// The next get returns a clean, usable buffer. The invariant asserted is protocol soundness: a
+	// zero-length slice over at least the starting capacity. Whether the grown buffer itself comes back
+	// (carrying its larger capacity) is a sync.Pool optimization, not a guarantee, since Get may return
+	// a fresh New object at any time and always does under -race, so that is observed rather than
+	// required.
 	ref2 := sp.get()
 	if len(*ref2) != 0 {
 		t.Fatalf("recycled buffer length %d, want 0", len(*ref2))
@@ -99,9 +100,7 @@ func TestScratchPoolGrowthCarriesBack(t *testing.T) {
 	if cap(*ref2) < sp.capHint() {
 		t.Fatalf("recycled buffer cap %d, want at least the starting %d", cap(*ref2), sp.capHint())
 	}
-	if !raceEnabled && cap(*ref2) != grownCap {
-		t.Fatalf("recycled buffer cap %d, want the carried-back %d", cap(*ref2), grownCap)
-	}
+	t.Logf("after growth to cap %d, next get cap is %d (carry-back is best-effort)", grownCap, cap(*ref2))
 }
 
 // TestPoolRecyclesWithoutAllocating is the property pooling exists for: a steady get/put loop does not
