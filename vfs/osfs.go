@@ -105,16 +105,23 @@ func (o *osFile) ReadAt(p []byte, off int64) (int, error)  { return o.f.ReadAt(p
 func (o *osFile) WriteAt(p []byte, off int64) (int, error) { return o.f.WriteAt(p, off) }
 
 func (o *osFile) Sync(mode SyncMode) error {
-	if mode == SyncBarrier {
+	switch mode {
+	case SyncBarrier:
 		// The cheaper ordering barrier: durable on crash, not guaranteed on power
 		// loss. Platform-specific (F_BARRIERFSYNC on macOS, fdatasync on Linux).
 		return barrierSync(o.f)
+	case SyncData:
+		// The data-durability level the WAL's normal flush asks for: fdatasync on
+		// Linux, which skips the inode-metadata write a full fsync forces, and
+		// F_FULLFSYNC on macOS, which has no cheaper power-safe primitive. Durable
+		// across power loss; the file's unrelated metadata such as mtime may lag.
+		return dataSync(o.f)
+	default: // SyncFull
+		// Data and metadata both durable: fsync on Linux, F_FULLFSYNC on macOS, via
+		// os.File.Sync. Used when the file's own size must be durable, e.g. after
+		// growth at checkpoint.
+		return o.f.Sync()
 	}
-	// SyncData and SyncFull both go through os.File.Sync, which issues F_FULLFSYNC on
-	// macOS: the bytes reach stable media and survive power loss. That full flush is
-	// correct for the FULL durability level; the cheaper barrier is reached only via
-	// SyncBarrier above.
-	return o.f.Sync()
 }
 
 func (o *osFile) Truncate(size int64) error { return o.f.Truncate(size) }
