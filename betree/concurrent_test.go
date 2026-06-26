@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -425,6 +426,103 @@ func TestConcurrentReadersEndState(t *testing.T) {
 		}
 		if string(got) != string(want) {
 			t.Fatalf("final k%03d = %q, want %q", i, got, want)
+		}
+	}
+}
+
+// TestCursorSlicesAliasStableUnderOverwrite is the regression gate for the clean-path
+// fold that aliases a cell's decoded bytes into the resolved pair instead of copying them
+// a second time (paged.go foldCleanResolved). The contract that change relies on is that
+// the bytes a cursor hands back stay the snapshot's bytes for as long as the caller holds
+// them, even after a writer overwrites those exact keys and flushes, which drops the
+// decoded boxes the cursor's slices point into. It holds because a decoded box is an
+// immutable private heap copy the leaf decode made, never a slice into a buffer-pool frame
+// a writer rewrites, so the garbage collector keeps the backing array alive precisely
+// because the retained slice references it, and the writer's new versions decode into
+// fresh boxes that never touch the old bytes.
+//
+// The test makes that property load-bearing: it walks a frozen version-1 cursor and
+// retains every Key and Value slice without copying, then runs a heavy overwrite-and-flush
+// churn at higher versions and forces a GC, and finally asserts the retained slices still
+// equal the version-1 base. If the fold had handed back frame-resident bytes, the churn's
+// page rewrites and the flush's box drops plus the GC would have changed or freed the bytes
+// under the retained slices and the final compare would diverge.
+func TestCursorSlicesAliasStableUnderOverwrite(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping aliasing stress in -short")
+	}
+	tr := newTreeBig(t)
+
+	const nkeys = 48
+	keyOf := func(i int) []byte { return []byte(fmt.Sprintf("k%05d", i)) }
+	// Padded so the keyspace spans several leaves and the overwrite churn splits and
+	// rewrites the pages the retained slices were decoded from.
+	baseVal := func(i int) []byte { return []byte(fmt.Sprintf("base-%05d-%0300d", i, i)) }
+
+	b0 := engine.NewWriteBatch(1)
+	for i := 0; i < nkeys; i++ {
+		b0.Set(keyOf(i), baseVal(i))
+	}
+	if err := tr.Apply(b0, b0.Version()); err != nil {
+		t.Fatalf("seed apply: %v", err)
+	}
+
+	// Walk the frozen snapshot and retain the cursor's own slices, no copy. These are the
+	// slices whose backing bytes the churn below must not be able to disturb.
+	rd, err := tr.NewReader(engine.Snapshot{Version: 1})
+	if err != nil {
+		t.Fatalf("reader: %v", err)
+	}
+	type kv struct{ k, v []byte }
+	var held []kv
+	it, err := rd.NewIter(engine.IterOptions{})
+	if err != nil {
+		t.Fatalf("iter: %v", err)
+	}
+	for ok := it.First(); ok; ok = it.Next() {
+		lv, err := it.Value()
+		if err != nil {
+			t.Fatalf("iter value: %v", err)
+		}
+		val, err := lv.Value()
+		if err != nil {
+			t.Fatalf("iter lazy value: %v", err)
+		}
+		held = append(held, kv{k: it.Key(), v: val})
+	}
+	it.Close()
+	rd.Close()
+	if len(held) != nkeys {
+		t.Fatalf("retained %d slices, want %d", len(held), nkeys)
+	}
+
+	// Churn: overwrite every key at rising versions with padded values and flush each
+	// batch, so the leaves the retained slices were decoded from split, get rewritten, and
+	// have their decoded boxes dropped many times over.
+	ver := uint64(1)
+	for b := 0; b < 200; b++ {
+		ver++
+		wb := engine.NewWriteBatch(ver)
+		for i := 0; i < nkeys; i++ {
+			wb.Set(keyOf(i), []byte(fmt.Sprintf("v%d-%05d-%0300d", ver, i, i)))
+		}
+		if err := tr.Apply(wb, wb.Version()); err != nil {
+			t.Fatalf("churn apply v%d: %v", ver, err)
+		}
+		if err := tr.Flush(); err != nil {
+			t.Fatalf("churn flush v%d: %v", ver, err)
+		}
+	}
+	// Force a collection so any bytes not kept alive by the retained slices themselves are
+	// reclaimed; a correct alias survives because the slice is the live reference.
+	runtime.GC()
+
+	for i := 0; i < nkeys; i++ {
+		if string(held[i].k) != string(keyOf(i)) {
+			t.Fatalf("retained key %d = %q, want %q", i, held[i].k, keyOf(i))
+		}
+		if string(held[i].v) != string(baseVal(i)) {
+			t.Fatalf("retained val %d = %q, want base", i, held[i].v)
 		}
 	}
 }
