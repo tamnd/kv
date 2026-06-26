@@ -31,26 +31,71 @@ import (
 	"context"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	"github.com/tamnd/kv/engine"
 	"github.com/tamnd/kv/format"
 	"github.com/tamnd/kv/pager"
 )
 
-// Tree is an opened Bε-tree core. In M0 its cells live in a sorted run of
-// generation-2 leaf pages on the pager (paged.go), guarded by one RWMutex (the
-// single-latched base): writers take the write lock and rewrite the run, readers
-// take the read lock and decode it. The pager handle is the substrate the run is
-// built over, the same way the shipped btree builds over it.
+// Tree is an opened Bε-tree core. Its cells live in a Bε-tree of generation-2 pages on
+// the pager (paged.go, tree.go) fronted by a mutable hot tail (tail.go). M2.3 takes the
+// single RWMutex the M0 skeleton wrapped around every access off the read path and
+// replaces it with an optimistic protocol (doc 05 section 1): a writer serializes on
+// wmu and bumps the gen seqlock around its change, and a reader gathers its view with no
+// whole-operation latch, validating gen before and after to restart if a writer crossed
+// it. Two narrow locks remain for the byte-level and map-level races the optimistic
+// protocol cannot launder on this pre-arena substrate, both documented below.
 type Tree struct {
-	// pgr is the shared pager the leaf run lives on. New holds it so db.newEngine
-	// constructs this core the same way it constructs the others.
+	// pgr is the shared pager the run lives on. New holds it so db.newEngine constructs
+	// this core the same way it constructs the others.
 	pgr *pager.Pager
 
-	// mu guards the run. Apply rewrites it under the write lock; reads decode it under
-	// the read lock. The single latch is the M0 base; M2 replaces it with optimistic
-	// lock coupling and epoch reclamation.
-	mu sync.RWMutex
+	// wmu serializes writers. Apply and Flush, and every structural mutation a rollover
+	// drives under them, run holding it, so at most one writer touches the tree or the
+	// tail at a time, matching the single-writer contract the DB's commit path already
+	// holds above the engine. It is the writer half of what the M0 RWMutex did; the
+	// reader half is gone, replaced by the optimistic read protocol.
+	wmu sync.Mutex
+
+	// tailMu guards the mutable tail map and the LSN fields against the readers that
+	// gather the tail. A writer holds it only across the brief map edits, never across
+	// the tree descent a rollover runs, so the only thing a writer's tail edit can block
+	// is a reader copying the tail, which is bounded by the 32KiB tail budget. The map
+	// needs real exclusion and not just the seqlock because a Go map read concurrent with
+	// a map write is a hard panic, not a race a later gen check could absorb.
+	tailMu sync.RWMutex
+
+	// fillGate serializes a reader's cold decode of a page's bytes against a writer's
+	// in-place rewrite of the same bytes. A hot read takes its content from the pager's
+	// immutable decoded box and touches no page bytes, so it never takes this gate; only
+	// a decode miss does, on the read side, while writePage takes the write side. This is
+	// the one byte-level race the optimistic protocol cannot launder, because the bytes
+	// really are mutated under a cold reader; removing even this narrow gate waits for
+	// M6's off-heap arena (doc 05 section 5), where node content lives in stable memory a
+	// reader reaches through an atomic-guarded index the race detector accepts.
+	fillGate sync.RWMutex
+
+	// gen is the read seqlock. A writer holding wmu bumps it to odd before its change and
+	// back to even after, so a reader that reads the same even value before and after its
+	// whole gather knows no writer crossed the read and its combined tail-plus-tree view
+	// is consistent. For the current whole-tree read this tree-level generation is
+	// equivalent to per-node optimistic validation, since the read touches every node
+	// anyway; M3 adopts the per-node version words (olc.go) when the read becomes a
+	// selective descent where lock coupling is what validates the path.
+	gen atomic.Uint64
+
+	// rootPgno mirrors the pager header's EngineRoot in an atomic so a lock-free reader
+	// reads the root page number without racing a writer's growRoot store into the header
+	// field. The header stays the durable source of truth; setRoot writes both, and the
+	// read path reads this mirror.
+	rootPgno atomic.Uint32
+
+	// recl is the epoch reclaimer (epoch.go). A reader pins a guard for the span of its
+	// gather so a page retired mid-read is not freed under it. The betree frees no page in
+	// a structural change today, so it holds nothing alive in practice; it is wired on the
+	// read path now so the protocol is exercised and ready for the milestones that free.
+	recl *reclaimer
 
 	// merge folds an existing value and a merge operand into a new value. Nil makes a
 	// merge operand behave as a plain set. The library's merge registry and the
@@ -60,8 +105,8 @@ type Tree struct {
 	// tail is the mutable hot tail (tail.go): an in-memory ordered region keyed by
 	// internal key that absorbs writes before any becomes a tree message, overwriting a
 	// hot key's slot in place rather than appending a message. tailBytes tracks its live
-	// size against the rollover budget. Both are guarded by mu, the same write latch
-	// Apply and Flush take. A nil map is the empty tail; tailPut lazily allocates it.
+	// size against the rollover budget. Both are guarded by tailMu. A nil map is the
+	// empty tail; tailPut lazily allocates it.
 	tail      map[string]message
 	tailBytes int
 
@@ -70,7 +115,7 @@ type Tree struct {
 	// LSN when the tail last went from empty to non-empty); durableLSN is the highest
 	// LSN whose effects have rolled over onto pages the checkpoint folds. The host reads
 	// durableLSN through DurableLSN to keep the WAL above the un-rolled tail, exactly as
-	// it does for the LSM memtable. All three are guarded by mu.
+	// it does for the LSM memtable. All three are guarded by tailMu.
 	curLSN     uint64
 	tailMinLSN uint64
 	durableLSN uint64
@@ -80,7 +125,7 @@ type Tree struct {
 // finish wiring it to the shared substrate. The signature matches the other cores so
 // db.newEngine constructs it the same way.
 func New(pgr *pager.Pager) *Tree {
-	return &Tree{pgr: pgr}
+	return &Tree{pgr: pgr, recl: newReclaimer()}
 }
 
 // Kind implements engine.Engine. It reports the new selector value so a file this
@@ -98,6 +143,9 @@ func (t *Tree) SetMergeFunc(f func(existing, operand []byte) []byte) { t.merge =
 // it does not take the latch.
 func (t *Tree) Open(env *engine.Env) error {
 	if t.pgr.Header().EngineRoot != format.NoPage {
+		// Seed the lock-free root mirror from the durable header so reads find the run
+		// without touching the header field a writer may later store into.
+		t.rootPgno.Store(t.pgr.Header().EngineRoot)
 		return nil
 	}
 	return t.emptyRoot()
@@ -116,9 +164,9 @@ func (t *Tree) Close() error { return nil }
 // directly) never sees a NoteLSN, leaving curLSN zero, and reaches durability through
 // Flush instead.
 func (t *Tree) NoteLSN(lsn uint64) {
-	t.mu.Lock()
+	t.tailMu.Lock()
 	t.curLSN = lsn
-	t.mu.Unlock()
+	t.tailMu.Unlock()
 }
 
 // DurableLSN reports the highest WAL LSN whose effects have rolled over onto pages the
@@ -129,8 +177,8 @@ func (t *Tree) NoteLSN(lsn uint64) {
 // writes live only in the heap and the WAL until the next rollover. The host keeps the
 // WAL above this point and recovery replays it back through Apply, rebuilding the tail.
 func (t *Tree) DurableLSN() uint64 {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
+	t.tailMu.RLock()
+	defer t.tailMu.RUnlock()
 	if len(t.tail) == 0 || t.tailMinLSN == 0 {
 		return t.durableLSN
 	}
@@ -147,10 +195,21 @@ func (t *Tree) DurableLSN() uint64 {
 // the only home of a committed write across that boundary. It is a no-op on an empty
 // tail.
 func (t *Tree) Flush() error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	t.wmu.Lock()
+	defer t.wmu.Unlock()
+	t.beginWrite()
+	defer t.endWrite()
 	return t.rollover()
 }
+
+// beginWrite and endWrite bracket a writer's change in the gen seqlock: beginWrite steps
+// gen from even to odd to mark a write in flight, endWrite steps it back to even. Both
+// run under wmu, so writers never overlap and gen walks even to odd to even cleanly. A
+// reader that sees an odd gen knows a writer is mid-change and waits for a clean window,
+// and a reader that reads the same even gen before and after its gather knows no write
+// crossed it.
+func (t *Tree) beginWrite() { t.gen.Add(1) }
+func (t *Tree) endWrite()   { t.gen.Add(1) }
 
 // Apply implements engine.Engine. Each batch entry lands first in the mutable hot
 // tail (tail.go), the in-memory region that absorbs writes before any becomes a tree
@@ -170,8 +229,13 @@ func (t *Tree) Flush() error {
 // plus the buffered tree identically to the unbuffered one it replaces (paged.go
 // gathers the tail, the buffers, and the leaf records into one fold).
 func (t *Tree) Apply(batch *engine.WriteBatch, commitVersion uint64) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	t.wmu.Lock()
+	defer t.wmu.Unlock()
+	// One gen window covers the whole batch: gen goes odd here and back to even at return,
+	// so a reader sees the batch as a single atomic change rather than a sequence of
+	// half-applied tail edits. Every tailPut and any rollover it triggers runs inside it.
+	t.beginWrite()
+	defer t.endWrite()
 
 	for _, e := range batch.Entries() {
 		if err := t.tailPut(e.InternalKey, e.Value); err != nil {
@@ -192,8 +256,11 @@ func (t *Tree) Maintain(ctx context.Context, budget engine.MaintBudget) (engine.
 // leaf pages times the page size. A run-walk error reports a zero footprint rather
 // than failing, since Stats has no error channel.
 func (t *Tree) Stats() engine.EngineStats {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
+	// Stats walks the run with no gen protocol; it takes wmu so no writer mutates the run
+	// under the walk. It is a rare, best-effort footprint probe, so serializing it behind
+	// the writer lock costs nothing the hot path feels.
+	t.wmu.Lock()
+	defer t.wmu.Unlock()
 	_, pages, err := t.loadRun()
 	if err != nil {
 		return engine.EngineStats{}
@@ -211,9 +278,11 @@ func (t *Tree) Reclaim(budget int) (int, error) { return 0, nil }
 // from the replayed Apply calls, so there is no separate index to reconstruct.
 func (t *Tree) RecoverFinished(lastVersion uint64) error { return nil }
 
-// NewReader implements engine.Engine, returning a consistent read view at snap.
+// NewReader implements engine.Engine, returning a consistent read view at snap. It
+// registers one epoch guard for the reader's whole life and the reader pins it per
+// gather, so the registration cost is paid once per reader, not once per Get.
 func (t *Tree) NewReader(snap engine.Snapshot) (engine.Reader, error) {
-	return &reader{t: t, snap: snap}, nil
+	return &reader{t: t, snap: snap, g: t.recl.register()}, nil
 }
 
 // resolved is one MVCC-resolved (userKey, value) pair in the snapshot view.
@@ -222,14 +291,16 @@ type resolved struct {
 	val []byte
 }
 
-// reader is a point/range read view at a fixed snapshot.
+// reader is a point/range read view at a fixed snapshot. g is the reader's epoch guard,
+// registered for its life and pinned across each snapshot gather.
 type reader struct {
 	t    *Tree
 	snap engine.Snapshot
+	g    *guard
 }
 
 func (r *reader) Get(userKey []byte) ([]byte, error) {
-	view, err := r.t.snapshot(r.snap)
+	view, err := r.t.snapshot(r.snap, r.g)
 	if err != nil {
 		return nil, err
 	}
@@ -243,7 +314,7 @@ func (r *reader) Get(userKey []byte) ([]byte, error) {
 }
 
 func (r *reader) NewIter(opts engine.IterOptions) (engine.Cursor, error) {
-	view, err := r.t.snapshot(r.snap)
+	view, err := r.t.snapshot(r.snap, r.g)
 	if err != nil {
 		return nil, err
 	}
@@ -265,7 +336,10 @@ func (r *reader) NewIter(opts engine.IterOptions) (engine.Cursor, error) {
 	return &cursor{view: filtered, pos: -1, reverse: opts.Reverse}, nil
 }
 
-func (r *reader) Close() error { return nil }
+func (r *reader) Close() error {
+	r.t.recl.unregister(r.g)
+	return nil
+}
 
 // cursor walks a pre-resolved snapshot view. Bounds and prefix are already applied;
 // reverse flips the direction of First/Last/Next/Prev.

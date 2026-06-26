@@ -199,7 +199,15 @@ func (t *Tree) writeLeafAllocated(pgno format.PageNo, lf *leaf) error {
 	if err != nil {
 		return err
 	}
+	// The fillGate rule again: this writes a fresh split sibling whose page number a
+	// just-written left piece already links to, so unlike storeLeafNew a latch-free reader
+	// can reach this page while the copy runs. The gate serializes the copy against the
+	// reader's cold decode, and the gen seqlock makes that reader restart since the whole
+	// rollover runs in one odd-gen window; the ClearDecoded drops any stale box.
+	t.fillGate.Lock()
 	copy(fr.Data(), dst)
+	fr.ClearDecoded()
+	t.fillGate.Unlock()
 	t.pgr.Unpin(fr, true)
 	return nil
 }

@@ -3,6 +3,7 @@ package betree
 import (
 	"bytes"
 	"fmt"
+	"runtime"
 	"sort"
 
 	"github.com/tamnd/kv/engine"
@@ -45,7 +46,7 @@ func (t *Tree) loadRun() (cells []record, pages []format.PageNo, err error) {
 			return nil, nil, fmt.Errorf("betree: leaf run cycles at page %d", pgno)
 		}
 		seen[pgno] = true
-		lf, derr := t.readLeaf(pgno)
+		lf, derr := t.viewLeaf(pgno)
 		if derr != nil {
 			return nil, nil, derr
 		}
@@ -84,7 +85,7 @@ func (t *Tree) collectBufferedMessages() ([]record, error) {
 		if typ == format.PageBTreeLeaf {
 			return nil
 		}
-		in, err := t.loadInterior(pgno)
+		in, err := t.viewInterior(pgno)
 		if err != nil {
 			return err
 		}
@@ -110,10 +111,83 @@ func (t *Tree) collectBufferedMessages() ([]record, error) {
 	return out, nil
 }
 
+// viewLeaf returns the decoded leaf at pgno for a read-only caller, reusing the
+// immutable decode cached on the frame when the page is resident and unchanged and
+// decoding only on a miss (spec 01 Finding 1: stop re-decoding a node already in the
+// buffer pool). It is the read path's counterpart to readLeaf: the returned *leaf is
+// shared and immutable, so a caller only reads its records and copies out, while the
+// write path keeps readLeaf, which decodes a private copy it is free to mutate. The
+// pager drops the cached view before any write-intent pin or frame rebind (Get with
+// Write intent calls clearDecoded), so a hit always describes the page's current bytes,
+// and the shared instance is exactly the immutable-content channel M2.3 needs to remove
+// the read latch: a reader pulls a published object, never raw frame bytes a writer is
+// mutating.
+func (t *Tree) viewLeaf(pgno format.PageNo) (*leaf, error) {
+	box, fr, err := t.pgr.ViewDecodedRef(pgno)
+	if err != nil {
+		return nil, err
+	}
+	if box != nil {
+		if l, ok := box.Value().(*leaf); ok {
+			return l, nil
+		}
+		// The cached node is not a leaf: a corrupt pointer led the walk to a page that is
+		// not the leaf it expected, the same type confusion decodeLeaf fails closed on.
+		return nil, ErrCorruptNode
+	}
+	// Cold miss: decode the bytes and publish the result for the next reader, both under
+	// fillGate so the raw read and the SetDecoded are serialized against a writer's memcpy
+	// and its second clear (tree.go writePage). Publishing inside the gate is what keeps a
+	// stale view from reaching the box: a writer serialized against this either ran fully
+	// before, so this decodes the new bytes, or fully after, so its clear drops whatever
+	// this published and the next reader cold-decodes the new bytes.
+	t.fillGate.RLock()
+	l, derr := decodeLeaf(fr.Data()[:t.pgr.UsablePageSize()])
+	if derr == nil {
+		fr.SetDecoded(l)
+	}
+	t.fillGate.RUnlock()
+	t.pgr.Unpin(fr, false)
+	if derr != nil {
+		return nil, derr
+	}
+	return l, nil
+}
+
+// viewInterior is viewLeaf for an interior node: the read path's shared-immutable decode
+// of an interior page, cached on the frame and reused across reads, with the write path
+// keeping loadInterior for its private mutable copy. The returned *interior is read-only.
+func (t *Tree) viewInterior(pgno format.PageNo) (*interior, error) {
+	box, fr, err := t.pgr.ViewDecodedRef(pgno)
+	if err != nil {
+		return nil, err
+	}
+	if box != nil {
+		if in, ok := box.Value().(*interior); ok {
+			return in, nil
+		}
+		return nil, ErrCorruptNode
+	}
+	// The same cold-fill gate as viewLeaf: decode and publish under fillGate so neither the
+	// raw read nor the SetDecoded races a writer's in-place rewrite of this frame.
+	t.fillGate.RLock()
+	in, derr := decodeInterior(fr.Data()[:t.pgr.UsablePageSize()])
+	if derr == nil {
+		fr.SetDecoded(in)
+	}
+	t.fillGate.RUnlock()
+	t.pgr.Unpin(fr, false)
+	if derr != nil {
+		return nil, derr
+	}
+	return in, nil
+}
+
 // readLeaf pins a leaf page for reading, decodes it with the generation-2 leaf
 // codec over the usable area, and unpins. decodeLeaf copies every key and value, so
 // the returned leaf owns its bytes and stays valid after the unpin and after the
-// frame is later evicted or rebound.
+// frame is later evicted or rebound. The write path uses it for a private mutable
+// decode; the read path uses viewLeaf, which shares one immutable decode.
 func (t *Tree) readLeaf(pgno format.PageNo) (*leaf, error) {
 	fr, err := t.pgr.Get(pgno, pager.Read)
 	if err != nil {
@@ -127,18 +201,63 @@ func (t *Tree) readLeaf(pgno format.PageNo) (*leaf, error) {
 	return lf, nil
 }
 
-// snapshot returns the sorted, MVCC-resolved view at snap by decoding the run and
-// folding each user key's version group with the shared format helpers: the same
-// fold the shipped cores and the oracle use, so a divergence is always a real bug
-// rather than a difference in resolution policy. It rebuilds the range-delete set
-// from the run's range-begin markers, the way the shipped btree does, so a read
-// folds a range delete whose marker cell a point read never lands on. M0 resolves
-// the whole run on every read; the paged descent and zero-copy cursor that make
-// reads scale are later slices.
-func (t *Tree) snapshot(snap engine.Snapshot) ([]resolved, error) {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
+// snapshot returns the sorted, MVCC-resolved view at snap under the optimistic read
+// protocol (doc 05 section 1): no whole-operation latch, with the gen seqlock validating
+// that no writer crossed the gather. A writer holding wmu bumps gen to odd before its
+// change and back to even after (betree.go beginWrite/endWrite), so a reader that sees
+// the same even gen before it starts and after it finishes knows its combined tail and
+// tree view is a consistent point in time. An odd gen, or a gen that moved, means a
+// writer was mid-change or crossed the read, so the reader retries. The retries are
+// bounded: after a few optimistic attempts the reader falls back to taking wmu, which
+// excludes every writer and gathers once cleanly, so a reader never starves under
+// sustained write load and is never worse than the M0 read latch it replaces. The
+// epoch guard g is pinned for the span of each gather so a page a writer retires
+// mid-read is not freed under the reader; the betree frees no page yet, so today it
+// holds nothing alive, but the protocol is in place for the milestones that free.
+func (t *Tree) snapshot(snap engine.Snapshot, g *guard) ([]resolved, error) {
+	const maxOptimistic = 4
+	for attempt := 0; attempt < maxOptimistic; attempt++ {
+		g0 := t.gen.Load()
+		if g0&1 != 0 {
+			// A writer is mid-change; the view it is building is not yet consistent. Yield and
+			// reread rather than gather a half-applied change the post-check would reject.
+			runtime.Gosched()
+			continue
+		}
+		g.pin()
+		view, err := t.gather(snap)
+		g.unpin()
+		if t.gen.Load() != g0 {
+			// A writer crossed this gather. Whatever it read may mix pre- and post-change
+			// state, so discard it (error and all, since the error may be a transient
+			// torn-structure decode) and retry from a fresh generation.
+			runtime.Gosched()
+			continue
+		}
+		return view, err
+	}
+	// Optimism exhausted under contention: take the writer lock so no writer runs, pin the
+	// guard, and gather once. This is the pessimistic floor, identical in cost to the M0
+	// read latch, and it always terminates.
+	t.wmu.Lock()
+	defer t.wmu.Unlock()
+	g.pin()
+	defer g.unpin()
+	return t.gather(snap)
+}
 
+// gather builds the resolved view once, with no latch of its own: it reads the tree's
+// hot nodes through the pager's immutable decoded boxes and the tail under tailMu, so
+// every shared access it makes is individually safe, and its caller (snapshot) wraps it
+// in the gen-validation that makes the combined view consistent as a whole. It decodes
+// the run and folds each user key's version group with the shared format helpers: the
+// same fold the shipped cores and the oracle use, so a divergence is always a real bug
+// rather than a difference in resolution policy. It rebuilds the range-delete set from
+// the run's range-begin markers, the way the shipped btree does, so a read folds a range
+// delete whose marker cell a point read never lands on. M0 resolves the whole run on
+// every read; the paged descent and zero-copy cursor that make reads scale are later
+// slices.
+func (t *Tree) gather(snap engine.Snapshot) ([]resolved, error) {
 	cells, _, err := t.loadRun()
 	if err != nil {
 		return nil, err
