@@ -360,20 +360,19 @@ type reader struct {
 }
 
 func (r *reader) Get(userKey []byte) ([]byte, error) {
-	// Bound the gather to the single key by reading the half-open range [userKey, userKey0),
-	// whose only member is userKey itself: any key strictly between userKey and userKey with
-	// a trailing zero byte would have to extend userKey by a byte below zero, which cannot
-	// exist. So the bounded gather folds just this key's version group rather than the whole
-	// keyspace, and the result holds at most this one resolved pair.
-	upper := append(append([]byte(nil), userKey...), 0x00)
-	view, err := r.t.snapshotRange(r.snap, r.g, userKey, upper)
+	// Take the on-page point path: seek the key's version group on the leaf rather than
+	// decode the whole leaf, fold that group, and return its visible value. snapshotPoint
+	// wraps the same optimistic gen-validation snapshotRange does, and pointGet itself falls
+	// back to the full gather when a range delete is in play, so the result is identical to
+	// the bounded-range read this replaces, just without the whole-leaf decode it paid.
+	val, found, err := r.t.snapshotPoint(r.snap, r.g, userKey)
 	if err != nil {
 		return nil, err
 	}
-	if len(view) > 0 && bytes.Equal(view[0].uk, userKey) {
-		return append([]byte(nil), view[0].val...), nil
+	if !found {
+		return nil, engine.ErrNotFound
 	}
-	return nil, engine.ErrNotFound
+	return append([]byte(nil), val...), nil
 }
 
 func (r *reader) NewIter(opts engine.IterOptions) (engine.Cursor, error) {
