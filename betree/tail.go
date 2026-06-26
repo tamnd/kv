@@ -65,6 +65,15 @@ const tailFlushBytes = 32 * 1024
 // rolls the tail over into the tree when the live bytes cross the budget. The caller
 // holds the write latch.
 func (t *Tree) tailPut(key, val []byte) error {
+	// A range-delete marker sets the sticky read-path flag so every later read takes the
+	// full gather, where the interval set is rebuilt whole and a marker's non-local coverage
+	// is honored even for a bounded scan (betree.go hasRangeDel, paged.go gatherRange). The
+	// caller holds wmu, so this set is serialized with the gen window the read validates
+	// against. The flag is never cleared: a tree that has held a range delete keeps taking
+	// the correct full path.
+	if format.KindOf(key) == format.KindRangeBegin {
+		t.hasRangeDel.Store(true)
+	}
 	// The map edit runs under tailMu so a latch-free reader gathering the tail never reads
 	// the map while it is being written, which in Go is a hard panic, not a race the gen
 	// check could absorb after the fact. The caller holds wmu, so this is the only writer.

@@ -119,6 +119,20 @@ type Tree struct {
 	curLSN     uint64
 	tailMinLSN uint64
 	durableLSN uint64
+
+	// hasRangeDel is the read path's range-delete signal. A range delete breaks the
+	// range-locality a bounded scan relies on: a marker whose low bound sits below the
+	// scan's lower bound can still cover keys inside the scan, and that marker's cell
+	// lives in a leaf the bounded leaf walk skips. So whenever the tree may carry any
+	// range delete, the bounded gather falls back to the full gather, which rebuilds the
+	// whole interval set and is the proven correct path. The flag is conservative and
+	// sticky: it is set once any range-begin marker is seen (at Open by scanning the run
+	// and the buffers, and on any range-begin write), never cleared, so a tree that has
+	// ever held a range delete always takes the full path. The scan workloads M3 targets
+	// (readseq, the ycsb scan mixes) issue no range deletes, so they always take the fast
+	// bounded path. It is atomic because a lock-free reader reads it while a writer under
+	// wmu may set it, the same reason the gen seqlock alone cannot launder the tail map.
+	hasRangeDel atomic.Bool
 }
 
 // New returns a Bε-tree core bound to pgr. Call Open to materialize the root and
@@ -146,7 +160,10 @@ func (t *Tree) Open(env *engine.Env) error {
 		// Seed the lock-free root mirror from the durable header so reads find the run
 		// without touching the header field a writer may later store into.
 		t.rootPgno.Store(t.pgr.Header().EngineRoot)
-		return nil
+		// Detect any range-delete marker already persisted in the run or the buffers so a
+		// reopened database that holds one takes the correct full-gather path from the
+		// first read. Markers written this session set the flag on the write path instead.
+		return t.initRangeDelFlag()
 	}
 	return t.emptyRoot()
 }
@@ -300,40 +317,37 @@ type reader struct {
 }
 
 func (r *reader) Get(userKey []byte) ([]byte, error) {
-	view, err := r.t.snapshot(r.snap, r.g)
+	// Bound the gather to the single key by reading the half-open range [userKey, userKey0),
+	// whose only member is userKey itself: any key strictly between userKey and userKey with
+	// a trailing zero byte would have to extend userKey by a byte below zero, which cannot
+	// exist. So the bounded gather folds just this key's version group rather than the whole
+	// keyspace, and the result holds at most this one resolved pair.
+	upper := append(append([]byte(nil), userKey...), 0x00)
+	view, err := r.t.snapshotRange(r.snap, r.g, userKey, upper)
 	if err != nil {
 		return nil, err
 	}
-	idx := sort.Search(len(view), func(i int) bool {
-		return bytes.Compare(view[i].uk, userKey) >= 0
-	})
-	if idx < len(view) && bytes.Equal(view[idx].uk, userKey) {
-		return append([]byte(nil), view[idx].val...), nil
+	if len(view) > 0 && bytes.Equal(view[0].uk, userKey) {
+		return append([]byte(nil), view[0].val...), nil
 	}
 	return nil, engine.ErrNotFound
 }
 
 func (r *reader) NewIter(opts engine.IterOptions) (engine.Cursor, error) {
-	view, err := r.t.snapshot(r.snap, r.g)
-	if err != nil {
-		return nil, err
-	}
 	lower, upper := opts.Lower, opts.Upper
 	if len(opts.Prefix) > 0 {
 		lower = opts.Prefix
 		upper = format.PrefixSuccessor(opts.Prefix)
 	}
-	var filtered []resolved
-	for _, e := range view {
-		if lower != nil && bytes.Compare(e.uk, lower) < 0 {
-			continue
-		}
-		if upper != nil && bytes.Compare(e.uk, upper) >= 0 {
-			continue
-		}
-		filtered = append(filtered, e)
+	// Gather only the leaves and messages overlapping the iterator's key range, so a short
+	// scan over a large tree no longer folds the whole keyspace. The reverse flag only
+	// flips the walk direction over the resolved view; the range itself is by user key, so
+	// the same bounded gather feeds a forward or a reverse iterator.
+	view, err := r.t.snapshotRange(r.snap, r.g, lower, upper)
+	if err != nil {
+		return nil, err
 	}
-	return &cursor{view: filtered, pos: -1, reverse: opts.Reverse}, nil
+	return &cursor{view: view, pos: -1, reverse: opts.Reverse}, nil
 }
 
 func (r *reader) Close() error {
