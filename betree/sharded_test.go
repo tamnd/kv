@@ -3,6 +3,8 @@ package betree
 import (
 	"fmt"
 	"math/rand"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/tamnd/kv/engine"
@@ -228,6 +230,150 @@ func TestShardedSubTreesAreDisjoint(t *testing.T) {
 			t.Fatalf("shard %d got no keys; the hash spread is broken", i)
 		}
 	}
+}
+
+// TestShardedConcurrentReadersFrozenSnapshot stresses the parallel cross-shard gather under reader
+// contention: many readers pin version 1 and scan the whole key space in a loop while a writer churns
+// higher versions across every shard and periodically flushes, retiring pages a scanning reader may be
+// mid-gather on. Each scanning reader fans its gather out to one goroutine per shard, so this drives the
+// new concurrent gather path against the optimistic read protocol and epoch reclamation at once: a frozen
+// snapshot must keep reading exactly its base values no matter what the writer does. It is the sharded
+// analogue of TestConcurrentReadersFrozenSnapshot, which proves the same property for the single-shard
+// Tree, and would fault under -race if a gather goroutine read a page the writer freed.
+func TestShardedConcurrentReadersFrozenSnapshot(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping concurrency stress in -short")
+	}
+	s, _, _ := newShardedCore(t, newHashPartitioner(4), 4096)
+	s.SetMergeFunc(concatMerge)
+
+	const nkeys = 48
+	keyOf := func(i int) []byte { return []byte(fmt.Sprintf("k%03d", i)) }
+	// Pad the base so a few churn batches cross the tail budget and the writer rolls real pages over,
+	// retiring frames the readers may be gathering rather than resting entirely in the hot tail.
+	baseVal := func(i int) []byte { return []byte(fmt.Sprintf("base-%03d-%0300d", i, i)) }
+
+	// Version 1: the frozen snapshot every reader reads at, spread across all four shards by the hash.
+	b0 := engine.NewWriteBatch(1)
+	for i := 0; i < nkeys; i++ {
+		b0.Set(keyOf(i), baseVal(i))
+	}
+	if err := s.Apply(b0, b0.Version()); err != nil {
+		t.Fatalf("seed apply: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	var writerDone atomic.Bool
+
+	// The writer: a bounded run of higher versions that churns every shard, with periodic flushes that
+	// drain the tails onto pages and retire the old ones, then it stops.
+	const nbatches = 150
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer writerDone.Store(true)
+		rng := rand.New(rand.NewSource(7))
+		ver := uint64(1)
+		for b := 0; b < nbatches; b++ {
+			ver++
+			wb := engine.NewWriteBatch(ver)
+			used := map[int]bool{}
+			for n := 0; n < 16; n++ {
+				i := rng.Intn(nkeys)
+				if used[i] {
+					continue
+				}
+				used[i] = true
+				if rng.Intn(6) == 0 {
+					wb.Delete(keyOf(i))
+				} else {
+					wb.Set(keyOf(i), []byte(fmt.Sprintf("v%d-%03d-%0300d", ver, i, i)))
+				}
+			}
+			if err := s.Apply(wb, wb.Version()); err != nil {
+				t.Errorf("writer apply v%d: %v", ver, err)
+				return
+			}
+			if ver%16 == 0 {
+				if err := s.Flush(); err != nil {
+					t.Errorf("writer flush v%d: %v", ver, err)
+					return
+				}
+			}
+		}
+	}()
+
+	// The readers: each pins version 1 and reads the whole universe until the writer is done, asserting
+	// every key always resolves to its base. Even readers take the point path, odd readers the scanning
+	// cursor, so both the routed Get and the parallel cross-shard gather run under contention. Each reader
+	// does at least one full pass even if the writer finishes first.
+	const nreaders = 6
+	for r := 0; r < nreaders; r++ {
+		r := r
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rd, err := s.NewReader(engine.Snapshot{Version: 1})
+			if err != nil {
+				t.Errorf("reader %d: new reader: %v", r, err)
+				return
+			}
+			defer rd.Close()
+			for pass := 0; ; pass++ {
+				if r%2 == 0 {
+					for i := 0; i < nkeys; i++ {
+						got, err := rd.Get(keyOf(i))
+						if err != nil {
+							t.Errorf("reader %d: get k%03d pass %d: %v", r, i, pass, err)
+							return
+						}
+						if string(got) != string(baseVal(i)) {
+							t.Errorf("reader %d: get k%03d pass %d = %q, want base", r, i, pass, got)
+							return
+						}
+					}
+				} else {
+					cur, err := rd.NewIter(engine.IterOptions{})
+					if err != nil {
+						t.Errorf("reader %d: iter pass %d: %v", r, pass, err)
+						return
+					}
+					seen := 0
+					for ok := cur.First(); ok; ok = cur.Next() {
+						lv, verr := cur.Value()
+						if verr != nil {
+							t.Errorf("reader %d: value pass %d: %v", r, pass, verr)
+							cur.Close()
+							return
+						}
+						v, verr := lv.Value()
+						if verr != nil {
+							t.Errorf("reader %d: lazy value pass %d: %v", r, pass, verr)
+							cur.Close()
+							return
+						}
+						i := seen
+						if string(cur.Key()) != string(keyOf(i)) || string(v) != string(baseVal(i)) {
+							t.Errorf("reader %d: scan pos %d pass %d = (%q,%q), want base", r, seen, pass, cur.Key(), v)
+							cur.Close()
+							return
+						}
+						seen++
+					}
+					cur.Close()
+					if seen != nkeys {
+						t.Errorf("reader %d: scan pass %d saw %d keys, want %d", r, pass, seen, nkeys)
+						return
+					}
+				}
+				if writerDone.Load() && pass > 0 {
+					return
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
 }
 
 // TestShardedPersistDirRewritesInPlace checks that flushing twice does not allocate a second directory

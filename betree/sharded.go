@@ -51,6 +51,7 @@ package betree
 import (
 	"bytes"
 	"context"
+	"sync"
 
 	"github.com/tamnd/kv/engine"
 	"github.com/tamnd/kv/format"
@@ -352,15 +353,53 @@ func (r *shardedReader) NewIter(opts engine.IterOptions) (engine.Cursor, error) 
 		lower = opts.Prefix
 		upper = format.PrefixSuccessor(opts.Prefix)
 	}
-	views := make([][]resolved, len(r.s.subs))
-	for i, sub := range r.s.subs {
-		v, err := sub.snapshotRange(r.snap, r.guards[i], lower, upper)
+	views, err := r.gather(lower, upper)
+	if err != nil {
+		return nil, err
+	}
+	return &cursor{view: mergeShardViews(views), pos: -1, reverse: opts.Reverse}, nil
+}
+
+// gather materializes every shard's resolved view of [lower, upper) at the reader's snapshot. The
+// per-shard gathers are independent reads of disjoint sub-trees: each walks its own index and tail under
+// its own already-registered epoch guard, and the only state they share is the pager, whose read path is
+// built for concurrent access (the distributed read latch). So a wide scan, the OLAP path the sharding
+// exists for, walks its N shard indexes in parallel across cores rather than one after another, and the
+// merge still runs once over the materialized views. A reader gathering its own sub-trees concurrently
+// races nothing two concurrent readers do not already race, which the optimistic read protocol handles.
+//
+// A single-shard core (the degenerate one-slot directory) stays inline: there is nothing to overlap, so
+// it pays no goroutine and no WaitGroup, exactly the no-cost path the default core deserves. The errors
+// land in a per-slot array so the goroutines never share an error word; the first non-nil is returned,
+// and a failed gather drops its whole scan, matching the sequential path's fail-fast.
+func (r *shardedReader) gather(lower, upper []byte) ([][]resolved, error) {
+	n := len(r.s.subs)
+	views := make([][]resolved, n)
+	if n == 1 {
+		v, err := r.s.subs[0].snapshotRange(r.snap, r.guards[0], lower, upper)
 		if err != nil {
 			return nil, err
 		}
-		views[i] = v
+		views[0] = v
+		return views, nil
 	}
-	return &cursor{view: mergeShardViews(views), pos: -1, reverse: opts.Reverse}, nil
+
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := range r.s.subs {
+		go func(i int) {
+			defer wg.Done()
+			views[i], errs[i] = r.s.subs[i].snapshotRange(r.snap, r.guards[i], lower, upper)
+		}(i)
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return nil, err
+		}
+	}
+	return views, nil
 }
 
 // Close unregisters every per-shard epoch guard.
