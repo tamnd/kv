@@ -28,3 +28,11 @@ func barrierSync(f *os.File) error {
 		return errno
 	}
 }
+
+// dataSync is the SyncData primitive on macOS. There is no fdatasync here, and a
+// plain fsync does not push the drive's own write cache to stable media, so the only
+// call that makes data durable across power loss is F_FULLFSYNC, which os.File.Sync
+// issues on darwin. SyncData and SyncFull therefore reach the same primitive on this
+// platform: the data-versus-metadata split that lets fdatasync skip the inode write
+// exists only on Linux, so there is nothing cheaper to choose here.
+func dataSync(f *os.File) error { return f.Sync() }

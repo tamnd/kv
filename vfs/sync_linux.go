@@ -15,3 +15,14 @@ import (
 func barrierSync(f *os.File) error {
 	return syscall.Fdatasync(int(f.Fd()))
 }
+
+// dataSync issues fdatasync on f, the SyncData primitive on Linux. It flushes the
+// file's data and only the metadata a reader needs to get it back (the size, when
+// the file grew), and skips unrelated inode metadata such as mtime, so it is cheaper
+// than the full fsync that backs SyncFull. This is the WAL's normal flush: an append
+// has to be durable but the log file's timestamps never matter, so paying for the
+// inode write fsync forces would be waste on the hot path. It is durable across power
+// loss on a correctly behaving device.
+func dataSync(f *os.File) error {
+	return syscall.Fdatasync(int(f.Fd()))
+}
