@@ -28,13 +28,18 @@ package betree
 // which is precisely what max-plus-one needs.
 //
 // The packing. One 64-bit word holds the whole timestamp: the high 48 bits are the physical
-// component in microseconds since the Unix epoch (enough for roughly 8900 years, and a
-// microsecond is fine grain for a read snapshot's staleness), and the low 16 bits are the
-// logical counter (0 through 65535). A microsecond holds 65536 logical ticks before it has to
-// borrow from the next microsecond, which is 65 billion events per second of headroom, far past
-// any commit rate, so the carry path exists for correctness but is effectively never taken. The
-// whole word is monotonic, so two timestamps compare as plain uint64s, which is what lets a
-// reader's "all commits at or below ts_r" be a single integer comparison.
+// component in milliseconds since the Unix epoch, and the low 16 bits are the logical counter (0
+// through 65535). Milliseconds, not microseconds, is what makes 48 bits the right width: 2^48
+// milliseconds is roughly 8900 years past the epoch, so the physical component never overflows the
+// field in any realistic deployment, whereas 48 bits of microseconds spans only about 8.9 years
+// and the current epoch is already well past that, which would silently truncate the high bits of
+// the shifted word and collapse distinct instants onto one timestamp. A millisecond holds 65536
+// logical ticks before it has to borrow from the next millisecond, which is 65 million events per
+// second of headroom, far past any commit rate, so the carry path exists for correctness but is
+// effectively never taken, and the logical counter is what separates events within a millisecond.
+// A millisecond is fine grain for a read snapshot's staleness, the only thing the physical
+// component bounds. The whole word is monotonic, so two timestamps compare as plain uint64s, which
+// is what lets a reader's "all commits at or below ts_r" be a single integer comparison.
 
 import (
 	"sync/atomic"
@@ -47,33 +52,33 @@ const (
 	// hlcLogicalMask isolates the logical counter.
 	hlcLogicalMask = (uint64(1) << hlcLogicalBits) - 1
 	// hlcMaxLogical is the largest logical value before a tick borrows from the physical
-	// component. At this point the next event in the same physical microsecond advances the
+	// component. At this point the next event in the same physical millisecond advances the
 	// physical component by one instead of overflowing the logical field into it.
 	hlcMaxLogical = hlcLogicalMask
 )
 
-// hlcTime is one packed hybrid-logical timestamp: physical microseconds in the high 48 bits,
+// hlcTime is one packed hybrid-logical timestamp: physical milliseconds in the high 48 bits,
 // logical counter in the low 16. Because the word is monotonic, a plain uint64 comparison is
 // the timestamp order, which is exactly the comparison a snapshot read ("commit timestamp at or
 // below my read timestamp") and the max-plus-one rule ("one past the highest observed") need.
 type hlcTime uint64
 
-// physical returns the physical (wall-clock-anchored) component, in microseconds since epoch.
+// physical returns the physical (wall-clock-anchored) component, in milliseconds since epoch.
 func (t hlcTime) physical() uint64 { return uint64(t) >> hlcLogicalBits }
 
 // logical returns the logical tie-breaking counter.
 func (t hlcTime) logical() uint64 { return uint64(t) & hlcLogicalMask }
 
-// packHLC builds a timestamp from a physical microsecond value and a logical counter. A logical
+// packHLC builds a timestamp from a physical millisecond value and a logical counter. A logical
 // value at or past the max borrows into the physical component so the packed word stays
 // well-formed and still strictly greater than the timestamp it advanced from; the caller below
 // only ever passes a logical value one past a valid one, so a single carry is always enough.
-func packHLC(physMicros, logical uint64) hlcTime {
+func packHLC(physMillis, logical uint64) hlcTime {
 	if logical > hlcMaxLogical {
-		physMicros += logical >> hlcLogicalBits
+		physMillis += logical >> hlcLogicalBits
 		logical &= hlcLogicalMask
 	}
-	return hlcTime(physMicros<<hlcLogicalBits | logical)
+	return hlcTime(physMillis<<hlcLogicalBits | logical)
 }
 
 // hlc is the hybrid logical clock: one atomic packed timestamp and the physical-time source it
@@ -83,20 +88,20 @@ func packHLC(physMicros, logical uint64) hlcTime {
 // timestamp is strictly greater than every timestamp issued or absorbed before it.
 type hlc struct {
 	state atomic.Uint64
-	// nowMicros returns the current physical time in microseconds since the Unix epoch. It is a
+	// nowMillis returns the current physical time in milliseconds since the Unix epoch. It is a
 	// field rather than a direct time.Now call so a test can drive the physical component
 	// deterministically, including holding it still to force the logical counter to do the work
 	// or moving it backward to prove the clock still never regresses.
-	nowMicros func() uint64
+	nowMillis func() uint64
 }
 
 // newHLC builds a clock reading the system wall clock. A nil now uses time.Now; a test passes a
 // controllable source.
 func newHLC(now func() uint64) *hlc {
 	if now == nil {
-		now = func() uint64 { return uint64(time.Now().UnixNano() / 1000) }
+		now = func() uint64 { return uint64(time.Now().UnixNano() / 1e6) }
 	}
-	return &hlc{nowMicros: now}
+	return &hlc{nowMillis: now}
 }
 
 // Now issues a fresh timestamp strictly greater than every timestamp this clock has issued or
@@ -108,14 +113,14 @@ func newHLC(now func() uint64) *hlc {
 func (h *hlc) Now() hlcTime {
 	for {
 		old := hlcTime(h.state.Load())
-		phys := h.nowMicros()
+		phys := h.nowMillis()
 		var next hlcTime
 		if phys > old.physical() {
 			// Wall clock moved past the stored physical instant: adopt it and reset the logical
 			// counter. This is the common path and keeps the timestamp anchored to real time.
 			next = packHLC(phys, 0)
 		} else {
-			// Wall clock has not advanced past the stored instant (same microsecond, or a clock that
+			// Wall clock has not advanced past the stored instant (same millisecond, or a clock that
 			// stalled or stepped back): hold the physical component and advance the logical counter,
 			// so the issued timestamp still strictly increases without depending on the wall clock.
 			next = packHLC(old.physical(), old.logical()+1)
@@ -138,7 +143,7 @@ func (h *hlc) Now() hlcTime {
 func (h *hlc) Update(observed hlcTime) hlcTime {
 	for {
 		old := hlcTime(h.state.Load())
-		phys := h.nowMicros()
+		phys := h.nowMillis()
 		// The new physical component is the largest of the wall clock, the stored instant, and the
 		// observed instant, so the result dominates real time, the clock's history, and the thing
 		// just observed.

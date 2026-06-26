@@ -14,14 +14,14 @@ import (
 // tests pin each clause, with a driven physical clock so the logical-counter and clock-regression
 // paths are exercised deterministically rather than left to chance.
 
-// fakeClock is a test-controlled physical-time source in microseconds. The test moves it
+// fakeClock is a test-controlled physical-time source in milliseconds. The test moves it
 // explicitly, including holding it still to force the logical counter to do the work and stepping
 // it backward to prove the clock still never regresses.
-type fakeClock struct{ micros atomic.Uint64 }
+type fakeClock struct{ millis atomic.Uint64 }
 
-func (c *fakeClock) now() uint64  { return c.micros.Load() }
-func (c *fakeClock) set(v uint64) { c.micros.Store(v) }
-func (c *fakeClock) add(d uint64) { c.micros.Add(d) }
+func (c *fakeClock) now() uint64  { return c.millis.Load() }
+func (c *fakeClock) set(v uint64) { c.millis.Store(v) }
+func (c *fakeClock) add(d uint64) { c.millis.Add(d) }
 
 func TestHLCPacking(t *testing.T) {
 	ts := packHLC(123456, 789)
@@ -229,5 +229,66 @@ func TestHLCConcurrentDistinctAndMonotone(t *testing.T) {
 	}
 	if len(seen) != workers*perWorker {
 		t.Fatalf("issued %d distinct timestamps, want %d", len(seen), workers*perWorker)
+	}
+}
+
+// realEpochMillis is roughly the current Unix time in milliseconds (mid 2026), a 41-bit value. The
+// earlier tests all drove the clock with tiny physical values, so the packed word never approached
+// the field boundary and an overflow in the physical-times-logical-width shift could not show. This
+// constant puts the physical component where a real deployment runs it.
+const realEpochMillis = uint64(1_780_000_000_000)
+
+func TestHLCNoOverflowAtEpochScale(t *testing.T) {
+	// At real epoch scale the physical component must round-trip through the packing without losing
+	// its high bits. In milliseconds the value is 41 bits and the 16-bit shift leaves it well inside
+	// 64 bits; the bug this guards against used microseconds, a 51-bit value whose shift overflowed
+	// and truncated the high bits, collapsing distinct instants onto one timestamp.
+	ts := packHLC(realEpochMillis, 7)
+	if ts.physical() != realEpochMillis {
+		t.Fatalf("physical() = %d after pack at epoch scale, want %d (high bits truncated)", ts.physical(), realEpochMillis)
+	}
+	if ts.logical() != 7 {
+		t.Fatalf("logical() = %d, want 7", ts.logical())
+	}
+	// Two instants that differ only above the 48-bit physical field would alias if the shift
+	// overflowed; well-formed inputs below the field width must stay distinct, and a one-millisecond
+	// step at epoch scale must produce a strictly greater word.
+	if packHLC(realEpochMillis, 0) == packHLC(realEpochMillis+1, 0) {
+		t.Fatal("adjacent epoch-scale instants packed to the same word")
+	}
+	if uint64(packHLC(realEpochMillis+1, 0)) <= uint64(packHLC(realEpochMillis, hlcMaxLogical)) {
+		t.Fatal("the next millisecond at epoch scale is not strictly greater than the last logical tick of this one")
+	}
+}
+
+func TestHLCNowDistinctAtEpochScale(t *testing.T) {
+	// Now must hand out strictly increasing, distinct values when the physical clock sits at real
+	// epoch scale and advances a millisecond at a time, the same shape the live clock sees. With the
+	// microsecond overflow this produced long runs of one repeated value (the truncated word), so a
+	// reader's snapshot timestamp and a committer's absorbed timestamp would silently collide.
+	clk := &fakeClock{}
+	clk.set(realEpochMillis)
+	h := newHLC(clk.now)
+
+	const n = 4096
+	seen := make(map[hlcTime]struct{}, n)
+	prev := h.Now()
+	seen[prev] = struct{}{}
+	for i := 1; i < n; i++ {
+		if i%3 == 0 {
+			clk.add(1) // advance a millisecond every few calls, mixing the adopt and logical paths
+		}
+		ts := h.Now()
+		if uint64(ts) <= uint64(prev) {
+			t.Fatalf("Now regressed or stalled at epoch scale: %d <= %d", uint64(ts), uint64(prev))
+		}
+		if _, dup := seen[ts]; dup {
+			t.Fatalf("Now issued a duplicate %d at epoch scale", uint64(ts))
+		}
+		seen[ts] = struct{}{}
+		prev = ts
+	}
+	if len(seen) != n {
+		t.Fatalf("got %d distinct timestamps, want %d", len(seen), n)
 	}
 }
