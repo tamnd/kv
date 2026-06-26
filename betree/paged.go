@@ -227,6 +227,12 @@ func (t *Tree) snapshotRange(snap engine.Snapshot, g *guard, lower, upper []byte
 		g.pin()
 		view, err := t.gatherRange(snap, lower, upper)
 		g.unpin()
+		// g.unpin is the read-side barrier this post-check depends on: it is a full-barrier
+		// atomic read-modify-write (epoch.go), so the gather's page reads above are ordered
+		// before the generation re-read below. A plain atomic load is only an acquire and
+		// would let a gather read sink past it, so the re-read could see an unchanged even
+		// generation while a gather read still raced a writer's in-place rewrite. Keep the
+		// unpin between the gather and this load.
 		if t.gen.Load() != g0 {
 			// A writer crossed this gather. Whatever it read may mix pre- and post-change
 			// state, so discard it (error and all, since the error may be a transient

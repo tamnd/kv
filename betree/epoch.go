@@ -109,8 +109,23 @@ func (g *guard) pin() {
 // unpin leaves the read critical section, publishing the inactive sentinel so the guard
 // stops holding anything alive. It does not itself free pages; reclamation runs from the
 // writer side after a retire, so a reader never pays for another goroutine's garbage.
+//
+// The publish is a Swap, not a Store, because unpin doubles as the optimistic read
+// protocol's read-side barrier (paged.go snapshotRange). That protocol gathers a view under
+// no latch and validates it by re-reading the generation after the gather; for the check to
+// be sound the gather's page reads must be ordered before that re-read. A plain atomic load
+// of the generation is only an acquire, which stops later reads from sinking above it but
+// not the gather's earlier reads from sinking below it, so on a weak-memory CPU the re-read
+// could observe an unchanged even generation while a gather read still races a writer's
+// in-place page rewrite and decodes a half-written or freshly zeroed page. An atomic
+// read-modify-write is both an acquire and a release: its release half orders the gather's
+// reads before it and its acquire half orders the generation re-read after it, so the two
+// compose to put every gather read before the re-read. unpin runs between the gather and the
+// re-read on every optimistic attempt, and the guard's own epoch word is a reader-private
+// line, so the barrier rides on a store the reader already makes and adds no traffic on the
+// shared generation line the way a barrier on the generation itself would.
 func (g *guard) unpin() {
-	g.ep.Store(inactiveEpoch)
+	g.ep.Swap(inactiveEpoch)
 }
 
 // advance bumps the global epoch and returns the new value. A writer calls it after a
