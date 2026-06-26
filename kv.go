@@ -40,6 +40,11 @@ const (
 	// LSM is the write-optimized log-structured core (spec 06). It is a later
 	// milestone; selecting it on a fresh file errors until it lands.
 	LSM = format.EngineLSM
+	// Beta is the unified Bε-tree core (the 2059 redesign). It is built behind the
+	// engine SPI and selectable on a fresh file, but it is not yet the default and the
+	// old cores are not yet retired: that switch is the redesign's flip milestone. Select
+	// it explicitly to exercise or measure the new core ahead of the flip.
+	Beta = format.EngineBeta
 )
 
 // Version is the current release of the kv library. It follows semantic versioning.

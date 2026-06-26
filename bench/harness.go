@@ -93,10 +93,14 @@ func syncName(s kv.Sync) string {
 }
 
 func engineName(e kv.EngineKind) string {
-	if e == kv.LSM {
+	switch e {
+	case kv.LSM:
 		return "lsm"
+	case kv.Beta:
+		return "betree"
+	default:
+		return "btree"
 	}
-	return "btree"
 }
 
 // openOptions builds the kv.Open options a config asks for: engine, durability, and the
