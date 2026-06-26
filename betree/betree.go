@@ -97,6 +97,16 @@ type Tree struct {
 	// read path now so the protocol is exercised and ready for the milestones that free.
 	recl *reclaimer
 
+	// encBuf pools the page-sized scratch buffer every node encode writes into. Each write
+	// helper (writeLeaf, storeLeafNew, the trial-fit checks the pack loop runs once per
+	// record) used to make a fresh usable-page byte slice and drop it, so a write-heavy
+	// batch churned one page-sized allocation per encode through the collector. This is the
+	// M6.3 pooled-transients substrate (pool.go) wired onto those call sites: a buffer is
+	// drawn from the pool, encoded into, copied to the frame, and returned, so steady-state
+	// encoding recycles a bounded set of buffers and allocates almost none. It is sized to
+	// the usable page area at construction, the only size a node encode ever needs.
+	encBuf *scratchPool
+
 	// merge folds an existing value and a merge operand into a new value. Nil makes a
 	// merge operand behave as a plain set. The library's merge registry and the
 	// conformance harness install it through SetMergeFunc.
@@ -153,7 +163,7 @@ type Tree struct {
 // finish wiring it to the shared substrate. The signature matches the other cores so
 // db.newEngine constructs it the same way.
 func New(pgr *pager.Pager) *Tree {
-	return &Tree{pgr: pgr, recl: newReclaimer()}
+	return &Tree{pgr: pgr, recl: newReclaimer(), encBuf: newScratchPool(pgr.UsablePageSize())}
 }
 
 // Kind implements engine.Engine. It reports the new selector value so a file this
