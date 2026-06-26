@@ -15,9 +15,10 @@ package betree
 // durable round-trip through the pager, proven in isolation, with nothing mounting a sharded tree on
 // it yet, exactly the discipline M0.1 used for the node codec and M5.1 used for the WAL frame: the
 // envelope is built and fuzzed before any live path depends on it. The single-root, single-shard
-// default core is untouched; it still roots directly at the header's EngineRoot. The sharded core the
-// next slice wires will instead point EngineRoot at a directory page and mount one sub-tree per root
-// the directory names.
+// default core is untouched; it still roots directly at the header's EngineRoot. A sharded core
+// instead points EngineRoot at a directory page and mounts one sub-tree per root the directory
+// names; the sub-tree that roots at a directory slot rather than the header is the rootStore seam
+// in root.go, and the SPI wrapper that routes and merges across those sub-trees is the slice after.
 //
 // What the directory must persist to rebuild the partitioner. A hash partitioner is fully described
 // by its shard count, since the FNV-1a hash is a fixed pure function and the count is the only

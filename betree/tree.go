@@ -24,16 +24,16 @@ import (
 	"github.com/tamnd/kv/pager"
 )
 
-// root reports the page that roots the tree, and setRoot records a new root. The pager
-// header's EngineRoot stays the durable source of truth so a reopen finds the tree
-// without a side file, the same way the shipped btree roots itself; setRoot writes it.
-// But a latch-free reader cannot read that header field while a writer's growRoot stores
-// into it without a data race, so setRoot also publishes the root into an atomic mirror
-// (Tree.rootPgno) that the read path loads. PageNo is an alias for uint32, so it crosses
-// the atomic word unchanged.
+// root reports the page that roots the tree, and setRoot records a new root. The durable
+// root store (root.go) stays the source of truth so a reopen finds the tree without a side
+// file: the pager header's EngineRoot for the single-shard core, the shard-directory slot
+// for a sub-tree, the same way the shipped btree roots itself in the header. But a latch-free
+// reader cannot read that durable home while a writer's growRoot stores into it without a data
+// race, so setRoot also publishes the root into an atomic mirror (Tree.rootPgno) that the read
+// path loads. PageNo is an alias for uint32, so it crosses the atomic word unchanged.
 func (t *Tree) root() format.PageNo { return format.PageNo(t.rootPgno.Load()) }
 func (t *Tree) setRoot(p format.PageNo) {
-	t.pgr.Header().EngineRoot = p
+	t.rstore.store(p)
 	t.rootPgno.Store(uint32(p))
 }
 
