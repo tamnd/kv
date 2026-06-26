@@ -294,15 +294,22 @@ func createLeaderless(fs vfs.FS, path string, opts Options, baseLSN uint64) (*ll
 
 // writeHeader encodes and writes the 40-byte leaderless header at offset 0.
 func (l *llLog) writeHeader() error {
+	return writeLeaderlessHeader(l.file, l.pageSize, l.salt, l.baseLSN)
+}
+
+// writeLeaderlessHeader encodes and writes the 40-byte leaderless header at offset 0 of file.
+// The serial reference writer and the concurrent committer (M5.2) share it so the on-disk
+// header is identical whichever writer produced the log, and RecoverLeaderless reads either.
+func writeLeaderlessHeader(file vfs.File, pageSize int, salt, baseLSN uint64) error {
 	h := make([]byte, llHeaderSize)
 	binary.BigEndian.PutUint32(h[0:4], llMagic)
 	binary.BigEndian.PutUint32(h[4:8], llVersion)
-	binary.BigEndian.PutUint32(h[8:12], uint32(l.pageSize))
-	binary.BigEndian.PutUint64(h[12:20], l.salt)
-	binary.BigEndian.PutUint64(h[20:28], l.baseLSN)
+	binary.BigEndian.PutUint32(h[8:12], uint32(pageSize))
+	binary.BigEndian.PutUint64(h[12:20], salt)
+	binary.BigEndian.PutUint64(h[20:28], baseLSN)
 	// h[28:32] reserved. The checksum covers the first 32 bytes.
 	binary.BigEndian.PutUint64(h[32:40], walChecksum.Sum(h[:32]))
-	if _, err := l.file.WriteAt(h, 0); err != nil {
+	if _, err := file.WriteAt(h, 0); err != nil {
 		return err
 	}
 	return nil
