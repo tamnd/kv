@@ -369,13 +369,24 @@ func cellsCleanSets(cells []record) bool {
 
 // foldCleanResolved builds the snapshot view of a clean cell run (one validated by
 // cellsCleanSets) with no fold: each cell visible at the snapshot becomes one resolved pair,
-// and a cell newer than the snapshot is skipped exactly as Fold would skip it. The keys and
-// values are copied out, the same caller-owned ownership the general fold gives, so a
-// returned pair never aliases a mutable tail slot or a page a later writer rewrites. (True
-// zero-copy hand-back of slices that point into the page for the transaction lifetime waits
-// for M6's off-heap arena, where a page lives in stable memory a reader can borrow without a
-// decode copy; on this substrate the decode already copies, so the saving here is the
-// removed fold, not the removed copy.)
+// and a cell newer than the snapshot is skipped exactly as Fold would skip it.
+//
+// The pair aliases the cell's bytes rather than copying them a second time. A cell's key and
+// value already are private heap copies the leaf decode made (node.go decodeLeaf appends each
+// key and value into a fresh slice), or a tail/buffer message's own heap bytes, never a slice
+// into a buffer-pool page a writer rewrites in place. Those backing arrays are immutable once
+// decoded (a writer that changes a leaf publishes a fresh decode and drops the old box, it
+// never mutates a published box), so a slice into them stays valid and stays the bytes the
+// snapshot saw for as long as the cursor references it, and the garbage collector keeps the
+// backing array alive exactly that long. So the second copy the fold used to make bought no
+// safety the decode copy had not already bought, and removing it halves the bytes moved on the
+// clean scan path (the readseq fold-skip case, doc 04 section 7 layer three). uk is the
+// user-key prefix subslice of the cell's internal key; val is the cell's value slice.
+//
+// This removes the fold-copy. The decode copy underneath it stays: true zero-copy hand-back of
+// slices that point straight into a buffer-pool frame for the transaction lifetime (no decode
+// copy either) waits for the copy-on-write write path that keeps a frame a cursor borrowed
+// frozen and the epoch reclaimer that retires the replaced frame, the later and riskier slice.
 func foldCleanResolved(cells []record, snap engine.Snapshot) []resolved {
 	out := make([]resolved, 0, len(cells))
 	for i := range cells {
@@ -383,8 +394,8 @@ func foldCleanResolved(cells []record, snap engine.Snapshot) []resolved {
 			continue // newer than the snapshot: not visible
 		}
 		out = append(out, resolved{
-			uk:  append([]byte(nil), format.UserKey(cells[i].key)...),
-			val: append([]byte(nil), cells[i].val...),
+			uk:  format.UserKey(cells[i].key),
+			val: cells[i].val,
 		})
 	}
 	return out
