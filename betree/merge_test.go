@@ -102,7 +102,7 @@ func TestMergeReverseViaCursor(t *testing.T) {
 	oracle := makeResolved(pairs)
 	merged := mergeShardViews(partitionView(oracle, newHashPartitioner(8)))
 
-	c := &cursor{view: merged, pos: -1, reverse: true}
+	c := newViewCursor(merged, true)
 	var got []string
 	for ok := c.First(); ok; ok = c.Next() {
 		got = append(got, string(c.Key()))

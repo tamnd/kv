@@ -381,15 +381,21 @@ func (r *reader) NewIter(opts engine.IterOptions) (engine.Cursor, error) {
 		lower = opts.Prefix
 		upper = format.PrefixSuccessor(opts.Prefix)
 	}
-	// Gather only the leaves and messages overlapping the iterator's key range, so a short
-	// scan over a large tree no longer folds the whole keyspace. The reverse flag only
-	// flips the walk direction over the resolved view; the range itself is by user key, so
-	// the same bounded gather feeds a forward or a reverse iterator.
-	view, err := r.t.snapshotRange(r.snap, r.g, lower, upper)
-	if err != nil {
-		return nil, err
-	}
-	return &cursor{view: view, pos: -1, reverse: opts.Reverse}, nil
+	// Stream the scan: gather nothing up front, and let the cursor fold one bounded window of
+	// the range at a time as it is walked. An unbounded iterator stopped after a few keys (the
+	// ycsb-e shape: NewIterator over the whole keyspace, SeekGE, then a few Next) no longer
+	// materializes the whole keyspace to serve those keys. Reverse iterators and any backward
+	// move take the proven full-materialization fallback inside the cursor.
+	return &cursor{
+		t:       r.t,
+		snap:    r.snap,
+		g:       r.g,
+		lower:   lower,
+		upper:   upper,
+		reverse: opts.Reverse,
+		winPos:  -1,
+		pos:     -1,
+	}, nil
 }
 
 func (r *reader) Close() error {
@@ -397,42 +403,161 @@ func (r *reader) Close() error {
 	return nil
 }
 
-// cursor walks a pre-resolved snapshot view. Bounds and prefix are already applied;
-// reverse flips the direction of First/Last/Next/Prev.
+// scanChunkKeys is the number of distinct user keys a forward scan window targets. It bounds
+// the work a single Next-driven refill does, so a short scan touches a handful of leaves and a
+// long scan refills window by window rather than folding the whole range at once. It is a soft
+// target (a window may hold a few more keys when tail or buffer messages land in its span), and
+// it is sized a little above the suite's default scan length so a typical short scan is one
+// window.
+const scanChunkKeys = 128
+
+// cursor walks a snapshot view of the tree in one of two modes. The forward streaming mode (the
+// !reverse path) folds the range one bounded window at a time, refilling as Next walks off the
+// end, so a scan that stops early never folds the rest of the run. The full fallback mode
+// materializes the whole [lower, upper) view once, the proven path snapshotRange always gave;
+// it is taken for reverse iterators and for any backward move (Prev, SeekLT, Last) or
+// range-delete read that the forward window cannot answer cheaply. Bounds and prefix are already
+// applied to lower/upper.
 type cursor struct {
-	view    []resolved
-	pos     int
+	t       *Tree
+	snap    engine.Snapshot
+	g       *guard
+	lower   []byte
+	upper   []byte
 	reverse bool
+
+	// Forward streaming window.
+	win     []resolved
+	winPos  int
+	nextKey []byte // inclusive start of the next window, valid when moreFwd
+	moreFwd bool
+	started bool
+
+	// Full fallback.
+	full      []resolved
+	usingFull bool
+	pos       int
+
+	err error
+}
+
+// newViewCursor wraps an already-materialized resolved view in a cursor fixed in
+// full-materialization mode. It is the entry point for callers that have gathered the whole view
+// themselves and only need it walked: the sharded reader, which merges its per-shard views into
+// one before handing it over (sharded.go). The streaming forward window is bypassed because the
+// view is already in hand.
+func newViewCursor(view []resolved, reverse bool) *cursor {
+	return &cursor{full: view, usingFull: true, pos: -1, winPos: -1, reverse: reverse}
+}
+
+// ensureFull switches the cursor into full-materialization mode, gathering the whole
+// [lower, upper) view once and translating the current forward position into an index over it,
+// so a backward move picks up where the forward walk left off. It is idempotent.
+func (c *cursor) ensureFull() {
+	if c.usingFull {
+		return
+	}
+	var curKey []byte
+	if c.started && c.winPos >= 0 && c.winPos < len(c.win) {
+		curKey = c.win[c.winPos].uk
+	}
+	view, err := c.t.snapshotRange(c.snap, c.g, c.lower, c.upper)
+	if err != nil {
+		c.err = err
+		view = nil
+	}
+	c.full = view
+	c.usingFull = true
+	switch {
+	case curKey != nil:
+		c.pos = sort.Search(len(c.full), func(i int) bool {
+			return bytes.Compare(c.full[i].uk, curKey) >= 0
+		})
+	case c.started && c.winPos >= len(c.win):
+		c.pos = len(c.full) // forward walk had run past the end
+	default:
+		c.pos = -1 // never positioned, or sat before the first key
+	}
+}
+
+// gatherFrom fills the forward window from fromKey (inclusive), skipping over windows that fold
+// to nothing (every key in the span deleted or invisible at the snapshot) until a non-empty
+// window or the end of the range. It returns whether the cursor landed on a live key.
+func (c *cursor) gatherFrom(fromKey []byte) bool {
+	c.started = true
+	for {
+		win, next, more, err := c.t.snapshotChunk(c.snap, c.g, fromKey, c.upper, scanChunkKeys)
+		if err != nil {
+			c.err = err
+			c.win = nil
+			c.winPos = 0
+			c.moreFwd = false
+			return false
+		}
+		c.win = win
+		c.winPos = 0
+		c.nextKey = next
+		c.moreFwd = more
+		if len(win) > 0 || !more {
+			return len(win) > 0
+		}
+		fromKey = next // empty window but the range continues: refill from its boundary
+	}
 }
 
 func (c *cursor) First() bool {
-	if c.reverse {
-		c.pos = len(c.view) - 1
-	} else {
-		c.pos = 0
+	if c.usingFull {
+		if c.reverse {
+			c.pos = len(c.full) - 1
+		} else {
+			c.pos = 0
+		}
+		return c.Valid()
 	}
-	return c.Valid()
+	if c.reverse || c.t.hasRangeDel.Load() {
+		c.ensureFull()
+		if c.reverse {
+			c.pos = len(c.full) - 1
+		} else {
+			c.pos = 0
+		}
+		return c.Valid()
+	}
+	return c.gatherFrom(c.lower)
 }
 
 func (c *cursor) Last() bool {
+	c.ensureFull()
 	if c.reverse {
 		c.pos = 0
 	} else {
-		c.pos = len(c.view) - 1
+		c.pos = len(c.full) - 1
 	}
 	return c.Valid()
 }
 
 func (c *cursor) Next() bool {
-	if c.reverse {
-		c.pos--
-	} else {
-		c.pos++
+	if c.usingFull {
+		if c.reverse {
+			c.pos--
+		} else {
+			c.pos++
+		}
+		return c.Valid()
 	}
-	return c.Valid()
+	c.winPos++
+	if c.winPos < len(c.win) {
+		return true
+	}
+	if c.moreFwd {
+		return c.gatherFrom(c.nextKey)
+	}
+	c.winPos = len(c.win) // park past the end so Valid stays false
+	return false
 }
 
 func (c *cursor) Prev() bool {
+	c.ensureFull()
 	if c.reverse {
 		c.pos++
 	} else {
@@ -442,46 +567,82 @@ func (c *cursor) Prev() bool {
 }
 
 func (c *cursor) SeekGE(userKey []byte) bool {
-	idx := sort.Search(len(c.view), func(i int) bool {
-		return bytes.Compare(c.view[i].uk, userKey) >= 0
-	})
-	c.pos = idx
-	return c.Valid()
+	if c.usingFull {
+		c.pos = sort.Search(len(c.full), func(i int) bool {
+			return bytes.Compare(c.full[i].uk, userKey) >= 0
+		})
+		return c.Valid()
+	}
+	if c.reverse || c.t.hasRangeDel.Load() {
+		c.ensureFull()
+		c.pos = sort.Search(len(c.full), func(i int) bool {
+			return bytes.Compare(c.full[i].uk, userKey) >= 0
+		})
+		return c.Valid()
+	}
+	from := userKey
+	if c.lower != nil && bytes.Compare(from, c.lower) < 0 {
+		from = c.lower
+	}
+	return c.gatherFrom(from)
 }
 
 func (c *cursor) SeekLT(userKey []byte) bool {
-	idx := sort.Search(len(c.view), func(i int) bool {
-		return bytes.Compare(c.view[i].uk, userKey) >= 0
+	c.ensureFull()
+	idx := sort.Search(len(c.full), func(i int) bool {
+		return bytes.Compare(c.full[i].uk, userKey) >= 0
 	})
 	c.pos = idx - 1
 	return c.Valid()
 }
 
-func (c *cursor) Valid() bool { return c.pos >= 0 && c.pos < len(c.view) }
+func (c *cursor) Valid() bool {
+	if c.usingFull {
+		return c.pos >= 0 && c.pos < len(c.full)
+	}
+	return c.winPos >= 0 && c.winPos < len(c.win)
+}
+
+// cur returns the resolved pair the cursor sits on, in whichever mode is live.
+func (c *cursor) cur() (resolved, bool) {
+	if c.usingFull {
+		if c.pos < 0 || c.pos >= len(c.full) {
+			return resolved{}, false
+		}
+		return c.full[c.pos], true
+	}
+	if c.winPos < 0 || c.winPos >= len(c.win) {
+		return resolved{}, false
+	}
+	return c.win[c.winPos], true
+}
 
 func (c *cursor) Key() []byte {
-	if !c.Valid() {
+	r, ok := c.cur()
+	if !ok {
 		return nil
 	}
-	return c.view[c.pos].uk
+	return r.uk
 }
 
 func (c *cursor) InternalKey() []byte {
-	if !c.Valid() {
+	r, ok := c.cur()
+	if !ok {
 		return nil
 	}
 	// The resolved view does not carry a version; synthesize a max-version internal
 	// key so the merge layer's comparisons above the seam stay well-defined, exactly
 	// as the model cursor does.
-	return format.EncodeInternalKey(c.view[c.pos].uk, format.MaxVersion, format.KindSet)
+	return format.EncodeInternalKey(r.uk, format.MaxVersion, format.KindSet)
 }
 
 func (c *cursor) Value() (engine.LazyValue, error) {
-	if !c.Valid() {
+	r, ok := c.cur()
+	if !ok {
 		return engine.LazyValue{}, nil
 	}
-	return engine.InlineValue(c.view[c.pos].val), nil
+	return engine.InlineValue(r.val), nil
 }
 
-func (c *cursor) Error() error { return nil }
+func (c *cursor) Error() error { return c.err }
 func (c *cursor) Close() error { return nil }

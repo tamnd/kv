@@ -357,7 +357,7 @@ func (r *shardedReader) NewIter(opts engine.IterOptions) (engine.Cursor, error) 
 	if err != nil {
 		return nil, err
 	}
-	return &cursor{view: mergeShardViews(views), pos: -1, reverse: opts.Reverse}, nil
+	return newViewCursor(mergeShardViews(views), opts.Reverse), nil
 }
 
 // gather materializes every shard's resolved view of [lower, upper) at the reader's snapshot. The

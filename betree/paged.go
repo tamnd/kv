@@ -696,6 +696,130 @@ func (t *Tree) collectRange(lower, upper []byte) ([]record, error) {
 	return cells, nil
 }
 
+// collectForwardChunk gathers the leaf-run cells for one forward scan window: starting at the
+// leaf that holds fromKey, it walks right siblings collecting records with user key in
+// [fromKey, upper), counting distinct user keys, and stops once it has reached the
+// (chunkKeys+1)th distinct key, which becomes the window's exclusive boundary and the next
+// window's inclusive start. It returns the collected leaf cells, that boundary key (nil when
+// the run reaches upper or ends), and whether a further window exists. It is the count-bounded
+// twin of collectRange's leaf walk, the streaming-cursor lever (doc 04 D5): a scan consumes one
+// window at a time, so an unbounded iterator stopped after a few keys never decodes the rest of
+// the run. Only the leaf cells are bounded here; the caller adds the tail and buffer messages
+// for the resulting key span and folds. The boundary is always strictly greater than fromKey
+// (the count test fires on a distinct key past fromKey), so the next window starts past this
+// one and the walk makes progress even when one user key spans many leaves of versions.
+func (t *Tree) collectForwardChunk(fromKey, upper []byte, chunkKeys int) (cells []record, boundary []byte, more bool, err error) {
+	start, err := t.startLeafFor(fromKey)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	distinct := 0
+	var lastKey []byte
+	seen := map[format.PageNo]bool{}
+	for pgno := start; pgno != format.NoPage; {
+		if seen[pgno] {
+			return nil, nil, false, fmt.Errorf("betree: leaf run cycles at page %d", pgno)
+		}
+		seen[pgno] = true
+		lf, derr := t.viewLeaf(pgno)
+		if derr != nil {
+			return nil, nil, false, derr
+		}
+		for i := range lf.records {
+			uk := format.UserKey(lf.records[i].key)
+			if fromKey != nil && bytes.Compare(uk, fromKey) < 0 {
+				continue
+			}
+			if upper != nil && bytes.Compare(uk, upper) >= 0 {
+				return cells, nil, false, nil // reached the iterator's upper bound
+			}
+			if lastKey == nil || !bytes.Equal(uk, lastKey) {
+				// A new distinct user key. Once the window already holds chunkKeys of them and
+				// this one sits past fromKey, it starts the next window: exclude it and stop.
+				if distinct >= chunkKeys && (fromKey == nil || bytes.Compare(uk, fromKey) > 0) {
+					return cells, append([]byte(nil), uk...), true, nil
+				}
+				distinct++
+				lastKey = append(lastKey[:0], uk...)
+			}
+			cells = append(cells, lf.records[i])
+		}
+		pgno = lf.right
+	}
+	return cells, nil, false, nil
+}
+
+// gatherChunk resolves one forward scan window: the leaf cells from collectForwardChunk plus the
+// hot tail and interior buffer messages that fall in the window's key span, folded into the
+// resolved view for [fromKey, boundary) (or [fromKey, upper) when the run is exhausted). It is
+// the bounded, streaming twin of gather: a scan folds one window's worth of keys at a time
+// instead of the whole keyspace up front. It runs only off the range-delete path; a cursor that
+// meets a range delete takes the full-materialization fallback in the cursor, the same way a
+// point read falls back, because a range delete's coverage is not local to a window.
+func (t *Tree) gatherChunk(snap engine.Snapshot, fromKey, upper []byte, chunkKeys int) (win []resolved, boundary []byte, more bool, err error) {
+	cells, boundary, more, err := t.collectForwardChunk(fromKey, upper, chunkKeys)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	effUpper := upper
+	if more {
+		effUpper = boundary
+	}
+	for _, r := range t.collectTailMessages() {
+		if inHalfOpen(format.UserKey(r.key), fromKey, effUpper) {
+			cells = append(cells, r)
+		}
+	}
+	buffered, err := t.collectBufferedRange(fromKey, effUpper)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	cells = append(cells, buffered...)
+	sort.Slice(cells, func(i, j int) bool {
+		return format.CompareInternal(cells[i].key, cells[j].key) < 0
+	})
+	if cellsCleanSets(cells) {
+		win = foldCleanResolved(cells, snap)
+	} else {
+		win = t.foldResolved(cells, snap, nil)
+	}
+	// The cells are already inside [fromKey, effUpper); clip defensively so a fold can never
+	// hand back a key outside the window the cursor promised.
+	win = clipRange(win, fromKey, effUpper)
+	return win, boundary, more, nil
+}
+
+// snapshotChunk is the streaming-cursor twin of snapshotRange: it wraps gatherChunk in the same
+// optimistic gen-validation and epoch pin so one window is gathered at one consistent point in
+// time, restarting if a writer crossed it and falling to the writer lock after a few spins. The
+// cursor calls it once per window. Snapshot isolation makes the per-window gathers compose: the
+// reader's snapshot version is fixed below any in-flight commit, so all data at that version is
+// already committed and immutable, and reading the range in windows is identical to reading it
+// whole.
+func (t *Tree) snapshotChunk(snap engine.Snapshot, g *guard, fromKey, upper []byte, chunkKeys int) ([]resolved, []byte, bool, error) {
+	const maxOptimistic = 4
+	for attempt := 0; attempt < maxOptimistic; attempt++ {
+		g0 := t.gen.Load()
+		if g0&1 != 0 {
+			runtime.Gosched()
+			continue
+		}
+		g.pin()
+		win, boundary, more, err := t.gatherChunk(snap, fromKey, upper, chunkKeys)
+		g.unpin()
+		if t.gen.Load() != g0 {
+			runtime.Gosched()
+			continue
+		}
+		return win, boundary, more, err
+	}
+	t.wmu.Lock()
+	defer t.wmu.Unlock()
+	g.pin()
+	defer g.unpin()
+	return t.gatherChunk(snap, fromKey, upper, chunkKeys)
+}
+
 // collectBufferedRange is the bounded twin of collectBufferedMessages: it walks the interior
 // tree but descends only into the children whose key span overlaps [lower, upper), so a short
 // scan never decodes the buffers of the subtrees its range cannot touch. At each interior node
