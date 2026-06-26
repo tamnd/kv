@@ -191,7 +191,8 @@ func (t *Tree) packLeaf(pgno format.PageNo, lf *leaf) ([]childSplit, error) {
 // the frame through GetAllocated so the dead prior bytes are not read back. It is the
 // fresh-page counterpart to writeLeaf, which rewrites an existing page in place.
 func (t *Tree) writeLeafAllocated(pgno format.PageNo, lf *leaf) error {
-	dst := make([]byte, t.pgr.UsablePageSize())
+	dst, ref := t.encBufGet(true)
+	defer t.encBufPut(ref)
 	if _, err := encodeLeaf(dst, lf); err != nil {
 		return err
 	}
@@ -362,15 +363,24 @@ func mergeMessages(a, b []message) []message {
 	return out
 }
 
-// leafFits reports whether lf encodes within the usable page area.
+// leafFits reports whether lf encodes within the usable page area. The trial buffer is
+// drawn unzeroed from the pool: the encode writes only at fixed offsets and the bytes are
+// discarded after the fit check, so a prior encode's leftover content cannot affect the
+// result. This is the hot per-record check the greedy pack loop runs, so skipping the
+// page-clear here is the allocation win that matters most.
 func (t *Tree) leafFits(lf *leaf) bool {
-	_, err := encodeLeaf(make([]byte, t.pgr.UsablePageSize()), lf)
+	dst, ref := t.encBufGet(false)
+	defer t.encBufPut(ref)
+	_, err := encodeLeaf(dst, lf)
 	return err == nil
 }
 
-// interiorFits reports whether in encodes within the usable page area.
+// interiorFits reports whether in encodes within the usable page area, with the same
+// discarded-trial-buffer reasoning as leafFits.
 func (t *Tree) interiorFits(in *interior) bool {
-	_, err := encodeInterior(make([]byte, t.pgr.UsablePageSize()), in)
+	dst, ref := t.encBufGet(false)
+	defer t.encBufPut(ref)
+	_, err := encodeInterior(dst, in)
 	return err == nil
 }
 

@@ -86,11 +86,42 @@ func (t *Tree) loadInterior(pgno format.PageNo) (*interior, error) {
 	return in, derr
 }
 
+// encBufGet draws a page-sized scratch buffer for one node encode from the pool
+// (betree.go encBuf) and returns it with the pool ref the caller hands back through
+// encBufPut. A persisted encode passes zero=true so the buffer's slack is cleared, because
+// the encoder writes only up to its content length and leaves the tail untouched; clearing
+// it keeps a page's unused tail deterministic and free of bytes from a prior pooled encode,
+// exactly as the make([]byte, ...) this replaces did. A trial-fit encode whose bytes are
+// discarded passes zero=false and skips the clear, which is the hot once-per-record path the
+// pack loop runs. The returned slice spans the usable page area; the pool buffer's capacity
+// is that size, so the reslice never exceeds it.
+//
+// The ref is returned for the caller to defer encBufPut on, rather than a release closure,
+// because a returned closure captures ref and escapes to the heap, one small allocation on
+// every encode and every trial fit. Returning the already-allocated ref and deferring a plain
+// method keeps the hot path free of that per-call allocation.
+func (t *Tree) encBufGet(zero bool) (buf []byte, ref *[]byte) {
+	ref = t.encBuf.get()
+	b := (*ref)[:t.pgr.UsablePageSize()]
+	if zero {
+		for i := range b {
+			b[i] = 0
+		}
+	}
+	return b, ref
+}
+
+// encBufPut returns a buffer drawn by encBufGet to the pool. It is the deferred counterpart
+// to encBufGet; keeping it a named method rather than a closure is what lets the deferred call
+// stay allocation-free on the encode path.
+func (t *Tree) encBufPut(ref *[]byte) { t.encBuf.put(ref) }
+
 // writeLeaf re-encodes lf into the existing page pgno. The caller has already
 // checked the leaf fits; an overflow here is a programming error, not a split
 // signal, so it surfaces as an error rather than being retried.
 func (t *Tree) writeLeaf(pgno format.PageNo, lf *leaf) error {
-	dst := make([]byte, t.pgr.UsablePageSize())
+	dst, ref := t.encBufGet(true)
+	defer t.encBufPut(ref)
 	if _, err := encodeLeaf(dst, lf); err != nil {
 		return err
 	}
@@ -100,7 +131,8 @@ func (t *Tree) writeLeaf(pgno format.PageNo, lf *leaf) error {
 // writeInterior re-encodes in into the existing page pgno, with the same
 // already-fits contract as writeLeaf.
 func (t *Tree) writeInterior(pgno format.PageNo, in *interior) error {
-	dst := make([]byte, t.pgr.UsablePageSize())
+	dst, ref := t.encBufGet(true)
+	defer t.encBufPut(ref)
 	if _, err := encodeInterior(dst, in); err != nil {
 		return err
 	}
@@ -137,7 +169,8 @@ func (t *Tree) writePage(pgno format.PageNo, body []byte) error {
 // storeLeafNew allocates a fresh page and writes lf into it, returning its number.
 // It is the new-page counterpart to writeLeaf, used when a split creates a sibling.
 func (t *Tree) storeLeafNew(lf *leaf) (format.PageNo, error) {
-	dst := make([]byte, t.pgr.UsablePageSize())
+	dst, ref := t.encBufGet(true)
+	defer t.encBufPut(ref)
 	if _, err := encodeLeaf(dst, lf); err != nil {
 		return 0, err
 	}
@@ -162,7 +195,8 @@ func (t *Tree) storeLeafNew(lf *leaf) (format.PageNo, error) {
 // storeInteriorNew allocates a fresh page and writes in into it, used when a split
 // propagates and grows a new interior or a new root.
 func (t *Tree) storeInteriorNew(in *interior) (format.PageNo, error) {
-	dst := make([]byte, t.pgr.UsablePageSize())
+	dst, ref := t.encBufGet(true)
+	defer t.encBufPut(ref)
 	if _, err := encodeInterior(dst, in); err != nil {
 		return 0, err
 	}
