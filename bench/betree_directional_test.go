@@ -1,6 +1,7 @@
 package bench
 
 import (
+	"os"
 	"sort"
 	"testing"
 
@@ -19,8 +20,8 @@ import (
 //
 // It runs off by default so the normal suite stays untouched; set BENCH_BETREE=1 to run it.
 func TestBetreeDirectional(t *testing.T) {
-	if testing.Short() {
-		t.Skip("directional bench skipped in -short")
+	if os.Getenv("BENCH_BETREE") == "" {
+		t.Skip("directional bench is opt-in: set BENCH_BETREE=1 to run (it runs the full suite on three engines and takes minutes)")
 	}
 
 	tmpl := DefaultConfig(kv.BTree, t.TempDir())
