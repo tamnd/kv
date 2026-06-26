@@ -398,6 +398,95 @@ func (r *reader) NewIter(opts engine.IterOptions) (engine.Cursor, error) {
 	}, nil
 }
 
+// StreamForward reports that this reader can drive the host's lazy forward-scan path. The
+// forward streaming window folds each window's hot tail and interior buffer messages along with
+// its leaf cells (gatherChunk), so a forward stream is complete: it never misses a message a
+// whole-range gather would catch. Returning true is what makes a bounded scan through the public
+// DB stack pull one window at a time instead of materializing the whole range; without it the host
+// falls back to draining a full NewIter, which is the regression the streaming window was built to
+// remove. It implements the host's forwardScanner capability.
+func (r *reader) StreamForward() bool { return true }
+
+// ScanForward is the stateless forward scan the host's forwardScanner capability requires
+// alongside StreamForward: it returns the first snapshot-visible entry whose user key is strictly
+// greater than after (or the first key in [lower, upper) when after is nil), re-descending each
+// call. The host prefers the stateful NewForwardCursor below and drives that instead when present,
+// so this is the correctness floor that keeps a bounded scan correct if the stateful path is ever
+// unavailable; it folds one window at the seek point rather than the whole range.
+func (r *reader) ScanForward(after, lower, upper []byte, keysOnly bool) (key, val []byte, ok bool, err error) {
+	from := lower
+	if after != nil {
+		// The immediate string successor of after is the smallest key strictly greater than it.
+		succ := append(append([]byte(nil), after...), 0x00)
+		if from == nil || bytes.Compare(succ, from) > 0 {
+			from = succ
+		}
+	}
+	c := &cursor{t: r.t, snap: r.snap, g: r.g, lower: lower, upper: upper, winPos: -1, pos: -1}
+	if !c.SeekGE(from) {
+		return nil, nil, false, c.Error()
+	}
+	rr, valid := c.cur()
+	if !valid {
+		return nil, nil, false, c.Error()
+	}
+	key = append([]byte(nil), rr.uk...)
+	if !keysOnly {
+		val = append([]byte(nil), rr.val...)
+	}
+	return key, val, true, nil
+}
+
+// NewForwardCursor opens a stateful forward stream cursor over [lower, upper) (nil bounds
+// unbounded), the engine.ForwardCursorer capability. It hands back the same forward streaming
+// cursor NewIter builds, adapted to the host's one-entry-per-call StreamCursor contract, reusing
+// the reader's snapshot and epoch guard so it stays valid for the reader's life. The host prefers
+// this over draining a NewIter when the reader is streamable, which is what routes a bounded scan
+// onto the window path end to end.
+func (r *reader) NewForwardCursor(lower, upper []byte) (engine.StreamCursor, error) {
+	return &streamCursor{
+		c: &cursor{
+			t:      r.t,
+			snap:   r.snap,
+			g:      r.g,
+			lower:  lower,
+			upper:  upper,
+			winPos: -1,
+			pos:    -1,
+		},
+	}, nil
+}
+
+// streamCursor adapts the forward streaming cursor to engine.StreamCursor: it drives the cursor
+// First then Next, one entry per NextEntry call, in ascending snapshot-visible order. The host
+// drives it single-consumer under its read lock, the contract StreamCursor states, and the keys
+// and values are freshly copied out so they outlive the window the cursor may refill underneath.
+type streamCursor struct {
+	c       *cursor
+	started bool
+}
+
+func (s *streamCursor) NextEntry(keysOnly bool) (key, val []byte, ok bool, err error) {
+	if !s.started {
+		s.started = true
+		ok = s.c.First()
+	} else {
+		ok = s.c.Next()
+	}
+	if !ok {
+		return nil, nil, false, s.c.Error()
+	}
+	r, valid := s.c.cur()
+	if !valid {
+		return nil, nil, false, s.c.Error()
+	}
+	key = append([]byte(nil), r.uk...)
+	if !keysOnly {
+		val = append([]byte(nil), r.val...)
+	}
+	return key, val, true, nil
+}
+
 func (r *reader) Close() error {
 	r.t.recl.unregister(r.g)
 	return nil
