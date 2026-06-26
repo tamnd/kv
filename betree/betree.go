@@ -85,10 +85,17 @@ type Tree struct {
 	// selective descent where lock coupling is what validates the path.
 	gen atomic.Uint64
 
-	// rootPgno mirrors the pager header's EngineRoot in an atomic so a lock-free reader
-	// reads the root page number without racing a writer's growRoot store into the header
-	// field. The header stays the durable source of truth; setRoot writes both, and the
-	// read path reads this mirror.
+	// rstore is where this tree records its root page number durably (root.go): the pager
+	// header for the single-shard core, a shard-directory slot for a sharded sub-tree. The
+	// seam lets N sub-trees live in one file at independent roots without each needing the
+	// one header field. setRoot writes through it and Open reads through it; the read path
+	// never touches it, reading the atomic mirror below instead.
+	rstore rootStore
+
+	// rootPgno mirrors the durable root (rstore) in an atomic so a lock-free reader reads the
+	// root page number without racing a writer's growRoot store into the durable home. The
+	// durable store stays the source of truth; setRoot writes both, and the read path reads
+	// this mirror.
 	rootPgno atomic.Uint32
 
 	// recl is the epoch reclaimer (epoch.go). A reader pins a guard for the span of its
@@ -163,7 +170,7 @@ type Tree struct {
 // finish wiring it to the shared substrate. The signature matches the other cores so
 // db.newEngine constructs it the same way.
 func New(pgr *pager.Pager) *Tree {
-	return &Tree{pgr: pgr, recl: newReclaimer(), encBuf: newScratchPool(pgr.UsablePageSize())}
+	return newTreeWithRoot(pgr, headerRootStore{pgr: pgr})
 }
 
 // Kind implements engine.Engine. It reports the new selector value so a file this
@@ -180,10 +187,11 @@ func (t *Tree) SetMergeFunc(f func(existing, operand []byte) []byte) { t.merge =
 // has nothing to rebuild. It runs once at construction before any concurrent use, so
 // it does not take the latch.
 func (t *Tree) Open(env *engine.Env) error {
-	if t.pgr.Header().EngineRoot != format.NoPage {
-		// Seed the lock-free root mirror from the durable header so reads find the run
-		// without touching the header field a writer may later store into.
-		t.rootPgno.Store(t.pgr.Header().EngineRoot)
+	if root := t.rstore.load(); root != format.NoPage {
+		// Seed the lock-free root mirror from the durable store (the header for the
+		// single-shard core, a directory slot for a sub-tree) so reads find the run without
+		// touching the durable home a writer may later store into.
+		t.rootPgno.Store(uint32(root))
 		// Detect any range-delete marker already persisted in the run or the buffers so a
 		// reopened database that holds one takes the correct full-gather path from the
 		// first read. Markers written this session set the flag on the write path instead.
