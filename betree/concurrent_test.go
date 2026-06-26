@@ -192,6 +192,139 @@ func TestConcurrentReadersFrozenSnapshot(t *testing.T) {
 	wg.Wait()
 }
 
+// TestConcurrentScanAcrossSplits is the regression gate for the split-sibling materialization
+// race. A leaf split reserves a fresh sibling page number and links the left piece at it; a
+// scanning reader walking the leaf chain steps into that page through the forward link. If the
+// fresh sibling is reachable before its bytes are written, the reader's getMiss admits a zeroed
+// frame for the page number, which then aliases the writer's GetAllocated for the same number
+// into a second frame, and the orphaned frame's later eviction corrupts the shard index so a
+// much later read of that page decodes zeros and fails. The fix writes split pieces right to
+// left so a fresh sibling is unreachable until its bytes land; this test drives the path hard
+// to keep it fixed.
+//
+// The driver concentrates churn on a small base keyspace so the few leaves holding those keys
+// split over and over right under the readers: the writer overwrites random in-range keys at
+// rising versions with padded values and flushes every batch, which fills and splits the hot
+// leaves continuously, while several readers scan the frozen version-1 snapshot end to end and
+// assert they always see exactly the base keyspace in order at its base values. Scanning is what
+// makes a reader walk the sibling links into a freshly split page, and overlapping the churn with
+// the scanned range is what puts a split in a reader's path often rather than at one boundary
+// leaf, so the reserved-sibling window is hit far more per iteration than a spread-out keyspace
+// would. Run it under -race with -count to compound the chances of catching any regression, the
+// way the race was originally found.
+func TestConcurrentScanAcrossSplits(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping concurrency stress in -short")
+	}
+	tr := newTreeBig(t)
+	tr.SetMergeFunc(concatMerge)
+
+	const nbase = 48
+	keyOf := func(i int) []byte { return []byte(fmt.Sprintf("k%05d", i)) }
+	// Values padded so each leaf holds only a few records and the repeated overwrites split the
+	// hot leaves quickly instead of resting many versions to a page.
+	baseVal := func(i int) []byte { return []byte(fmt.Sprintf("base-%05d-%0300d", i, i)) }
+
+	// Version 1: the frozen base keyspace every scanning reader verifies.
+	b0 := engine.NewWriteBatch(1)
+	for i := 0; i < nbase; i++ {
+		b0.Set(keyOf(i), baseVal(i))
+	}
+	if err := tr.Apply(b0, b0.Version()); err != nil {
+		t.Fatalf("seed apply: %v", err)
+	}
+
+	var writerDone atomic.Bool
+	var wg sync.WaitGroup
+
+	// The writer overwrites random in-range keys at rising versions with padded values and
+	// flushes every batch, so the leaves the readers scan split again and again across the run.
+	const nbatches = 300
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer writerDone.Store(true)
+		rng := rand.New(rand.NewSource(99))
+		ver := uint64(1)
+		for b := 0; b < nbatches; b++ {
+			ver++
+			wb := engine.NewWriteBatch(ver)
+			used := map[int]bool{}
+			for n := 0; n < 12; n++ {
+				i := rng.Intn(nbase)
+				if used[i] {
+					continue
+				}
+				used[i] = true
+				wb.Set(keyOf(i), []byte(fmt.Sprintf("v%d-%05d-%0300d", ver, i, i)))
+			}
+			if err := tr.Apply(wb, wb.Version()); err != nil {
+				t.Errorf("writer apply v%d: %v", ver, err)
+				return
+			}
+			if err := tr.Flush(); err != nil {
+				t.Errorf("writer flush v%d: %v", ver, err)
+				return
+			}
+		}
+	}()
+
+	// The readers scan the frozen version-1 snapshot end to end, walking the leaf chain across
+	// every split the writer drives. Each must surface exactly the base keys in order at base.
+	const nreaders = 6
+	for r := 0; r < nreaders; r++ {
+		r := r
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rd, err := tr.NewReader(engine.Snapshot{Version: 1})
+			if err != nil {
+				t.Errorf("reader %d: new reader: %v", r, err)
+				return
+			}
+			defer rd.Close()
+			for pass := 0; ; pass++ {
+				it, err := rd.NewIter(engine.IterOptions{})
+				if err != nil {
+					t.Errorf("reader %d: new iter pass %d: %v", r, pass, err)
+					return
+				}
+				seen := 0
+				for ok := it.First(); ok; ok = it.Next() {
+					lv, err := it.Value()
+					if err != nil {
+						it.Close()
+						t.Errorf("reader %d: iter value pass %d: %v", r, pass, err)
+						return
+					}
+					val, err := lv.Value()
+					if err != nil {
+						it.Close()
+						t.Errorf("reader %d: iter lazy value pass %d: %v", r, pass, err)
+						return
+					}
+					if string(it.Key()) != string(keyOf(seen)) || string(val) != string(baseVal(seen)) {
+						it.Close()
+						t.Errorf("reader %d: iter pos %d pass %d = (%q,%q), want base", r, seen, pass, it.Key(), val)
+						return
+					}
+					seen++
+				}
+				it.Close()
+				if seen != nbase {
+					t.Errorf("reader %d: iter pass %d saw %d keys, want %d", r, pass, seen, nbase)
+					return
+				}
+				if pass > 0 && writerDone.Load() {
+					return
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+}
+
 // TestConcurrentReadersEndState drives the same churn but verifies the final committed
 // state: after the writer's bounded run, a fresh reader at the final version must match
 // the single-writer model exactly, so the concurrent rollovers and splits did not

@@ -162,7 +162,16 @@ func (t *Tree) packLeaf(pgno format.PageNo, lf *leaf) ([]childSplit, error) {
 		pages[i] = t.pgr.AllocateNumber()
 	}
 
-	var splits []childSplit
+	// Build every piece first, then write them right to left so a page is materialized
+	// before any forward link names it. Piece i's right link is pages[i+1], so writing
+	// high index to low means each piece's right sibling already exists on disk when the
+	// piece (and its link) lands. The first piece, which reuses pgno and is the one a left
+	// sibling and the parent already point at, is written last; until then a reader walking
+	// in cannot step into a reserved-but-unwritten sibling, which is what would otherwise let
+	// its getMiss admit a zeroed frame that aliases this writer's GetAllocated for the same
+	// page number. With the order reversed each fresh sibling is unreachable until its bytes
+	// are in place, exactly like storeLeafNew.
+	pieces := make([]*leaf, len(chunks))
 	for i, chunk := range chunks {
 		left := lf.left
 		if i > 0 {
@@ -172,17 +181,19 @@ func (t *Tree) packLeaf(pgno format.PageNo, lf *leaf) ([]childSplit, error) {
 		if i < len(chunks)-1 {
 			right = pages[i+1]
 		}
-		piece := &leaf{records: chunk, left: left, right: right, bucketSize: defaultBucketSize}
-		if i == 0 {
-			if err := t.writeLeaf(pages[i], piece); err != nil {
-				return nil, err
-			}
-		} else {
-			if err := t.writeLeafAllocated(pages[i], piece); err != nil {
-				return nil, err
-			}
-			splits = append(splits, childSplit{sep: append([]byte(nil), chunk[0].key...), page: pages[i]})
+		pieces[i] = &leaf{records: chunk, left: left, right: right, bucketSize: defaultBucketSize}
+	}
+	for i := len(chunks) - 1; i >= 1; i-- {
+		if err := t.writeLeafAllocated(pages[i], pieces[i]); err != nil {
+			return nil, err
 		}
+	}
+	if err := t.writeLeaf(pages[0], pieces[0]); err != nil {
+		return nil, err
+	}
+	var splits []childSplit
+	for i := 1; i < len(chunks); i++ {
+		splits = append(splits, childSplit{sep: append([]byte(nil), chunks[i][0].key...), page: pages[i]})
 	}
 	return splits, nil
 }
@@ -200,11 +211,13 @@ func (t *Tree) writeLeafAllocated(pgno format.PageNo, lf *leaf) error {
 	if err != nil {
 		return err
 	}
-	// The fillGate rule again: this writes a fresh split sibling whose page number a
-	// just-written left piece already links to, so unlike storeLeafNew a latch-free reader
-	// can reach this page while the copy runs. The gate serializes the copy against the
-	// reader's cold decode, and the gen seqlock makes that reader restart since the whole
-	// rollover runs in one odd-gen window; the ClearDecoded drops any stale box.
+	// packLeaf writes the fresh siblings before the piece that links to them, so by the
+	// invariant there this page is not reachable from the live tree until this copy lands:
+	// no latch-free reader can be mid-decode of it, and no reader getMiss can admit a zeroed
+	// frame for pgno that would alias this writer's GetAllocated. The fillGate Lock still
+	// brackets the copy and ClearDecoded so the page joins the tree atomically with respect
+	// to a cold decode once it does become reachable, and the rollover's odd-gen window keeps
+	// the optimistic seqlock honest for the in-place pieces that are reachable throughout.
 	t.fillGate.Lock()
 	copy(fr.Data(), dst)
 	fr.ClearDecoded()

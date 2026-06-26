@@ -427,10 +427,21 @@ func (p *Pager) allocateNumberLocked() uint32 {
 // or a stale freed page) is dead and a read would be wasted I/O. The caller Unpins
 // exactly once, as with Allocate; this is simply Allocate's second half, split out so a
 // bulk writer can materialize reserved pages one at a time.
+//
+// The page must not already be resident. A freshly reserved number is past the high-water
+// mark or just popped from the freelist (where Free dropped its frame), so a frame for it
+// in the cache means something reached the page before its bytes were written and faulted
+// it in as a hole of zeros. Admitting a second frame for that number would orphan the first
+// against the index and corrupt the cache when either is evicted, so this reports the
+// violation instead of papering over it; a correct caller writes a reserved page before any
+// link names it, which keeps a latch-free reader from faulting it in early.
 func (p *Pager) GetAllocated(pgno uint32) (*Frame, error) {
 	sh := p.shardFor(pgno)
 	sh.rl.Lock()
 	defer sh.rl.Unlock()
+	if _, resident := sh.index[pgno]; resident {
+		return nil, fmt.Errorf("pager: GetAllocated on resident page %d (reserved page reached before it was written)", pgno)
+	}
 	fr, err := p.admit(sh, pgno)
 	if err != nil {
 		return nil, err
