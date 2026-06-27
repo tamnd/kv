@@ -506,13 +506,19 @@ func (r *reader) Close() error {
 	return nil
 }
 
-// scanChunkKeys is the number of distinct user keys a forward scan window targets. It bounds
-// the work a single Next-driven refill does, so a short scan touches a handful of leaves and a
+// scanChunkKeys is the largest number of distinct user keys a forward scan window targets, the
+// cap a long scan's window grows to. It bounds the work a single Next-driven refill does, so a
 // long scan refills window by window rather than folding the whole range at once. It is a soft
-// target (a window may hold a few more keys when tail or buffer messages land in its span), and
-// it is sized a little above the suite's default scan length so a typical short scan is one
-// window.
+// target (a window may hold a few more keys when tail or buffer messages land in its span).
 const scanChunkKeys = 128
+
+// scanChunkStart is the first window a fresh scan gathers. A scan does not announce its length, so
+// the cursor reads ahead: it starts at this smaller window and doubles toward scanChunkKeys on each
+// refill, so a short scan (the ycsb-e shape, where the suite's scan lengths are uniform up to a
+// hundred) folds one small window instead of the full cap, while a long scan still amortizes its
+// later refills against the larger window. Sized so the suite's typical short scan is one window
+// and folds about half the keys the flat cap used to gather.
+const scanChunkStart = 64
 
 // cursor walks a snapshot view of the tree in one of two modes. The forward streaming mode (the
 // !reverse path) folds the range one bounded window at a time, refilling as Next walks off the
@@ -532,6 +538,7 @@ type cursor struct {
 	// Forward streaming window.
 	win     []resolved
 	winPos  int
+	winKeys int    // target distinct keys for the next refill, grows from scanChunkStart to the cap
 	nextKey []byte // inclusive start of the next window, valid when moreFwd
 	moreFwd bool
 	started bool
@@ -583,13 +590,35 @@ func (c *cursor) ensureFull() {
 	}
 }
 
+// resetWindow returns the read-ahead window to its starting size for a fresh scan (First, SeekGE).
+// growWindow widens it toward the cap for a refill driven by Next walking off the current window or
+// by skipping an empty span, so a scan that keeps going ramps up while a short one never pays the cap.
+func (c *cursor) resetWindow() { c.winKeys = scanChunkStart }
+func (c *cursor) growWindow() {
+	if c.winKeys < scanChunkStart {
+		c.winKeys = scanChunkStart
+		return
+	}
+	if c.winKeys < scanChunkKeys {
+		c.winKeys *= 2
+		if c.winKeys > scanChunkKeys {
+			c.winKeys = scanChunkKeys
+		}
+	}
+}
+
 // gatherFrom fills the forward window from fromKey (inclusive), skipping over windows that fold
 // to nothing (every key in the span deleted or invisible at the snapshot) until a non-empty
-// window or the end of the range. It returns whether the cursor landed on a live key.
+// window or the end of the range. It returns whether the cursor landed on a live key. The caller
+// sets the window size first (resetWindow on a fresh scan, growWindow on a Next refill); an empty
+// span skipped here grows the window too, since the cursor is covering more ground than it landed.
 func (c *cursor) gatherFrom(fromKey []byte) bool {
 	c.started = true
+	if c.winKeys < scanChunkStart {
+		c.winKeys = scanChunkStart // a cursor reaching here without a reset still gets a sane window
+	}
 	for {
-		win, next, more, err := c.t.snapshotChunk(c.snap, c.g, fromKey, c.upper, scanChunkKeys)
+		win, next, more, err := c.t.snapshotChunk(c.snap, c.g, fromKey, c.upper, c.winKeys)
 		if err != nil {
 			c.err = err
 			c.win = nil
@@ -605,6 +634,7 @@ func (c *cursor) gatherFrom(fromKey []byte) bool {
 			return len(win) > 0
 		}
 		fromKey = next // empty window but the range continues: refill from its boundary
+		c.growWindow()
 	}
 }
 
@@ -626,6 +656,7 @@ func (c *cursor) First() bool {
 		}
 		return c.Valid()
 	}
+	c.resetWindow()
 	return c.gatherFrom(c.lower)
 }
 
@@ -653,6 +684,7 @@ func (c *cursor) Next() bool {
 		return true
 	}
 	if c.moreFwd {
+		c.growWindow()
 		return c.gatherFrom(c.nextKey)
 	}
 	c.winPos = len(c.win) // park past the end so Valid stays false
@@ -687,6 +719,7 @@ func (c *cursor) SeekGE(userKey []byte) bool {
 	if c.lower != nil && bytes.Compare(from, c.lower) < 0 {
 		from = c.lower
 	}
+	c.resetWindow()
 	return c.gatherFrom(from)
 }
 
