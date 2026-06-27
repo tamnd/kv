@@ -109,7 +109,12 @@ func (t *Tree) pushDown(pgno format.PageNo, msgs []message) ([]childSplit, error
 	if err != nil {
 		return nil, err
 	}
+	// Track the change in resident buffered messages so the read path can skip the spine walk
+	// when nothing is buffered. mergeMessages collapses exact-internal-key replays, so the count
+	// added is the buffer's growth, not len(msgs). This runs under wmu, so the counter is exact.
+	before := len(in.buffer)
 	in.buffer = mergeMessages(in.buffer, msgs)
+	t.bufferedMsgs.Add(int64(len(in.buffer) - before))
 
 	// Flush the heaviest child while the node does not fit the page. Each flush
 	// removes one child's messages from the buffer, so the buffer strictly shrinks and
@@ -122,6 +127,10 @@ func (t *Tree) pushDown(pgno format.PageNo, msgs []message) ([]childSplit, error
 		if len(run) == 0 {
 			break
 		}
+		// These messages leave this interior buffer. If the child is a leaf they land as records
+		// (no longer buffered); if the child is an interior its own mergeMessages re-adds them to
+		// the count. Either way subtracting them here keeps the running total exact.
+		t.bufferedMsgs.Add(-int64(len(run)))
 		splits, err := t.pushDown(in.childPage(c), run)
 		if err != nil {
 			return nil, err

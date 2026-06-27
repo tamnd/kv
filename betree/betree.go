@@ -164,6 +164,20 @@ type Tree struct {
 	// for maybeRebuildLocator. It is single-writer state guarded by wmu, since only a rollover
 	// (under wmu) touches it.
 	locRebuildCount uint64
+
+	// bufferedMsgs counts the messages currently resting in interior node buffers, the part of
+	// a write that has not yet flushed down to a leaf. A read consults the interior buffers (the
+	// spine walk in collectBufferedRange) only because a key's newest write may still sit in one;
+	// when this count is zero no write is buffered anywhere, so the read skips the spine walk
+	// entirely and answers from the leaves and tail alone. A read-heavy workload drives the
+	// buffers empty (sequential and dense writes flush straight through to leaves), so this turns
+	// the per-Get interior descent into a single atomic load on the common path. It is exact, not
+	// conservative: every message added to an interior buffer increments it and every message
+	// flushed out of one decrements it, both only under wmu, so a zero means genuinely empty. A
+	// lock-free reader loads it inside the gen-validated window, so a concurrent writer's update
+	// crosses the generation and the read retries. It is seeded at Open by summing the resident
+	// buffers a reopened tree inherits.
+	bufferedMsgs atomic.Int64
 }
 
 // New returns a Bε-tree core bound to pgr. Call Open to materialize the root and

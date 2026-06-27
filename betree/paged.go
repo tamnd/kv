@@ -11,6 +11,13 @@ import (
 	"github.com/tamnd/kv/pager"
 )
 
+// maxDescentDepth bounds a root-to-leaf interior descent. A betree packs many pivots per
+// interior page, so its height stays in the single digits even at a billion keys; this bound
+// sits far above any sound height and exists only as an allocation-free cycle guard, so a
+// corrupt child pointer that revisits a page recurses past it and returns an error instead of
+// hanging. It replaces the per-page seen-set those descents used to allocate on every read.
+const maxDescentDepth = 128
+
 // This file is M0's paged storage: it moves the core's cells off the in-memory map
 // the skeleton started with and onto a real chain of generation-2 leaf pages on the
 // pager, using the node codec from node.go. It is the PR that puts the new core on
@@ -68,16 +75,17 @@ func (t *Tree) loadRun() (cells []record, pages []format.PageNo, err error) {
 // The cycle guard turns a corrupt child pointer into an error rather than a hang.
 func (t *Tree) collectBufferedMessages() ([]record, error) {
 	var out []record
-	seen := map[format.PageNo]bool{}
-	var visit func(pgno format.PageNo) error
-	visit = func(pgno format.PageNo) error {
+	// Depth-bounded descent instead of a per-page seen-set: the walk only ever goes root to leaf
+	// through interior nodes, so its depth is the tree height and the bound is the cycle guard,
+	// with no map allocated on the read path.
+	var visit func(pgno format.PageNo, depth int) error
+	visit = func(pgno format.PageNo, depth int) error {
 		if pgno == format.NoPage {
 			return nil
 		}
-		if seen[pgno] {
-			return fmt.Errorf("betree: interior buffer walk cycles at page %d", pgno)
+		if depth > maxDescentDepth {
+			return fmt.Errorf("betree: interior buffer walk exceeds depth %d at page %d", maxDescentDepth, pgno)
 		}
-		seen[pgno] = true
 		typ, err := t.pageType(pgno)
 		if err != nil {
 			return err
@@ -95,17 +103,17 @@ func (t *Tree) collectBufferedMessages() ([]record, error) {
 				val: append([]byte(nil), m.val...),
 			})
 		}
-		if err := visit(in.leftmost); err != nil {
+		if err := visit(in.leftmost, depth+1); err != nil {
 			return err
 		}
 		for _, p := range in.pivots {
-			if err := visit(p.child); err != nil {
+			if err := visit(p.child, depth+1); err != nil {
 				return err
 			}
 		}
 		return nil
 	}
-	if err := visit(t.root()); err != nil {
+	if err := visit(t.root(), 0); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -523,12 +531,37 @@ func (t *Tree) collectKeyCells(userKey []byte) ([]record, error) {
 		return nil, err
 	}
 	var cells []record
-	seen := map[format.PageNo]bool{}
+	// One user key's version group spans one leaf in the common case (after the locator lands the
+	// covering leaf) and only walks right when a key's versions straddle a leaf boundary. So the
+	// cycle guard records visited pages in a stack ring and never allocates for the short walk,
+	// promoting to a map only for the rare key whose versions cross more leaves than the ring
+	// holds. A corrupt right-sibling pointer that loops trips the guard either way.
+	var ring [16]format.PageNo
+	steps := 0
+	var seen map[format.PageNo]bool
 	for pgno := start; pgno != format.NoPage; {
-		if seen[pgno] {
-			return nil, fmt.Errorf("betree: leaf run cycles at page %d", pgno)
+		if seen != nil {
+			if seen[pgno] {
+				return nil, fmt.Errorf("betree: leaf run cycles at page %d", pgno)
+			}
+			seen[pgno] = true
+		} else {
+			for i := 0; i < steps; i++ {
+				if ring[i] == pgno {
+					return nil, fmt.Errorf("betree: leaf run cycles at page %d", pgno)
+				}
+			}
+			if steps < len(ring) {
+				ring[steps] = pgno
+			} else {
+				seen = make(map[format.PageNo]bool, steps*2)
+				for i := 0; i < steps; i++ {
+					seen[ring[i]] = true
+				}
+				seen[pgno] = true
+			}
 		}
-		seen[pgno] = true
+		steps++
 		recs, right, more, err := t.leafKeyCells(pgno, userKey)
 		if err != nil {
 			return nil, err
@@ -831,6 +864,13 @@ func (t *Tree) snapshotChunk(snap engine.Snapshot, g *guard, fromKey, upper []by
 // that side, matching the leaf walk. The cycle guard turns a corrupt child pointer into an
 // error rather than a hang.
 func (t *Tree) collectBufferedRange(lower, upper []byte) ([]record, error) {
+	// No message rests in any interior buffer, so the spine walk has nothing to collect and the
+	// read answers from the leaves and tail alone. The count is read inside the caller's
+	// gen-validated window, so a writer that buffers a message concurrently crosses the
+	// generation and the read retries; a stable zero means genuinely empty for this read.
+	if t.bufferedMsgs.Load() == 0 {
+		return nil, nil
+	}
 	var lik, uik []byte
 	if lower != nil {
 		// (lower, MaxVersion) is the smallest internal key for user key lower, so the child that
@@ -841,16 +881,17 @@ func (t *Tree) collectBufferedRange(lower, upper []byte) ([]record, error) {
 		uik = format.EncodeInternalKey(upper, format.MaxVersion, format.KindSet)
 	}
 	var out []record
-	seen := map[format.PageNo]bool{}
-	var visit func(pgno format.PageNo) error
-	visit = func(pgno format.PageNo) error {
+	// Depth-bounded descent instead of a per-page seen-set: the walk only ever goes root to leaf
+	// through interior nodes, so its depth is the tree height and the bound is the cycle guard,
+	// with no map allocated on the read path.
+	var visit func(pgno format.PageNo, depth int) error
+	visit = func(pgno format.PageNo, depth int) error {
 		if pgno == format.NoPage {
 			return nil
 		}
-		if seen[pgno] {
-			return fmt.Errorf("betree: interior buffer walk cycles at page %d", pgno)
+		if depth > maxDescentDepth {
+			return fmt.Errorf("betree: interior buffer walk exceeds depth %d at page %d", maxDescentDepth, pgno)
 		}
-		seen[pgno] = true
 		typ, err := t.pageType(pgno)
 		if err != nil {
 			return err
@@ -884,13 +925,13 @@ func (t *Tree) collectBufferedRange(lower, upper []byte) ([]record, error) {
 			hiSlot = in.childIndex(uik)
 		}
 		for s := loSlot; s <= hiSlot; s++ {
-			if err := visit(in.childPage(s)); err != nil {
+			if err := visit(in.childPage(s), depth+1); err != nil {
 				return err
 			}
 		}
 		return nil
 	}
-	if err := visit(t.root()); err != nil {
+	if err := visit(t.root(), 0); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -988,21 +1029,31 @@ func (t *Tree) initRangeDelFlag() error {
 	if err != nil {
 		return err
 	}
+	runHasRangeDel := false
 	for _, c := range cells {
 		if format.KindOf(c.key) == format.KindRangeBegin {
-			t.hasRangeDel.Store(true)
-			return nil
+			runHasRangeDel = true
+			break
 		}
 	}
+	// Walk the buffers regardless of what the run held, because this also seeds bufferedMsgs
+	// with the messages the reopened tree inherits resting in interior buffers. That seed must
+	// be exact before any read consults it, since collectBufferedRange skips the spine walk on a
+	// zero count; an early return here on a run-level range delete would leave the count unseeded.
 	buffered, err := t.collectBufferedMessages()
 	if err != nil {
 		return err
 	}
+	t.bufferedMsgs.Store(int64(len(buffered)))
+	bufHasRangeDel := false
 	for _, c := range buffered {
 		if format.KindOf(c.key) == format.KindRangeBegin {
-			t.hasRangeDel.Store(true)
-			return nil
+			bufHasRangeDel = true
+			break
 		}
+	}
+	if runHasRangeDel || bufHasRangeDel {
+		t.hasRangeDel.Store(true)
 	}
 	return nil
 }
