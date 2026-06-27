@@ -44,6 +44,7 @@ package betree
 // oracle already pins.
 
 import (
+	"bytes"
 	"sort"
 
 	"github.com/tamnd/kv/format"
@@ -184,6 +185,39 @@ func (t *Tree) collectTailMessages() []record {
 	}
 	out := make([]record, 0, len(t.tail))
 	for _, m := range t.tail {
+		out = append(out, record{
+			key: append([]byte(nil), m.key...),
+			val: append([]byte(nil), m.val...),
+		})
+	}
+	return out
+}
+
+// collectTailMessagesRange is the range-bounded twin of collectTailMessages: it copies out only the
+// tail slots whose user key falls in [lower, upper), so a short scan window never pays to copy the
+// whole tail. The full collector hands every slot back and the caller filters after the copy, which
+// for a 50-key scan over a tail of a few hundred recent writes copies hundreds of key and value
+// slices the window then throws away. The filter is the dominant cost and the dominant allocation of
+// a hot-tail scan (a tree whose recent inserts have not flushed), so the scan path folds only the
+// window's slice of the tail instead. The same RLock fences a concurrent writer's map edit; the
+// returned records are fresh copies, so they outlive the lock and the caller's gen-validation
+// decides whether the snapshot keeps them. nil bounds mean unbounded on that side, matching
+// inHalfOpen, so a nil/nil call copies the whole tail exactly as collectTailMessages does.
+func (t *Tree) collectTailMessagesRange(lower, upper []byte) []record {
+	t.tailMu.RLock()
+	defer t.tailMu.RUnlock()
+	if len(t.tail) == 0 {
+		return nil
+	}
+	var out []record
+	for _, m := range t.tail {
+		uk := format.UserKey(m.key)
+		if lower != nil && bytes.Compare(uk, lower) < 0 {
+			continue
+		}
+		if upper != nil && bytes.Compare(uk, upper) >= 0 {
+			continue
+		}
 		out = append(out, record{
 			key: append([]byte(nil), m.key...),
 			val: append([]byte(nil), m.val...),

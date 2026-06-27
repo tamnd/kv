@@ -73,6 +73,57 @@ func BenchmarkScanStreaming(b *testing.B) {
 	}
 }
 
+// fillTail writes count messages at version 2 spread across the keyspace and does not flush, so they
+// rest in the mutable hot tail the way recent inserts do in a YCSB-E mix. It keeps the batch under the
+// tail rollover budget so the whole set stays in the tail and every later scan folds it.
+func fillTail(tb testing.TB, tr *Tree, n, count int) {
+	tb.Helper()
+	wb := engine.NewWriteBatch(2)
+	stride := n / count
+	if stride < 1 {
+		stride = 1
+	}
+	for i := 0; i < n && wb.Len() < count; i += stride {
+		wb.Set([]byte(fmt.Sprintf("k%08d", i)), []byte(fmt.Sprintf("w%08d", i)))
+	}
+	if err := tr.Apply(wb, wb.Version()); err != nil {
+		tb.Fatalf("fill tail: %v", err)
+	}
+}
+
+// BenchmarkScanFreshReaderHotTail mirrors the directional ycsb-e shape the streaming microbench above
+// misses: a fresh reader per op (the public db.View path opens one) over a tree whose hot tail holds
+// recent inserts. Each scan op must fold the tail, so this is the bench that shows the per-op tail
+// cost a freshly flushed tree never pays.
+func BenchmarkScanFreshReaderHotTail(b *testing.B) {
+	const n = 20000
+	const scanLen = 50
+	tr := benchTree(b, n)
+	fillTail(b, tr, n, 250)
+	snap := engine.Snapshot{Version: 2}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		rd, err := tr.NewReader(snap)
+		if err != nil {
+			b.Fatalf("reader: %v", err)
+		}
+		seek := []byte(fmt.Sprintf("k%08d", (i*977)%(n-scanLen)))
+		it, err := rd.NewIter(engine.IterOptions{})
+		if err != nil {
+			b.Fatalf("iter: %v", err)
+		}
+		seen := 0
+		for ok := it.SeekGE(seek); ok && seen < scanLen; ok = it.Next() {
+			_ = it.Key()
+			seen++
+		}
+		if seen != scanLen {
+			b.Fatalf("scan saw %d, want %d", seen, scanLen)
+		}
+		rd.Close()
+	}
+}
+
 // BenchmarkScanEager measures the same shape against the whole-range gather the cursor used before
 // the streaming window: gather every key at or after the seek (the old unbounded iterator folded
 // the entire keyspace up front) and take the first scanLen. It is the baseline the streaming
