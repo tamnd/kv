@@ -114,6 +114,14 @@ type Tunables struct {
 	// because there is nowhere to sync. The zero value is None, so a memory-only store
 	// is always None, the benchmarked ceiling.
 	Durability Durability
+
+	// CheckpointBytes is how many durable record bytes may be appended before a
+	// checkpoint is due (doc 05 section 5). It bounds the recovery replay delta. Zero
+	// defaults to 256 MiB in durable mode. M4 records and exposes this and the
+	// bytes-since-checkpoint counter; the automatic background scheduler that fires a
+	// checkpoint when the threshold is crossed is a later milestone, so at M4 a
+	// checkpoint is taken by calling Checkpoint.
+	CheckpointBytes int64
 }
 
 // DefaultTunables returns a full-resident, memory-only configuration: 256 shards,
@@ -248,6 +256,85 @@ func (s *Store) Spilled() int {
 		sh.mu.RUnlock()
 	}
 	return n
+}
+
+// CheckpointStats reports the checkpoint observability counters (doc 08 section 1.4):
+// the committed checkpoint generation, the last snapshot's byte size, and the durable
+// bytes appended since that checkpoint (which drives the cadence). It is the zero value
+// for a memory-only store.
+type CheckpointStats struct {
+	Generation           uint64
+	SnapshotBytes        uint64
+	BytesSinceCheckpoint int64
+}
+
+// CheckpointStats returns the current checkpoint counters.
+func (s *Store) CheckpointStats() CheckpointStats {
+	if s.df == nil {
+		return CheckpointStats{}
+	}
+	return CheckpointStats{
+		Generation:           s.df.sb.generation,
+		SnapshotBytes:        uint64(s.df.snapBytes.Load()),
+		BytesSinceCheckpoint: s.df.bytesSinceCkpt.Load(),
+	}
+}
+
+// Checkpoint writes a durable index snapshot and commits it through the superblock
+// double-slot (doc 05 section 4, D8). It captures each shard's consistent cut, writes
+// the snapshot extents and fsyncs them, then flips the superblock generation in one
+// barrier, the atomic commit point. It is a no-op error in memory-only mode. M4
+// provides the explicit call; a background cadence scheduler is a later milestone.
+func (s *Store) Checkpoint() error {
+	if s.df == nil {
+		return errors.New("hashlog: Checkpoint requires durable mode")
+	}
+	sections := make([]snapSection, len(s.shards))
+	frontiers := make([]shardFrontier, len(s.shards))
+	for i, sh := range s.shards {
+		sections[i], frontiers[i] = sh.captureCut()
+	}
+	barrier := s.t.Durability != DurabilityNone
+	stream := encodeSnapshot(len(s.shards), s.df.sb.generation+1, sections)
+	root, err := s.df.writeSnapshot(stream, barrier)
+	if err != nil {
+		return err
+	}
+	sync := s.df.f.Sync
+	if barrier {
+		sync = s.df.syncData
+	}
+	return s.df.commitCheckpoint(root, uint64(len(stream)), frontiers, sync)
+}
+
+// captureCut takes shard sh's consistent cut for a checkpoint (doc 05 section 3): it
+// briefly holds the write lock, copies the live tuples into a private slice, and reads
+// the durable frontier as the cut LSN F_shard. Under Normal it first flushes and syncs
+// the shard's log so the recorded frontier is genuinely durable up to the cut (doc 05
+// section 5: a recorded frontier must be a durable frontier under the active dial).
+// The copy form gives an exact as-of-F_shard view with no post-cut bleed.
+func (sh *shard) captureCut() (snapSection, shardFrontier) {
+	sh.mu.Lock()
+	if sh.df != nil && sh.durability == DurabilityNormal {
+		sh.flushDurable(true)
+	}
+	t := sh.index.Load()
+	tuples := make([]snapTuple, 0, sh.idxLive)
+	for j := range t.slots {
+		e := t.slots[j].Load()
+		if e == nil || e == tombstone {
+			continue
+		}
+		tuples = append(tuples, snapTuple{key: append([]byte(nil), e.key...), loc: e.loc})
+	}
+	fr := shardFrontier{
+		frontierLSN: uint64(sh.frontier.Load()),
+		tailExtent:  sh.pageExtent[sh.tailPage],
+		tailOff:     uint64(sh.pageFill[sh.tailPage]),
+	}
+	sec := snapSection{shard: sh.shardID, frontierLSN: fr.frontierLSN, tuples: tuples}
+	sh.mu.Unlock()
+	return sec, fr
 }
 
 // valLoc points the index straight at a value in the log: addr is the logical
@@ -493,6 +580,7 @@ func (sh *shard) set(key, value []byte) error {
 		// knows how much to write and how far the frontier may advance.
 		sh.pageFill[sh.tailPage] = sh.tailPos
 		sh.pageMaxLSN[sh.tailPage] = int64(lsn)
+		sh.df.bytesSinceCkpt.Add(int64(n))
 	} else {
 		n := encodeRecord(page[sh.tailPos:], key, value)
 		sh.tailPos += n

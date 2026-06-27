@@ -27,7 +27,7 @@ type superblock struct {
 	frontiers []shardFrontier
 
 	// free is the allocator's free-extent-id stack, persisted inline (M0). The
-	// overflow chain for a free list too large to fit inline is M4.
+	// overflow chain for a free list too large to fit inline is M8.
 	free []int64
 }
 
@@ -69,7 +69,7 @@ func (sb *superblock) encode(slotID int) ([]byte, error) {
 		return nil, fmt.Errorf("hashlog: superblock has %d frontiers, want %d", len(sb.frontiers), shardCount)
 	}
 	if len(sb.free) > inlineFreeCapacity(shardCount) {
-		return nil, fmt.Errorf("hashlog: free list of %d does not fit inline (cap %d); overflow chain is M4",
+		return nil, fmt.Errorf("hashlog: free list of %d does not fit inline (cap %d); overflow chain is M8",
 			len(sb.free), inlineFreeCapacity(shardCount))
 	}
 
@@ -155,7 +155,7 @@ func decodeSuperblock(buf []byte) (*superblock, error) {
 	freeListLen := binary.LittleEndian.Uint64(buf[56:64])
 	freeListExtent := int64(binary.LittleEndian.Uint64(buf[48:56]))
 
-	// The free-list overflow chain is M4; an M0 slot is always inline.
+	// The free-list overflow chain is M8; an M0 slot is always inline.
 	if freeListExtent != -1 {
 		return nil, errBadSuperblock
 	}

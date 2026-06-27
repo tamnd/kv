@@ -84,7 +84,7 @@ func checkNoAliasing(t *testing.T, s *Store) {
 	}
 }
 
-func key(i int) []byte   { return []byte(fmt.Sprintf("key:%06d", i)) }
+func key(i int) []byte { return []byte(fmt.Sprintf("key:%06d", i)) }
 func value(rng *rand.Rand) []byte {
 	n := 50 + rng.Intn(450)
 	b := make([]byte, n)

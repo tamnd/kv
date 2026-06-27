@@ -49,6 +49,16 @@ type durableFile struct {
 	// writes the other slot, so the last committed checkpoint is never in flight.
 	sb        *superblock
 	newerSlot int
+
+	// Checkpoint state (M4, doc 05). snapRoot and snapCount are the currently committed
+	// index snapshot's contiguous extent run, freed when the next checkpoint supersedes
+	// it; snapRoot is -1 when no snapshot has committed yet. snapBytes is the last
+	// snapshot's stream length and bytesSinceCkpt counts durable record bytes appended
+	// since the last checkpoint, both observability counters (doc 08 section 1.4).
+	snapRoot       int64
+	snapCount      int64
+	snapBytes      atomic.Int64
+	bytesSinceCkpt atomic.Int64
 }
 
 // validateDurableTunables checks the durable-mode knobs (doc 03 section 10). It
@@ -76,6 +86,9 @@ func validateDurableTunables(t Tunables) (Tunables, error) {
 	}
 	if t.Durability < DurabilityNone || t.Durability > DurabilityFull {
 		return t, fmt.Errorf("hashlog: Durability %d out of range", t.Durability)
+	}
+	if t.CheckpointBytes == 0 {
+		t.CheckpointBytes = 256 << 20
 	}
 	return t, nil
 }
@@ -137,6 +150,8 @@ func (d *durableFile) initFresh() error {
 	d.newerSlot = 0
 	d.alloc = newAllocator(0, nil)
 	d.fileEnd = d.sbSize
+	d.snapRoot = -1
+	d.snapCount = 0
 	return nil
 }
 
@@ -169,6 +184,17 @@ func (d *durableFile) readExisting() error {
 	}
 	d.alloc = newAllocator(int64(newer.extentCount), newer.free)
 	d.lsn.Store(newer.lsnHighWater)
+	// Reconstruct the committed snapshot's extent run so the next checkpoint frees it.
+	// The run is contiguous (it was allocated as one, M4), so its extent count is the
+	// stream length rounded up to whole extents.
+	d.snapRoot = newer.snapshotRoot
+	if newer.snapshotRoot >= 0 && newer.snapshotLen > 0 {
+		d.snapCount = (int64(newer.snapshotLen) + d.extentSize - 1) / d.extentSize
+	} else {
+		d.snapRoot = -1
+		d.snapCount = 0
+	}
+	d.snapBytes.Store(int64(newer.snapshotLen))
 	fi, err := d.f.Stat()
 	if err != nil {
 		return err
@@ -206,7 +232,7 @@ func (d *durableFile) syncData() error {
 func (d *durableFile) commit() error {
 	count, free := d.alloc.counts()
 	if len(free) > inlineFreeCapacity(d.shardCount) {
-		return fmt.Errorf("hashlog: free list of %d exceeds inline capacity %d; overflow chain is M4",
+		return fmt.Errorf("hashlog: free list of %d exceeds inline capacity %d; overflow chain is M8",
 			len(free), inlineFreeCapacity(d.shardCount))
 	}
 	nsb := &superblock{
@@ -220,6 +246,17 @@ func (d *durableFile) commit() error {
 		frontiers:    d.sb.frontiers,
 		free:         free,
 	}
+	return d.writeCheckpointSlot(nsb, d.f.Sync)
+}
+
+// writeCheckpointSlot writes nsb into the older of the two superblock slots (never the
+// newer, so the last committed checkpoint stays intact as the fallback) and then runs
+// the durability barrier sync. That barrier is the atomic commit point (doc 05 section
+// 4 step 6, the LMDB meta-page flip): before it returns the new checkpoint does not
+// exist for recovery, after it returns the new slot wins by generation. In-memory sb
+// and newerSlot are advanced only after the barrier succeeds, so a failed sync leaves
+// the durableFile describing the prior committed checkpoint.
+func (d *durableFile) writeCheckpointSlot(nsb *superblock, sync func() error) error {
 	older := 1 - d.newerSlot
 	buf, err := nsb.encode(older)
 	if err != nil {
@@ -228,11 +265,77 @@ func (d *durableFile) commit() error {
 	if _, err := d.f.WriteAt(buf, int64(older*d.slotSize)); err != nil {
 		return err
 	}
-	if err := d.f.Sync(); err != nil {
+	if err := sync(); err != nil {
 		return err
 	}
 	d.sb = nsb
 	d.newerSlot = older
+	return nil
+}
+
+// writeSnapshot writes a snapshot stream into a freshly allocated contiguous extent
+// run and, when barrier is set, fsyncs it (doc 05 section 4 steps 2-4). It then frees
+// the previously committed snapshot's run back to the allocator so the next checkpoint
+// can reuse it. The previous run is freed only after the new snapshot is durable, and
+// the new run is never the previous run, so a crash before the superblock commit
+// leaves the old snapshot intact and the half-written new one orphaned and reclaimed.
+// It returns the new run's first extent id, which the superblock records as the
+// snapshot root.
+func (d *durableFile) writeSnapshot(stream []byte, barrier bool) (int64, error) {
+	n := (int64(len(stream)) + d.extentSize - 1) / d.extentSize
+	if n < 1 {
+		n = 1
+	}
+	root, _ := d.alloc.allocRun(n)
+	if err := d.growExtent(root + n - 1); err != nil {
+		d.alloc.freeRun(root, n)
+		return 0, err
+	}
+	if _, err := d.f.WriteAt(stream, d.extentOffset(root)); err != nil {
+		d.alloc.freeRun(root, n)
+		return 0, err
+	}
+	if barrier {
+		if err := d.syncData(); err != nil {
+			d.alloc.freeRun(root, n)
+			return 0, err
+		}
+	}
+	if d.snapRoot >= 0 {
+		d.alloc.freeRun(d.snapRoot, d.snapCount)
+	}
+	d.snapRoot = root
+	d.snapCount = n
+	return root, nil
+}
+
+// commitCheckpoint records a new checkpoint: it builds the superblock with the new
+// generation, the snapshot location, the per-shard frontiers, the allocator free list
+// (now reflecting the freed superseded snapshot and the in-use new one), and the LSN
+// high-water, then writes and barriers the slot (doc 05 section 4 step 5-6). On
+// success it resets the bytes-since-checkpoint counter and records the snapshot size.
+func (d *durableFile) commitCheckpoint(snapRoot int64, snapLen uint64, frontiers []shardFrontier, sync func() error) error {
+	count, free := d.alloc.counts()
+	if len(free) > inlineFreeCapacity(d.shardCount) {
+		return fmt.Errorf("hashlog: free list of %d exceeds inline capacity %d; overflow chain is M8",
+			len(free), inlineFreeCapacity(d.shardCount))
+	}
+	nsb := &superblock{
+		generation:   d.sb.generation + 1,
+		extentSize:   uint64(d.extentSize),
+		extentCount:  uint64(count),
+		lsnHighWater: d.lsn.Load(),
+		snapshotRoot: snapRoot,
+		snapshotLen:  snapLen,
+		shardCount:   uint32(d.shardCount),
+		frontiers:    frontiers,
+		free:         free,
+	}
+	if err := d.writeCheckpointSlot(nsb, sync); err != nil {
+		return err
+	}
+	d.snapBytes.Store(int64(snapLen))
+	d.bytesSinceCkpt.Store(0)
 	return nil
 }
 
