@@ -400,6 +400,78 @@ func TestBoundedBufferEqualsFullBuffer(t *testing.T) {
 	}
 }
 
+// TestBufferedCountMatchesResident asserts the tree's resident-buffer counter stays exactly
+// equal to the messages actually resting in interior buffers, the invariant the read path's
+// spine-walk skip depends on: collectBufferedRange returns nothing when the counter is zero, so
+// an overcount would only cost a needless walk but an undercount would skip a buffered message
+// and return a stale answer. It checks the counter against a full buffer walk after a thin
+// scatter that parks messages in buffers (the non-zero case), and confirms the dense sequential
+// tree benchTree builds drains its buffers to zero so the skip path is the one a point read on
+// it takes (the zero case), with reads still correct there.
+func TestBufferedCountMatchesResident(t *testing.T) {
+	tr := newTreeSmall(t)
+	rng := rand.New(rand.NewSource(11))
+	const nkeys = 5000
+	keyOf := func(i int) []byte { return []byte(fmt.Sprintf("key%06d", i)) }
+
+	ver := uint64(0)
+	for round := 0; round < 200; round++ {
+		ver++
+		b := engine.NewWriteBatch(ver)
+		used := map[int]bool{}
+		for n := 0; n < 40; n++ {
+			i := rng.Intn(nkeys)
+			if used[i] {
+				continue
+			}
+			used[i] = true
+			b.Set(keyOf(i), []byte(fmt.Sprintf("v%d", ver)))
+		}
+		tr.NoteLSN(ver)
+		if err := tr.Apply(b, ver); err != nil {
+			t.Fatalf("apply round %d: %v", round, err)
+		}
+		// The counter must equal the real resident count at every step, not just at the end.
+		resident, err := tr.collectBufferedMessages()
+		if err != nil {
+			t.Fatalf("buffer walk round %d: %v", round, err)
+		}
+		if got := tr.bufferedMsgs.Load(); got != int64(len(resident)) {
+			t.Fatalf("round %d: bufferedMsgs=%d, resident buffer messages=%d", round, got, len(resident))
+		}
+	}
+	final, err := tr.collectBufferedMessages()
+	if err != nil {
+		t.Fatalf("final buffer walk: %v", err)
+	}
+	if len(final) == 0 {
+		t.Fatal("thin scatter left no resident buffer messages: the non-zero case is not exercised")
+	}
+
+	// The dense sequential tree drains every message to a leaf, so its counter is zero and a
+	// point read takes the skip path. Confirm the counter is zero and the reads are correct.
+	dense := benchTree(t, 4000)
+	if got := dense.bufferedMsgs.Load(); got != 0 {
+		drained, _ := dense.collectBufferedMessages()
+		t.Fatalf("dense sequential tree: bufferedMsgs=%d, want 0 (resident=%d)", got, len(drained))
+	}
+	rd, err := dense.NewReader(engine.Snapshot{Version: 1})
+	if err != nil {
+		t.Fatalf("reader: %v", err)
+	}
+	defer rd.Close()
+	for i := 0; i < 4000; i += 137 {
+		key := []byte(fmt.Sprintf("k%08d", i))
+		val, err := rd.Get(key)
+		if err != nil {
+			t.Fatalf("get %q: %v", key, err)
+		}
+		if want := fmt.Sprintf("v%08d-%0100d", i, i); string(val) != want {
+			t.Fatalf("get %q on skip path: got %q want %q", key, val, want)
+		}
+	}
+}
+
 // TestReverseIsForwardReversed checks the reverse iterator returns the bounded view in
 // descending order: the bound is by user key and the reverse flag only flips the walk, so a
 // reverse read must equal the forward bounded read reversed.
