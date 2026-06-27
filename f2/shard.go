@@ -1,6 +1,7 @@
 package f2
 
 import (
+	"os"
 	"sync"
 	"sync/atomic"
 )
@@ -29,8 +30,8 @@ type shard struct {
 	_ [24]byte // pad the struct toward a cache line
 }
 
-func newShard(pageSize int) *shard {
-	s := &shard{log: newLog(pageSize)}
+func newShard(pageSize int, spill *os.File, budget int) *shard {
+	s := &shard{log: newLog(pageSize, spill, budget)}
 	s.index.Store(newIndex(minIndexSlots))
 	return s
 }

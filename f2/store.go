@@ -36,7 +36,12 @@
 // open either engine through the same knobs.
 package f2
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+)
 
 // Durability is the per-store durability dial, the same contract hashlog uses so
 // an adapter maps the kvbench dial onto either engine identically. It is
@@ -113,11 +118,14 @@ var (
 // Stats reports the engine's space accounting, the data a memory and scalability
 // study needs. Counts are summed across shards.
 type Stats struct {
-	Keys       int64 // live keys
-	IndexSlots int64 // total index slots allocated across shards
-	IndexBytes int64 // resident index cost: IndexSlots * 8
-	LogBytes   int64 // bytes appended to the logs (live plus stranded)
-	DeadBytes  int64 // bytes stranded by overwrites and deletes
+	Keys        int64 // live keys
+	IndexSlots  int64 // total index slots allocated across shards
+	IndexBytes  int64 // resident index cost: IndexSlots * 8
+	LogBytes    int64 // bytes appended to the logs (live plus stranded)
+	DeadBytes   int64 // bytes stranded by overwrites and deletes
+	ResidentLog int64 // log bytes held in RAM (all of LogBytes in memory-only mode)
+	SpilledLog  int64 // log bytes spilled to scratch files in larger-than-memory mode
+	ResidentMem int64 // total resident footprint estimate: IndexBytes + ResidentLog
 }
 
 // BytesPerKey is the resident index cost per live key, the headline scalability
@@ -134,13 +142,17 @@ func (s Stats) BytesPerKey() float64 {
 // own write lock and the shard for a key is fixed by the key's hash.
 type Store struct {
 	shards []*shard
+	files  []*os.File // per-shard scratch files in spill mode, nil otherwise
+	dir    string     // scratch directory to remove on close, empty otherwise
 	mask   uint64
 	t      Tunables
 }
 
-// New opens a Store with the given tunables. The memory-only core requires only a
-// power-of-two shard count and a positive page size; the spill and durable modes
-// validate their own extra knobs when those files build them.
+// New opens a Store with the given tunables. With neither Dir nor Path set it is
+// the full-resident, memory-only core. With Dir set it is the larger-than-memory
+// mode: each shard keeps ResidentPagesPerShard pages in RAM and spills the rest
+// to a scratch file under Dir. Path selects the durable single-file mode, which a
+// later file builds.
 func New(t Tunables) (*Store, error) {
 	if t.Shards <= 0 || t.Shards&(t.Shards-1) != 0 {
 		return nil, errBadTunables
@@ -151,16 +163,37 @@ func New(t Tunables) (*Store, error) {
 	if t.Path != "" {
 		return nil, errDurableUnbuilt
 	}
-	if t.Durability != DurabilityNone && t.Path == "" {
-		return nil, errBadTunables // nowhere to sync
+	if t.Durability != DurabilityNone {
+		return nil, errBadTunables // nowhere to sync without a Path
+	}
+	if t.Dir != "" && t.ResidentPagesPerShard < 1 {
+		return nil, errBadTunables // a spill mode must keep at least the tail resident
 	}
 	s := &Store{
 		shards: make([]*shard, t.Shards),
 		mask:   uint64(t.Shards - 1),
 		t:      t,
 	}
+	if t.Dir != "" {
+		if err := os.MkdirAll(t.Dir, 0o755); err != nil {
+			return nil, err
+		}
+		s.dir = t.Dir
+		s.files = make([]*os.File, t.Shards)
+	}
 	for i := range s.shards {
-		s.shards[i] = newShard(t.PageSize)
+		var f *os.File
+		if s.files != nil {
+			path := filepath.Join(t.Dir, fmt.Sprintf("f2-shard-%05d.spill", i))
+			var err error
+			f, err = os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
+			if err != nil {
+				_ = s.Close()
+				return nil, err
+			}
+			s.files[i] = f
+		}
+		s.shards[i] = newShard(t.PageSize, f, t.ResidentPagesPerShard)
 	}
 	return s, nil
 }
@@ -197,10 +230,21 @@ func (s *Store) Delete(key []byte) error {
 // flush, so it is a no-op; the durable mode overrides the work behind it.
 func (s *Store) Checkpoint() error { return nil }
 
-// Close releases the store. The memory-only core holds no OS resources, so it
-// only drops its shards.
+// Close releases the store. In spill mode it closes and removes the per-shard
+// scratch files, which are not meant to outlive the process; the memory-only core
+// holds no OS resources and only drops its shards.
 func (s *Store) Close() error {
+	for _, f := range s.files {
+		if f != nil {
+			_ = f.Close()
+			_ = os.Remove(f.Name())
+		}
+	}
+	if s.dir != "" {
+		_ = os.Remove(s.dir) // succeeds only if now empty, which is the intent
+	}
 	s.shards = nil
+	s.files = nil
 	return nil
 }
 
@@ -215,8 +259,12 @@ func (s *Store) Stats() Stats {
 		st.IndexSlots += int64(len(t.slots))
 		st.LogBytes += int64(sh.logBytes)
 		st.DeadBytes += int64(sh.deadBytes)
+		spilled := int64(sh.log.evict) * sh.log.pageSize
+		st.SpilledLog += spilled
+		st.ResidentLog += int64(sh.logBytes) - spilled
 		sh.mu.RUnlock()
 	}
 	st.IndexBytes = st.IndexSlots * 8
+	st.ResidentMem = st.IndexBytes + st.ResidentLog
 	return st
 }
