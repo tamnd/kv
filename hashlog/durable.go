@@ -403,6 +403,15 @@ func (d *durableFile) logBodyOffset(id int64) int64 {
 	return d.extentOffset(id) + extentHeaderBytes
 }
 
+// extentBodyOffset returns the byte offset of any extent's first body byte, past the
+// header. It is logBodyOffset generalised to a non-log extent: the M9 oversize-cont
+// extents hold raw value bytes in their bodies and read and write from here (doc 03
+// section 7). The arithmetic is identical; the separate name keeps the log read path and
+// the oversize read path each reading through a self-documenting call.
+func (d *durableFile) extentBodyOffset(id int64) int64 {
+	return d.extentOffset(id) + extentHeaderBytes
+}
+
 // growExtent extends the file so extent id exists in it, if it does not already. It
 // is only-grow and concurrency-safe: two shards allocating and growing at once never
 // shrink the file past each other (a freed-and-reused id is already in the file, so

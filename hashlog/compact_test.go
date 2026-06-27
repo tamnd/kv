@@ -97,9 +97,11 @@ func checkConservationM8(t *testing.T, s *Store) {
 		freeSet[id] = true
 	}
 	holes := 0
+	liveCont := int64(0)
 	for _, sh := range s.shards {
 		sh.mu.RLock()
 		holes += len(sh.pendingFree)
+		liveCont += sh.liveOversizeExtents
 		sh.mu.RUnlock()
 	}
 	holes += len(s.pendingRetry)
@@ -107,10 +109,14 @@ func checkConservationM8(t *testing.T, s *Store) {
 	if s.df.snapRoot >= 0 {
 		snap = s.df.snapCount
 	}
-	accounted := int64(len(inUse)) + int64(len(free)) + snap + int64(holes)
+	// liveCont are the oversize-cont extents a live spanning value occupies (M9, doc 03
+	// section 7). They are allocated but in no page directory, so they would otherwise read
+	// as a leak; a superseded chain leaves liveCont and joins the holes via pendingFree, so
+	// there is no window where a cont extent is counted twice or not at all.
+	accounted := int64(len(inUse)) + int64(len(free)) + snap + int64(holes) + liveCont
 	if accounted != count {
-		t.Fatalf("conservation: inUse %d + free %d + snapshot %d + holes %d = %d != count %d",
-			len(inUse), len(free), snap, holes, accounted, count)
+		t.Fatalf("conservation: inUse %d + free %d + snapshot %d + holes %d + liveCont %d = %d != count %d",
+			len(inUse), len(free), snap, holes, liveCont, accounted, count)
 	}
 }
 
