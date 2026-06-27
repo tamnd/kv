@@ -176,8 +176,20 @@ func (s *Store) recover() error {
 func (d *durableFile) scanExtents(physCount int64) (chains [][]extentRef, inUse map[int64]struct{}, err error) {
 	chains = make([][]extentRef, d.shardCount)
 	inUse = make(map[int64]struct{})
+	// Extents the committed superblock records free are not part of any live chain: a
+	// compaction retired them and a checkpoint freed them, but their on-disk log header is
+	// left stale (the retire never rewrites it). Skip them so a freed-not-yet-reused extent
+	// is not chained back in as a phantom page (M8, doc 06 section 7.3). A freed extent that
+	// was since reused carries a fresh header at its new base, so it is not in this set.
+	freeSet := make(map[int64]struct{}, len(d.sb.free))
+	for _, id := range d.sb.free {
+		freeSet[id] = struct{}{}
+	}
 	hdr := make([]byte, extentHeaderBytes)
 	for id := int64(0); id < physCount; id++ {
+		if _, ok := freeSet[id]; ok {
+			continue
+		}
 		if _, err := d.f.ReadAt(hdr, d.extentOffset(id)); err != nil {
 			return nil, nil, err
 		}
@@ -252,9 +264,11 @@ func (sh *shard) rebuild(d *durableFile, pageSize int64, chain []extentRef, sec 
 		}
 	}
 
-	// Build the per-page arrays. Every page in 0..maxPid must have an extent (a shard
-	// spills and flushes its pages in order, so the on-disk pages are a gapless prefix);
-	// a gap means corruption and we fail closed.
+	// Build the per-page arrays. A gap in the page sequence is normal after compaction:
+	// a retired extent leaves a permanent hole at its page id (pageExtent stays -1), which
+	// the directory carries and no live key points at (M8, doc 06 section 7.3). So a missing
+	// page is a hole, not corruption; the snapshot-tuple check below still fails closed if a
+	// live key points into a hole, which would be a genuine inconsistency.
 	npages := maxPid + 1
 	if npages < 1 {
 		npages = 1
@@ -265,20 +279,15 @@ func (sh *shard) rebuild(d *durableFile, pageSize int64, chain []extentRef, sec 
 	pageFill := make([]int, npages)
 	pageFlushed := make([]int, npages)
 	pageMaxLSN := make([]int64, npages)
+	deadBytes := make([]int64, npages)
 	for pid := int64(0); pid < npages; pid++ {
 		pageExtent[pid] = -1
+		diskOff[pid] = -1
 	}
 	for _, e := range chain {
 		pid := e.baseAddr / pageSize
 		pageExtent[pid] = e.id
 		diskOff[pid] = d.logBodyOffset(e.id)
-	}
-	if len(chain) > 0 {
-		for pid := int64(0); pid <= maxPid; pid++ {
-			if pageExtent[pid] < 0 {
-				return res, fmt.Errorf("hashlog: shard %d is missing log page %d", sh.shardID, pid)
-			}
-		}
 	}
 
 	// Seed a fresh index from the snapshot section. The tuples carry no per-key LSN (doc
@@ -324,7 +333,7 @@ func (sh *shard) rebuild(d *durableFile, pageSize int64, chain []extentRef, sec 
 	lastPage := maxPid
 	for pid := startPage; pid <= maxPid && pid < npages; pid++ {
 		if pageExtent[pid] < 0 {
-			break
+			continue // a compaction hole: no extent, no records, skip to the next page
 		}
 		if _, err := d.f.ReadAt(body, d.logBodyOffset(pageExtent[pid])); err != nil {
 			return res, err
@@ -415,6 +424,7 @@ func (sh *shard) rebuild(d *durableFile, pageSize int64, chain []extentRef, sec 
 	sh.pageFill = pageFill
 	sh.pageFlushed = pageFlushed
 	sh.pageMaxLSN = pageMaxLSN
+	sh.deadBytes = deadBytes
 	sh.tailPage = tailPage
 	sh.tailPos = pageFill[tailPage]
 	sh.spilledPages = spilled
@@ -426,7 +436,67 @@ func (sh *shard) rebuild(d *durableFile, pageSize int64, chain []extentRef, sec 
 		frontier = int64(res.maxLSN)
 	}
 	sh.frontier.Store(frontier)
+	// Record the committed checkpoint's frontier as the lower bound a tombstone discard
+	// checks against, the same value the live store stamps at checkpoint commit (M8, doc 06
+	// section 3.4). It is the snapshot's per-shard frontier, the highest LSN baked into the
+	// recovered checkpoint.
+	sh.ckptFrontier.Store(int64(fr.frontierLSN))
+	// Recompute the per-page dead-byte tally exactly from the rebuilt index and the on-disk
+	// records (M8, doc 06 section 2.2): a data record is dead when the index no longer points
+	// at it, the same condition the live store credits on an overwrite or delete. This makes a
+	// recovered store choose the same compaction targets a never-crashed one would.
+	if err := sh.recomputeDeadBytes(d, pageSize, npages); err != nil {
+		return res, err
+	}
 	return res, nil
+}
+
+// recomputeDeadBytes rebuilds the per-page dead-byte tally after recovery, so the in-memory
+// counter the compactor reads matches what a never-crashed store would hold (doc 06 section
+// 2.2). It walks each backed page's records against the just-rebuilt index: a data record is
+// dead exactly when the index does not point at its value address (it was overwritten or
+// deleted), the same predicate the live store credits incrementally. A tombstone is not
+// counted dead, matching the live store, which credits the data record a delete kills but
+// never the tombstone itself; a discardable tombstone is reclaimed only when its page is
+// compacted for its dead data (doc 06 section 3.4). It runs while recovery owns the shard
+// exclusively, so it reads the shard fields without the lock.
+func (sh *shard) recomputeDeadBytes(d *durableFile, pageSize int64, npages int64) error {
+	body := make([]byte, pageSize)
+	for pid := int64(0); pid < npages; pid++ {
+		if sh.pageExtent[pid] < 0 {
+			continue
+		}
+		fill := sh.pageFill[pid]
+		if fill <= 0 {
+			continue
+		}
+		var src []byte
+		if p := sh.pages.Load().pages[pid]; p != nil {
+			src = p[:fill]
+		} else {
+			if _, err := d.f.ReadAt(body[:fill], d.logBodyOffset(sh.pageExtent[pid])); err != nil {
+				return err
+			}
+			src = body[:fill]
+		}
+		dead := int64(0)
+		pos := 0
+		for pos < fill {
+			_, flags, key, value, n, derr := decodeDurableRecord(src[pos:])
+			if derr != nil || n == 0 {
+				break
+			}
+			if flags&flagTombstone == 0 {
+				valueAddr := pid*pageSize + int64(pos) + int64(durableValOff(key, value))
+				if e := sh.index.Load().lookupEntry(tableHash(key), key); e == nil || e.loc.addr != valueAddr {
+					dead += int64(durableRecordLenFor(len(key), len(value)))
+				}
+			}
+			pos += n
+		}
+		sh.deadBytes[pid] = dead
+	}
+	return nil
 }
 
 // recoverInsert places a tuple into the rebuilt table without growing it. The table is

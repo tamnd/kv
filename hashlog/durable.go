@@ -47,9 +47,19 @@ type durableFile struct {
 
 	// sb is the current durable superblock (the content of the newer slot), and
 	// newerSlot is which physical slot (0 for A, 1 for B) currently holds it. A commit
-	// writes the other slot, so the last committed checkpoint is never in flight.
+	// writes the other slot, so the last committed checkpoint is never in flight. sb is
+	// reassigned by a commit with no shard lock held, so it is only read single-threaded
+	// (open, recovery) or from inside the committing goroutine itself.
 	sb        *superblock
 	newerSlot int
+
+	// gen mirrors sb.generation as an atomic so the log-extent header writer (which runs
+	// concurrently with a commit, under a shard lock the commit does not take) can stamp
+	// the current generation without racing the sb pointer reassignment. It is advanced
+	// in lockstep with every sb assignment. The stamp is informational at this milestone
+	// (recovery does not validate it), so reading the pre- or post-commit value is equally
+	// correct; the atomic only exists to make that read data-race free.
+	gen atomic.Uint64
 
 	// existed is true when the file already held a superblock on open, so the Store
 	// must run recovery (M5) to rebuild each shard's index from the checkpoint plus the
@@ -156,6 +166,7 @@ func (d *durableFile) initFresh() error {
 		return err
 	}
 	d.sb = sb
+	d.gen.Store(sb.generation)
 	d.newerSlot = 0
 	d.alloc = newAllocator(0, nil)
 	d.fileEnd = d.sbSize
@@ -186,6 +197,7 @@ func (d *durableFile) readExisting() error {
 		return fmt.Errorf("hashlog: file has extent size %d, opened with %d", newer.extentSize, d.extentSize)
 	}
 	d.sb = newer
+	d.gen.Store(newer.generation)
 	if newer == slotA {
 		d.newerSlot = 0
 	} else {
@@ -278,6 +290,7 @@ func (d *durableFile) writeCheckpointSlot(nsb *superblock, sync func() error) er
 		return err
 	}
 	d.sb = nsb
+	d.gen.Store(nsb.generation)
 	d.newerSlot = older
 	return nil
 }
@@ -321,13 +334,34 @@ func (d *durableFile) writeSnapshot(stream []byte, barrier bool) (int64, error) 
 // commitCheckpoint records a new checkpoint: it builds the superblock with the new
 // generation, the snapshot location, the per-shard frontiers, the allocator free list
 // (now reflecting the freed superseded snapshot and the in-use new one), and the LSN
-// high-water, then writes and barriers the slot (doc 05 section 4 step 5-6). On
-// success it resets the bytes-since-checkpoint counter and records the snapshot size.
-func (d *durableFile) commitCheckpoint(snapRoot int64, snapLen uint64, frontiers []shardFrontier, sync func() error) error {
+// high-water, then writes and barriers the slot (doc 05 section 4 step 5-6). On success
+// it resets the bytes-since-checkpoint counter and records the snapshot size.
+//
+// pending holds the extents a compaction pass retired and this checkpoint should record
+// durably free (M8, doc 06 section 7.3): they are written into the slot's free list and,
+// only after the commit barrier returns, pushed onto the allocator's in-memory free stack
+// so they become reusable. Freeing them in memory only after the durable record commits
+// is what excludes the dangling-pointer-on-reuse hazard: a crash before the commit
+// recovers the prior checkpoint, whose snapshot may still point into a pending extent, and
+// that extent's bytes are intact because it was never reused (doc 06 section 7.4). When
+// more pending extents arrive than the inline free list can hold, the surplus is returned
+// as overflow for the caller to retry at the next checkpoint, so a large reclamation does
+// not need the free-list overflow chain to make progress.
+func (d *durableFile) commitCheckpoint(snapRoot int64, snapLen uint64, frontiers []shardFrontier, pending []int64, sync func() error) (overflow []int64, err error) {
 	count, free := d.alloc.counts()
-	if len(free) > inlineFreeCapacity(d.shardCount) {
-		return fmt.Errorf("hashlog: free list of %d exceeds inline capacity %d; overflow chain is M8",
-			len(free), inlineFreeCapacity(d.shardCount))
+	room := inlineFreeCapacity(d.shardCount) - len(free)
+	if room < 0 {
+		room = 0
+	}
+	fit := pending
+	if len(pending) > room {
+		fit = pending[:room]
+		overflow = append([]int64(nil), pending[room:]...)
+	}
+	durFree := append(append([]int64(nil), free...), fit...)
+	if len(durFree) > inlineFreeCapacity(d.shardCount) {
+		return nil, fmt.Errorf("hashlog: free list of %d exceeds inline capacity %d; overflow chain is M8",
+			len(durFree), inlineFreeCapacity(d.shardCount))
 	}
 	nsb := &superblock{
 		generation:   d.sb.generation + 1,
@@ -338,14 +372,21 @@ func (d *durableFile) commitCheckpoint(snapRoot int64, snapLen uint64, frontiers
 		snapshotLen:  snapLen,
 		shardCount:   uint32(d.shardCount),
 		frontiers:    frontiers,
-		free:         free,
+		free:         durFree,
 	}
 	if err := d.writeCheckpointSlot(nsb, sync); err != nil {
-		return err
+		return nil, err
+	}
+	// The durable record is committed, so the retired extents are now safe to reuse: push
+	// them onto the in-memory free stack. A later alloc (compaction's own copy appends, or
+	// an ordinary roll) hands them back out, which is what keeps the file bounded under
+	// churn rather than growing an extent per overwrite.
+	for _, id := range fit {
+		d.alloc.freeExtent(id)
 	}
 	d.snapBytes.Store(int64(snapLen))
 	d.bytesSinceCkpt.Store(0)
-	return nil
+	return overflow, nil
 }
 
 // extentOffset returns the byte offset in the file of extent id's first byte, the start
@@ -395,7 +436,7 @@ func (d *durableFile) writeLogExtentHeader(id int64, shardID int, prev, baseAddr
 		prevExtent: prev,
 		nextExtent: -1,
 		baseAddr:   baseAddr,
-		genStamp:   d.sb.generation,
+		genStamp:   d.gen.Load(),
 	}
 	_, err := d.f.WriteAt(encodeExtentHeader(h), d.extentOffset(id))
 	return err

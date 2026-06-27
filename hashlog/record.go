@@ -59,9 +59,27 @@ func durableRecordLen(key, value []byte) int {
 // index points at recordStart + durableValOff, exactly as the in-memory set computes
 // its valOff with the lsn and flags added in.
 func durableValOff(key, value []byte) int {
+	return durableValOffFor(len(key), len(value))
+}
+
+// durableValOffFor is durableValOff computed from the key and value lengths alone, so
+// the compactor and the overwrite credit can recover a record's header offset from the
+// index entry (which carries the key bytes and the value length, doc 06 section 2.3)
+// without holding the value bytes. The geometry is the same: lsn, the two length
+// varints, flags, then the key.
+func durableValOffFor(keyLen, valLen int) int {
 	return recordLSNSize +
-		uvarintLen(uint64(len(key))) + uvarintLen(uint64(len(value))) +
-		recordFlagsSize + len(key)
+		uvarintLen(uint64(keyLen)) + uvarintLen(uint64(valLen)) +
+		recordFlagsSize + keyLen
+}
+
+// durableRecordLenFor is durableRecordLen computed from the key and value lengths
+// alone, so the dead-byte accounting can size a record it is about to kill from the
+// index entry without the value bytes (doc 06 section 2.1).
+func durableRecordLenFor(keyLen, valLen int) int {
+	return recordFixedOverhead +
+		uvarintLen(uint64(keyLen)) + uvarintLen(uint64(valLen)) +
+		keyLen + valLen
 }
 
 // encodeDurableRecord writes a durable record into dst (at least durableRecordLen

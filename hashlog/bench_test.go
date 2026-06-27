@@ -146,6 +146,69 @@ func BenchmarkCheckpoint(b *testing.B) {
 	}
 }
 
+// BenchmarkCompact measures one compaction pass over a store that a full overwrite has
+// left with wholly-dead sealed pages: select the dead extents, copy the live records each
+// still holds to the tail, repoint the index, and retire them. The overwrite that
+// manufactures the dead pages is excluded from the timer (StopTimer around it), so the
+// number is the reclaim work itself, not the writes that created the garbage. It is the
+// cost of the background space-reclamation pass M8 adds, paid off the write path. Numbers
+// stay local until the M10 hardware gate.
+func BenchmarkCompact(b *testing.B) {
+	path := filepath.Join(b.TempDir(), "compact.hlog")
+	t := Tunables{
+		Shards:                8,
+		PageSize:              4096,
+		ExtentSize:            4096,
+		ResidentPagesPerShard: 8,
+		Path:                  path,
+		Durability:            DurabilityNormal,
+	}
+	s, err := New(t)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer s.Close()
+
+	const keys = 50000
+	for i := 0; i < keys; i++ {
+		if err := s.Set(benchKey(i), benchValue(64)); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if err := s.Checkpoint(); err != nil {
+		b.Fatal(err)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		// Overwrite every key with a different-size value so the prior versions go dead and
+		// their pages cross the threshold. This is setup, not the work under test, so it runs
+		// with the timer stopped.
+		b.StopTimer()
+		size := 48 + (i%8)*16 // varies per round so each overwrite appends and kills the old record
+		v := benchValue(size)
+		for k := 0; k < keys; k++ {
+			if err := s.Set(benchKey(k), v); err != nil {
+				b.Fatal(err)
+			}
+		}
+		b.StartTimer()
+
+		if err := s.Compact(); err != nil {
+			b.Fatal(err)
+		}
+
+		// Fold in a checkpoint off the timer so the retired extents are freed and reused,
+		// keeping the file from growing across rounds.
+		b.StopTimer()
+		if err := s.Checkpoint(); err != nil {
+			b.Fatal(err)
+		}
+		b.StartTimer()
+	}
+}
+
 // BenchmarkResidentCeilingGet is the memory-only path the durable work must never
 // slow. It mirrors the resident config the head-to-head bench uses, so a drift here
 // flags that the durable branch leaked cost into the full-resident GET.
