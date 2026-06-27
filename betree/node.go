@@ -429,9 +429,13 @@ func collectLeafKey(src, userKey []byte) (recs []record, right format.PageNo, re
 	// Linear-scan forward from the start bucket, reconstructing front-coded keys (front
 	// coding resets at each bucket boundary, where the key is stored whole), skipping records
 	// below userKey, keeping those that match, and stopping the moment a record passes
-	// userKey.
+	// userKey. cur is a single reused scratch holding the running reconstructed key: front
+	// coding rebuilds each key as the previous key's shared prefix plus this record's suffix,
+	// so keeping cur[:shared] and appending the suffix in place reconstructs the next key with
+	// no per-record allocation. A heap copy is taken only for a record that matches userKey,
+	// which on a point read is the one key's version group, not the whole scanned run.
 	off := int(binary.BigEndian.Uint16(src[leafHeaderEnd+startBucket*2:]))
-	var prev []byte
+	var cur []byte
 	for i := startBucket * bucketSize; i < n; i++ {
 		shared, m := format.Uvarint(src[off:])
 		if m <= 0 {
@@ -449,18 +453,14 @@ func collectLeafKey(src, userKey []byte) (recs []record, right format.PageNo, re
 		suf := src[off : off+int(l)]
 		off += int(l)
 
-		var key []byte
 		if shared == 0 {
-			key = append([]byte(nil), suf...)
+			cur = append(cur[:0], suf...)
 		} else {
-			if shared > uint64(len(prev)) {
+			if shared > uint64(len(cur)) {
 				return nil, 0, false, ErrCorruptNode
 			}
-			key = make([]byte, 0, int(shared)+len(suf))
-			key = append(key, prev[:shared]...)
-			key = append(key, suf...)
+			cur = append(cur[:shared], suf...)
 		}
-		prev = key
 
 		vlen, m := format.Uvarint(src[off:])
 		if m <= 0 || vlen > uint64(len(src)) || off+m+int(vlen) > len(src) {
@@ -468,12 +468,13 @@ func collectLeafKey(src, userKey []byte) (recs []record, right format.PageNo, re
 		}
 		off += m
 
-		switch c := format.CompareUser(format.UserKey(key), userKey); {
+		switch c := format.CompareUser(format.UserKey(cur), userKey); {
 		case c < 0:
 			off += int(vlen) // below the run: skip its value and keep scanning
 		case c > 0:
 			return recs, right, false, nil // passed the run: the group is complete on this leaf
 		default:
+			key := append([]byte(nil), cur...)
 			val := append([]byte(nil), src[off:off+int(vlen)]...)
 			off += int(vlen)
 			recs = append(recs, record{key: key, val: val})
