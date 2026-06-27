@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
 )
 
 // durableFile is the one file a durable hashlog Store lives in (spec 2070 doc 03).
@@ -23,6 +24,12 @@ type durableFile struct {
 	sbSize     int64
 
 	alloc *allocator
+
+	// lsn is the per-store monotonic log sequence number (D4): every durable record
+	// carries the next value, and recovery and compaction order by it. It is seeded on
+	// open from the superblock's lsnHighWater and advanced by nextLSN on each durable
+	// append. commit writes the current value back as the new high water.
+	lsn atomic.Uint64
 
 	// growMu guards file growth so concurrent shards extending the file for newly
 	// allocated extents never shrink it past each other. fileEnd is the current file
@@ -151,12 +158,20 @@ func (d *durableFile) readExisting() error {
 		d.newerSlot = 1
 	}
 	d.alloc = newAllocator(int64(newer.extentCount), newer.free)
+	d.lsn.Store(newer.lsnHighWater)
 	fi, err := d.f.Stat()
 	if err != nil {
 		return err
 	}
 	d.fileEnd = fi.Size()
 	return nil
+}
+
+// nextLSN returns the next log sequence number for a durable append. It is the
+// per-store monotonic counter (D4), advanced with one atomic add so a writer on any
+// shard gets a unique increasing value without holding a store-wide lock.
+func (d *durableFile) nextLSN() uint64 {
+	return d.lsn.Add(1)
 }
 
 // commit writes a new checkpoint into the older slot with a generation one higher
@@ -175,7 +190,7 @@ func (d *durableFile) commit() error {
 		generation:   d.sb.generation + 1,
 		extentSize:   uint64(d.extentSize),
 		extentCount:  uint64(count),
-		lsnHighWater: d.sb.lsnHighWater,
+		lsnHighWater: d.lsn.Load(),
 		snapshotRoot: d.sb.snapshotRoot,
 		snapshotLen:  d.sb.snapshotLen,
 		shardCount:   uint32(d.shardCount),

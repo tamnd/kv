@@ -386,7 +386,17 @@ func encodeRecord(dst, key, value []byte) int {
 }
 
 func (sh *shard) set(key, value []byte) error {
-	rl := recordLen(key, value)
+	// In durable mode the record carries the self-describing header (lsn, flags, CRC)
+	// the log needs for recovery; the memory-only store keeps the leaner record so its
+	// benchmarked ceiling does not move. Either way the index ends up pointing straight
+	// at the value, so the read path is identical.
+	durable := sh.df != nil
+	var rl int
+	if durable {
+		rl = durableRecordLen(key, value)
+	} else {
+		rl = recordLen(key, value)
+	}
 	if rl > sh.pageSize {
 		return errors.New("hashlog: record larger than page size")
 	}
@@ -414,13 +424,20 @@ func (sh *shard) set(key, value []byte) error {
 	}
 	page := ps.pages[sh.tailPage]
 	recStart := sh.tailPage*int64(sh.pageSize) + int64(sh.tailPos)
-	n := encodeRecord(page[sh.tailPos:], key, value)
-	sh.tailPos += n
-	// The value sits after the key-length varint, the key, and the value-length
-	// varint. Point the index straight at it so reads skip the record decode. The
-	// index publish (an atomic store) is the release that makes the record bytes
-	// above visible to a lock-free reader's acquiring load.
-	valOff := uvarintLen(uint64(len(key))) + len(key) + uvarintLen(uint64(len(value)))
+	// Encode the record and compute the value's offset from the record start. The
+	// value sits after the header and the key, so point the index straight at it and
+	// reads skip the record decode. The index publish (an atomic store) is the release
+	// that makes the record bytes above visible to a lock-free reader's acquiring load.
+	var valOff int
+	if durable {
+		n := encodeDurableRecord(page[sh.tailPos:], sh.df.nextLSN(), key, value, 0)
+		sh.tailPos += n
+		valOff = durableValOff(key, value)
+	} else {
+		n := encodeRecord(page[sh.tailPos:], key, value)
+		sh.tailPos += n
+		valOff = uvarintLen(uint64(len(key))) + len(key) + uvarintLen(uint64(len(value)))
+	}
 	sh.indexPut(tableHash(key), key, valLoc{addr: recStart + int64(valOff), vlen: uint32(len(value))})
 	return nil
 }
