@@ -77,6 +77,17 @@ type Tunables struct {
 	// runs memory-only: spilling is disabled even if ResidentPagesPerShard is set,
 	// so an over-budget Set keeps the page resident rather than losing it.
 	Dir string
+
+	// Path selects the durable single-file mode (spec 2070): the Store is backed by
+	// one file at this path that survives a crash with no lost acknowledged write.
+	// Empty keeps the memory-only mode, the benchmarked ceiling. Mutually exclusive
+	// with Dir. The durable mode is built behind this knob and is off by default; the
+	// memory-only DefaultTunables never sets it.
+	Path string
+
+	// ExtentSize is the durable extent size in bytes. It must equal PageSize and be a
+	// power of two. Zero defaults to PageSize. Ignored in memory-only mode.
+	ExtentSize int
 }
 
 // DefaultTunables returns a full-resident, memory-only configuration: 256 shards,
