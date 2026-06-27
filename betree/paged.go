@@ -455,6 +455,176 @@ func clipRange(view []resolved, lower, upper []byte) []resolved {
 	return out
 }
 
+// pointGet resolves a single user key without the whole-leaf decode the bounded gather pays.
+// It is the read-path-first fix for the ycsb-c regression the directional checkpoint found:
+// the bounded gatherRange routes to the right leaf but then decodes every record on it, sorts
+// the lot, and folds, to answer one key, where the shipped btree seeks the key on the page.
+// pointGet seeks the key's run on the page instead (collectLeafKey), folds just that one small
+// version group, and returns its visible value.
+//
+// It returns (value, true, nil) on a visible Set, (nil, false, nil) on a not-found or a key
+// whose newest visible version is a delete, and an error only on a torn decode the optimistic
+// caller retries. It still consults the hot tail and the interior buffers, so a write that has
+// not reached its leaf is seen, and it falls back to the full gather whenever a range delete is
+// in play: a range delete's coverage is not local to its marker, so a marker on another key can
+// cover this one, which the per-key leaf seek would never visit. The hasRangeDel read sits
+// inside the gen-validated region its caller wraps this in, so a range delete written
+// concurrently flips the flag, crosses the generation, and is re-evaluated on the retry.
+func (t *Tree) pointGet(snap engine.Snapshot, userKey []byte) ([]byte, bool, error) {
+	if t.hasRangeDel.Load() {
+		view, err := t.gather(snap)
+		if err != nil {
+			return nil, false, err
+		}
+		upper := append(append([]byte(nil), userKey...), 0x00)
+		view = clipRange(view, userKey, upper)
+		if len(view) > 0 && bytes.Equal(view[0].uk, userKey) {
+			return view[0].val, true, nil
+		}
+		return nil, false, nil
+	}
+
+	cells, err := t.collectKeyCells(userKey)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(cells) == 0 {
+		return nil, false, nil
+	}
+	sort.Slice(cells, func(i, j int) bool {
+		return format.CompareInternal(cells[i].key, cells[j].key) < 0
+	})
+	// The group is one user key, so the same clean fold-skip the scan path uses applies: a
+	// single plain Set folds to its own value with no MVCC machinery, anything else (an
+	// overwrite chain, a delete, a merge, a TTL) takes the general fold.
+	var view []resolved
+	if cellsCleanSets(cells) {
+		view = foldCleanResolved(cells, snap)
+	} else {
+		view = t.foldResolved(cells, snap, nil)
+	}
+	if len(view) > 0 && bytes.Equal(view[0].uk, userKey) {
+		return view[0].val, true, nil
+	}
+	return nil, false, nil
+}
+
+// collectKeyCells gathers one user key's version-group cells from the three places a write may
+// rest: the leaf run, the mutable tail, and the interior buffers. It is the per-key twin of
+// collectRange. The leaf part is the cheap part: it routes to the start leaf with the same
+// learned locator the scan uses, then walks right siblings seeking only userKey's records on
+// each page (leafKeyCells), stopping as soon as a leaf's keys pass userKey. The tail and the
+// buffers are small and bounded, so they are collected and filtered to userKey rather than
+// indexed. The caller holds the epoch guard and wraps this in the gen validation, so the three
+// reads compose into one consistent point in time. It runs only off the range-delete path.
+func (t *Tree) collectKeyCells(userKey []byte) ([]record, error) {
+	start, err := t.startLeafFor(userKey)
+	if err != nil {
+		return nil, err
+	}
+	var cells []record
+	seen := map[format.PageNo]bool{}
+	for pgno := start; pgno != format.NoPage; {
+		if seen[pgno] {
+			return nil, fmt.Errorf("betree: leaf run cycles at page %d", pgno)
+		}
+		seen[pgno] = true
+		recs, right, more, err := t.leafKeyCells(pgno, userKey)
+		if err != nil {
+			return nil, err
+		}
+		cells = append(cells, recs...)
+		if !more {
+			break
+		}
+		pgno = right
+	}
+
+	for _, r := range t.collectTailMessages() {
+		if bytes.Equal(format.UserKey(r.key), userKey) {
+			cells = append(cells, r)
+		}
+	}
+	upper := append(append([]byte(nil), userKey...), 0x00)
+	buffered, err := t.collectBufferedRange(userKey, upper)
+	if err != nil {
+		return nil, err
+	}
+	cells = append(cells, buffered...)
+	return cells, nil
+}
+
+// leafKeyCells returns one user key's records from a single leaf page, its right-sibling
+// pointer, and whether the caller should keep walking right. A hot leaf whose decode is cached
+// is filtered straight from the immutable box (no re-parse), aliasing the box's heap bytes the
+// same way the clean scan fold does. A cold leaf is parsed on the page for just this key
+// (collectLeafKey) and deliberately left undecoded in the cache: the point of this path is to
+// not pay the whole-leaf decode under cache pressure, so populating the cache with one would
+// defeat it, and a later scan that needs the whole leaf still decodes and caches it then.
+func (t *Tree) leafKeyCells(pgno format.PageNo, userKey []byte) ([]record, format.PageNo, bool, error) {
+	box, fr, err := t.pgr.ViewDecodedRef(pgno)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	if box != nil {
+		lf, ok := box.Value().(*leaf)
+		if !ok {
+			return nil, 0, false, ErrCorruptNode
+		}
+		var recs []record
+		for i := range lf.records {
+			switch c := format.CompareUser(format.UserKey(lf.records[i].key), userKey); {
+			case c < 0:
+				continue
+			case c > 0:
+				return recs, lf.right, false, nil
+			default:
+				recs = append(recs, lf.records[i])
+			}
+		}
+		return recs, lf.right, true, nil
+	}
+	// Cold: parse just this key's run off the page, under fillGate so the raw read does not
+	// race a writer's in-place rewrite, and drop the pin without caching a decode.
+	t.fillGate.RLock()
+	recs, right, more, perr := collectLeafKey(fr.Data()[:t.pgr.UsablePageSize()], userKey)
+	t.fillGate.RUnlock()
+	t.pgr.Unpin(fr, false)
+	if perr != nil {
+		return nil, 0, false, perr
+	}
+	return recs, right, more, nil
+}
+
+// snapshotPoint is the point-read twin of snapshotRange: it wraps pointGet in the same
+// optimistic gen-validation and epoch pin so a single-key read sees one consistent point in
+// time with no whole-operation latch, restarting if a writer crossed it and falling to the
+// writer lock after a few spins. The protocol is identical to snapshotRange's; see its comments
+// for why the unpin between the gather and the post-check is the read-side barrier.
+func (t *Tree) snapshotPoint(snap engine.Snapshot, g *guard, userKey []byte) ([]byte, bool, error) {
+	const maxOptimistic = 4
+	for attempt := 0; attempt < maxOptimistic; attempt++ {
+		g0 := t.gen.Load()
+		if g0&1 != 0 {
+			runtime.Gosched()
+			continue
+		}
+		g.pin()
+		val, found, err := t.pointGet(snap, userKey)
+		g.unpin()
+		if t.gen.Load() != g0 {
+			runtime.Gosched()
+			continue
+		}
+		return val, found, err
+	}
+	t.wmu.Lock()
+	defer t.wmu.Unlock()
+	g.pin()
+	defer g.unpin()
+	return t.pointGet(snap, userKey)
+}
+
 // collectRange gathers every cell whose user key falls in [lower, upper) from the three
 // places a write may rest: the leaf run, the mutable tail, and the interior buffers. The
 // leaf walk is the bounded part that makes this cheap: it routes straight to the leaf that

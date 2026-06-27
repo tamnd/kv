@@ -344,6 +344,145 @@ func min(a, b int) int {
 	return b
 }
 
+// collectLeafKey extracts just the records for one user key from a leaf page, using the
+// on-page bucket restart array to seek to the key's run instead of decoding every record
+// the way decodeLeaf does. It is the point-read fast path's leaf primitive (doc 04 the
+// ycsb-c lever): a Get folds one key's small version group without materializing the rest of
+// the page, which is what the whole-leaf decode the bounded gather used cost on a cold miss.
+//
+// It returns the matching records as fresh heap copies, the same ownership decodeLeaf gives,
+// so a caller may retain them; the page's right-sibling pointer, so the caller can walk on;
+// and reachedEnd, which is true whenever the scan reached the last record of the leaf without
+// passing the user key. The caller keeps walking right siblings while reachedEnd is true,
+// because the start leaf may sit too far left (the learned locator only promises a leaf whose
+// smallest key is at or before the target) and because a key's version group can straddle a
+// leaf boundary, so older versions of the key may continue on the next leaf. When the scan
+// instead passes the user key on this leaf, the group is complete and reachedEnd is false.
+func collectLeafKey(src, userKey []byte) (recs []record, right format.PageNo, reachedEnd bool, err error) {
+	if len(src) < leafHeaderEnd {
+		return nil, 0, false, ErrCorruptNode
+	}
+	ch := format.DecodeCommonHeader(src)
+	if ch.Type != format.PageBTreeLeaf {
+		return nil, 0, false, ErrCorruptNode
+	}
+	n := int(ch.CellCount)
+	bucketCount := int(binary.BigEndian.Uint16(src[8:10]))
+	bucketSize := int(binary.BigEndian.Uint16(src[10:12]))
+	right = format.PageNo(binary.BigEndian.Uint32(src[12:16]))
+	if n == 0 {
+		return nil, right, false, nil
+	}
+	if bucketSize <= 0 || bucketCount != (n+bucketSize-1)/bucketSize {
+		return nil, 0, false, ErrCorruptNode
+	}
+
+	// target is the smallest internal key for userKey: MaxVersion inverts to a zero version
+	// trailer and KindDelete is the smallest kind byte, so no record for userKey, and no
+	// record for any larger user key, sorts before it. The binary search lands on the bucket
+	// whose run holds target's insertion point, which is at or before userKey's first record.
+	target := format.EncodeInternalKey(userKey, format.MaxVersion, format.KindDelete)
+
+	// firstKey reads the full (restart) key of bucket b directly from its offset.
+	firstKey := func(b int) ([]byte, error) {
+		if leafHeaderEnd+b*2+2 > len(src) {
+			return nil, ErrCorruptNode
+		}
+		off := int(binary.BigEndian.Uint16(src[leafHeaderEnd+b*2:]))
+		if off >= len(src) {
+			return nil, ErrCorruptNode
+		}
+		shared, m := format.Uvarint(src[off:])
+		if m <= 0 || shared != 0 {
+			return nil, ErrCorruptNode
+		}
+		off += m
+		klen, m := format.Uvarint(src[off:])
+		if m <= 0 || klen > uint64(len(src)) || off+m+int(klen) > len(src) {
+			return nil, ErrCorruptNode
+		}
+		off += m
+		return src[off : off+int(klen)], nil
+	}
+
+	// Last bucket whose first key is <= target, i.e. the bucket userKey's run begins in (or
+	// just after). When target sorts before the whole leaf, start at bucket 0: userKey's
+	// records, all at or after target, may still sit at the very front.
+	lo, hi := 0, bucketCount
+	for lo < hi {
+		mid := (lo + hi) / 2
+		fk, ferr := firstKey(mid)
+		if ferr != nil {
+			return nil, 0, false, ferr
+		}
+		if format.CompareInternal(fk, target) <= 0 {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	startBucket := 0
+	if lo > 0 {
+		startBucket = lo - 1
+	}
+
+	// Linear-scan forward from the start bucket, reconstructing front-coded keys (front
+	// coding resets at each bucket boundary, where the key is stored whole), skipping records
+	// below userKey, keeping those that match, and stopping the moment a record passes
+	// userKey.
+	off := int(binary.BigEndian.Uint16(src[leafHeaderEnd+startBucket*2:]))
+	var prev []byte
+	for i := startBucket * bucketSize; i < n; i++ {
+		shared, m := format.Uvarint(src[off:])
+		if m <= 0 {
+			return nil, 0, false, ErrCorruptNode
+		}
+		off += m
+		if i%bucketSize == 0 && shared != 0 {
+			return nil, 0, false, ErrCorruptNode
+		}
+		l, m := format.Uvarint(src[off:])
+		if m <= 0 || l > uint64(len(src)) || off+m+int(l) > len(src) {
+			return nil, 0, false, ErrCorruptNode
+		}
+		off += m
+		suf := src[off : off+int(l)]
+		off += int(l)
+
+		var key []byte
+		if shared == 0 {
+			key = append([]byte(nil), suf...)
+		} else {
+			if shared > uint64(len(prev)) {
+				return nil, 0, false, ErrCorruptNode
+			}
+			key = make([]byte, 0, int(shared)+len(suf))
+			key = append(key, prev[:shared]...)
+			key = append(key, suf...)
+		}
+		prev = key
+
+		vlen, m := format.Uvarint(src[off:])
+		if m <= 0 || vlen > uint64(len(src)) || off+m+int(vlen) > len(src) {
+			return nil, 0, false, ErrCorruptNode
+		}
+		off += m
+
+		switch c := format.CompareUser(format.UserKey(key), userKey); {
+		case c < 0:
+			off += int(vlen) // below the run: skip its value and keep scanning
+		case c > 0:
+			return recs, right, false, nil // passed the run: the group is complete on this leaf
+		default:
+			val := append([]byte(nil), src[off:off+int(vlen)]...)
+			off += int(vlen)
+			recs = append(recs, record{key: key, val: val})
+		}
+	}
+	// Reached the last record without passing userKey, so a continuation may sit to the right.
+	return recs, right, true, nil
+}
+
 // message is one buffered Bε message addressed to a key in an interior node's
 // subtree (doc 06 section 2). kind is the operation (set/delete/merge/range), seq
 // orders messages for one key oldest to newest, key is the full internal key, and
