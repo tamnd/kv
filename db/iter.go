@@ -38,6 +38,15 @@ type Iterator struct {
 	after   []byte // exclusive cursor: the last key pulled from stream, nil before the first pull
 	drained bool   // no more entries to pull (range exhausted, or fully materialized)
 	err     error  // first mid-scan error, surfaced through Error
+
+	// Forward re-seat state for the streaming cursor path. A forward SeekGE re-opens the cursor at the
+	// seek key in one descent instead of folding the whole prefix, but that leaves the buffer missing
+	// the keys below the seek. reseated records that the cursor no longer covers from the range lower
+	// bound, and base is the key it was re-seated to; a backward step re-opens at the lower bound to
+	// restore the prefix before it reads. Both are zero on the materialized and stateless-stream paths,
+	// which never re-seat.
+	reseated bool
+	base     []byte
 }
 
 // forwardScanner is the optional capability an engine reader exposes when it can
@@ -349,11 +358,78 @@ func (it *Iterator) SeekGE(key []byte) bool {
 		it.pos = idx - 1
 		return it.Valid()
 	}
-	it.fillKeyGE(key)
+	from := key
+	if it.lower != nil && bytes.Compare(from, it.lower) < 0 {
+		from = it.lower
+	}
+	if it.scursor != nil {
+		// Streaming forward: re-seat the cursor at from in one descent rather than front-filling the
+		// buffer from the range start, which folds every key in the prefix the scan then skips, the
+		// dominant cost of the ycsb-e shape (NewIterator over the whole keyspace, SeekGE to a random
+		// key, a short run of Next). A seek at or ahead of the cursor's current coverage re-seats
+		// forward; a seek behind it re-opens at the lower bound first so the front-fill below still
+		// has the skipped prefix to search.
+		if !it.reseated || bytes.Compare(from, it.base) >= 0 {
+			if it.reopenAt(from) {
+				it.reseated = true
+				it.pos = 0
+				it.fillTo(0)
+				return it.Valid()
+			}
+		} else if it.reopenAt(it.lower) {
+			it.reseated = false
+		}
+	}
+	it.fillKeyGE(from)
 	it.pos = sort.Search(len(it.items), func(i int) bool {
-		return bytes.Compare(it.items[i].key, key) >= 0
+		return bytes.Compare(it.items[i].key, from) >= 0
 	})
 	return it.Valid()
+}
+
+// reopenAt re-opens the streaming forward cursor positioned at from, discarding the current buffer.
+// Both streaming engines descend to a forward cursor's lower bound in one step, so re-opening with
+// lower advanced to from seeks straight there instead of folding the prefix the scan would skip. It
+// runs under the engine read lock, the same lock NewIterator built the first cursor under, because
+// NewForwardCursor may snapshot mutable engine state (a btree's range-delete set) at construction. The
+// from bytes are copied so a caller that reuses its seek key after the call cannot corrupt the cursor's
+// bound, and the copy becomes base. It returns false when the reader lacks the cursor capability or the
+// re-open errors, leaving the caller on the front-fill path.
+func (it *Iterator) reopenAt(from []byte) bool {
+	fc, ok := it.rd.(engine.ForwardCursorer)
+	if !ok {
+		return false
+	}
+	lo := from
+	if lo != nil {
+		lo = append([]byte(nil), from...)
+	}
+	sh := it.db.rl.RLock()
+	c, err := fc.NewForwardCursor(lo, it.upper)
+	it.db.rl.RUnlock(sh)
+	if err != nil {
+		it.err = err
+		return false
+	}
+	it.scursor = c
+	it.items = it.items[:0]
+	it.after = nil
+	it.drained = false
+	it.base = lo
+	return true
+}
+
+// coverFromLower restores the cursor's coverage to the range lower bound when a forward SeekGE has
+// re-seated it past part of the range. A backward step needs the keys the re-seated scan skipped, which
+// only a cursor opened at the lower bound holds. It is a no-op on a cursor that still covers from the
+// lower bound (a fresh iterator, or one only walked forward) and on the materialized and stateless
+// paths, so the common forward scan never pays for it.
+func (it *Iterator) coverFromLower() {
+	if it.scursor != nil && it.reseated {
+		if it.reopenAt(it.lower) {
+			it.reseated = false
+		}
+	}
 }
 
 // SeekLT positions at the last visible key < key in the iteration direction.
@@ -365,6 +441,7 @@ func (it *Iterator) SeekLT(key []byte) bool {
 		it.pos = idx
 		return it.Valid()
 	}
+	it.coverFromLower()
 	it.fillKeyGE(key)
 	idx := sort.Search(len(it.items), func(i int) bool {
 		return bytes.Compare(it.items[i].key, key) >= 0
@@ -378,6 +455,7 @@ func (it *Iterator) First() bool {
 	if it.reverse {
 		it.pos = len(it.items) - 1
 	} else {
+		it.coverFromLower()
 		it.fillTo(0)
 		it.pos = 0
 	}
@@ -389,6 +467,7 @@ func (it *Iterator) Last() bool {
 	if it.reverse {
 		it.pos = 0
 	} else {
+		it.coverFromLower()
 		it.drainAll()
 		it.pos = len(it.items) - 1
 	}
@@ -410,9 +489,30 @@ func (it *Iterator) Next() bool {
 func (it *Iterator) Prev() bool {
 	if it.reverse {
 		it.pos++
-	} else {
-		it.pos--
+		return it.Valid()
 	}
+	if it.scursor != nil && it.reseated {
+		// Stepping back below the re-seat point needs the keys the forward scan skipped. Re-open at
+		// the lower bound and front-fill back to the current key so pos still points at it, then the
+		// step below lands on the key before it. A step back from past-the-end drains the whole range.
+		var cur []byte
+		if it.pos >= 0 && it.pos < len(it.items) {
+			cur = append([]byte(nil), it.items[it.pos].key...)
+		}
+		if it.reopenAt(it.lower) {
+			it.reseated = false
+			if cur != nil {
+				it.fillKeyGE(cur)
+				it.pos = sort.Search(len(it.items), func(i int) bool {
+					return bytes.Compare(it.items[i].key, cur) >= 0
+				})
+			} else {
+				it.drainAll()
+				it.pos = len(it.items)
+			}
+		}
+	}
+	it.pos--
 	return it.Valid()
 }
 

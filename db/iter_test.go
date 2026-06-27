@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/tamnd/kv/engine"
+	"github.com/tamnd/kv/format"
 )
 
 // collect walks an iterator forward (in its direction) and returns the keys, and
@@ -195,6 +196,71 @@ func TestIterSeek(t *testing.T) {
 		}
 		return nil
 	})
+}
+
+// TestIterSeekReseat exercises the forward streaming re-seat across a range large enough that a
+// mid-range SeekGE skips a real prefix, then drives every backward step that must restore that
+// prefix: Prev across the re-seat point, SeekLT below it, a SeekGE to a key behind the current
+// position, First, and Last. It runs on both streaming engines (the default B-tree and the Beta
+// core) so the re-seat path and its lower-bound fallback are both covered. A regression in the
+// re-seat bookkeeping shows up here as a missing earlier key, the exact shape of the bug the
+// original front-fill avoided by never skipping the prefix.
+func TestIterSeekReseat(t *testing.T) {
+	for _, eng := range []struct {
+		name string
+		kind format.EngineKind
+	}{
+		{"btree", format.EngineBTree},
+		{"beta", format.EngineBeta},
+	} {
+		t.Run(eng.name, func(t *testing.T) {
+			d := openMem(t, Options{Engine: eng.kind})
+			seedRange(t, d, 40) // k00..k39
+			d.View(func(txn *Txn) error {
+				it, _ := txn.NewIterator(engine.IterOptions{})
+				defer it.Close()
+
+				// Forward re-seat past the prefix, then step back across the re-seat point.
+				if !it.SeekGE([]byte("k20")) || string(it.Key()) != "k20" {
+					t.Fatalf("SeekGE k20 -> %q", it.Key())
+				}
+				if !it.Prev() || string(it.Key()) != "k19" {
+					t.Fatalf("Prev after re-seat -> %q, want k19", it.Key())
+				}
+
+				// After a forward re-seat, SeekLT below the re-seat point must still find the key.
+				if !it.SeekGE([]byte("k30")) || string(it.Key()) != "k30" {
+					t.Fatalf("SeekGE k30 -> %q", it.Key())
+				}
+				if !it.SeekLT([]byte("k05")) || string(it.Key()) != "k04" {
+					t.Fatalf("SeekLT k05 after re-seat -> %q, want k04", it.Key())
+				}
+
+				// A backward SeekGE (to a key behind the current base) re-opens at the lower bound.
+				if !it.SeekGE([]byte("k35")) || string(it.Key()) != "k35" {
+					t.Fatalf("SeekGE k35 -> %q", it.Key())
+				}
+				if !it.SeekGE([]byte("k10")) || string(it.Key()) != "k10" {
+					t.Fatalf("SeekGE k10 after re-seat -> %q, want k10", it.Key())
+				}
+
+				// First and Last must restore full coverage after a forward re-seat.
+				if !it.SeekGE([]byte("k25")) || string(it.Key()) != "k25" {
+					t.Fatalf("SeekGE k25 -> %q", it.Key())
+				}
+				if !it.First() || string(it.Key()) != "k00" {
+					t.Fatalf("First after re-seat -> %q, want k00", it.Key())
+				}
+				if !it.SeekGE([]byte("k25")) || string(it.Key()) != "k25" {
+					t.Fatalf("SeekGE k25 (2) -> %q", it.Key())
+				}
+				if !it.Last() || string(it.Key()) != "k39" {
+					t.Fatalf("Last after re-seat -> %q, want k39", it.Key())
+				}
+				return nil
+			})
+		})
+	}
 }
 
 // TestIterSnapshotStable checks a long-lived iterator does not see a concurrent
