@@ -140,6 +140,11 @@ type Store struct {
 	// df is the durable single-file backing, non-nil only when a Path is set. In the
 	// memory-only default it stays nil and no shard touches it.
 	df *durableFile
+
+	// rec holds what the open-time recovery did (M5), exposed through RecoveryStats. It
+	// is the zero value for a memory-only store and for a freshly created durable file
+	// (nothing to recover).
+	rec recoveryStats
 }
 
 // New builds a Store. It returns an error if the tunables are invalid, when a Dir is
@@ -187,6 +192,16 @@ func New(t Tunables) (*Store, error) {
 			return nil, err
 		}
 		s.shards[i] = sh
+	}
+	// A durable file that already held a checkpoint (or a log written before any
+	// checkpoint) is recovered now: rebuild every shard's index from the last valid
+	// checkpoint plus the durable log tail (doc 05 section 6, D9), before the store
+	// serves a single request. A brand-new file has nothing to recover.
+	if df != nil && df.existed {
+		if err := s.recover(); err != nil {
+			s.Close()
+			return nil, err
+		}
 	}
 	return s, nil
 }
@@ -280,6 +295,27 @@ func (s *Store) CheckpointStats() CheckpointStats {
 	}
 }
 
+// RecoveryStats reports what the open-time recovery did (doc 08 section 1.5): how many
+// delta records were replayed across all shards, how many log bytes each shard
+// replayed past its checkpoint frontier, and where each shard's CRC-stop fired (the
+// torn-tail logical address, or -1 when the scan reached a clean end with no torn
+// record). It is the zero value for a memory-only store and for a freshly created
+// durable file. The per-shard slices are indexed by shard id.
+type RecoveryStats struct {
+	ReplayedRecords int64
+	BytesReplayed   []int64
+	TornTailOffset  []int64
+}
+
+// RecoveryStats returns the counters recorded by the open-time recovery.
+func (s *Store) RecoveryStats() RecoveryStats {
+	return RecoveryStats{
+		ReplayedRecords: s.rec.replayedRecords,
+		BytesReplayed:   s.rec.bytesReplayed,
+		TornTailOffset:  s.rec.tornTailOff,
+	}
+}
+
 // Checkpoint writes a durable index snapshot and commits it through the superblock
 // double-slot (doc 05 section 4, D8). It captures each shard's consistent cut, writes
 // the snapshot extents and fsyncs them, then flips the superblock generation in one
@@ -309,14 +345,19 @@ func (s *Store) Checkpoint() error {
 
 // captureCut takes shard sh's consistent cut for a checkpoint (doc 05 section 3): it
 // briefly holds the write lock, copies the live tuples into a private slice, and reads
-// the durable frontier as the cut LSN F_shard. Under Normal it first flushes and syncs
-// the shard's log so the recorded frontier is genuinely durable up to the cut (doc 05
-// section 5: a recorded frontier must be a durable frontier under the active dial).
-// The copy form gives an exact as-of-F_shard view with no post-cut bleed.
+// the durable frontier as the cut LSN F_shard. It first writes the shard's resident log
+// pages to disk so every value the snapshot tuples point at has an on-disk home: a
+// checkpoint is a recovery point, and recovery reads those values back by address (doc
+// 05 section 3, the snapshot references durable value locations). Under Normal and Full
+// the flush also syncs and advances the frontier so the recorded frontier is genuinely
+// durable up to the cut (doc 05 section 5); under None the bytes are written but not
+// barriered, matching the dial's no-per-write-sync contract while still leaving a clean
+// reopen recoverable. The copy form gives an exact as-of-F_shard view with no post-cut
+// bleed.
 func (sh *shard) captureCut() (snapSection, shardFrontier) {
 	sh.mu.Lock()
-	if sh.df != nil && sh.durability == DurabilityNormal {
-		sh.flushDurable(true)
+	if sh.df != nil {
+		sh.flushDurable(sh.durability != DurabilityNone)
 	}
 	t := sh.index.Load()
 	tuples := make([]snapTuple, 0, sh.idxLive)
@@ -518,6 +559,35 @@ func encodeRecord(dst, key, value []byte) int {
 	return n
 }
 
+// rollFor makes room in the tail page for a record of rl bytes. When the record does
+// not fit, it seals the current tail page and starts a fresh one, publishing the new
+// directory before any record lands on it so a reader that later sees the record's index
+// entry also sees the page it lives on. Under the Normal dial the seal is a group-commit
+// flush point, so the sealed pages are made durable here (doc 04 sections 5.3, 6.2). It
+// runs under the shard write lock and is shared by the durable SET and DELETE appends.
+func (sh *shard) rollFor(rl int) {
+	if sh.tailPos+rl <= sh.pageSize {
+		return
+	}
+	if sh.df != nil && sh.durability == DurabilityNormal {
+		sh.flushDurable(true)
+	}
+	ps := sh.pages.Load()
+	sh.tailPage++
+	sh.tailPos = 0
+	np := make([][]byte, len(ps.pages)+1)
+	copy(np, ps.pages)
+	np[sh.tailPage] = make([]byte, sh.pageSize)
+	sh.pages.Store(&pageSet{pages: np})
+	sh.diskOff = append(sh.diskOff, 0)
+	sh.pageExtent = append(sh.pageExtent, -1)
+	sh.pageFill = append(sh.pageFill, 0)
+	sh.pageFlushed = append(sh.pageFlushed, 0)
+	sh.pageMaxLSN = append(sh.pageMaxLSN, 0)
+	sh.residentOrder = append(sh.residentOrder, sh.tailPage)
+	sh.evictIfNeeded()
+}
+
 func (sh *shard) set(key, value []byte) error {
 	// In durable mode the record carries the self-describing header (lsn, flags, CRC)
 	// the log needs for recovery; the memory-only store keeps the leaner record so its
@@ -536,34 +606,8 @@ func (sh *shard) set(key, value []byte) error {
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
 
+	sh.rollFor(rl)
 	ps := sh.pages.Load()
-	// Roll to a fresh page when the record does not fit in the tail page. The sealed
-	// page becomes eligible for flushing once it leaves the resident cap. Publish the
-	// new directory before writing the record into it so a reader that later sees the
-	// record's index entry also sees the page it lives on.
-	if sh.tailPos+rl > sh.pageSize {
-		// The tail page seals here: no more records land on it. Under Normal the seal is
-		// a group-commit flush point, so make the sealed pages durable now (doc 04
-		// section 5.3, 6.2); the bounded loss window is the records since this seal.
-		if durable && sh.durability == DurabilityNormal {
-			sh.flushDurable(true)
-		}
-		sh.tailPage++
-		sh.tailPos = 0
-		np := make([][]byte, len(ps.pages)+1)
-		copy(np, ps.pages)
-		np[sh.tailPage] = make([]byte, sh.pageSize)
-		ps = &pageSet{pages: np}
-		sh.pages.Store(ps)
-		sh.diskOff = append(sh.diskOff, 0)
-		sh.pageExtent = append(sh.pageExtent, -1)
-		sh.pageFill = append(sh.pageFill, 0)
-		sh.pageFlushed = append(sh.pageFlushed, 0)
-		sh.pageMaxLSN = append(sh.pageMaxLSN, 0)
-		sh.residentOrder = append(sh.residentOrder, sh.tailPage)
-		sh.evictIfNeeded()
-		ps = sh.pages.Load()
-	}
 	page := ps.pages[sh.tailPage]
 	recStart := sh.tailPage*int64(sh.pageSize) + int64(sh.tailPos)
 	// Encode the record and compute the value's offset from the record start. The
@@ -654,24 +698,62 @@ func (sh *shard) growIndex() *idxTable {
 	return nt
 }
 
-func (sh *shard) delete(key []byte) error {
-	thash := tableHash(key)
-	sh.mu.Lock()
+// indexDeleteLocked tombstones key's slot when present and reports whether it was found.
+// It runs under the shard write lock. The tombstone (rather than a cleared slot) keeps
+// the open-addressing probe chain intact for a concurrent lock-free reader.
+func (sh *shard) indexDeleteLocked(thash uint64, key []byte) bool {
 	t := sh.index.Load()
 	i := thash & t.mask
 	for {
 		e := t.slots[i].Load()
 		if e == nil {
-			break
+			return false
 		}
 		if e != tombstone && e.thash == thash && bytes.Equal(e.key, key) {
 			t.slots[i].Store(tombstone)
 			sh.idxLive--
-			break
+			return true
 		}
 		i = (i + 1) & t.mask
 	}
-	sh.mu.Unlock()
+}
+
+func (sh *shard) delete(key []byte) error {
+	thash := tableHash(key)
+	if sh.df == nil {
+		// Memory-only: drop the index entry. There is no log to make the delete durable,
+		// and appending nothing keeps the benchmarked ceiling untouched.
+		sh.mu.Lock()
+		sh.indexDeleteLocked(thash, key)
+		sh.mu.Unlock()
+		return nil
+	}
+	// Durable: a delete appends a tombstone record so it survives a crash (D7). The
+	// tombstone carries a fresh LSN, strictly greater than the key's last SET, so replay
+	// resolves the key absent last-writer-wins (doc 05 section 6). A delete of an absent
+	// key has nothing to make durable, so it appends no record.
+	rl := durableRecordLen(key, nil)
+	if rl > sh.pageSize {
+		return errors.New("hashlog: tombstone larger than page size")
+	}
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	if !sh.indexDeleteLocked(thash, key) {
+		return nil
+	}
+	sh.rollFor(rl)
+	ps := sh.pages.Load()
+	page := ps.pages[sh.tailPage]
+	lsn := sh.df.nextLSN()
+	n := encodeDurableRecord(page[sh.tailPos:], lsn, key, nil, flagTombstone)
+	sh.tailPos += n
+	sh.pageFill[sh.tailPage] = sh.tailPos
+	sh.pageMaxLSN[sh.tailPage] = int64(lsn)
+	sh.df.bytesSinceCkpt.Add(int64(n))
+	// Under Full the delete does not return until its tombstone is in a synced extent.
+	if sh.durability == DurabilityFull {
+		sh.flushDurable(true)
+	}
 	return nil
 }
 
@@ -728,10 +810,18 @@ func (sh *shard) evictIfNeeded() {
 	}
 }
 
-// ensureExtent assigns an extent to page pid if it has none, growing the file to
-// cover it, and returns the extent's base byte offset. It runs under the shard write
-// lock. A page keeps the same extent for its life, so a partially flushed tail page
-// and its later eviction write into the one extent.
+// ensureExtent assigns an extent to page pid if it has none, growing the file to cover
+// it and writing the extent's self-describing header, and returns the extent's body
+// byte offset (past the header). It runs under the shard write lock. A page keeps the
+// same extent for its life, so a partially flushed tail page and its later eviction
+// write into the one extent.
+//
+// The header carries the owning shard, the page's logical base address, and the
+// previous extent in the shard's chain, written before any record body lands in the
+// extent so recovery can find and order the shard's extents from the file alone (doc 03
+// section 5). The next link is left unset: recovery orders a shard's extents by their
+// base address, so it never needs the forward link, and the compactor that splices the
+// chain is M8 (recorded in the implementation spec-resolution note).
 func (sh *shard) ensureExtent(pid int64) (int64, error) {
 	ext := sh.pageExtent[pid]
 	if ext < 0 {
@@ -740,10 +830,18 @@ func (sh *shard) ensureExtent(pid int64) (int64, error) {
 			sh.df.alloc.freeExtent(id)
 			return 0, err
 		}
+		prev := int64(-1)
+		if pid > 0 {
+			prev = sh.pageExtent[pid-1]
+		}
+		if err := sh.df.writeLogExtentHeader(id, sh.shardID, prev, pid*int64(sh.pageSize)); err != nil {
+			sh.df.alloc.freeExtent(id)
+			return 0, err
+		}
 		ext = id
 		sh.pageExtent[pid] = id
 	}
-	return sh.df.extentOffset(ext), nil
+	return sh.df.logBodyOffset(ext), nil
 }
 
 // writePageRemainder writes the record bytes of page pid that are not yet on disk into

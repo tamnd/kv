@@ -165,7 +165,9 @@ func TestGrowExtent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := extentByteOffset(d.sbSize, d.extentSize, id) + d.extentSize
+	// An on-disk extent is one stride: the header plus the body. Growing for an extent
+	// extends the file through that extent's stride, not the bare body size.
+	want := d.extentOffset(id) + d.stride
 	if fi.Size() != want {
 		t.Fatalf("file size after grow %d, want %d", fi.Size(), want)
 	}
@@ -178,7 +180,7 @@ func TestGrowExtent(t *testing.T) {
 		t.Fatal(err)
 	}
 	fi, _ = d.f.Stat()
-	want2 := extentByteOffset(d.sbSize, d.extentSize, id2) + d.extentSize
+	want2 := d.extentOffset(id2) + d.stride
 	if fi.Size() != want2 {
 		t.Fatalf("file shrank: size %d, want %d", fi.Size(), want2)
 	}
