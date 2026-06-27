@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"runtime"
+	"slices"
 	"sort"
 
 	"github.com/tamnd/kv/engine"
@@ -445,22 +446,30 @@ func (t *Tree) foldResolved(cells []record, snap engine.Snapshot, rangeDels []fo
 	return out
 }
 
-// clipRange drops the resolved pairs outside [lower, upper) from an already-ascending view.
-// It is the range-delete fallback's clip: the full gather resolves the whole keyspace, and
-// this trims it to the bounded reader's window so the caller sees the same shape it would
-// from the bounded path. A nil bound is unbounded on that side.
+// clipRange trims an already-ascending view to the pairs inside [lower, upper). The in-bounds
+// pairs are a contiguous run (the view is sorted by user key), so the trim is two binary searches
+// for the run's bounds and an aliased sub-slice, not a copy: a window whose pairs already sit
+// inside its span (the streaming-scan case, where collectForwardChunk and the tail and buffer
+// filters already bounded the cells) returns the view untouched with no allocation, and the
+// range-delete fallback that clips a whole-keyspace gather down to one reader's window returns the
+// sub-slice that covers it. A nil bound is unbounded on that side.
 func clipRange(view []resolved, lower, upper []byte) []resolved {
-	var out []resolved
-	for _, e := range view {
-		if lower != nil && bytes.Compare(e.uk, lower) < 0 {
-			continue
-		}
-		if upper != nil && bytes.Compare(e.uk, upper) >= 0 {
-			continue
-		}
-		out = append(out, e)
+	lo := 0
+	if lower != nil {
+		lo = sort.Search(len(view), func(i int) bool {
+			return bytes.Compare(view[i].uk, lower) >= 0
+		})
 	}
-	return out
+	hi := len(view)
+	if upper != nil {
+		hi = sort.Search(len(view), func(i int) bool {
+			return bytes.Compare(view[i].uk, upper) >= 0
+		})
+	}
+	if lo == 0 && hi == len(view) {
+		return view
+	}
+	return view[lo:hi]
 }
 
 // pointGet resolves a single user key without sorting and folding the whole leaf the way the
@@ -830,14 +839,42 @@ func (t *Tree) collectForwardChunk(fromKey, upper []byte, chunkKeys int) (cells 
 	if err != nil {
 		return nil, nil, false, err
 	}
+	// Presize the window to its distinct-key target so the per-record append does not grow the
+	// slice through a chain of reallocations as it fills (one version per key is the common case,
+	// so chunkKeys is the right first cut; a key with several versions still grows it from there).
+	cells = make([]record, 0, chunkKeys)
 	distinct := 0
 	var lastKey []byte
-	seen := map[format.PageNo]bool{}
+	// One window spans a handful of leaves, so the cycle guard keeps visited pages in a small
+	// inline ring and never allocates for the common walk, promoting to a map only for a window
+	// wide enough to cross more leaves than the ring holds. A corrupt right-sibling pointer that
+	// loops trips the guard either way.
+	var ring [32]format.PageNo
+	steps := 0
+	var seen map[format.PageNo]bool
 	for pgno := start; pgno != format.NoPage; {
-		if seen[pgno] {
-			return nil, nil, false, fmt.Errorf("betree: leaf run cycles at page %d", pgno)
+		if seen != nil {
+			if seen[pgno] {
+				return nil, nil, false, fmt.Errorf("betree: leaf run cycles at page %d", pgno)
+			}
+			seen[pgno] = true
+		} else {
+			for i := 0; i < steps; i++ {
+				if ring[i] == pgno {
+					return nil, nil, false, fmt.Errorf("betree: leaf run cycles at page %d", pgno)
+				}
+			}
+			if steps < len(ring) {
+				ring[steps] = pgno
+			} else {
+				seen = make(map[format.PageNo]bool, steps*2)
+				for i := 0; i < steps; i++ {
+					seen[ring[i]] = true
+				}
+				seen[pgno] = true
+			}
 		}
-		seen[pgno] = true
+		steps++
 		lf, derr := t.viewLeaf(pgno)
 		if derr != nil {
 			return nil, nil, false, derr
@@ -892,8 +929,8 @@ func (t *Tree) gatherChunk(snap engine.Snapshot, fromKey, upper []byte, chunkKey
 		return nil, nil, false, err
 	}
 	cells = append(cells, buffered...)
-	sort.Slice(cells, func(i, j int) bool {
-		return format.CompareInternal(cells[i].key, cells[j].key) < 0
+	slices.SortFunc(cells, func(a, b record) int {
+		return format.CompareInternal(a.key, b.key)
 	})
 	if cellsCleanSets(cells) {
 		win = foldCleanResolved(cells, snap)
