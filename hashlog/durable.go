@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 )
 
 // durableFile is the one file a durable hashlog Store lives in (spec 2070 doc 03).
@@ -22,6 +23,12 @@ type durableFile struct {
 	sbSize     int64
 
 	alloc *allocator
+
+	// growMu guards file growth so concurrent shards extending the file for newly
+	// allocated extents never shrink it past each other. fileEnd is the current file
+	// size, advanced only forward.
+	growMu  sync.Mutex
+	fileEnd int64
 
 	// sb is the current durable superblock (the content of the newer slot), and
 	// newerSlot is which physical slot (0 for A, 1 for B) currently holds it. A commit
@@ -112,6 +119,7 @@ func (d *durableFile) initFresh() error {
 	d.sb = sb
 	d.newerSlot = 0
 	d.alloc = newAllocator(0, nil)
+	d.fileEnd = d.sbSize
 	return nil
 }
 
@@ -143,6 +151,11 @@ func (d *durableFile) readExisting() error {
 		d.newerSlot = 1
 	}
 	d.alloc = newAllocator(int64(newer.extentCount), newer.free)
+	fi, err := d.f.Stat()
+	if err != nil {
+		return err
+	}
+	d.fileEnd = fi.Size()
 	return nil
 }
 
@@ -185,12 +198,28 @@ func (d *durableFile) commit() error {
 	return nil
 }
 
-// growFile extends the file so extent id exists in it, zero-filling through the new
-// extent's end. The extent header and records are written by the log path (M1); M0
-// only guarantees the bytes exist so a later WriteAt into the extent is in-bounds.
-func (d *durableFile) growFile(id int64) error {
-	end := extentByteOffset(d.sbSize, d.extentSize, id) + d.extentSize
-	return d.f.Truncate(end)
+// extentOffset returns the byte offset in the file of extent id's first byte.
+func (d *durableFile) extentOffset(id int64) int64 {
+	return extentByteOffset(d.sbSize, d.extentSize, id)
+}
+
+// growExtent extends the file so extent id exists in it, if it does not already. It
+// is only-grow and concurrency-safe: two shards allocating and growing at once never
+// shrink the file past each other (a freed-and-reused id is already in the file, so
+// its end is below fileEnd and this is a no-op). The bytes through the extent's end
+// exist before the log path writes records into them.
+func (d *durableFile) growExtent(id int64) error {
+	end := d.extentOffset(id) + d.extentSize
+	d.growMu.Lock()
+	defer d.growMu.Unlock()
+	if end <= d.fileEnd {
+		return nil
+	}
+	if err := d.f.Truncate(end); err != nil {
+		return err
+	}
+	d.fileEnd = end
+	return nil
 }
 
 // Close closes the file. The durableFile must not be used afterward.

@@ -102,10 +102,15 @@ type Store struct {
 	shards []*shard
 	mask   uint64
 	t      Tunables
+
+	// df is the durable single-file backing, non-nil only when a Path is set. In the
+	// memory-only default it stays nil and no shard touches it.
+	df *durableFile
 }
 
-// New builds a Store. It returns an error if the tunables are invalid or, when a
-// Dir is set, a shard log file cannot be created.
+// New builds a Store. It returns an error if the tunables are invalid, when a Dir is
+// set and a shard log file cannot be created, or when a Path is set and the durable
+// file cannot be opened.
 func New(t Tunables) (*Store, error) {
 	if t.Shards <= 0 || t.Shards&(t.Shards-1) != 0 {
 		return nil, errors.New("hashlog: Shards must be a power of two")
@@ -113,16 +118,34 @@ func New(t Tunables) (*Store, error) {
 	if t.PageSize <= 64 {
 		return nil, errors.New("hashlog: PageSize too small")
 	}
+
+	var df *durableFile
+	if t.Path != "" {
+		var err error
+		t, err = validateDurableTunables(t)
+		if err != nil {
+			return nil, err
+		}
+		df, err = openDurableFile(t.Path, t.Shards, int64(t.ExtentSize))
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	s := &Store{
 		shards: make([]*shard, t.Shards),
 		mask:   uint64(t.Shards - 1),
 		t:      t,
+		df:     df,
 	}
 	for i := range s.shards {
-		sh, err := newShard(t)
+		sh, err := newShard(t, df, i)
 		if err != nil {
 			for j := 0; j < i; j++ {
 				s.shards[j].close()
+			}
+			if df != nil {
+				df.Close()
 			}
 			return nil, err
 		}
@@ -131,11 +154,17 @@ func New(t Tunables) (*Store, error) {
 	return s, nil
 }
 
-// Close releases every shard's log file. The Store must not be used afterward.
+// Close releases every shard's log file and, in durable mode, the single file. The
+// Store must not be used afterward.
 func (s *Store) Close() error {
 	var first error
 	for _, sh := range s.shards {
 		if err := sh.close(); err != nil && first == nil {
+			first = err
+		}
+	}
+	if s.df != nil {
+		if err := s.df.Close(); err != nil && first == nil {
 			first = err
 		}
 	}
@@ -290,33 +319,47 @@ type shard struct {
 	residentCap int // ResidentPagesPerShard; 0 means unbounded
 	evicts      bool
 	file        *os.File
-	fileEnd     int64  // next free byte offset in the log file
+	fileEnd     int64  // next free byte offset in the scratch log file (Dir mode)
 	scratch     []byte // reusable record-encode buffer, only touched under mu
+
+	// Durable single-file mode (spec 2070, set only when a Path is configured). df is
+	// the shared file; shardID tags this shard's extents; pageExtent maps a spilled
+	// page id to the extent that holds it (parallel to diskOff), or -1 while the page
+	// is resident and not yet spilled. The memory-only path leaves df nil and never
+	// touches any of this.
+	df         *durableFile
+	shardID    int
+	pageExtent []int64
 }
 
-func newShard(t Tunables) (*shard, error) {
+func newShard(t Tunables, df *durableFile, shardID int) (*shard, error) {
 	sh := &shard{
 		pageSize:    t.PageSize,
 		residentCap: t.ResidentPagesPerShard,
 		scratch:     make([]byte, 0, 256),
+		df:          df,
+		shardID:     shardID,
 	}
 	sh.index.Store(newIdxTable(1024))
 	// Page 0 starts resident and empty.
 	sh.pages.Store(&pageSet{pages: [][]byte{make([]byte, t.PageSize)}})
 	sh.diskOff = append(sh.diskOff, 0)
+	sh.pageExtent = append(sh.pageExtent, -1)
 	sh.residentOrder = append(sh.residentOrder, 0)
-	if t.Dir != "" {
+	if df == nil && t.Dir != "" {
 		f, err := os.CreateTemp(t.Dir, "hashlog-shard-*.log")
 		if err != nil {
 			return nil, err
 		}
 		sh.file = f
 	}
-	sh.evicts = sh.residentCap > 0 && sh.file != nil
+	sh.evicts = sh.residentCap > 0 && (sh.file != nil || df != nil)
 	return sh, nil
 }
 
 func (sh *shard) close() error {
+	// In durable mode the file is shared and owned by the Store, so the shard does not
+	// close it. Only a private scratch file (Dir mode) is closed and removed here.
 	if sh.file == nil {
 		return nil
 	}
@@ -364,6 +407,7 @@ func (sh *shard) set(key, value []byte) error {
 		ps = &pageSet{pages: np}
 		sh.pages.Store(ps)
 		sh.diskOff = append(sh.diskOff, 0)
+		sh.pageExtent = append(sh.pageExtent, -1)
 		sh.residentOrder = append(sh.residentOrder, sh.tailPage)
 		sh.evictIfNeeded()
 		ps = sh.pages.Load()
@@ -461,12 +505,16 @@ func (sh *shard) delete(key []byte) error {
 }
 
 // evictIfNeeded flushes resident pages to disk until the shard is back within its
-// resident page budget. With no budget or no log file it does nothing and pages
-// stay resident. It runs under the shard write lock, so the slow-path readers it
-// coordinates with (which hold the read lock) never observe a half-updated
-// directory.
+// resident page budget. With no budget or no backing (neither a scratch file nor a
+// durable file) it does nothing and pages stay resident. It runs under the shard
+// write lock, so the slow-path readers it coordinates with (which hold the read
+// lock) never observe a half-updated directory.
+//
+// In durable mode the spilled page goes into an extent allocated from the one file's
+// pool rather than appended to a per-shard scratch file: that is the M1 substrate
+// swap, changing where the bytes live, not what they are.
 func (sh *shard) evictIfNeeded() {
-	if sh.residentCap <= 0 || sh.file == nil {
+	if sh.residentCap <= 0 || (sh.file == nil && sh.df == nil) {
 		return
 	}
 	// Keep the tail page resident always (it is still being appended), so the
@@ -479,13 +527,33 @@ func (sh *shard) evictIfNeeded() {
 			sh.residentOrder = sh.residentOrder[1:]
 			continue
 		}
-		off := sh.fileEnd
-		if _, err := sh.file.WriteAt(page, off); err != nil {
-			// On a write error keep the page resident rather than lose data; stop
-			// evicting this round and leave the order untouched.
-			return
+
+		var off int64
+		if sh.df != nil {
+			// Durable mode: allocate an extent for this page, ensure the file is large
+			// enough, and write the page into it. pageExtent records the home so a
+			// spilled read finds the bytes; diskOff caches the extent's byte offset so
+			// the read path is the same single ReadAt as the scratch path.
+			id, _ := sh.df.alloc.alloc()
+			if err := sh.df.growExtent(id); err != nil {
+				return
+			}
+			off = sh.df.extentOffset(id)
+			if _, err := sh.df.f.WriteAt(page, off); err != nil {
+				sh.df.alloc.freeExtent(id)
+				return
+			}
+			sh.pageExtent[pid] = id
+		} else {
+			off = sh.fileEnd
+			if _, err := sh.file.WriteAt(page, off); err != nil {
+				// On a write error keep the page resident rather than lose data; stop
+				// evicting this round and leave the order untouched.
+				return
+			}
+			sh.fileEnd += int64(len(page))
 		}
-		sh.fileEnd += int64(len(page))
+
 		sh.diskOff[pid] = off
 		np := make([][]byte, len(ps.pages))
 		copy(np, ps.pages)
@@ -532,11 +600,15 @@ func (sh *shard) get(key []byte) ([]byte, bool, error) {
 		sh.mu.RUnlock()
 		return val, true, nil
 	}
-	// Spilled: the page is on disk. Its file offset is stable (the log file is
-	// append-only and pageIDs are never reused), so read exactly the value bytes
-	// back outside the lock.
+	// Spilled: the page is on disk. Its byte offset is stable (an extent's offset is
+	// fixed once allocated and pageIDs are never reused), so read exactly the value
+	// bytes back outside the lock. In durable mode the file is the shared one; in Dir
+	// mode it is the shard's scratch file.
 	dOff := sh.diskOff[pid]
 	f := sh.file
+	if sh.df != nil {
+		f = sh.df.f
+	}
 	sh.mu.RUnlock()
 	if f == nil {
 		return nil, false, errors.New("hashlog: address neither resident nor on disk")
