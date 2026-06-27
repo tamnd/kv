@@ -919,11 +919,11 @@ func (t *Tree) gatherChunk(snap engine.Snapshot, fromKey, upper []byte, chunkKey
 	if more {
 		effUpper = boundary
 	}
-	for _, r := range t.collectTailMessages() {
-		if inHalfOpen(format.UserKey(r.key), fromKey, effUpper) {
-			cells = append(cells, r)
-		}
-	}
+	// Fold only the tail slots inside this window, not the whole tail. A hot-tail scan (recent
+	// inserts not yet flushed) otherwise copies and folds every tail slot per window, which the
+	// allocation profile shows is the dominant cost of the ycsb-e shape; the window's slice is all
+	// the fold for [fromKey, effUpper) can see.
+	cells = append(cells, t.collectTailMessagesRange(fromKey, effUpper)...)
 	buffered, err := t.collectBufferedRange(fromKey, effUpper)
 	if err != nil {
 		return nil, nil, false, err
