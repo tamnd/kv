@@ -463,12 +463,14 @@ func clipRange(view []resolved, lower, upper []byte) []resolved {
 	return out
 }
 
-// pointGet resolves a single user key without the whole-leaf decode the bounded gather pays.
-// It is the read-path-first fix for the ycsb-c regression the directional checkpoint found:
-// the bounded gatherRange routes to the right leaf but then decodes every record on it, sorts
-// the lot, and folds, to answer one key, where the shipped btree seeks the key on the page.
-// pointGet seeks the key's run on the page instead (collectLeafKey), folds just that one small
-// version group, and returns its visible value.
+// pointGet resolves a single user key without sorting and folding the whole leaf the way the
+// bounded gather does. It is the read-path-first fix for the ycsb-c regression the directional
+// checkpoint found: the bounded gatherRange routes to the right leaf but then folds every
+// record on it to answer one key, where the shipped btree seeks the key on the page. pointGet
+// gathers just that one user key's version group from its leaf, the tail, and the buffers
+// (collectKeyCells), folds that small group, and returns its visible value. The leaf the group
+// lives on is decoded once and cached on its frame, so a repeated read of a hot key (the
+// Zipfian ycsb-c shape) binary-searches the cached decode with no re-parse and no copy.
 //
 // It returns (value, true, nil) on a visible Set, (nil, false, nil) on a not-found or a key
 // whose newest visible version is a delete, and an error only on a torn decode the optimistic
@@ -578,12 +580,18 @@ func (t *Tree) collectKeyCells(userKey []byte) ([]record, error) {
 			cells = append(cells, r)
 		}
 	}
-	upper := append(append([]byte(nil), userKey...), 0x00)
-	buffered, err := t.collectBufferedRange(userKey, upper)
-	if err != nil {
-		return nil, err
+	// Skip the buffered-range gather and the bound it needs when no message rests in any
+	// interior buffer, the at-rest state of a read-heavy workload. collectBufferedRange already
+	// short-circuits on a zero count, but checking it here also drops the upper-bound allocation
+	// the call would have needed.
+	if t.bufferedMsgs.Load() > 0 {
+		upper := append(append([]byte(nil), userKey...), 0x00)
+		buffered, err := t.collectBufferedRange(userKey, upper)
+		if err != nil {
+			return nil, err
+		}
+		cells = append(cells, buffered...)
 	}
-	cells = append(cells, buffered...)
 	return cells, nil
 }
 
@@ -604,29 +612,57 @@ func (t *Tree) leafKeyCells(pgno format.PageNo, userKey []byte) ([]record, forma
 		if !ok {
 			return nil, 0, false, ErrCorruptNode
 		}
-		var recs []record
-		for i := range lf.records {
-			switch c := format.CompareUser(format.UserKey(lf.records[i].key), userKey); {
-			case c < 0:
-				continue
-			case c > 0:
-				return recs, lf.right, false, nil
-			default:
-				recs = append(recs, lf.records[i])
-			}
-		}
-		return recs, lf.right, true, nil
+		recs, more := filterLeafForKey(lf, userKey)
+		return recs, lf.right, more, nil
 	}
-	// Cold: parse just this key's run off the page, under fillGate so the raw read does not
-	// race a writer's in-place rewrite, and drop the pin without caching a decode.
+	// Cold miss: decode the whole leaf and publish it on the frame so the next read of this
+	// page takes the box path above, which aliases the decoded records with no re-parse and no
+	// copy. The point read used to parse just the one key off the page and drop the pin without
+	// caching, to avoid the whole-leaf decode under cache pressure, but on any workload that
+	// reads a key more than once (the Zipfian ycsb-c shape, where a handful of hot leaves take
+	// almost every read) that re-parsed and re-copied the same hot leaf on every Get. Caching
+	// the decode pays its one-time cost once and turns every repeat into the zero-copy box hit,
+	// the same decode-and-publish viewLeaf does for the scan path. The decode and the SetDecoded
+	// run under fillGate so neither the raw read nor the publish races a writer's in-place
+	// rewrite of this frame; see viewLeaf for why publishing inside the gate cannot leave a
+	// stale view in the box.
 	t.fillGate.RLock()
-	recs, right, more, perr := collectLeafKey(fr.Data()[:t.pgr.UsablePageSize()], userKey)
+	lf, derr := decodeLeaf(fr.Data()[:t.pgr.UsablePageSize()])
+	if derr == nil {
+		fr.SetDecoded(lf)
+	}
 	t.fillGate.RUnlock()
 	t.pgr.Unpin(fr, false)
-	if perr != nil {
-		return nil, 0, false, perr
+	if derr != nil {
+		return nil, 0, false, derr
 	}
-	return recs, right, more, nil
+	recs, more := filterLeafForKey(lf, userKey)
+	return recs, lf.right, more, nil
+}
+
+// filterLeafForKey returns the records of one user key from a decoded leaf and whether the
+// caller should keep walking right siblings. The leaf's records are sorted by internal key,
+// which is user key ascending then version descending, so one user key's whole version group
+// is a contiguous run and a binary search lands its first record in log time rather than a
+// linear scan of the page. The returned records alias the decoded leaf's immutable heap bytes
+// the same way the clean scan fold aliases them: the decode owns private copies a writer never
+// mutates, and the cursor that retains them keeps them alive. more is true when the run reaches
+// the last record without the page passing the user key, because the group may continue on the
+// next leaf (a version group can straddle a leaf boundary, or the located leaf may sit left of
+// the target).
+func filterLeafForKey(lf *leaf, userKey []byte) (recs []record, more bool) {
+	n := len(lf.records)
+	lo := sort.Search(n, func(i int) bool {
+		return format.CompareUser(format.UserKey(lf.records[i].key), userKey) >= 0
+	})
+	for i := lo; i < n; i++ {
+		c := format.CompareUser(format.UserKey(lf.records[i].key), userKey)
+		if c > 0 {
+			return recs, false
+		}
+		recs = append(recs, lf.records[i])
+	}
+	return recs, true
 }
 
 // snapshotPoint is the point-read twin of snapshotRange: it wraps pointGet in the same
