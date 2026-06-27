@@ -85,7 +85,9 @@ func TestSuperblockCRCCatchesBitFlip(t *testing.T) {
 func TestSuperblockFreeOverflowRejected(t *testing.T) {
 	shards := 256
 	sb := newSuperblock(shards, 1<<20)
-	// One past the inline capacity must fail to encode (overflow chain is M4).
+	// One past the inline capacity must fail to encode as an inline list: a list this
+	// large rides the free-list overflow run, which the durable file selects by setting
+	// freeListExtent, not by stuffing extra ids into the inline slot.
 	cap := inlineFreeCapacity(shards)
 	sb.free = make([]int64, cap+1)
 	if _, err := sb.encode(0); err == nil {

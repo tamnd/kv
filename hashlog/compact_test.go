@@ -109,14 +109,22 @@ func checkConservationM8(t *testing.T, s *Store) {
 	if s.df.snapRoot >= 0 {
 		snap = s.df.snapCount
 	}
+	// The free-list overflow run holds a free list too large for the inline slot (doc 03
+	// section 3). Like the snapshot run it is allocated but sits in no page directory and is
+	// not on the free stack while committed, so it is its own conservation category. It is
+	// zero whenever the live free list still fits inline.
+	freeRun := int64(0)
+	if s.df.freeRoot >= 0 {
+		freeRun = s.df.freeCount
+	}
 	// liveCont are the oversize-cont extents a live spanning value occupies (M9, doc 03
 	// section 7). They are allocated but in no page directory, so they would otherwise read
 	// as a leak; a superseded chain leaves liveCont and joins the holes via pendingFree, so
 	// there is no window where a cont extent is counted twice or not at all.
-	accounted := int64(len(inUse)) + int64(len(free)) + snap + int64(holes) + liveCont
+	accounted := int64(len(inUse)) + int64(len(free)) + snap + freeRun + int64(holes) + liveCont
 	if accounted != count {
-		t.Fatalf("conservation: inUse %d + free %d + snapshot %d + holes %d + liveCont %d = %d != count %d",
-			len(inUse), len(free), snap, holes, liveCont, accounted, count)
+		t.Fatalf("conservation: inUse %d + free %d + snapshot %d + freeRun %d + holes %d + liveCont %d = %d != count %d",
+			len(inUse), len(free), snap, freeRun, holes, liveCont, accounted, count)
 	}
 }
 
