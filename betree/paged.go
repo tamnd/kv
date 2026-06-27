@@ -494,29 +494,54 @@ func (t *Tree) pointGet(snap engine.Snapshot, userKey []byte) ([]byte, bool, err
 		return nil, false, nil
 	}
 
-	cells, err := t.collectKeyCells(userKey)
+	cells, sorted, err := t.collectKeyCells(userKey)
 	if err != nil {
 		return nil, false, err
 	}
 	if len(cells) == 0 {
 		return nil, false, nil
 	}
-	sort.Slice(cells, func(i, j int) bool {
-		return format.CompareInternal(cells[i].key, cells[j].key) < 0
-	})
+	// The single-leaf fast path returns the window already in internal-key order, so the sort is
+	// only paid when the tail, a buffer, or a leaf straddle merged cells from more than one source.
+	if !sorted {
+		sort.Slice(cells, func(i, j int) bool {
+			return format.CompareInternal(cells[i].key, cells[j].key) < 0
+		})
+	}
 	// The group is one user key, so the same clean fold-skip the scan path uses applies: a
 	// single plain Set folds to its own value with no MVCC machinery, anything else (an
-	// overwrite chain, a delete, a merge, a TTL) takes the general fold.
-	var view []resolved
+	// overwrite chain, a delete, a merge, a TTL) takes the general fold. The clean case returns
+	// the newest visible value straight from the sorted group with no resolved slice (pointFoldClean);
+	// only the rare non-clean group materializes the fold's view.
 	if cellsCleanSets(cells) {
-		view = foldCleanResolved(cells, snap)
-	} else {
-		view = t.foldResolved(cells, snap, nil)
+		if val, ok := pointFoldClean(cells, snap); ok {
+			return val, true, nil
+		}
+		return nil, false, nil
 	}
+	view := t.foldResolved(cells, snap, nil)
 	if len(view) > 0 && bytes.Equal(view[0].uk, userKey) {
 		return view[0].val, true, nil
 	}
 	return nil, false, nil
+}
+
+// pointFoldClean returns the value of the newest cell visible at snap from a clean version group,
+// one validated by cellsCleanSets. The cells are sorted newest-first within the user key, so the
+// first cell at or below the snapshot version is the visible one and the rest are older versions
+// the point read never returns. It is the point-read twin of foldCleanResolved without the
+// resolved slice that walk builds: the point caller wants one value, not a view, so this stops at
+// the first hit and hands its value back aliased the same way (the decode copy owns the bytes; the
+// caller copies the one value out). A group with no version at or below the snapshot is not
+// visible, which is reported as not found.
+func pointFoldClean(cells []record, snap engine.Snapshot) ([]byte, bool) {
+	for i := range cells {
+		if format.Version(cells[i].key) > snap.Version {
+			continue // newer than the snapshot: not visible
+		}
+		return cells[i].val, true
+	}
+	return nil, false
 }
 
 // collectKeyCells gathers one user key's version-group cells from the three places a write may
@@ -527,72 +552,91 @@ func (t *Tree) pointGet(snap engine.Snapshot, userKey []byte) ([]byte, bool, err
 // buffers are small and bounded, so they are collected and filtered to userKey rather than
 // indexed. The caller holds the epoch guard and wraps this in the gen validation, so the three
 // reads compose into one consistent point in time. It runs only off the range-delete path.
-func (t *Tree) collectKeyCells(userKey []byte) ([]record, error) {
+func (t *Tree) collectKeyCells(userKey []byte) (cells []record, sorted bool, err error) {
 	start, err := t.startLeafFor(userKey)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	var cells []record
-	// One user key's version group spans one leaf in the common case (after the locator lands the
-	// covering leaf) and only walks right when a key's versions straddle a leaf boundary. So the
-	// cycle guard records visited pages in a stack ring and never allocates for the short walk,
-	// promoting to a map only for the rare key whose versions cross more leaves than the ring
-	// holds. A corrupt right-sibling pointer that loops trips the guard either way.
-	var ring [16]format.PageNo
-	steps := 0
-	var seen map[format.PageNo]bool
-	for pgno := start; pgno != format.NoPage; {
-		if seen != nil {
-			if seen[pgno] {
-				return nil, fmt.Errorf("betree: leaf run cycles at page %d", pgno)
-			}
-			seen[pgno] = true
-		} else {
-			for i := 0; i < steps; i++ {
-				if ring[i] == pgno {
-					return nil, fmt.Errorf("betree: leaf run cycles at page %d", pgno)
-				}
-			}
-			if steps < len(ring) {
-				ring[steps] = pgno
-			} else {
-				seen = make(map[format.PageNo]bool, steps*2)
-				for i := 0; i < steps; i++ {
-					seen[ring[i]] = true
+	// Read the located leaf first: the common case lands the whole version group on it.
+	recs, right, more, err := t.leafKeyCells(start, userKey)
+	if err != nil {
+		return nil, false, err
+	}
+	tail := t.collectTailMessages() // nil with no alloc when the tail is empty
+	buffered := t.bufferedMsgs.Load() > 0
+	// Fast path: the group rests entirely on this one leaf (no straddle to a right sibling), the
+	// mutable tail is empty, and no message rests in any interior buffer. That is the at-rest
+	// state of a read-heavy workload, and it makes the leaf window the entire answer. Return it
+	// aliased with no accumulation copy, and report it sorted so pointGet skips the sort: the
+	// window filterLeafForKey returned is already internal-key order (one user key, versions
+	// descending). The buffered-range gather and the upper bound it needs are skipped with it.
+	if !more && len(tail) == 0 && !buffered {
+		return recs, true, nil
+	}
+	// General path: the group straddles leaves, or the tail or a buffer holds a version of it.
+	// Copy the first window out (the walk and merges below grow it), walk any right siblings the
+	// group straddles, then merge the tail and buffered cells. The result is not ordered, so it
+	// is reported unsorted and pointGet sorts it.
+	cells = append([]record(nil), recs...)
+	if more {
+		// One user key's version group spans one leaf in the common case and only walks right when
+		// a key's versions straddle a leaf boundary. So the cycle guard records visited pages in a
+		// stack ring and never allocates for the short walk, promoting to a map only for the rare
+		// key whose versions cross more leaves than the ring holds. The located leaf is the first
+		// visited page, so it seeds the ring. A corrupt right-sibling pointer that loops trips the
+		// guard either way.
+		var ring [16]format.PageNo
+		ring[0] = start
+		steps := 1
+		var seen map[format.PageNo]bool
+		for pgno := right; pgno != format.NoPage; {
+			if seen != nil {
+				if seen[pgno] {
+					return nil, false, fmt.Errorf("betree: leaf run cycles at page %d", pgno)
 				}
 				seen[pgno] = true
+			} else {
+				for i := 0; i < steps; i++ {
+					if ring[i] == pgno {
+						return nil, false, fmt.Errorf("betree: leaf run cycles at page %d", pgno)
+					}
+				}
+				if steps < len(ring) {
+					ring[steps] = pgno
+				} else {
+					seen = make(map[format.PageNo]bool, steps*2)
+					for i := 0; i < steps; i++ {
+						seen[ring[i]] = true
+					}
+					seen[pgno] = true
+				}
 			}
+			steps++
+			rs, r2, m2, err := t.leafKeyCells(pgno, userKey)
+			if err != nil {
+				return nil, false, err
+			}
+			cells = append(cells, rs...)
+			if !m2 {
+				break
+			}
+			pgno = r2
 		}
-		steps++
-		recs, right, more, err := t.leafKeyCells(pgno, userKey)
-		if err != nil {
-			return nil, err
-		}
-		cells = append(cells, recs...)
-		if !more {
-			break
-		}
-		pgno = right
 	}
-
-	for _, r := range t.collectTailMessages() {
+	for _, r := range tail {
 		if bytes.Equal(format.UserKey(r.key), userKey) {
 			cells = append(cells, r)
 		}
 	}
-	// Skip the buffered-range gather and the bound it needs when no message rests in any
-	// interior buffer, the at-rest state of a read-heavy workload. collectBufferedRange already
-	// short-circuits on a zero count, but checking it here also drops the upper-bound allocation
-	// the call would have needed.
-	if t.bufferedMsgs.Load() > 0 {
+	if buffered {
 		upper := append(append([]byte(nil), userKey...), 0x00)
-		buffered, err := t.collectBufferedRange(userKey, upper)
+		bufd, err := t.collectBufferedRange(userKey, upper)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
-		cells = append(cells, buffered...)
+		cells = append(cells, bufd...)
 	}
-	return cells, nil
+	return cells, false, nil
 }
 
 // leafKeyCells returns one user key's records from a single leaf page, its right-sibling
@@ -655,14 +699,18 @@ func filterLeafForKey(lf *leaf, userKey []byte) (recs []record, more bool) {
 	lo := sort.Search(n, func(i int) bool {
 		return format.CompareUser(format.UserKey(lf.records[i].key), userKey) >= 0
 	})
-	for i := lo; i < n; i++ {
-		c := format.CompareUser(format.UserKey(lf.records[i].key), userKey)
-		if c > 0 {
-			return recs, false
-		}
-		recs = append(recs, lf.records[i])
+	// The group is a contiguous run starting at lo, so its end is where the page first passes the
+	// user key. A version group is a handful of records, so a short forward scan finds the end
+	// cheaper than a second binary search. Returning the sub-slice aliases the decoded leaf's
+	// records with no copy: the caller folds it in place and copies only the one visible value
+	// out, the same lifetime rule the box-hit scan fold relies on. more is true when the run
+	// reaches the last record (hi == n) without the page passing the key, because the group may
+	// continue on the next leaf or the located leaf may sit left of the target.
+	hi := lo
+	for hi < n && format.CompareUser(format.UserKey(lf.records[hi].key), userKey) == 0 {
+		hi++
 	}
-	return recs, true
+	return lf.records[lo:hi], hi == n
 }
 
 // snapshotPoint is the point-read twin of snapshotRange: it wraps pointGet in the same
