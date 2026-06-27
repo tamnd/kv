@@ -55,6 +55,26 @@ import (
 	"sync/atomic"
 )
 
+// Durability is the per-store durability dial (spec 2070 doc 04 section 5, D6). It is
+// set once when the store opens, not per write.
+type Durability int
+
+const (
+	// DurabilityNone never fsyncs. A sealed page reaches the OS at flush, but no device
+	// barrier is issued, so the on-disk bytes are a spill, not a crash-safe journal.
+	// This is the memory-only benchmark regime and the larger-than-memory speed ceiling
+	// (doc 04 section 5.2). It is the zero value, so the default store is None.
+	DurabilityNone Durability = iota
+	// DurabilityNormal fsyncs on seal boundaries (and, from M4, at checkpoints), not on
+	// every SET. The loss window on a crash is the writes since the last seal sync, a
+	// bounded window (doc 04 section 5.3).
+	DurabilityNormal
+	// DurabilityFull fsyncs before every SET returns: a SET does not acknowledge until
+	// its record is in a synced extent, so nothing acknowledged is lost (doc 04 section
+	// 5.4). It sits on the fsync floor at concurrency one.
+	DurabilityFull
+)
+
 // Tunables holds the knobs that shape a Store. The zero value is not valid; use
 // DefaultTunables and override.
 type Tunables struct {
@@ -88,6 +108,12 @@ type Tunables struct {
 	// ExtentSize is the durable extent size in bytes. It must equal PageSize and be a
 	// power of two. Zero defaults to PageSize. Ignored in memory-only mode.
 	ExtentSize int
+
+	// Durability is the durability dial (None, Normal, Full). It is meaningful only in
+	// durable mode (a Path is set); selecting Normal or Full without a Path is an error
+	// because there is nowhere to sync. The zero value is None, so a memory-only store
+	// is always None, the benchmarked ceiling.
+	Durability Durability
 }
 
 // DefaultTunables returns a full-resident, memory-only configuration: 256 shards,
@@ -117,6 +143,9 @@ func New(t Tunables) (*Store, error) {
 	}
 	if t.PageSize <= 64 {
 		return nil, errors.New("hashlog: PageSize too small")
+	}
+	if t.Durability != DurabilityNone && t.Path == "" {
+		return nil, errors.New("hashlog: Normal or Full durability needs a Path")
 	}
 
 	var df *durableFile
@@ -330,6 +359,19 @@ type shard struct {
 	df         *durableFile
 	shardID    int
 	pageExtent []int64
+
+	// Durable frontier state (M3, doc 04 section 4). durability is the dial; frontier
+	// is the highest LSN known to sit in a synced extent of this shard, advanced only
+	// after a real fsync. The parallel per-page arrays track, for each page, how many
+	// bytes hold records (pageFill), how many of those are already written to the
+	// page's extent (pageFlushed), and the highest LSN on the page (pageMaxLSN). All
+	// are maintained under mu; frontier is atomic so a reader observes a published
+	// advance without the lock.
+	durability  Durability
+	frontier    atomic.Int64
+	pageFill    []int
+	pageFlushed []int
+	pageMaxLSN  []int64
 }
 
 func newShard(t Tunables, df *durableFile, shardID int) (*shard, error) {
@@ -339,12 +381,16 @@ func newShard(t Tunables, df *durableFile, shardID int) (*shard, error) {
 		scratch:     make([]byte, 0, 256),
 		df:          df,
 		shardID:     shardID,
+		durability:  t.Durability,
 	}
 	sh.index.Store(newIdxTable(1024))
 	// Page 0 starts resident and empty.
 	sh.pages.Store(&pageSet{pages: [][]byte{make([]byte, t.PageSize)}})
 	sh.diskOff = append(sh.diskOff, 0)
 	sh.pageExtent = append(sh.pageExtent, -1)
+	sh.pageFill = append(sh.pageFill, 0)
+	sh.pageFlushed = append(sh.pageFlushed, 0)
+	sh.pageMaxLSN = append(sh.pageMaxLSN, 0)
 	sh.residentOrder = append(sh.residentOrder, 0)
 	if df == nil && t.Dir != "" {
 		f, err := os.CreateTemp(t.Dir, "hashlog-shard-*.log")
@@ -409,6 +455,12 @@ func (sh *shard) set(key, value []byte) error {
 	// new directory before writing the record into it so a reader that later sees the
 	// record's index entry also sees the page it lives on.
 	if sh.tailPos+rl > sh.pageSize {
+		// The tail page seals here: no more records land on it. Under Normal the seal is
+		// a group-commit flush point, so make the sealed pages durable now (doc 04
+		// section 5.3, 6.2); the bounded loss window is the records since this seal.
+		if durable && sh.durability == DurabilityNormal {
+			sh.flushDurable(true)
+		}
 		sh.tailPage++
 		sh.tailPos = 0
 		np := make([][]byte, len(ps.pages)+1)
@@ -418,6 +470,9 @@ func (sh *shard) set(key, value []byte) error {
 		sh.pages.Store(ps)
 		sh.diskOff = append(sh.diskOff, 0)
 		sh.pageExtent = append(sh.pageExtent, -1)
+		sh.pageFill = append(sh.pageFill, 0)
+		sh.pageFlushed = append(sh.pageFlushed, 0)
+		sh.pageMaxLSN = append(sh.pageMaxLSN, 0)
 		sh.residentOrder = append(sh.residentOrder, sh.tailPage)
 		sh.evictIfNeeded()
 		ps = sh.pages.Load()
@@ -430,15 +485,26 @@ func (sh *shard) set(key, value []byte) error {
 	// that makes the record bytes above visible to a lock-free reader's acquiring load.
 	var valOff int
 	if durable {
-		n := encodeDurableRecord(page[sh.tailPos:], sh.df.nextLSN(), key, value, 0)
+		lsn := sh.df.nextLSN()
+		n := encodeDurableRecord(page[sh.tailPos:], lsn, key, value, 0)
 		sh.tailPos += n
 		valOff = durableValOff(key, value)
+		// Record where the tail page now ends and the highest LSN it holds, so a flush
+		// knows how much to write and how far the frontier may advance.
+		sh.pageFill[sh.tailPage] = sh.tailPos
+		sh.pageMaxLSN[sh.tailPage] = int64(lsn)
 	} else {
 		n := encodeRecord(page[sh.tailPos:], key, value)
 		sh.tailPos += n
 		valOff = uvarintLen(uint64(len(key))) + len(key) + uvarintLen(uint64(len(value)))
 	}
 	sh.indexPut(tableHash(key), key, valLoc{addr: recStart + int64(valOff), vlen: uint32(len(value))})
+	// Under Full the SET does not return until its record is in a synced extent: flush
+	// the tail's new bytes and fsync, which advances the frontier past this LSN (doc 04
+	// section 5.4). Under None and Normal the SET returns here without a per-write sync.
+	if durable && sh.durability == DurabilityFull {
+		sh.flushDurable(true)
+	}
 	return nil
 }
 
@@ -545,33 +611,26 @@ func (sh *shard) evictIfNeeded() {
 			continue
 		}
 
-		var off int64
 		if sh.df != nil {
-			// Durable mode: allocate an extent for this page, ensure the file is large
-			// enough, and write the page into it. pageExtent records the home so a
-			// spilled read finds the bytes; diskOff caches the extent's byte offset so
-			// the read path is the same single ReadAt as the scratch path.
-			id, _ := sh.df.alloc.alloc()
-			if err := sh.df.growExtent(id); err != nil {
+			// Durable mode: write the page's record bytes into its extent (allocating one
+			// the first time), then drop the resident copy. writePageRemainder writes
+			// only the bytes not already flushed by a durability sync, so a page the Full
+			// dial already flushed costs no second write, and it sets diskOff to the
+			// extent base so a spilled read is the same single ReadAt as the scratch path.
+			if err := sh.writePageRemainder(pid, page); err != nil {
 				return
 			}
-			off = sh.df.extentOffset(id)
-			if _, err := sh.df.f.WriteAt(page, off); err != nil {
-				sh.df.alloc.freeExtent(id)
-				return
-			}
-			sh.pageExtent[pid] = id
 		} else {
-			off = sh.fileEnd
+			off := sh.fileEnd
 			if _, err := sh.file.WriteAt(page, off); err != nil {
 				// On a write error keep the page resident rather than lose data; stop
 				// evicting this round and leave the order untouched.
 				return
 			}
 			sh.fileEnd += int64(len(page))
+			sh.diskOff[pid] = off
 		}
 
-		sh.diskOff[pid] = off
 		np := make([][]byte, len(ps.pages))
 		copy(np, ps.pages)
 		np[pid] = nil
@@ -579,6 +638,81 @@ func (sh *shard) evictIfNeeded() {
 		sh.residentOrder = sh.residentOrder[1:]
 		sh.spilledPages++
 	}
+}
+
+// ensureExtent assigns an extent to page pid if it has none, growing the file to
+// cover it, and returns the extent's base byte offset. It runs under the shard write
+// lock. A page keeps the same extent for its life, so a partially flushed tail page
+// and its later eviction write into the one extent.
+func (sh *shard) ensureExtent(pid int64) (int64, error) {
+	ext := sh.pageExtent[pid]
+	if ext < 0 {
+		id, _ := sh.df.alloc.alloc()
+		if err := sh.df.growExtent(id); err != nil {
+			sh.df.alloc.freeExtent(id)
+			return 0, err
+		}
+		ext = id
+		sh.pageExtent[pid] = id
+	}
+	return sh.df.extentOffset(ext), nil
+}
+
+// writePageRemainder writes the record bytes of page pid that are not yet on disk into
+// its extent and marks them flushed, then points diskOff at the extent base so the
+// value bytes read back at base plus the in-page offset. It writes only the unflushed
+// suffix, so re-flushing a growing tail page costs one write per appended record, not
+// a rewrite of the whole page.
+func (sh *shard) writePageRemainder(pid int64, page []byte) error {
+	base, err := sh.ensureExtent(pid)
+	if err != nil {
+		return err
+	}
+	from := sh.pageFlushed[pid]
+	to := sh.pageFill[pid]
+	if from < to {
+		if _, err := sh.df.f.WriteAt(page[from:to], base+int64(from)); err != nil {
+			return err
+		}
+		sh.pageFlushed[pid] = to
+	}
+	sh.diskOff[pid] = base
+	return nil
+}
+
+// flushDurable writes the unflushed record bytes of every page up to the tail into
+// their extents in seal order and, when doSync is set, issues one device barrier and
+// advances the frontier to the highest LSN now durable. The frontier advances only on
+// the sync, never on a bare write, so a crash can never leave the frontier ahead of
+// what reached the device (doc 04 section 4.2, the I4 monotonic watermark). It runs
+// under the shard write lock.
+func (sh *shard) flushDurable(doSync bool) {
+	ps := sh.pages.Load()
+	maxLSN := sh.frontier.Load()
+	for pid := int64(0); pid <= sh.tailPage; pid++ {
+		// A page's records are all durable once their bytes are synced, so the frontier
+		// may reach this page's highest LSN. Account it whether or not the page is still
+		// resident: an evicted page was already written to its extent.
+		if sh.pageMaxLSN[pid] > maxLSN {
+			maxLSN = sh.pageMaxLSN[pid]
+		}
+		page := ps.pages[pid]
+		if page == nil || sh.pageFlushed[pid] >= sh.pageFill[pid] {
+			continue
+		}
+		if err := sh.writePageRemainder(pid, page); err != nil {
+			// A write failed: keep what is flushed and do not sync or advance, so the
+			// frontier never claims bytes that did not reach the file.
+			return
+		}
+	}
+	if !doSync {
+		return
+	}
+	if err := sh.df.syncData(); err != nil {
+		return
+	}
+	sh.frontier.Store(maxLSN)
 }
 
 func (sh *shard) get(key []byte) ([]byte, bool, error) {

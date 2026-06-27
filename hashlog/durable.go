@@ -37,6 +37,13 @@ type durableFile struct {
 	growMu  sync.Mutex
 	fileEnd int64
 
+	// syncCount counts device barriers issued, so a test can assert the dial's flush
+	// points (None issues none, Full one per SET). syncHook, when set, replaces the
+	// real barrier; the crash scaffold uses it to freeze the file image at an fsync
+	// boundary. Production leaves it nil and goes straight to platformSyncData.
+	syncCount atomic.Int64
+	syncHook  func(*os.File) error
+
 	// sb is the current durable superblock (the content of the newer slot), and
 	// newerSlot is which physical slot (0 for A, 1 for B) currently holds it. A commit
 	// writes the other slot, so the last committed checkpoint is never in flight.
@@ -66,6 +73,9 @@ func validateDurableTunables(t Tunables) (Tunables, error) {
 	}
 	if t.Shards <= 0 || t.Shards > maxShardCount {
 		return t, fmt.Errorf("hashlog: Shards %d out of range", t.Shards)
+	}
+	if t.Durability < DurabilityNone || t.Durability > DurabilityFull {
+		return t, fmt.Errorf("hashlog: Durability %d out of range", t.Durability)
 	}
 	return t, nil
 }
@@ -172,6 +182,19 @@ func (d *durableFile) readExisting() error {
 // shard gets a unique increasing value without holding a store-wide lock.
 func (d *durableFile) nextLSN() uint64 {
 	return d.lsn.Add(1)
+}
+
+// syncData issues one true device barrier on the file (fdatasync on Linux,
+// F_FULLFSYNC on macOS, doc 04 section 8) and counts it. A frontier advance is gated
+// on this returning, so the barrier is the real one, not a plain Sync that on macOS
+// would not flush the drive cache. The injectable hook lets a test freeze the file
+// image at the boundary.
+func (d *durableFile) syncData() error {
+	d.syncCount.Add(1)
+	if d.syncHook != nil {
+		return d.syncHook(d.f)
+	}
+	return platformSyncData(d.f)
 }
 
 // commit writes a new checkpoint into the older slot with a generation one higher
