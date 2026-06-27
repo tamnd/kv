@@ -931,8 +931,18 @@ func (t *Tree) startLeafFor(lower []byte) (format.PageNo, error) {
 	if loc := t.locator.Load(); loc != nil {
 		if pg := loc.locate(lik); pg != format.NoPage {
 			lf, err := t.viewLeaf(pg)
+			// Accept the located leaf only when it actually brackets the target: its first key
+			// at or before lik AND its last key at or after lik. The first-key check alone is
+			// satisfied by every leaf to the left of the target, so an imprecise locate that
+			// undershoots would be accepted and the caller's right-sibling walk would then drag
+			// across every leaf between the located one and the real one. A point read paid this
+			// as hundreds of leaves of wasted scan per Get. When the bracket fails, fall through
+			// to the exact descent, which lands on the covering leaf in one logarithmic spine
+			// walk, the same locate the shipped btree does. A scan starting mid-run still walks
+			// right from here; the bracket only rejects a locate that is plainly too far left.
 			if err == nil && len(lf.records) > 0 &&
-				format.CompareInternal(lf.records[0].key, lik) <= 0 {
+				format.CompareInternal(lf.records[0].key, lik) <= 0 &&
+				format.CompareInternal(lik, lf.records[len(lf.records)-1].key) <= 0 {
 				return pg, nil
 			}
 		}
