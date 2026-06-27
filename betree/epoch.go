@@ -39,15 +39,36 @@ import (
 // page alive.
 const inactiveEpoch = ^uint64(0)
 
+// reclaimSlots is the number of preallocated guard slots a reader can claim without taking
+// a lock or allocating. It is sized well above the concurrency the engine runs at (the
+// write path caps concurrent groups in the low tens and reads fan out no wider), so in
+// practice every register lands in a slot and the overflow map below is never touched. A
+// reader that finds all slots taken falls back to the map rather than blocking or failing,
+// so the cap is a fast-path budget, not a hard reader limit.
+const reclaimSlots = 256
+
 // reclaimer is the epoch-based memory reclaimer. Its zero value is not usable; construct
 // it with newReclaimer.
+//
+// Guard registration is the per-read hot path: every db.View opens a reader, registers a
+// guard, and unregisters it on close, so register/unregister run once per read across the
+// point, scan, and mixed workloads. They claim and release a slot from a fixed lock-free
+// array with a single compare-and-swap and a single store, paying no lock and no
+// allocation. The mutex and the overflow map below cover only the cold paths: the rare
+// reader that arrives when every slot is taken, and the writer-side retire/reclaim list
+// that no reader touches.
 type reclaimer struct {
 	global atomic.Uint64
 
-	mu      sync.Mutex
-	guards  map[uint64]*guard
-	nextID  uint64
-	retired []retired
+	// slots is the lock-free fast path. A reader claims a free slot with a CAS on its state
+	// word and releases it with a store; an idle or free slot publishes inactiveEpoch and so
+	// never lowers the reclaim minimum.
+	slots [reclaimSlots]guard
+
+	mu       sync.Mutex
+	overflow map[uint64]*guard // guards that did not fit a slot; empty in normal operation
+	nextID   uint64
+	retired  []retired
 }
 
 // retired is one page waiting to be freed: the epoch at which a writer unlinked it and
@@ -64,36 +85,75 @@ type retired struct {
 // pages the reader might be looking at. A guard is registered once and reused across many
 // pin/unpin cycles so the steady-state read pays one atomic store to enter and one to
 // leave, with no allocation and no lock.
+//
+// A guard lives either in the reclaimer's slot array or, when the array was full at
+// register time, in the overflow map. state is meaningful only for slot guards: it is the
+// claim word a register CAS-flips from free (0) to taken (1) and an unregister stores back
+// to free. id is meaningful only for overflow guards: it is the map key unregister deletes.
 type guard struct {
-	r  *reclaimer
-	id uint64
-	ep atomic.Uint64
+	r      *reclaimer
+	id     uint64
+	ep     atomic.Uint64
+	state  atomic.Uint32 // slot guards only: 0 free, 1 taken
+	inSlot bool
 }
+
+const (
+	slotFree  = 0
+	slotTaken = 1
+)
 
 func newReclaimer() *reclaimer {
-	return &reclaimer{guards: make(map[uint64]*guard)}
+	r := &reclaimer{overflow: make(map[uint64]*guard)}
+	// Every slot starts free, owned by r, and publishing inactiveEpoch so a never-claimed
+	// slot never lowers the reclaim minimum below the live readers. Without this an unused
+	// slot would hold the zero epoch and pin every retired page forever.
+	for i := range r.slots {
+		g := &r.slots[i]
+		g.r = r
+		g.inSlot = true
+		g.ep.Store(inactiveEpoch)
+	}
+	return r
 }
 
-// register creates a guard for a reader. The guard starts inactive (holding nothing) and
-// is reused for the reader's lifetime; readers that come and go register and unregister,
-// while a long-lived reader registers once.
+// register hands a reader a guard for its lifetime. It first sweeps the slot array for a
+// free slot and claims it with a single CAS, the path every read takes in normal operation
+// (the array is sized past the engine's concurrency). Only when every slot is taken does it
+// fall back to the locked overflow map, so the common case pays no lock and no allocation.
+// The guard starts inactive (holding nothing); the reader pins it before its first read.
 func (r *reclaimer) register() *guard {
+	for i := range r.slots {
+		g := &r.slots[i]
+		// A free slot already publishes inactiveEpoch (newReclaimer seeds it, unregister
+		// restores it), so the CAS alone makes the slot ours; no ep store is needed.
+		if g.state.Load() == slotFree && g.state.CompareAndSwap(slotFree, slotTaken) {
+			return g
+		}
+	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	id := r.nextID
 	r.nextID++
 	g := &guard{r: r, id: id}
 	g.ep.Store(inactiveEpoch)
-	r.guards[id] = g
+	r.overflow[id] = g
+	r.mu.Unlock()
 	return g
 }
 
 // unregister drops a guard the reader will not use again. The guard must be unpinned (not
 // in a critical section) when it is dropped, which it always is because a reader unpins
-// before it discards its handle.
+// before it discards its handle. A slot guard is released by restoring its inactive epoch
+// and then storing its state back to free, so the next register that claims this slot finds
+// it already holding inactiveEpoch. An overflow guard is removed from the map under the lock.
 func (r *reclaimer) unregister(g *guard) {
+	if g.inSlot {
+		g.ep.Store(inactiveEpoch)
+		g.state.Store(slotFree)
+		return
+	}
 	r.mu.Lock()
-	delete(r.guards, g.id)
+	delete(r.overflow, g.id)
 	r.mu.Unlock()
 }
 
@@ -178,11 +238,21 @@ func (r *reclaimer) reclaim() {
 }
 
 // minActiveLocked returns the minimum epoch any active guard is holding, or the current
-// global epoch when no guard is active. A guard publishing the inactive sentinel holds
-// nothing and is skipped. The caller holds r.mu.
+// global epoch when no guard is active. A guard publishing the inactive sentinel (a free
+// slot, an idle slot, or an unpinned overflow guard) holds the maximum epoch and so never
+// lowers the minimum, which lets the slot scan ignore each slot's claim state and read only
+// its epoch. The slot epochs are read with plain atomic loads and need no lock; the caller
+// holds r.mu for the overflow map walk. A torn read here can only return a value at or below
+// the true minimum, which keeps a retired page alive a little longer and never frees one
+// early, so the scan is safe without serialising against register and unregister.
 func (r *reclaimer) minActiveLocked() uint64 {
 	min := inactiveEpoch
-	for _, g := range r.guards {
+	for i := range r.slots {
+		if e := r.slots[i].ep.Load(); e < min {
+			min = e
+		}
+	}
+	for _, g := range r.overflow {
 		if e := g.ep.Load(); e < min {
 			min = e
 		}
