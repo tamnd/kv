@@ -82,6 +82,30 @@ func BenchmarkHashlogSet(b *testing.B) {
 	}
 }
 
+// BenchmarkF2Overwrite isolates the overwrite path: a prefilled store, every Set
+// repointing an existing key. This is the path that reads the old record to verify
+// the key and account its stranded bytes; folding that to a single read is the
+// write-side win measured here, and the ycsb-a/overwrite kvbench gain it drives.
+func BenchmarkF2Overwrite(b *testing.B) {
+	s := fillF2(b, benchKeys)
+	defer s.Close()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = s.Set(tkey(i%benchKeys), tval(i))
+	}
+}
+
+func BenchmarkHashlogOverwrite(b *testing.B) {
+	s := fillHashlog(b, benchKeys)
+	defer s.Close()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = s.Set(tkey(i%benchKeys), tval(i))
+	}
+}
+
 func BenchmarkF2Get(b *testing.B) {
 	s := fillF2(b, benchKeys)
 	defer s.Close()

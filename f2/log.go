@@ -307,6 +307,13 @@ func durableRecordSpan(b []byte) int {
 // accounting. The caller holds the shard write lock.
 func (l *log) recordBytes(addr int64) int {
 	key, value := l.read(addr)
+	return l.recordLenKV(key, value)
+}
+
+// recordLenKV returns the on-log size of an already-decoded key/value pair in
+// this log's format, so an overwrite or delete that just read the old record can
+// account its stranded bytes without reading it a second time.
+func (l *log) recordLenKV(key, value []byte) int {
 	if l.df != nil {
 		return durableRecordLen(key, value)
 	}

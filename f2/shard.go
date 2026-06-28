@@ -100,14 +100,17 @@ func (s *shard) put(idx *index, h uint64, key []byte, off int64, n int) {
 		}
 		// A tombstone slot or a tag+key match is the same key's old home: reuse it.
 		if slotTag(slot) == tag {
-			tomb := slot&slotTombstone != 0
-			if tomb || s.keyAt(slot, key) {
+			if slot&slotTombstone != 0 {
 				idx.slots[i].Store(makeSlot(tag, off))
-				if tomb {
-					idx.live++ // a tombstone slot coming back to life
-				} else {
-					s.deadBytes += int64(s.log.recordBytes(slotAddr(slot)))
-				}
+				idx.live++ // a tombstone slot coming back to life
+				return
+			}
+			// Read the old record once: it both confirms the key and gives the
+			// stranded-byte count, so an overwrite touches the log a single time.
+			rkey, rval := s.log.read(slotAddr(slot))
+			if bytesEqual(rkey, key) {
+				idx.slots[i].Store(makeSlot(tag, off))
+				s.deadBytes += int64(s.log.recordLenKV(rkey, rval))
 				return
 			}
 		}
@@ -146,11 +149,15 @@ func (s *shard) delLocked(idx *index, h uint64, key []byte) bool {
 		if slot == 0 {
 			return false // not present
 		}
-		if slot&slotTombstone == 0 && slotTag(slot) == tag && s.keyAt(slot, key) {
-			idx.slots[i].Store(slot | slotTombstone)
-			idx.live--
-			s.deadBytes += int64(s.log.recordBytes(slotAddr(slot)))
-			return true
+		if slot&slotTombstone == 0 && slotTag(slot) == tag {
+			// One read confirms the key and sizes its stranded bytes.
+			rkey, rval := s.log.read(slotAddr(slot))
+			if bytesEqual(rkey, key) {
+				idx.slots[i].Store(slot | slotTombstone)
+				idx.live--
+				s.deadBytes += int64(s.log.recordLenKV(rkey, rval))
+				return true
+			}
 		}
 		i = (i + 1) & mask
 	}
@@ -171,13 +178,6 @@ func (s *shard) recoverApply(h uint64, key []byte, off int64, n int, tombstone b
 		return
 	}
 	s.put(idx, h, key, off, n)
-}
-
-// keyAt reports whether the record a slot points at carries key. The caller holds
-// mu, so the log is stable.
-func (s *shard) keyAt(slot uint64, key []byte) bool {
-	rkey, _ := s.log.read(slotAddr(slot))
-	return bytesEqual(rkey, key)
 }
 
 // grow doubles the index and replays every live slot into the new table, dropping
