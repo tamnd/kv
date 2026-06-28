@@ -2,6 +2,7 @@ package f2
 
 import (
 	"encoding/binary"
+	"sync"
 	"sync/atomic"
 )
 
@@ -285,29 +286,55 @@ func (l *log) decodeAt(b []byte) (key, value []byte) {
 }
 
 // readEvicted preads a record from the file into an owned buffer. It does one
-// probe read sized to cover most records in a single syscall and allocation; only
-// a record larger than the probe needs a second exact read. The probe may overrun
-// into the next record or the page tail, which is harmless because a record never
+// probe read sized to cover most records in a single syscall; only a record
+// larger than the probe needs a second exact read. The probe may overrun into
+// the next record or the page tail, which is harmless because a record never
 // straddles a page and decode consumes only its own bytes.
 const evictProbe = 512
 
+// probePool recycles the fixed-size scratch buffers readEvicted preads into. The
+// probe is transient: its decoded key and value are copied into an exactly sized
+// owned slice before the probe goes back to the pool, so a returned slice never
+// aliases a buffer another reader will reuse. Pooling turns the steady-state cold
+// read from a 512-byte slab allocation per call into a single allocation sized to
+// the record, which is the dominant cost once a working set spills to the file.
+var probePool = sync.Pool{New: func() any { b := make([]byte, evictProbe); return &b }}
+
 func (l *log) readEvicted(at int64) (key, value []byte) {
-	buf := make([]byte, evictProbe)
+	bp := probePool.Get().(*[]byte)
+	buf := (*bp)[:evictProbe]
 	n, _ := l.df.f.ReadAt(buf, at)
 	buf = buf[:n]
 	total := durableRecordSpan(buf)
 	if total <= 0 {
+		probePool.Put(bp)
 		return nil, nil
 	}
 	if total > len(buf) {
+		// Record is larger than the probe: read it exactly into a fresh owned slice
+		// and decode that. This is the rare path, so it does not warrant pooling, and
+		// the slices it returns already own their backing array.
+		probePool.Put(bp)
 		full := make([]byte, total)
 		m, _ := l.df.f.ReadAt(full, at)
 		if m < total {
 			return nil, nil // short read: do not decode a truncated record
 		}
-		buf = full
+		return l.decodeAt(full)
 	}
-	return l.decodeAt(buf)
+	k, v := l.decodeAt(buf)
+	if k == nil {
+		probePool.Put(bp)
+		return nil, nil
+	}
+	// Copy the decoded key and value into one owned slice before recycling the
+	// probe. The result is sized to the record, not the 512-byte probe.
+	out := make([]byte, len(k)+len(v))
+	copy(out, k)
+	copy(out[len(k):], v)
+	key, value = out[:len(k):len(k)], out[len(k):]
+	probePool.Put(bp)
+	return key, value
 }
 
 // durableRecordSpan returns the total on-log byte length of the durable record at
