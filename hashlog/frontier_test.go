@@ -166,7 +166,7 @@ func scanShardFrozenLSNs(t *testing.T, frozen []byte, sh *shard) map[uint64]bool
 		if ext < 0 {
 			continue // never written to the file
 		}
-		base := sh.df.extentOffset(ext)
+		base := sh.df.logBodyOffset(ext)
 		end := base + int64(sh.pageFill[pid])
 		if end > int64(len(frozen)) {
 			continue // not present in this frozen image

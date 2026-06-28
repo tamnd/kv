@@ -19,7 +19,8 @@ type durableFile struct {
 	f          *os.File
 	path       string
 	shardCount int
-	extentSize int64
+	extentSize int64 // the page/body size: bytes of an extent available for records
+	stride     int64 // the on-disk extent size: extentSize plus the extent header
 	slotSize   int
 	sbSize     int64
 
@@ -49,6 +50,12 @@ type durableFile struct {
 	// writes the other slot, so the last committed checkpoint is never in flight.
 	sb        *superblock
 	newerSlot int
+
+	// existed is true when the file already held a superblock on open, so the Store
+	// must run recovery (M5) to rebuild each shard's index from the checkpoint plus the
+	// log tail. A brand-new file (initFresh) leaves it false: there is nothing to
+	// recover.
+	existed bool
 
 	// Checkpoint state (M4, doc 05). snapRoot and snapCount are the currently committed
 	// index snapshot's contiguous extent run, freed when the next checkpoint supersedes
@@ -106,6 +113,7 @@ func openDurableFile(path string, shardCount int, extentSize int64) (*durableFil
 		path:       path,
 		shardCount: shardCount,
 		extentSize: extentSize,
+		stride:     extentSize + extentHeaderBytes,
 		slotSize:   superblockSlotSize(shardCount),
 		sbSize:     superblockSize(shardCount),
 	}
@@ -126,6 +134,7 @@ func openDurableFile(path string, shardCount int, extentSize int64) (*durableFil
 		f.Close()
 		return nil, err
 	}
+	d.existed = true
 	return d, nil
 }
 
@@ -189,7 +198,7 @@ func (d *durableFile) readExisting() error {
 	// stream length rounded up to whole extents.
 	d.snapRoot = newer.snapshotRoot
 	if newer.snapshotRoot >= 0 && newer.snapshotLen > 0 {
-		d.snapCount = (int64(newer.snapshotLen) + d.extentSize - 1) / d.extentSize
+		d.snapCount = (int64(newer.snapshotLen) + d.stride - 1) / d.stride
 	} else {
 		d.snapRoot = -1
 		d.snapCount = 0
@@ -282,7 +291,7 @@ func (d *durableFile) writeCheckpointSlot(nsb *superblock, sync func() error) er
 // It returns the new run's first extent id, which the superblock records as the
 // snapshot root.
 func (d *durableFile) writeSnapshot(stream []byte, barrier bool) (int64, error) {
-	n := (int64(len(stream)) + d.extentSize - 1) / d.extentSize
+	n := (int64(len(stream)) + d.stride - 1) / d.stride
 	if n < 1 {
 		n = 1
 	}
@@ -339,9 +348,18 @@ func (d *durableFile) commitCheckpoint(snapRoot int64, snapLen uint64, frontiers
 	return nil
 }
 
-// extentOffset returns the byte offset in the file of extent id's first byte.
+// extentOffset returns the byte offset in the file of extent id's first byte, the start
+// of its header. Extents are spaced one stride apart, so consecutive ids are contiguous
+// and a snapshot run reads back as one region.
 func (d *durableFile) extentOffset(id int64) int64 {
-	return extentByteOffset(d.sbSize, d.extentSize, id)
+	return extentByteOffset(d.sbSize, d.stride, id)
+}
+
+// logBodyOffset returns the byte offset of a log extent's first body byte: past the
+// extent header. A shard's page bytes are written here, so a logical address maps to
+// logBodyOffset(extent) plus the in-page offset (doc 03 section 5).
+func (d *durableFile) logBodyOffset(id int64) int64 {
+	return d.extentOffset(id) + extentHeaderBytes
 }
 
 // growExtent extends the file so extent id exists in it, if it does not already. It
@@ -350,7 +368,7 @@ func (d *durableFile) extentOffset(id int64) int64 {
 // its end is below fileEnd and this is a no-op). The bytes through the extent's end
 // exist before the log path writes records into them.
 func (d *durableFile) growExtent(id int64) error {
-	end := d.extentOffset(id) + d.extentSize
+	end := d.extentOffset(id) + d.stride
 	d.growMu.Lock()
 	defer d.growMu.Unlock()
 	if end <= d.fileEnd {
@@ -361,6 +379,26 @@ func (d *durableFile) growExtent(id int64) error {
 	}
 	d.fileEnd = end
 	return nil
+}
+
+// writeLogExtentHeader writes the self-describing header at the front of a freshly
+// allocated log extent (doc 03 section 5): its kind, the owning shard, the previous
+// extent in the shard's chain, the logical base address of its first body byte, and the
+// allocator generation stamp. It is written before any record body lands in the extent,
+// so recovery scanning the file can identify the extent as this shard's and place it at
+// its base address. The next link is left at -1; recovery orders by base address and
+// does not follow forward links at M5.
+func (d *durableFile) writeLogExtentHeader(id int64, shardID int, prev, baseAddr int64) error {
+	h := extentHeader{
+		kind:       extentKindLog,
+		shardID:    int32(shardID),
+		prevExtent: prev,
+		nextExtent: -1,
+		baseAddr:   baseAddr,
+		genStamp:   d.sb.generation,
+	}
+	_, err := d.f.WriteAt(encodeExtentHeader(h), d.extentOffset(id))
+	return err
 }
 
 // Close closes the file. The durableFile must not be used afterward.
