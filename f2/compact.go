@@ -132,8 +132,7 @@ func (s *Store) compactLocked(sh *shard) error {
 			continue // an unreadable record: drop it rather than copy garbage forward
 		}
 		off := nl.packResident(key, value)
-		h := hash64(key)
-		insertCompacted(ni, tagOf(h), h, off)
+		insertCompacted(ni, mixOf(hash64(key)), off)
 		liveBytes += int64(nl.recordLenKV(key, value))
 	}
 
@@ -177,13 +176,13 @@ func (s *Store) compactLocked(sh *shard) error {
 // rewrite. The keys are the live set, each distinct, so it only ever lands on an
 // empty slot, no tombstone or overwrite case to handle. The caller sized the table
 // to stay under the load factor, so the probe is short.
-func insertCompacted(ni *index, tag, h uint64, off int64) {
+func insertCompacted(ni *index, mix uint64, off int64) {
 	mask := ni.mask
-	j := (h ^ (h >> 15)) & mask
+	j := mix & mask
 	for ni.slots[j].Load() != 0 {
 		j = (j + 1) & mask
 	}
-	ni.slots[j].Store(makeSlot(tag, off))
+	ni.slots[j].Store(makeSlot(fpOf(mix), off))
 	ni.live++
 	ni.used++
 }

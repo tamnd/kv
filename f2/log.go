@@ -2,9 +2,17 @@ package f2
 
 import (
 	"encoding/binary"
+	"errors"
 	"sync"
 	"sync/atomic"
 )
+
+// errLogFull is returned by append when the shard's log would pass the largest
+// address an index slot can encode (slotAddrMask is the address plus one). The
+// store must be compacted, which resets each shard's log to a fresh generation at
+// offset zero, before it can take more writes. With compaction this is unreachable
+// in practice; the guard turns a silently truncated address into a clear error.
+var errLogFull = errors.New("f2: shard log address space exhausted, compact the store")
 
 // log is one shard's append-only record store, laid out as fixed-size pages. A
 // logical address is a byte offset into the flattened page sequence: page index
@@ -97,6 +105,9 @@ func (l *log) append(key, value []byte, tombstone bool) (int64, int, error) {
 	if within+int64(n) > l.pageSize {
 		off += l.pageSize - within // to the next page boundary
 		off += l.hdr               // past its header
+	}
+	if uint64(off)+1 > slotAddrMask {
+		return 0, 0, errLogFull // the index cannot encode this address
 	}
 	pi := int(off / l.pageSize)
 	page, err := l.pageFor(pi)

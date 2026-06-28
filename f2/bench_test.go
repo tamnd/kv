@@ -106,6 +106,38 @@ func BenchmarkHashlogOverwrite(b *testing.B) {
 	}
 }
 
+// BenchmarkF2GrowEvicted isolates the index grow on a budgeted durable shard, the
+// path S3 changed. It builds one shard with many live keys whose log pages are
+// nearly all evicted, then times a single doubling rehash. Before S3 the replay did
+// one pread per live key to recover its home; after it the replay reads the home
+// from the slot's fingerprint, touching the log not at all.
+func BenchmarkF2GrowEvicted(b *testing.B) {
+	const keys = 1 << 16
+	s, err := New(Tunables{
+		Shards:                1,
+		PageSize:              4096,
+		ResidentPagesPerShard: 4,
+		Path:                  filepath.Join(b.TempDir(), "grow.db"),
+		Durability:            DurabilityNone,
+	})
+	if err != nil {
+		b.Fatalf("New: %v", err)
+	}
+	defer s.Close()
+	for i := 0; i < keys; i++ {
+		if err := s.Set(tkey(i), tval(i)); err != nil {
+			b.Fatalf("Set: %v", err)
+		}
+	}
+	sh := s.shards[0]
+	old := sh.index.Load()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = sh.grow(old) // old is not mutated, so each iteration rehashes the same set
+	}
+}
+
 func BenchmarkF2Get(b *testing.B) {
 	s := fillF2(b, benchKeys)
 	defer s.Close()
