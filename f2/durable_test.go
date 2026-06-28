@@ -297,16 +297,54 @@ func TestDurableRecoveryEvicted(t *testing.T) {
 // memory-only store rejects a durability dial and a resident budget (it has
 // nowhere to sync or evict), and a record larger than the usable page is refused.
 func TestDurableValidation(t *testing.T) {
-	if _, err := New(Tunables{Shards: 4, PageSize: 4096, Durability: DurabilityNormal}); err != errBadTunables {
-		t.Fatalf("dial without path: got %v want errBadTunables", err)
+	if _, err := New(Tunables{Shards: 4, PageSize: 4096, Durability: DurabilityNormal}); err != errDurabilityNoPath {
+		t.Fatalf("dial without path: got %v want errDurabilityNoPath", err)
 	}
-	if _, err := New(Tunables{Shards: 4, PageSize: 4096, ResidentPagesPerShard: 2}); err != errBadTunables {
-		t.Fatalf("budget without path: got %v want errBadTunables", err)
+	if _, err := New(Tunables{Shards: 4, PageSize: 4096, ResidentPagesPerShard: 2}); err != errBudgetNoPath {
+		t.Fatalf("budget without path: got %v want errBudgetNoPath", err)
 	}
 	path := filepath.Join(t.TempDir(), "f2.db")
 	s := mustOpenT(t, Tunables{Shards: 4, PageSize: 256, Path: path})
 	if err := s.Set([]byte("k"), make([]byte, 256)); err != errValueTooBig {
 		t.Fatalf("oversize durable Set: got %v want errValueTooBig", err)
+	}
+}
+
+// TestCloseGuards pins the lifecycle contract: a double Close is a no-op, and any
+// operation after Close returns errClosed instead of panicking on freed state.
+func TestCloseGuards(t *testing.T) {
+	s := mustOpenT(t, durableTunables(t, DurabilityNone))
+	if err := s.Set(tkey(1), tval(1)); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("second Close should be a no-op: %v", err)
+	}
+	if _, _, err := s.Get(tkey(1)); err != errClosed {
+		t.Fatalf("Get after Close: got %v want errClosed", err)
+	}
+	if err := s.Set(tkey(2), tval(2)); err != errClosed {
+		t.Fatalf("Set after Close: got %v want errClosed", err)
+	}
+	if err := s.Delete(tkey(1)); err != errClosed {
+		t.Fatalf("Delete after Close: got %v want errClosed", err)
+	}
+}
+
+// TestFileLockExcludesSecondOpen pins A1: a second open of the same file fails
+// fast with errLocked rather than letting two writers corrupt one store.
+func TestFileLockExcludesSecondOpen(t *testing.T) {
+	tn := durableTunables(t, DurabilityNone)
+	s, err := New(tn)
+	if err != nil {
+		t.Fatalf("first New: %v", err)
+	}
+	defer s.Close()
+	if _, err := New(tn); err != errLocked {
+		t.Fatalf("second New: got %v want errLocked", err)
 	}
 }
 

@@ -174,11 +174,14 @@ func TestRecordTooBig(t *testing.T) {
 // TestBadTunables checks the open-time validation: a non-power-of-two shard count
 // and a durability dial without a path are both rejected.
 func TestBadTunables(t *testing.T) {
-	if _, err := New(Tunables{Shards: 100, PageSize: 1 << 16}); err != errBadTunables {
-		t.Fatalf("non-pow2 shards: got %v", err)
+	if _, err := New(Tunables{Shards: 100, PageSize: 1 << 16}); err != errBadShards {
+		t.Fatalf("non-pow2 shards: got %v want errBadShards", err)
 	}
-	if _, err := New(Tunables{Shards: 4, PageSize: 1 << 16, Durability: DurabilityFull}); err != errBadTunables {
-		t.Fatalf("durability without path: got %v", err)
+	if _, err := New(Tunables{Shards: 4, PageSize: 1 << 16, Durability: DurabilityFull}); err != errDurabilityNoPath {
+		t.Fatalf("durability without path: got %v want errDurabilityNoPath", err)
+	}
+	if _, err := New(Tunables{Shards: 4, PageSize: 8}); err != errBadPageSize {
+		t.Fatalf("tiny page: got %v want errBadPageSize", err)
 	}
 }
 
