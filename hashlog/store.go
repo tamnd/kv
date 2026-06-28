@@ -734,6 +734,14 @@ type shard struct {
 	pageFill    []int
 	pageFlushed []int
 	pageMaxLSN  []int64
+	// firstDirty is the lowest page id that may hold unflushed bytes, the start of the
+	// flush scan (L3). A barrier flush leaves every page below the tail fully written, so
+	// it advances firstDirty to the tail, and the next flush scans only the tail-and-up
+	// suffix instead of rescanning from page 0. It advances only on a real barrier (the
+	// dial that flushes per write), so under None, which flushes only at checkpoint and
+	// close, it stays at 0 and those rare flushes still fold every page's LSN. Maintained
+	// under mu.
+	firstDirty int64
 
 	// Epoch reclamation state (M6, doc 07). deferred holds page buffers retired by
 	// eviction, each stamped with the global epoch at retire time; the reclaimer moves an
@@ -1350,7 +1358,12 @@ func (sh *shard) writePageRemainder(pid int64, page []byte) (int64, error) {
 func (sh *shard) flushDurable(doSync bool) error {
 	ps := sh.pages.Load()
 	maxLSN := sh.frontier.Load()
-	for pid := int64(0); pid <= sh.tailPage; pid++ {
+	// Scan only the dirty suffix [firstDirty, tail] (L3). Pages below firstDirty were
+	// fully written by an earlier barrier flush, and that flush also folded their LSN
+	// into the frontier this scan starts from, so skipping them loses neither bytes nor
+	// watermark. Under None, where firstDirty never advances, this is the full scan as
+	// before. The scan was O(pages) per Full write; this makes it O(1) amortized.
+	for pid := sh.firstDirty; pid <= sh.tailPage; pid++ {
 		// A page's records are all durable once their bytes are synced, so the frontier
 		// may reach this page's highest LSN. Account it whether or not the page is still
 		// resident: an evicted page was already written to its extent.
@@ -1363,7 +1376,9 @@ func (sh *shard) flushDurable(doSync bool) error {
 		}
 		if _, err := sh.writePageRemainder(pid, page); err != nil {
 			// A write failed: keep what is flushed and do not sync or advance, so the
-			// frontier never claims bytes that did not reach the file. Report it so the
+			// frontier never claims bytes that did not reach the file. firstDirty is left
+			// where it was (at or below this page), so a retry rescans the same suffix,
+			// skips the pages this attempt did flush, and retries here. Report it so the
 			// caller does not treat the unflushed records as durable.
 			return err
 		}
@@ -1375,6 +1390,10 @@ func (sh *shard) flushDurable(doSync bool) error {
 		return err
 	}
 	sh.frontier.Store(maxLSN)
+	// Every page up to the tail is now written and synced, so the next flush can start at
+	// the tail, the only page that can take more bytes. firstDirty advances only here, on
+	// a real barrier, so the frontier always covers everything below it.
+	sh.firstDirty = sh.tailPage
 	return nil
 }
 

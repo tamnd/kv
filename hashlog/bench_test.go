@@ -1,6 +1,7 @@
 package hashlog
 
 import (
+	"os"
 	"path/filepath"
 	"strconv"
 	"testing"
@@ -103,6 +104,55 @@ func BenchmarkDurableDialSet(b *testing.B) {
 				if err := s.Set(benchKey(i), v); err != nil {
 					b.Fatal(err)
 				}
+			}
+		})
+	}
+}
+
+// BenchmarkFullSetFlushSuffix isolates L3: a Full SET flushes its tail and barriers,
+// and flushDurable used to scan every page from page 0 to find the dirty suffix, so the
+// per-SET CPU cost grew with the log's page count. The sub-benchmarks prefill the single
+// shard to a fixed page count, then time fresh Full SETs: before the suffix fix the
+// ns/op climbs with the prefill (more pages to scan), after it is flat. Eviction is off
+// (a huge resident budget) so no page faults intrude, and the device barrier is stubbed
+// to a no-op so the number is the page-scan CPU the fix targets, not F_FULLFSYNC latency
+// (which would swamp it and make the prefill take minutes). Correctness of the real
+// barrier is covered by the durability tests, not here.
+func BenchmarkFullSetFlushSuffix(b *testing.B) {
+	const pageSize = 256
+	for _, pages := range []int{16, 512, 8192} {
+		b.Run("pages="+strconv.Itoa(pages), func(b *testing.B) {
+			path := filepath.Join(b.TempDir(), "flush.hlog")
+			t := Tunables{
+				Shards:                1,
+				PageSize:              pageSize,
+				ExtentSize:            pageSize,
+				ResidentPagesPerShard: 1 << 24,
+				Path:                  path,
+				Durability:            DurabilityFull,
+			}
+			s, err := New(t)
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer s.Close()
+			s.df.syncHook = func(*os.File) error { return nil } // measure scan, not the barrier
+			v := benchValue(8)
+			sh := s.shards[0]
+			i := 0
+			for sh.tailPage < int64(pages) {
+				if err := s.Set(benchKey(i), v); err != nil {
+					b.Fatal(err)
+				}
+				i++
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for n := 0; n < b.N; n++ {
+				if err := s.Set(benchKey(i), v); err != nil {
+					b.Fatal(err)
+				}
+				i++
 			}
 		})
 	}
