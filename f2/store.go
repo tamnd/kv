@@ -115,10 +115,23 @@ func DefaultTunables() Tunables {
 const defaultCheckpointBytes = 256 << 20
 
 var (
-	errBadTunables  = errors.New("f2: invalid tunables")
-	errValueTooBig  = errors.New("f2: record does not fit in a page")
-	errPageMismatch = errors.New("f2: file page size or shard count differs from tunables")
+	errBadShards        = errors.New("f2: Shards must be a power of two greater than zero")
+	errBadPageSize      = errors.New("f2: PageSize must leave room for a block header and a record")
+	errDurabilityNoPath = errors.New("f2: Durability other than None requires a Path")
+	errBudgetNoPath     = errors.New("f2: ResidentPagesPerShard requires a Path")
+	errBadBudget        = errors.New("f2: ResidentPagesPerShard must be zero or at least one")
+	errValueTooBig      = errors.New("f2: record does not fit in a page")
+	errPageMismatch     = errors.New("f2: file page size or shard count differs from tunables")
+	errLocked           = errors.New("f2: file is already open by another process")
+	errClosed           = errors.New("f2: store is closed")
 )
+
+// minPageSize is the smallest page f2 accepts. A durable page must hold its
+// header and at least a minimal record; a memory page needs room for a record's
+// length prefixes. The floor keeps maxRecord positive so a misconfigured tiny
+// page is rejected at New instead of making every Set fail with a confusing
+// size error.
+const minPageSize = blockHeaderSize + 64
 
 // Stats reports the engine's space accounting, the data a memory and scalability
 // study needs. Counts are summed across shards.
@@ -153,6 +166,7 @@ type Store struct {
 
 	ckptBytes int64        // checkpoint interval, 0 disables auto-checkpoint
 	sinceCkpt atomic.Int64 // durable bytes appended since the last checkpoint
+	closed    atomic.Bool  // set once by Close, makes later calls return errClosed
 }
 
 // New opens a Store with the given tunables. With no Path it is the
@@ -163,20 +177,23 @@ type Store struct {
 // the file's records, so the store comes back with every key it acknowledged.
 func New(t Tunables) (*Store, error) {
 	if t.Shards <= 0 || t.Shards&(t.Shards-1) != 0 {
-		return nil, errBadTunables
+		return nil, errBadShards
 	}
-	if t.PageSize <= 0 {
-		return nil, errBadTunables
+	if t.PageSize < minPageSize {
+		return nil, errBadPageSize
 	}
 	if t.Path == "" {
 		// Memory-only: nothing to sync and nowhere to evict to.
-		if t.Durability != DurabilityNone || t.ResidentPagesPerShard != 0 {
-			return nil, errBadTunables
+		if t.Durability != DurabilityNone {
+			return nil, errDurabilityNoPath
+		}
+		if t.ResidentPagesPerShard != 0 {
+			return nil, errBudgetNoPath
 		}
 		return newMemory(t), nil
 	}
-	if t.ResidentPagesPerShard != 0 && t.ResidentPagesPerShard < 1 {
-		return nil, errBadTunables
+	if t.ResidentPagesPerShard < 0 {
+		return nil, errBadBudget
 	}
 	return newDurable(t)
 }
@@ -200,6 +217,12 @@ func newMemory(t Tunables) *Store {
 func newDurable(t Tunables) (*Store, error) {
 	f, err := os.OpenFile(t.Path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
+		return nil, err
+	}
+	// One writer per file: a second process opening the same path would write the
+	// superblock and append blocks independently and corrupt it.
+	if err := lockFile(f); err != nil {
+		_ = f.Close()
 		return nil, err
 	}
 	ckpt := t.CheckpointBytes
@@ -249,6 +272,9 @@ func (s *Store) shardFor(h uint64) *shard { return s.shards[(h>>shardShift)&s.ma
 // it; it stays valid as long as the store is open because resident pages are
 // never freed or rewritten in this profile.
 func (s *Store) Get(key []byte) ([]byte, bool, error) {
+	if s.closed.Load() {
+		return nil, false, errClosed
+	}
 	h := hash64(key)
 	return s.shardFor(h).get(h, key)
 }
@@ -258,6 +284,9 @@ func (s *Store) Get(key []byte) ([]byte, bool, error) {
 // durable mode the record carries a CRC and, past the checkpoint interval, the
 // write triggers a checkpoint so recovery replay stays bounded.
 func (s *Store) Set(key, value []byte) error {
+	if s.closed.Load() {
+		return errClosed
+	}
 	var n int
 	if s.df != nil {
 		n = durableRecordLen(key, value)
@@ -283,6 +312,9 @@ func (s *Store) Set(key, value []byte) error {
 
 // Delete removes key. It is a no-op if the key is absent.
 func (s *Store) Delete(key []byte) error {
+	if s.closed.Load() {
+		return errClosed
+	}
 	h := hash64(key)
 	return s.shardFor(h).del(h, key)
 }
@@ -293,6 +325,9 @@ func (s *Store) Delete(key []byte) error {
 // recovery after this point replays only what follows. Under a non-None dial the
 // flush and the superblock are fsynced.
 func (s *Store) Checkpoint() error {
+	if s.closed.Load() {
+		return errClosed
+	}
 	if s.df == nil {
 		return nil
 	}
@@ -317,6 +352,9 @@ func (s *Store) Checkpoint() error {
 // is the durable store and is never removed. The memory-only core holds no OS
 // resources and only drops its shards.
 func (s *Store) Close() error {
+	if s.closed.Swap(true) {
+		return nil // idempotent: a second Close is a no-op, not a double free
+	}
 	if s.df != nil {
 		// Flush and stamp the superblock even under None, so a clean close is always
 		// fully recoverable; only a crash exposes the dial's loss window.
@@ -334,12 +372,9 @@ func (s *Store) Close() error {
 		if err := s.df.writeSuperblock(); err != nil {
 			return err
 		}
-		err := s.df.f.Close()
-		s.shards = nil
-		s.df = nil
-		return err
+		unlockFile(s.df.f)
+		return s.df.f.Close()
 	}
-	s.shards = nil
 	return nil
 }
 

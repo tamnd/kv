@@ -275,7 +275,10 @@ func (l *log) read(addr int64) (key, value []byte) {
 // the durable or lean format for this log.
 func (l *log) decodeAt(b []byte) (key, value []byte) {
 	if l.df != nil {
-		k, v, _, _, _ := decodeDurable(b)
+		k, v, _, _, ok := decodeDurable(b)
+		if !ok {
+			return nil, nil // bad CRC or short buffer: report nothing, never wrong bytes
+		}
 		return k, v
 	}
 	return decodeRecord(b)
@@ -292,14 +295,19 @@ func (l *log) readEvicted(at int64) (key, value []byte) {
 	buf := make([]byte, evictProbe)
 	n, _ := l.df.f.ReadAt(buf, at)
 	buf = buf[:n]
-	if total := durableRecordSpan(buf); total > 0 && total <= len(buf) {
-		return l.decodeAt(buf) // the probe already holds the whole record
-	} else if total > len(buf) {
-		full := make([]byte, total)
-		_, _ = l.df.f.ReadAt(full, at)
-		return l.decodeAt(full)
+	total := durableRecordSpan(buf)
+	if total <= 0 {
+		return nil, nil
 	}
-	return nil, nil
+	if total > len(buf) {
+		full := make([]byte, total)
+		m, _ := l.df.f.ReadAt(full, at)
+		if m < total {
+			return nil, nil // short read: do not decode a truncated record
+		}
+		buf = full
+	}
+	return l.decodeAt(buf)
 }
 
 // durableRecordSpan returns the total on-log byte length of the durable record at
