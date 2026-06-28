@@ -139,10 +139,17 @@ func (sh *shard) compactExtent(pid int64) error {
 			break // clean end of the page's records
 		}
 		if flags&flagTombstone != 0 {
-			sh.relocateTombstone(lsn, key)
+			if err := sh.relocateTombstone(lsn, key); err != nil {
+				// A seal-flush failed copying a record forward. The source extent is not yet
+				// retired, so every original still lives; abort without retiring it and the
+				// data is intact for a later pass to compact (D5).
+				return err
+			}
 		} else {
 			valueAddr := pageBase + int64(pos) + int64(durableValOff(key, value))
-			sh.relocateData(lsn, flags, key, value, valueAddr)
+			if err := sh.relocateData(lsn, flags, key, value, valueAddr); err != nil {
+				return err
+			}
 		}
 		pos += n
 	}
@@ -160,14 +167,18 @@ func (sh *shard) compactExtent(pid int64) error {
 // published (the index repoints to it, REPOINTED); if a racing overwrite or delete moved
 // the key off the old address between the probe and the lock the copy is abandoned, its
 // bytes credited dead in the output page so the accounting stays exact (ABANDONED).
-func (sh *shard) relocateData(lsn uint64, flags byte, key, value []byte, oldValueAddr int64) {
+func (sh *shard) relocateData(lsn uint64, flags byte, key, value []byte, oldValueAddr int64) error {
 	thash := tableHash(key)
 	if e := sh.index.Load().lookupEntry(thash, key); e == nil || e.loc.addr != oldValueAddr {
-		return
+		return nil
 	}
 
 	sh.mu.Lock()
-	newValueAddr, newPid, encLen := sh.appendRelocated(lsn, flags, key, value)
+	newValueAddr, newPid, encLen, err := sh.appendRelocated(lsn, flags, key, value)
+	if err != nil {
+		sh.mu.Unlock()
+		return err
+	}
 	// An oversize home record carries the 24-byte descriptor as its value and the oversize
 	// marker in its index entry. Relocating it copies the home record verbatim, descriptor
 	// and all, so the moved record still points at the same in-place cont chain; the repoint
@@ -191,6 +202,7 @@ func (sh *shard) relocateData(lsn uint64, flags byte, key, value []byte, oldValu
 		sh.store.abandonedCopies.Add(1)
 	}
 	sh.mu.Unlock()
+	return nil
 }
 
 // relocateTombstone decides whether a tombstone must be copied forward or can be dropped
@@ -203,17 +215,18 @@ func (sh *shard) relocateData(lsn uint64, flags byte, key, value []byte, oldValu
 // so the discard decision is taken against one consistent moment; ckptFrontier only ever
 // advances, and it only ever holds a committed value, so the predicate is a sound
 // conservative lower bound (doc 06 section 3.4).
-func (sh *shard) relocateTombstone(lsn uint64, key []byte) {
+func (sh *shard) relocateTombstone(lsn uint64, key []byte) error {
 	sh.mu.Lock()
 	frontier := uint64(sh.ckptFrontier.Load())
 	e := sh.index.Load().lookupEntry(tableHash(key), key)
 	if lsn <= frontier && e == nil {
 		sh.store.discardedTombstones.Add(1)
 		sh.mu.Unlock()
-		return
+		return nil
 	}
-	sh.appendRelocated(lsn, flagTombstone, key, nil)
+	_, _, _, err := sh.appendRelocated(lsn, flagTombstone, key, nil)
 	sh.mu.Unlock()
+	return err
 }
 
 // appendRelocated appends a copied record to the tail with a caller-supplied LSN (the
@@ -223,9 +236,14 @@ func (sh *shard) relocateTombstone(lsn uint64, key []byte) {
 // LSN and flags, points past the header and key to the value, and advances the page's
 // fill and (by max, never assign) its highest LSN, since a relocated low LSN must not
 // lower a page that already holds higher ones. It runs under the shard write lock.
-func (sh *shard) appendRelocated(lsn uint64, flags byte, key, value []byte) (valueAddr int64, pid int64, encLen int) {
+func (sh *shard) appendRelocated(lsn uint64, flags byte, key, value []byte) (valueAddr int64, pid int64, encLen int, err error) {
 	rl := durableRecordLen(key, value)
-	sh.rollFor(rl)
+	if err := sh.rollFor(rl); err != nil {
+		// A Normal seal-flush failed rolling the output page. Do not append the copy: the
+		// original still lives in its un-retired source extent, so the caller aborts the
+		// extent's compaction and the data is intact (D5).
+		return 0, 0, 0, err
+	}
 	ps := sh.pages.Load()
 	page := ps.pages[sh.tailPage]
 	recStart := sh.tailPage*int64(sh.pageSize) + int64(sh.tailPos)
@@ -236,7 +254,7 @@ func (sh *shard) appendRelocated(lsn uint64, flags byte, key, value []byte) (val
 		sh.pageMaxLSN[sh.tailPage] = int64(lsn)
 	}
 	sh.df.bytesSinceCkpt.Add(int64(n))
-	return recStart + int64(durableValOff(key, value)), sh.tailPage, n
+	return recStart + int64(durableValOff(key, value)), sh.tailPage, n, nil
 }
 
 // indexRepointLocked republishes key's index slot to point at a new value location,

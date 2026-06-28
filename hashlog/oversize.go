@@ -148,7 +148,12 @@ func (sh *shard) setOversizeLocked(key, value []byte) error {
 		// reconciled free on the next recovery, since no home record will ever reference it.
 		return errors.New("hashlog: oversize home record larger than page size")
 	}
-	sh.rollFor(rl)
+	if err := sh.rollFor(rl); err != nil {
+		// The cont chain is already written; on a failed seal-flush no home record names it,
+		// so recovery's physical scan reconciles the orphan chain free (same as the
+		// oversize-home-too-big path above). Report the error rather than acknowledging.
+		return err
+	}
 	ps := sh.pages.Load()
 	page := ps.pages[sh.tailPage]
 	recStart := sh.tailPage*int64(sh.pageSize) + int64(sh.tailPos)
@@ -167,7 +172,7 @@ func (sh *shard) setOversizeLocked(key, value []byte) error {
 	// unit before the SET acknowledges (I6). Under None and Normal the home record reaches
 	// the device at the next seal or checkpoint, which likewise flushes the cont writes.
 	if sh.durability == DurabilityFull {
-		sh.flushDurable(true)
+		return sh.flushDurable(true)
 	}
 	return nil
 }

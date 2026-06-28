@@ -296,8 +296,11 @@ func (s *Store) Close() error {
 			continue
 		}
 		sh.mu.Lock()
-		sh.flushDurable(true)
+		err := sh.flushDurable(true)
 		sh.mu.Unlock()
+		if err != nil && first == nil {
+			first = err
+		}
 	}
 	for _, sh := range s.shards {
 		if err := sh.close(); err != nil && first == nil {
@@ -467,7 +470,14 @@ func (s *Store) Checkpoint() error {
 	s.pendingRetry = nil
 	for i, sh := range s.shards {
 		var pf []int64
-		sections[i], frontiers[i], pf = sh.captureCut()
+		var err error
+		sections[i], frontiers[i], pf, err = sh.captureCut()
+		if err != nil {
+			// A shard's cut flush failed, so its values are not all durable. Keep the
+			// retired extents pending for a later checkpoint and abort without committing.
+			s.pendingRetry = pending
+			return err
+		}
 		pending = append(pending, pf...)
 	}
 	barrier := s.t.Durability != DurabilityNone
@@ -511,10 +521,16 @@ func (s *Store) Checkpoint() error {
 // barriered, matching the dial's no-per-write-sync contract while still leaving a clean
 // reopen recoverable. The copy form gives an exact as-of-F_shard view with no post-cut
 // bleed.
-func (sh *shard) captureCut() (snapSection, shardFrontier, []int64) {
+func (sh *shard) captureCut() (snapSection, shardFrontier, []int64, error) {
 	sh.mu.Lock()
 	if sh.df != nil {
-		sh.flushDurable(sh.durability != DurabilityNone)
+		if err := sh.flushDurable(sh.durability != DurabilityNone); err != nil {
+			sh.mu.Unlock()
+			// The cut's values are not all on disk, so a snapshot taken now could point at
+			// records the file does not hold. Abort the checkpoint rather than commit a
+			// recovery point the device never received (D4).
+			return snapSection{}, shardFrontier{}, nil, err
+		}
 	}
 	t := sh.index.Load()
 	tuples := make([]snapTuple, 0, sh.idxLive)
@@ -540,7 +556,7 @@ func (sh *shard) captureCut() (snapSection, shardFrontier, []int64) {
 	pending := sh.pendingFree
 	sh.pendingFree = nil
 	sh.mu.Unlock()
-	return sec, fr, pending
+	return sec, fr, pending, nil
 }
 
 // valLoc points the index straight at a value in the log: addr is the logical
@@ -811,12 +827,20 @@ func encodeRecord(dst, key, value []byte) int {
 // entry also sees the page it lives on. Under the Normal dial the seal is a group-commit
 // flush point, so the sealed pages are made durable here (doc 04 sections 5.3, 6.2). It
 // runs under the shard write lock and is shared by the durable SET and DELETE appends.
-func (sh *shard) rollFor(rl int) {
+//
+// It returns an error only when the Normal seal-flush fails. In that case it does not
+// roll: sealing a page that did not fully reach the device would make it a non-final
+// sealed page that the recovery scan trusts as complete, breaking the invariant that
+// every non-final sealed page is fully synced (D5). The tail is left where it is and the
+// caller propagates the error instead of acknowledging the write.
+func (sh *shard) rollFor(rl int) error {
 	if sh.tailPos+rl <= sh.pageSize {
-		return
+		return nil
 	}
 	if sh.df != nil && sh.durability == DurabilityNormal {
-		sh.flushDurable(true)
+		if err := sh.flushDurable(true); err != nil {
+			return err
+		}
 	}
 	ps := sh.pages.Load()
 	sh.tailPage++
@@ -834,6 +858,7 @@ func (sh *shard) rollFor(rl int) {
 	sh.deadBytes = append(sh.deadBytes, 0)
 	sh.residentOrder = append(sh.residentOrder, sh.tailPage)
 	sh.evictIfNeeded()
+	return nil
 }
 
 func (sh *shard) set(key, value []byte) error {
@@ -888,7 +913,9 @@ func (sh *shard) set(key, value []byte) error {
 			sh.supersedeOldLocked(old)
 		}
 	}
-	sh.rollFor(rl)
+	if err := sh.rollFor(rl); err != nil {
+		return err
+	}
 	ps := sh.pages.Load()
 	page := ps.pages[sh.tailPage]
 	recStart := sh.tailPage*int64(sh.pageSize) + int64(sh.tailPos)
@@ -917,7 +944,7 @@ func (sh *shard) set(key, value []byte) error {
 	// the tail's new bytes and fsync, which advances the frontier past this LSN (doc 04
 	// section 5.4). Under None and Normal the SET returns here without a per-write sync.
 	if durable && sh.durability == DurabilityFull {
-		sh.flushDurable(true)
+		return sh.flushDurable(true)
 	}
 	return nil
 }
@@ -1105,7 +1132,9 @@ func (sh *shard) delete(key []byte) error {
 	}
 	sh.supersedeOldLocked(old)
 	sh.indexDeleteLocked(thash, key)
-	sh.rollFor(rl)
+	if err := sh.rollFor(rl); err != nil {
+		return err
+	}
 	ps := sh.pages.Load()
 	page := ps.pages[sh.tailPage]
 	lsn := sh.df.nextLSN()
@@ -1116,7 +1145,7 @@ func (sh *shard) delete(key []byte) error {
 	sh.df.bytesSinceCkpt.Add(int64(n))
 	// Under Full the delete does not return until its tombstone is in a synced extent.
 	if sh.durability == DurabilityFull {
-		sh.flushDurable(true)
+		return sh.flushDurable(true)
 	}
 	return nil
 }
@@ -1315,8 +1344,10 @@ func (sh *shard) writePageRemainder(pid int64, page []byte) (int64, error) {
 // advances the frontier to the highest LSN now durable. The frontier advances only on
 // the sync, never on a bare write, so a crash can never leave the frontier ahead of
 // what reached the device (doc 04 section 4.2, the I4 monotonic watermark). It runs
-// under the shard write lock.
-func (sh *shard) flushDurable(doSync bool) {
+// under the shard write lock. It returns the write or sync error so the caller never
+// acknowledges a write whose bytes did not reach the device (D4): on an error the
+// frontier is left where it was, so what is reported durable still matches the file.
+func (sh *shard) flushDurable(doSync bool) error {
 	ps := sh.pages.Load()
 	maxLSN := sh.frontier.Load()
 	for pid := int64(0); pid <= sh.tailPage; pid++ {
@@ -1332,17 +1363,19 @@ func (sh *shard) flushDurable(doSync bool) {
 		}
 		if _, err := sh.writePageRemainder(pid, page); err != nil {
 			// A write failed: keep what is flushed and do not sync or advance, so the
-			// frontier never claims bytes that did not reach the file.
-			return
+			// frontier never claims bytes that did not reach the file. Report it so the
+			// caller does not treat the unflushed records as durable.
+			return err
 		}
 	}
 	if !doSync {
-		return
+		return nil
 	}
 	if err := sh.df.syncData(); err != nil {
-		return
+		return err
 	}
 	sh.frontier.Store(maxLSN)
+	return nil
 }
 
 func (sh *shard) get(key []byte) ([]byte, bool, error) {

@@ -166,8 +166,10 @@ func openDurableFile(path string, shardCount int, extentSize int64) (*durableFil
 }
 
 // initFresh lays down two valid generation-0 slots on a brand-new file and stands up
-// an empty allocator. Both slots are written and fsynced so a crash right after
-// creation still leaves a recoverable file.
+// an empty allocator. Both slots are written and made durable with a true device
+// barrier so a crash right after creation still leaves a recoverable file. A plain
+// Sync on macOS does not flush the drive cache, so the creation barrier goes through
+// platformSyncData like every other commit point (D7).
 func (d *durableFile) initFresh() error {
 	sb := newSuperblock(d.shardCount, d.extentSize)
 	for slot := 0; slot < 2; slot++ {
@@ -179,7 +181,7 @@ func (d *durableFile) initFresh() error {
 			return err
 		}
 	}
-	if err := d.f.Sync(); err != nil {
+	if err := platformSyncData(d.f); err != nil {
 		return err
 	}
 	d.sb = sb
@@ -278,11 +280,13 @@ func (d *durableFile) syncData() error {
 }
 
 // commit writes a new checkpoint into the older slot with a generation one higher
-// than the current durable one, then fsyncs. The fsync is the atomic commit point:
-// before it the durable state is the prior slot, after it the just-written slot wins
-// by generation (doc 03 section 3). At M0 the frontier and snapshot fields carry
-// over from the prior superblock as placeholders; the allocator state is what M0
-// actually advances.
+// than the current durable one, then issues a true device barrier. The barrier is the
+// atomic commit point: before it the durable state is the prior slot, after it the
+// just-written slot wins by generation (doc 03 section 3). The barrier goes through
+// syncData (platformSyncData), not a plain Sync that on macOS would leave the slot in
+// the drive cache and so not actually commit (D7). At M0 the frontier and snapshot
+// fields carry over from the prior superblock as placeholders; the allocator state is
+// what M0 actually advances.
 func (d *durableFile) commit() error {
 	_, free := d.alloc.counts()
 	inline, freeExt, freeLen, err := d.persistFreeList(free, true)
@@ -304,7 +308,7 @@ func (d *durableFile) commit() error {
 		freeListExtent: freeExt,
 		freeListLen:    freeLen,
 	}
-	return d.writeCheckpointSlot(nsb, d.f.Sync)
+	return d.writeCheckpointSlot(nsb, d.syncData)
 }
 
 // persistFreeList decides how the allocator's free list is recorded in the next
