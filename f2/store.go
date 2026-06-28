@@ -229,9 +229,15 @@ func newDurable(t Tunables) (*Store, error) {
 			_ = f.Close()
 			return nil, err
 		}
-	} else if err := df.writeSuperblock(); err != nil { // stamp a fresh file
-		_ = f.Close()
-		return nil, err
+	} else { // stamp a fresh file, then make its directory entry durable
+		if err := df.writeSuperblock(); err != nil {
+			_ = f.Close()
+			return nil, err
+		}
+		if err := syncDir(t.Path); err != nil {
+			_ = f.Close()
+			return nil, err
+		}
 	}
 	return s, nil
 }
@@ -278,8 +284,7 @@ func (s *Store) Set(key, value []byte) error {
 // Delete removes key. It is a no-op if the key is absent.
 func (s *Store) Delete(key []byte) error {
 	h := hash64(key)
-	s.shardFor(h).del(h, key)
-	return nil
+	return s.shardFor(h).del(h, key)
 }
 
 // Checkpoint is a durability barrier. In the memory-only core there is nothing to
@@ -293,11 +298,14 @@ func (s *Store) Checkpoint() error {
 	}
 	for _, sh := range s.shards {
 		sh.mu.Lock()
-		sh.log.flushTail()
+		err := sh.log.flushTail()
 		sh.mu.Unlock()
+		if err != nil {
+			return err
+		}
 	}
 	if s.df.dial != DurabilityNone {
-		if err := s.df.f.Sync(); err != nil {
+		if err := platformSyncData(s.df.f); err != nil {
 			return err
 		}
 	}
@@ -314,10 +322,15 @@ func (s *Store) Close() error {
 		// fully recoverable; only a crash exposes the dial's loss window.
 		for _, sh := range s.shards {
 			sh.mu.Lock()
-			sh.log.flushTail()
+			ferr := sh.log.flushTail()
 			sh.mu.Unlock()
+			if ferr != nil {
+				return ferr
+			}
 		}
-		_ = s.df.f.Sync()
+		if err := platformSyncData(s.df.f); err != nil {
+			return err
+		}
 		if err := s.df.writeSuperblock(); err != nil {
 			return err
 		}
