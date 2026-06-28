@@ -303,10 +303,11 @@ func (sh *shard) readOversizeChain(desc oversizeDescriptor) ([]byte, error) {
 		return nil, errBadOversize
 	}
 	// Bound the chain against the file before trusting extentCnt to size an allocation, so a
-	// descriptor read off a damaged record cannot drive a huge make. fileEnd is monotonic, so
-	// reading it without the grow lock only ever under-counts a concurrent growth, never the
-	// reverse, which keeps this a safe upper bound.
-	maxExtents := sh.df.fileEnd/sh.df.stride + 1
+	// descriptor read off a damaged record cannot drive a huge make. The atomic file end is read
+	// without the grow lock that a concurrent shard may hold to extend the file; it is monotonic,
+	// so a lock-free read only ever under-counts a concurrent growth, never the reverse, which
+	// keeps this a safe upper bound.
+	maxExtents := sh.df.fileEndAtomic.Load()/sh.df.stride + 1
 	if desc.headExtent+desc.extentCnt > maxExtents {
 		return nil, errBadOversize
 	}

@@ -284,6 +284,21 @@ func New(t Tunables) (*Store, error) {
 // Store must not be used afterward.
 func (s *Store) Close() error {
 	var first error
+	// A clean close must leave the whole acknowledged workload durable (doc 05 section 8):
+	// for a clean close the recovered set equals the entire live set. Under Normal the tail
+	// page is synced only at a seal or a checkpoint, so the records appended since the last
+	// of those still live only in the unsynced tail. Flush every durable shard's dirty pages
+	// and sync before the file closes, so recovery replays them. Under Full the tail is
+	// already synced and this re-sync is a cheap barrier; the memory-only profile has no df
+	// and skips it.
+	for _, sh := range s.shards {
+		if sh.df == nil {
+			continue
+		}
+		sh.mu.Lock()
+		sh.flushDurable(true)
+		sh.mu.Unlock()
+	}
 	for _, sh := range s.shards {
 		if err := sh.close(); err != nil && first == nil {
 			first = err
@@ -468,7 +483,7 @@ func (s *Store) Checkpoint() error {
 	if barrier {
 		sync = s.df.syncData
 	}
-	overflow, err := s.df.commitCheckpoint(root, uint64(len(stream)), frontiers, pending, sync)
+	overflow, err := s.df.commitCheckpoint(root, uint64(len(stream)), frontiers, pending, barrier, sync)
 	if err != nil {
 		s.pendingRetry = pending
 		return err
@@ -653,8 +668,8 @@ type shard struct {
 	inPlace       bool
 	mutableWindow int
 	file          *os.File
-	fileEnd     int64  // next free byte offset in the scratch log file (Dir mode)
-	scratch     []byte // reusable record-encode buffer, only touched under mu
+	fileEnd       int64  // next free byte offset in the scratch log file (Dir mode)
+	scratch       []byte // reusable record-encode buffer, only touched under mu
 
 	// Durable single-file mode (spec 2070, set only when a Path is configured). df is
 	// the shared file; shardID tags this shard's extents; pageExtent maps a spilled

@@ -103,6 +103,21 @@ func (s *Store) recover() error {
 		}
 	}
 
+	// The committed free-list overflow run, like the snapshot run, carries no log header
+	// and so is not seen by the extent scan. Fold it in too, bounded against the physical
+	// file, so the run holding the recovered free list is not handed back out before the
+	// next checkpoint rotates it (doc 03 section 3). A run head past the physical end means
+	// a crash dropped the file growth that the slot referenced; the run is simply absent and
+	// the reconciliation below treats those ids as never-allocated.
+	if d.freeRoot >= 0 {
+		for k := int64(0); k < d.freeCount; k++ {
+			id := d.freeRoot + k
+			if id >= 0 && id < physCount {
+				inUse[id] = struct{}{}
+			}
+		}
+	}
+
 	// Step c: per-shard, in parallel (the shards share nothing, D2). Each worker writes
 	// only its own shard and its own stats slot, plus the shared max-LSN and
 	// replayed-record atomics, so there is no cross-shard race. The allocator is
@@ -190,20 +205,28 @@ func (s *Store) recover() error {
 func (d *durableFile) scanExtents(physCount int64) (chains [][]extentRef, inUse map[int64]struct{}, err error) {
 	chains = make([][]extentRef, d.shardCount)
 	inUse = make(map[int64]struct{})
-	// Extents the committed superblock records free are not part of any live chain: a
-	// compaction retired them and a checkpoint freed them, but their on-disk log header is
-	// left stale (the retire never rewrites it). Skip them so a freed-not-yet-reused extent
-	// is not chained back in as a phantom page (M8, doc 06 section 7.3). A freed extent that
-	// was since reused carries a fresh header at its new base, so it is not in this set.
-	freeSet := make(map[int64]struct{}, len(d.sb.free))
-	for _, id := range d.sb.free {
-		freeSet[id] = struct{}{}
-	}
+	// Chain every extent whose current header decodes as a live log extent, and let the value
+	// of last-writer-wins by LSN sort out any duplicate. The committed superblock's free list is
+	// deliberately NOT used to pre-skip extents here, because it cannot tell two cases apart that
+	// share an id (doc 06 section 7.3, corrected):
+	//
+	//   - A retired phantom: a compaction retired the extent and the checkpoint freed it, leaving
+	//     a stale log header at the old base. Its records are all superseded (their live copies
+	//     were relocated before the retire), so chaining it resurrects only a fully dead page: an
+	//     equal-LSN relocation copy ties and the first replayed wins with identical bytes, a
+	//     lower-LSN record loses. The next compaction retires the page again, so the extent is
+	//     not leaked, only briefly counted in use.
+	//   - A reused extent: after the checkpoint, an append allocated this free extent for a new
+	//     page and put live post-checkpoint records in it. Those records are in no snapshot and
+	//     exist nowhere else, so the extent MUST be chained or every write since the checkpoint
+	//     is lost. A reused extent always carries a fresh header at its current base (the read
+	//     below sees the latest header), so it chains at the right page.
+	//
+	// A generation-stamp filter was tempting but is racy: an append stamps the extent with
+	// d.gen while a concurrent checkpoint advances it, so a post-checkpoint write can carry the
+	// prior generation and be skipped. Chaining everything and resolving by LSN is exact.
 	hdr := make([]byte, extentHeaderBytes)
 	for id := int64(0); id < physCount; id++ {
-		if _, ok := freeSet[id]; ok {
-			continue
-		}
 		if _, err := d.f.ReadAt(hdr, d.extentOffset(id)); err != nil {
 			return nil, nil, err
 		}
@@ -366,13 +389,21 @@ func (sh *shard) rebuild(d *durableFile, pageSize int64, chain []extentRef, sec 
 		for pos < int(pageSize) {
 			lsn, flags, key, value, n, derr := decodeDurableRecord(body[pos:])
 			if derr != nil || n == 0 {
-				// A clean page end is zero padding left when a record did not fit and the
-				// log rolled to the next page; a genuine torn tail is non-zero bytes a crash
-				// left mid-append. Only the latter is the CRC-stop the frontier names.
-				if !allZero(body[pos:]) {
+				// This page's records end here. A clean end is zero padding left when a record
+				// did not fit and the log rolled to the next page. Non-zero bytes mean one of
+				// two things: the genuine torn tail a crash left mid-append, or stale bytes a
+				// reused extent still holds past this page's records. A reused extent is a freed
+				// snapshot run handed back to the log (doc 05 section 6); growExtent only zeroes
+				// freshly grown extents, so a reused one keeps its old body past the sealed
+				// records. Either way this page is done, but only the final page can carry the
+				// genuine torn tail: records are written in strict page order and every sealed
+				// page is synced before the log rolls forward (Normal and Full) or flushed at a
+				// clean Close, so a non-final page's trailing garbage is always stale. Record the
+				// torn position only for the highest page and keep scanning the rest, otherwise a
+				// stale tail on a sealed page would drop every post-checkpoint delta record that
+				// follows it.
+				if pid == maxPid && !allZero(body[pos:]) {
 					res.tornAt = pid*pageSize + int64(pos)
-					lastPage = pid
-					pid = maxPid // stop the outer scan after this page
 				}
 				break
 			}
@@ -408,9 +439,6 @@ func (sh *shard) rebuild(d *durableFile, pageSize int64, chain []extentRef, sec 
 		pageFill[pid] = pos
 		pageFlushed[pid] = pos
 		pageMaxLSN[pid] = int64(pageMax)
-		if res.tornAt >= 0 {
-			break
-		}
 	}
 
 	// Publish the rebuilt shard state. The tail page is held resident so appends

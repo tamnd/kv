@@ -1,6 +1,7 @@
 package hashlog
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -37,6 +38,13 @@ type durableFile struct {
 	// size, advanced only forward.
 	growMu  sync.Mutex
 	fileEnd int64
+
+	// fileEndAtomic mirrors fileEnd as an atomic so the oversize read path (which bounds a
+	// descriptor's cont run against the file end while holding only a shard read lock) can read
+	// the size without taking growMu, which a concurrent shard may hold to extend the file. It
+	// is advanced in lockstep with fileEnd under growMu, so a lock-free reader sees a value at
+	// or below the true end, the safe under-count direction the bound needs (M9).
+	fileEndAtomic atomic.Int64
 
 	// syncCount counts device barriers issued, so a test can assert the dial's flush
 	// points (None issues none, Full one per SET). syncHook, when set, replaces the
@@ -76,6 +84,15 @@ type durableFile struct {
 	snapCount      int64
 	snapBytes      atomic.Int64
 	bytesSinceCkpt atomic.Int64
+
+	// freeRoot and freeCount are the currently committed free-list overflow run, the
+	// twin of snapRoot/snapCount for the allocator's free stack (doc 03 section 3). When
+	// the free list outgrows the inline slot capacity a checkpoint writes it into a
+	// contiguous extent run and records the head here; the next checkpoint rotates this
+	// run free once its replacement is durable. freeRoot is -1 when the live free list
+	// still fits inline and no run is committed.
+	freeRoot  int64
+	freeCount int64
 }
 
 // validateDurableTunables checks the durable-mode knobs (doc 03 section 10). It
@@ -170,8 +187,11 @@ func (d *durableFile) initFresh() error {
 	d.newerSlot = 0
 	d.alloc = newAllocator(0, nil)
 	d.fileEnd = d.sbSize
+	d.fileEndAtomic.Store(d.fileEnd)
 	d.snapRoot = -1
 	d.snapCount = 0
+	d.freeRoot = -1
+	d.freeCount = 0
 	return nil
 }
 
@@ -216,11 +236,24 @@ func (d *durableFile) readExisting() error {
 		d.snapCount = 0
 	}
 	d.snapBytes.Store(int64(newer.snapshotLen))
+	// Reconstruct the committed free-list overflow run the same way, so the next
+	// checkpoint rotates it free. Its extent count is the id count times 8 bytes rounded
+	// up to whole strides. The run's ids themselves are advisory: recover rebuilds the
+	// allocator from the physical scan (M5), and the open-time allocator below is seeded
+	// from the inline list (empty for an overflow file) only as a placeholder until then.
+	d.freeRoot = newer.freeListExtent
+	if newer.freeListExtent >= 0 && newer.freeListLen > 0 {
+		d.freeCount = (int64(newer.freeListLen)*8 + d.stride - 1) / d.stride
+	} else {
+		d.freeRoot = -1
+		d.freeCount = 0
+	}
 	fi, err := d.f.Stat()
 	if err != nil {
 		return err
 	}
 	d.fileEnd = fi.Size()
+	d.fileEndAtomic.Store(d.fileEnd)
 	return nil
 }
 
@@ -251,23 +284,93 @@ func (d *durableFile) syncData() error {
 // over from the prior superblock as placeholders; the allocator state is what M0
 // actually advances.
 func (d *durableFile) commit() error {
-	count, free := d.alloc.counts()
-	if len(free) > inlineFreeCapacity(d.shardCount) {
-		return fmt.Errorf("hashlog: free list of %d exceeds inline capacity %d; overflow chain is M8",
-			len(free), inlineFreeCapacity(d.shardCount))
+	_, free := d.alloc.counts()
+	inline, freeExt, freeLen, err := d.persistFreeList(free, true)
+	if err != nil {
+		return err
 	}
+	// Re-read the count after persistFreeList: an overflow run may have grown the pool.
+	count, _ := d.alloc.counts()
 	nsb := &superblock{
-		generation:   d.sb.generation + 1,
-		extentSize:   uint64(d.extentSize),
-		extentCount:  uint64(count),
-		lsnHighWater: d.lsn.Load(),
-		snapshotRoot: d.sb.snapshotRoot,
-		snapshotLen:  d.sb.snapshotLen,
-		shardCount:   uint32(d.shardCount),
-		frontiers:    d.sb.frontiers,
-		free:         free,
+		generation:     d.sb.generation + 1,
+		extentSize:     uint64(d.extentSize),
+		extentCount:    uint64(count),
+		lsnHighWater:   d.lsn.Load(),
+		snapshotRoot:   d.sb.snapshotRoot,
+		snapshotLen:    d.sb.snapshotLen,
+		shardCount:     uint32(d.shardCount),
+		frontiers:      d.sb.frontiers,
+		free:           inline,
+		freeListExtent: freeExt,
+		freeListLen:    freeLen,
 	}
 	return d.writeCheckpointSlot(nsb, d.f.Sync)
+}
+
+// persistFreeList decides how the allocator's free list is recorded in the next
+// checkpoint slot (doc 03 section 3). A list that fits the inline slot capacity rides
+// inline (freeListExtent -1); a larger one is written into a contiguous extent run and
+// only its head and id count go in the slot. It returns the inline ids (nil for the
+// overflow case), the head extent id (-1 inline), and the id count the slot records.
+// The barrier flag forwards the durability dial: under Normal and Full the overflow run
+// is synced before the slot that points at it commits, so a crash cannot leave the slot
+// referencing an unwritten run.
+func (d *durableFile) persistFreeList(free []int64, barrier bool) (inline []int64, freeExt int64, freeLen uint64, err error) {
+	if len(free) <= inlineFreeCapacity(d.shardCount) {
+		// The list fits inline now. If a prior checkpoint had spilled it to a run, that run
+		// is superseded: drop it back to the allocator. The on-disk slot we are about to
+		// write records the ids inline, and recovery rebuilds the allocator from the
+		// physical scan regardless, so freeing the run in memory here leaks nothing.
+		if d.freeRoot >= 0 {
+			d.alloc.freeRun(d.freeRoot, d.freeCount)
+			d.freeRoot = -1
+			d.freeCount = 0
+		}
+		return free, -1, uint64(len(free)), nil
+	}
+	root, err := d.writeFreeList(free, barrier)
+	if err != nil {
+		return nil, -1, 0, err
+	}
+	return nil, root, uint64(len(free)), nil
+}
+
+// writeFreeList serialises the free-id list into a freshly allocated contiguous extent
+// run and, when barrier is set, fsyncs it (the free-list twin of writeSnapshot). It then
+// rotates the previously committed run free, only after the new one is durable and never
+// reusing the old run for the new write, so a crash before the superblock commit leaves
+// the old run intact for the prior checkpoint and orphans the half-written new one for
+// recovery to reclaim. It returns the new run's head extent id.
+func (d *durableFile) writeFreeList(free []int64, barrier bool) (int64, error) {
+	stream := make([]byte, len(free)*8)
+	for i, id := range free {
+		binary.LittleEndian.PutUint64(stream[i*8:i*8+8], uint64(id))
+	}
+	n := (int64(len(stream)) + d.stride - 1) / d.stride
+	if n < 1 {
+		n = 1
+	}
+	root, _ := d.alloc.allocRun(n)
+	if err := d.growExtent(root + n - 1); err != nil {
+		d.alloc.freeRun(root, n)
+		return 0, err
+	}
+	if _, err := d.f.WriteAt(stream, d.extentOffset(root)); err != nil {
+		d.alloc.freeRun(root, n)
+		return 0, err
+	}
+	if barrier {
+		if err := d.syncData(); err != nil {
+			d.alloc.freeRun(root, n)
+			return 0, err
+		}
+	}
+	if d.freeRoot >= 0 {
+		d.alloc.freeRun(d.freeRoot, d.freeCount)
+	}
+	d.freeRoot = root
+	d.freeCount = n
+	return root, nil
 }
 
 // writeCheckpointSlot writes nsb into the older of the two superblock slots (never the
@@ -343,36 +446,35 @@ func (d *durableFile) writeSnapshot(stream []byte, barrier bool) (int64, error) 
 // so they become reusable. Freeing them in memory only after the durable record commits
 // is what excludes the dangling-pointer-on-reuse hazard: a crash before the commit
 // recovers the prior checkpoint, whose snapshot may still point into a pending extent, and
-// that extent's bytes are intact because it was never reused (doc 06 section 7.4). When
-// more pending extents arrive than the inline free list can hold, the surplus is returned
-// as overflow for the caller to retry at the next checkpoint, so a large reclamation does
-// not need the free-list overflow chain to make progress.
-func (d *durableFile) commitCheckpoint(snapRoot int64, snapLen uint64, frontiers []shardFrontier, pending []int64, sync func() error) (overflow []int64, err error) {
-	count, free := d.alloc.counts()
-	room := inlineFreeCapacity(d.shardCount) - len(free)
-	if room < 0 {
-		room = 0
+// that extent's bytes are intact because it was never reused (doc 06 section 7.4). The
+// whole free list, base plus pending, rides the inline slot when it fits and spills to the
+// free-list overflow run when it does not (doc 03 section 3), so a large reclamation
+// always lands in one checkpoint. The overflow return is retained for the caller's API but
+// is now always empty.
+func (d *durableFile) commitCheckpoint(snapRoot int64, snapLen uint64, frontiers []shardFrontier, pending []int64, barrier bool, sync func() error) (overflow []int64, err error) {
+	_, free := d.alloc.counts()
+	// The pending extents are not yet in the allocator's free stack (they are freed in
+	// memory only after the commit barrier below), so the durable free list this checkpoint
+	// records is the current free stack plus pending, the post-commit free set.
+	durFree := append(append([]int64(nil), free...), pending...)
+	inline, freeExt, freeLen, err := d.persistFreeList(durFree, barrier)
+	if err != nil {
+		return nil, err
 	}
-	fit := pending
-	if len(pending) > room {
-		fit = pending[:room]
-		overflow = append([]int64(nil), pending[room:]...)
-	}
-	durFree := append(append([]int64(nil), free...), fit...)
-	if len(durFree) > inlineFreeCapacity(d.shardCount) {
-		return nil, fmt.Errorf("hashlog: free list of %d exceeds inline capacity %d; overflow chain is M8",
-			len(durFree), inlineFreeCapacity(d.shardCount))
-	}
+	// Re-read the count after persistFreeList: an overflow run may have grown the pool.
+	count, _ := d.alloc.counts()
 	nsb := &superblock{
-		generation:   d.sb.generation + 1,
-		extentSize:   uint64(d.extentSize),
-		extentCount:  uint64(count),
-		lsnHighWater: d.lsn.Load(),
-		snapshotRoot: snapRoot,
-		snapshotLen:  snapLen,
-		shardCount:   uint32(d.shardCount),
-		frontiers:    frontiers,
-		free:         durFree,
+		generation:     d.sb.generation + 1,
+		extentSize:     uint64(d.extentSize),
+		extentCount:    uint64(count),
+		lsnHighWater:   d.lsn.Load(),
+		snapshotRoot:   snapRoot,
+		snapshotLen:    snapLen,
+		shardCount:     uint32(d.shardCount),
+		frontiers:      frontiers,
+		free:           inline,
+		freeListExtent: freeExt,
+		freeListLen:    freeLen,
 	}
 	if err := d.writeCheckpointSlot(nsb, sync); err != nil {
 		return nil, err
@@ -381,12 +483,12 @@ func (d *durableFile) commitCheckpoint(snapRoot int64, snapLen uint64, frontiers
 	// them onto the in-memory free stack. A later alloc (compaction's own copy appends, or
 	// an ordinary roll) hands them back out, which is what keeps the file bounded under
 	// churn rather than growing an extent per overwrite.
-	for _, id := range fit {
+	for _, id := range pending {
 		d.alloc.freeExtent(id)
 	}
 	d.snapBytes.Store(int64(snapLen))
 	d.bytesSinceCkpt.Store(0)
-	return overflow, nil
+	return nil, nil
 }
 
 // extentOffset returns the byte offset in the file of extent id's first byte, the start
@@ -428,6 +530,7 @@ func (d *durableFile) growExtent(id int64) error {
 		return err
 	}
 	d.fileEnd = end
+	d.fileEndAtomic.Store(end)
 	return nil
 }
 

@@ -26,9 +26,18 @@ type superblock struct {
 	// frontiers has one entry per shard. It is len shardCount.
 	frontiers []shardFrontier
 
-	// free is the allocator's free-extent-id stack, persisted inline (M0). The
-	// overflow chain for a free list too large to fit inline is M8.
+	// free is the allocator's free-extent-id stack when it is recorded inline (the slot
+	// has room, freeListExtent is -1). When the list is too large to fit inline it is
+	// written into a contiguous extent run instead and free is nil here: freeListExtent
+	// is the run's head extent id and freeListLen the id count (doc 03 section 3).
 	free []int64
+
+	// freeListExtent is -1 when the free list rides inline in this slot, or the head
+	// extent id of the run that holds it when it does not fit inline. freeListLen is the
+	// number of free ids the slot describes either way (len(free) inline, the run's id
+	// count overflow), so a reader knows the size before it reads the run.
+	freeListExtent int64
+	freeListLen    uint64
 }
 
 // shardFrontier is the per-shard durable cut a checkpoint records: the highest LSN
@@ -44,15 +53,17 @@ type shardFrontier struct {
 // extents, an empty free list, every shard's frontier zeroed, no snapshot.
 func newSuperblock(shardCount int, extentSize int64) *superblock {
 	return &superblock{
-		generation:   0,
-		extentSize:   uint64(extentSize),
-		extentCount:  0,
-		lsnHighWater: 0,
-		snapshotRoot: -1,
-		snapshotLen:  0,
-		shardCount:   uint32(shardCount),
-		frontiers:    make([]shardFrontier, shardCount),
-		free:         nil,
+		generation:     0,
+		extentSize:     uint64(extentSize),
+		extentCount:    0,
+		lsnHighWater:   0,
+		snapshotRoot:   -1,
+		snapshotLen:    0,
+		shardCount:     uint32(shardCount),
+		frontiers:      make([]shardFrontier, shardCount),
+		free:           nil,
+		freeListExtent: -1,
+		freeListLen:    0,
 	}
 }
 
@@ -68,9 +79,18 @@ func (sb *superblock) encode(slotID int) ([]byte, error) {
 	if len(sb.frontiers) != shardCount {
 		return nil, fmt.Errorf("hashlog: superblock has %d frontiers, want %d", len(sb.frontiers), shardCount)
 	}
-	if len(sb.free) > inlineFreeCapacity(shardCount) {
-		return nil, fmt.Errorf("hashlog: free list of %d does not fit inline (cap %d); overflow chain is M8",
-			len(sb.free), inlineFreeCapacity(shardCount))
+	// The free list either rides inline (freeListExtent -1) or in an extent run the caller
+	// has already written (freeListExtent the head). Inline only: bound it against the slot
+	// and record its length; overflow: there are no inline ids and freeListLen is the run's
+	// id count the caller computed.
+	inline := sb.freeListExtent < 0
+	freeLen := sb.freeListLen
+	if inline {
+		if len(sb.free) > inlineFreeCapacity(shardCount) {
+			return nil, fmt.Errorf("hashlog: free list of %d does not fit inline (cap %d)",
+				len(sb.free), inlineFreeCapacity(shardCount))
+		}
+		freeLen = uint64(len(sb.free))
 	}
 
 	slot := superblockSlotSize(shardCount)
@@ -84,8 +104,8 @@ func (sb *superblock) encode(slotID int) ([]byte, error) {
 	binary.LittleEndian.PutUint64(buf[24:32], sb.extentSize)
 	binary.LittleEndian.PutUint64(buf[32:40], sb.extentCount)
 	binary.LittleEndian.PutUint64(buf[40:48], sb.lsnHighWater)
-	binary.LittleEndian.PutUint64(buf[48:56], ^uint64(0)) // freeListExtent: -1, inline only at M0
-	binary.LittleEndian.PutUint64(buf[56:64], uint64(len(sb.free)))
+	binary.LittleEndian.PutUint64(buf[48:56], uint64(sb.freeListExtent))
+	binary.LittleEndian.PutUint64(buf[56:64], freeLen)
 	binary.LittleEndian.PutUint64(buf[64:72], uint64(sb.snapshotRoot))
 	binary.LittleEndian.PutUint64(buf[72:80], sb.snapshotLen)
 	binary.LittleEndian.PutUint32(buf[80:84], sb.shardCount)
@@ -155,10 +175,12 @@ func decodeSuperblock(buf []byte) (*superblock, error) {
 	freeListLen := binary.LittleEndian.Uint64(buf[56:64])
 	freeListExtent := int64(binary.LittleEndian.Uint64(buf[48:56]))
 
-	// The free-list overflow chain is M8; an M0 slot is always inline.
-	if freeListExtent != -1 {
+	// freeListExtent is -1 for an inline list or a non-negative head extent id for the
+	// overflow run (doc 03 section 3). Any other negative value is a malformed field.
+	if freeListExtent < -1 {
 		return nil, errBadSuperblock
 	}
+	inline := freeListExtent == -1
 
 	// Bound every variable region against the slot before allocating.
 	if frontierOff != frontierArrayOff {
@@ -171,24 +193,36 @@ func decodeSuperblock(buf []byte) (*superblock, error) {
 	if frontierEnd > slot-crcSize {
 		return nil, errBadSuperblock
 	}
-	if freeListLen > uint64(inlineFreeCapacity(shardCount)) {
-		return nil, errBadSuperblock
-	}
-	freeEnd := freeOff + int(freeListLen)*8
-	if freeEnd > slot-crcSize {
-		return nil, errBadSuperblock
+	// An inline list must fit the slot; an overflow list lives off-slot, so only its
+	// length scalar is read here and the run is read back by the durable-file open.
+	if inline {
+		if freeListLen > uint64(inlineFreeCapacity(shardCount)) {
+			return nil, errBadSuperblock
+		}
+		freeEnd := freeOff + int(freeListLen)*8
+		if freeEnd > slot-crcSize {
+			return nil, errBadSuperblock
+		}
 	}
 
 	sb := &superblock{
-		generation:   binary.LittleEndian.Uint64(buf[16:24]),
-		extentSize:   binary.LittleEndian.Uint64(buf[24:32]),
-		extentCount:  binary.LittleEndian.Uint64(buf[32:40]),
-		lsnHighWater: binary.LittleEndian.Uint64(buf[40:48]),
-		snapshotRoot: int64(binary.LittleEndian.Uint64(buf[64:72])),
-		snapshotLen:  binary.LittleEndian.Uint64(buf[72:80]),
-		shardCount:   uint32(shardCount),
-		frontiers:    make([]shardFrontier, shardCount),
-		free:         make([]int64, freeListLen),
+		generation:     binary.LittleEndian.Uint64(buf[16:24]),
+		extentSize:     binary.LittleEndian.Uint64(buf[24:32]),
+		extentCount:    binary.LittleEndian.Uint64(buf[32:40]),
+		lsnHighWater:   binary.LittleEndian.Uint64(buf[40:48]),
+		snapshotRoot:   int64(binary.LittleEndian.Uint64(buf[64:72])),
+		snapshotLen:    binary.LittleEndian.Uint64(buf[72:80]),
+		shardCount:     uint32(shardCount),
+		frontiers:      make([]shardFrontier, shardCount),
+		freeListExtent: freeListExtent,
+	}
+	// For an inline list the ids are the source of truth and freeListLen is redundant with
+	// len(free), so it stays zero in memory (encode recomputes it from free). For the
+	// overflow run there are no inline ids, so the count is the only handle on the list size.
+	if inline {
+		sb.free = make([]int64, freeListLen)
+	} else {
+		sb.freeListLen = freeListLen
 	}
 
 	off := frontierOff

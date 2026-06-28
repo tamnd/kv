@@ -3,6 +3,7 @@ package hashlog
 import (
 	"bytes"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -176,12 +177,37 @@ func TestM7CrashAfterInPlaceSynced(t *testing.T) {
 // an in-place update whose page is never synced recovers the previous durable value, with
 // no torn half-update. The key's first value is forced durable in a sealed-and-synced
 // page, then a fresh record for the key is appended and overwritten in place in the
-// unsynced tail; a reopen without a checkpoint must recover the previous durable value,
+// unsynced tail; a crash that loses that tail must recover the previous durable value,
 // because the in-place bytes never reached the device.
+//
+// The crash is modelled with a frozen file image, not a Close. A clean Close is a graceful
+// shutdown that flushes the resident tail (so M10 can assert every acknowledged write
+// survives a reopen), which would make the unsynced in-place bytes durable. To lose them the
+// way a real crash does, the test snapshots the file at its last sync barrier, which is the
+// seal that made durv durable, and recovers from that image: the unsynced tail records are
+// written into the resident page after the snapshot and so are absent from it.
 func TestM7CrashAfterInPlaceUnsynced(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "unsynced.hlog")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "unsynced.hlog")
 	tun := inPlaceTunables(path, DurabilityNormal)
 	s := mustStore(t, tun)
+
+	// Freeze a byte-for-byte image of the file at each sync barrier. The last seal during the
+	// filler loop overwrites it last, so after the loop the image holds every synced page
+	// (durv among them) and nothing from the still-resident tail.
+	var frozen []byte
+	s.df.syncHook = func(f *os.File) error {
+		fi, err := f.Stat()
+		if err != nil {
+			return err
+		}
+		buf := make([]byte, fi.Size())
+		if _, err := f.ReadAt(buf, 0); err != nil {
+			return err
+		}
+		frozen = buf
+		return platformSyncData(f)
+	}
 
 	key := []byte("k")
 	if err := s.Set(key, []byte("durv")); err != nil {
@@ -197,6 +223,13 @@ func TestM7CrashAfterInPlaceUnsynced(t *testing.T) {
 	if s.Spilled() == 0 {
 		t.Fatal("no page spilled; durv was not forced durable")
 	}
+	if frozen == nil {
+		t.Fatal("no sync barrier captured; durv was not forced durable")
+	}
+	// Stop updating the image: the unsynced in-place writes that follow must not be captured,
+	// just as a crash would not have flushed them.
+	s.df.syncHook = nil
+
 	before := s.InPlaceUpdates()
 	// A fresh record for key lands in the unsynced tail (its old record is below the
 	// read-only boundary now, so this appends), then a same-size overwrite of it goes
@@ -210,10 +243,22 @@ func TestM7CrashAfterInPlaceUnsynced(t *testing.T) {
 	if s.InPlaceUpdates() == before {
 		t.Fatal("expected the tmp2 SET to be an in-place update of the unsynced tail record")
 	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
 
-	// Reopen without a checkpoint: a crash that loses the unsynced tail. Recovery must
-	// land on the previous durable value, never a torn record.
-	s2 := reopen(t, s, tun)
+	// Recover from the frozen image: a crash that lost the unsynced tail. Recovery must land
+	// on the previous durable value, never a torn record.
+	fp := filepath.Join(dir, "unsynced-frozen.hlog")
+	if err := os.WriteFile(fp, frozen, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rt := tun
+	rt.Path = fp
+	s2, err := New(rt)
+	if err != nil {
+		t.Fatalf("recover frozen image: %v", err)
+	}
 	defer s2.Close()
 	v, ok, err := s2.Get(key)
 	if err != nil {

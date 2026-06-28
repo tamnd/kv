@@ -84,7 +84,8 @@ func freeInlineOff(shardCount int) int {
 
 // inlineFreeCapacity returns how many free extent ids fit inline in a slot, after
 // the header, the frontier array, and the trailing CRC. A free list larger than
-// this needs the overflow chain (deferred to M4).
+// this spills to the free-list overflow run (doc 03 section 3): the slot then records
+// only the run's head extent id and id count, not the ids themselves.
 func inlineFreeCapacity(shardCount int) int {
 	slot := superblockSlotSize(shardCount)
 	avail := slot - freeInlineOff(shardCount) - crcSize
