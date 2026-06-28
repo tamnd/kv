@@ -209,6 +209,67 @@ func BenchmarkCompact(b *testing.B) {
 	}
 }
 
+// BenchmarkOversize measures the SET and GET cost of a spanning value (M9, doc 03 section
+// 7): a SET writes the cont chain then the home record, a GET reads the descriptor and
+// reassembles the value from its cont extents with a CRC check. The value is large enough to
+// span several cont extents, so the number is dominated by the byte movement the chain costs,
+// not the index work. Like the rest of the durable suite the figure stays local until the M10
+// hardware gate; it travels with the code as a regression guard on the spanning path.
+func BenchmarkOversize(b *testing.B) {
+	const valueBytes = 16384
+	for _, op := range []string{"Set", "Get"} {
+		b.Run(op, func(b *testing.B) {
+			path := filepath.Join(b.TempDir(), "oversize.hlog")
+			t := Tunables{
+				Shards:                8,
+				PageSize:              4096,
+				ExtentSize:            4096,
+				ResidentPagesPerShard: 8,
+				Path:                  path,
+				Durability:            DurabilityNormal,
+			}
+			s, err := New(t)
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer s.Close()
+			v := benchValue(valueBytes)
+
+			if op == "Get" {
+				const keys = 2000
+				for i := 0; i < keys; i++ {
+					if err := s.Set(benchKey(i), v); err != nil {
+						b.Fatal(err)
+					}
+				}
+				if s.OversizeValues() == 0 {
+					b.Fatal("benchmark stored no oversize values")
+				}
+				b.ReportAllocs()
+				b.ResetTimer()
+				b.RunParallel(func(pb *testing.PB) {
+					i := 0
+					for pb.Next() {
+						if _, _, err := s.Get(benchKey(i % keys)); err != nil {
+							b.Fatal(err)
+						}
+						i++
+					}
+				})
+				return
+			}
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if err := s.Set(benchKey(i), v); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
 // BenchmarkResidentCeilingGet is the memory-only path the durable work must never
 // slow. It mirrors the resident config the head-to-head bench uses, so a drift here
 // flags that the durable branch leaked cost into the full-resident GET.

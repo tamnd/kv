@@ -103,22 +103,13 @@ func (s *Store) recover() error {
 		}
 	}
 
-	// Step b, part 2: reconcile the allocator with the physical file. Every log extent
-	// and the committed snapshot run are in use; every other physical extent is free,
-	// which reclaims any orphaned half-checkpoint extents from a crash before commit
-	// (doc 05 section 4). This replaces the slot-derived allocator the open built,
-	// because post-checkpoint log growth allocated extents the slot does not record.
-	free := make([]int64, 0)
-	for id := int64(0); id < physCount; id++ {
-		if _, ok := inUse[id]; !ok {
-			free = append(free, id)
-		}
-	}
-	d.alloc = newAllocator(physCount, free)
-
 	// Step c: per-shard, in parallel (the shards share nothing, D2). Each worker writes
 	// only its own shard and its own stats slot, plus the shared max-LSN and
-	// replayed-record atomics, so there is no cross-shard race.
+	// replayed-record atomics, so there is no cross-shard race. The allocator is
+	// reconciled after this section, not before, because a shard's live oversize cont
+	// extents are only known once its index is rebuilt, and they must be folded into the
+	// in-use set before any extent is declared free (M9, doc 03 section 7). The rebuild
+	// itself never touches the allocator, so deferring it changes nothing the workers see.
 	s.rec = recoveryStats{
 		bytesReplayed: make([]int64, s.t.Shards),
 		tornTailOff:   make([]int64, s.t.Shards),
@@ -127,6 +118,7 @@ func (s *Store) recover() error {
 	maxLSN.Store(d.sb.lsnHighWater)
 	var replayed atomic.Int64
 	errs := make([]error, s.t.Shards)
+	contByShard := make([][]int64, s.t.Shards)
 	var wg sync.WaitGroup
 	for i, sh := range s.shards {
 		wg.Add(1)
@@ -143,6 +135,7 @@ func (s *Store) recover() error {
 			}
 			s.rec.bytesReplayed[i] = r.bytes
 			s.rec.tornTailOff[i] = r.tornAt
+			contByShard[i] = r.contIds
 			replayed.Add(r.records)
 			for {
 				cur := maxLSN.Load()
@@ -159,6 +152,27 @@ func (s *Store) recover() error {
 		}
 	}
 	s.rec.replayedRecords = replayed.Load()
+
+	// Step b, part 2: reconcile the allocator with the physical file. Every log extent, the
+	// committed snapshot run, and every cont extent a live oversize value occupies are in
+	// use; every other physical extent is free, which reclaims any orphaned half-checkpoint
+	// extents and torn oversize chains from a crash before commit (doc 05 section 4, doc 03
+	// section 7). This replaces the slot-derived allocator the open built, because
+	// post-checkpoint log growth allocated extents the slot does not record.
+	for _, ids := range contByShard {
+		for _, id := range ids {
+			if id >= 0 && id < physCount {
+				inUse[id] = struct{}{}
+			}
+		}
+	}
+	free := make([]int64, 0)
+	for id := int64(0); id < physCount; id++ {
+		if _, ok := inUse[id]; !ok {
+			free = append(free, id)
+		}
+	}
+	d.alloc = newAllocator(physCount, free)
 
 	// Step d: resume the store LSN counter past the highest LSN seen, so the first
 	// post-recovery write gets an LSN strictly greater than any already on disk.
@@ -232,6 +246,12 @@ type shardRebuildResult struct {
 	records int64
 	bytes   int64
 	tornAt  int64
+	// contIds are the oversize-cont extents the shard's live values occupy (M9, doc 03
+	// section 7). A cont extent carries no log header and sits in no page directory, so the
+	// extent scan does not see it as in use; recovery collects it from each live oversize
+	// home record's descriptor and the caller folds it into the in-use set before
+	// reconciling the allocator, so a live spanning value's bytes are never handed back out.
+	contIds []int64
 }
 
 // rebuild reconstructs one shard: it builds the page directory from the shard's log
@@ -363,7 +383,16 @@ func (sh *shard) rebuild(d *durableFile, pageSize int64, chain []extentRef, sec 
 					recoverDelete(idx, key, &live)
 				} else {
 					valOff := durableValOff(key, value)
-					recoverInsertGrow(&idx, key, valLoc{addr: recStart + int64(valOff), vlen: uint32(len(value))}, &live, &occ)
+					// An oversize home record's value is its 24-byte descriptor; carry the
+					// oversize marker into the rebuilt index entry so a post-recovery read
+					// assembles the cont chain instead of slicing the descriptor (M9, doc 03
+					// section 7). A snapshot-seeded oversize key already carries the marker
+					// through the snapshot's vlen field.
+					vlen := uint32(len(value))
+					if flags&flagOversize != 0 {
+						vlen = valLocOversizeBit | oversizeDescriptorLen
+					}
+					recoverInsertGrow(&idx, key, valLoc{addr: recStart + int64(valOff), vlen: vlen}, &live, &occ)
 				}
 			}
 			if lsn > pageMax {
@@ -448,7 +477,51 @@ func (sh *shard) rebuild(d *durableFile, pageSize int64, chain []extentRef, sec 
 	if err := sh.recomputeDeadBytes(d, pageSize, npages); err != nil {
 		return res, err
 	}
+	// Collect the cont extents the live oversize values occupy (M9, doc 03 section 7). Each
+	// live oversize entry's home record carries a descriptor naming a contiguous cont run;
+	// read it back and record the run, both to fold into the allocator in-use set (so a live
+	// chain is never reused) and to seed the shard's live-cont accounting. A descriptor that
+	// fails to read or decode is skipped: it would mean a CRC-valid home record pointing at a
+	// bad descriptor, which the read path also rejects.
+	cont, contCount, err := sh.collectLiveOversize(npages)
+	if err != nil {
+		return res, err
+	}
+	sh.liveOversizeExtents = contCount
+	res.contIds = cont
 	return res, nil
+}
+
+// collectLiveOversize walks the rebuilt index for live oversize values and returns the cont
+// extents they occupy and their total count. It reads each oversize home record's descriptor
+// through the just-published page directory (resident or on disk), so it sees exactly the
+// chains the recovered store will read. It runs while recovery owns the shard exclusively,
+// so it loads the directory without the lock. A descriptor it cannot read or decode
+// contributes nothing rather than failing recovery, matching the fail-closed read path.
+func (sh *shard) collectLiveOversize(npages int64) ([]int64, int64, error) {
+	ps := sh.pages.Load()
+	var ids []int64
+	var count int64
+	t := sh.index.Load()
+	descBytes := make([]byte, oversizeDescriptorLen)
+	for i := range t.slots {
+		e := t.slots[i].Load()
+		if e == nil || e == tombstone || !e.loc.isOversize() {
+			continue
+		}
+		if err := sh.readAtLogicalLocked(ps, e.loc.addr, descBytes); err != nil {
+			continue
+		}
+		desc, derr := decodeOversizeDescriptor(descBytes)
+		if derr != nil || desc.extentCnt < 1 || desc.headExtent < 0 {
+			continue
+		}
+		for k := int64(0); k < desc.extentCnt; k++ {
+			ids = append(ids, desc.headExtent+k)
+		}
+		count += desc.extentCnt
+	}
+	return ids, count, nil
 }
 
 // recomputeDeadBytes rebuilds the per-page dead-byte tally after recovery, so the in-memory

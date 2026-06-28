@@ -204,6 +204,12 @@ type Store struct {
 	abandonedCopies     atomic.Int64
 	discardedTombstones atomic.Int64
 
+	// oversizeValues counts values stored as a cont chain rather than inline (M9, doc 03
+	// section 7). It is observability: a test or an operator can confirm the oversize path
+	// is taken for values that span an extent. It stays zero on the memory-only and
+	// full-resident profiles, which reject an over-page value rather than span it.
+	oversizeValues atomic.Int64
+
 	// pendingRetry holds extents a compaction retired but a checkpoint could not durably
 	// free this round (a commit error, or the inline free list was full, doc 06 section
 	// 7.3). The next checkpoint retries them. They stay holes in their shard's directory
@@ -348,6 +354,15 @@ func (s *Store) Spilled() int {
 // log-growth level (doc 04 section 7.3).
 func (s *Store) InPlaceUpdates() int64 {
 	return s.inPlaceUpdates.Load()
+}
+
+// OversizeValues returns how many values the store stored as a cont chain because they did
+// not fit one extent (M9, doc 03 section 7). It is zero in the memory-only and
+// full-resident profiles, which reject an over-page value. A workload with large values
+// should show it climbing, confirming the spanning path is exercised rather than the value
+// silently rejected.
+func (s *Store) OversizeValues() int64 {
+	return s.oversizeValues.Load()
 }
 
 // CompactionStats reports the compaction observability counters (M8, doc 06 section 10).
@@ -667,6 +682,15 @@ type shard struct {
 	ckptFrontier        atomic.Int64
 	compactMu           sync.Mutex
 
+	// liveOversizeExtents is how many oversize-cont extents this shard's live values
+	// currently occupy (M9, doc 03 section 7). It is maintained under the write lock: an
+	// oversize SET adds its chain length, and superseding or deleting an oversize value
+	// moves its chain to pendingFree and subtracts it. It is the conservation term for the
+	// cont extents, which are allocated but live in no page directory, so a test can prove
+	// every extent is accounted for (in a page, free, in the snapshot, a hole, or a live
+	// cont chain). It stays zero where oversize is rejected.
+	liveOversizeExtents int64
+
 	// Durable frontier state (M3, doc 04 section 4). durability is the dial; frontier
 	// is the highest LSN known to sit in a synced extent of this shard, advanced only
 	// after a real fsync. The parallel per-page arrays track, for each page, how many
@@ -809,11 +833,24 @@ func (sh *shard) set(key, value []byte) error {
 	} else {
 		rl = recordLen(key, value)
 	}
-	if rl > sh.pageSize {
+	// A value whose inline record overflows a page is oversize (M9, doc 03 section 7): in
+	// durable eviction-possible mode it is stored as a cont chain; anywhere else it is
+	// rejected. The full-resident lock-free profile aliases the page on read and cannot
+	// return a spanning value zero-copy, and the memory-only profile has no file to span
+	// into, so both reject it rather than carry the oversize branch.
+	oversize := durable && rl > sh.pageSize
+	if oversize && !sh.inPlace {
+		return errors.New("hashlog: value too large for this store profile; oversize values need a durable store with a resident page budget")
+	}
+	if !oversize && rl > sh.pageSize {
 		return errors.New("hashlog: record larger than page size")
 	}
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
+
+	if oversize {
+		return sh.setOversizeLocked(key, value)
+	}
 
 	// In-place fast case (M7, doc 04 section 7, D7): a same-size SET to a key whose record
 	// is still in the mutable tail window overwrites the value bytes and re-stamps the LSN
@@ -833,7 +870,7 @@ func (sh *shard) set(key, value []byte) error {
 	// the key and the old value length, which size the dead record with no value read.
 	if durable {
 		if old := sh.index.Load().lookupEntry(thash, key); old != nil {
-			sh.creditDeadLocked(old)
+			sh.supersedeOldLocked(old)
 		}
 	}
 	sh.rollFor(rl)
@@ -879,7 +916,10 @@ func (sh *shard) set(key, value []byte) error {
 // rather than panicking, so a stale or relocated entry never indexes out of bounds.
 func (sh *shard) creditDeadLocked(e *entry) {
 	keyLen := len(e.key)
-	valLen := int(e.loc.vlen)
+	// length() masks the oversize marker, so an oversize home record is sized by its 24-byte
+	// descriptor (its inline value), exactly the bytes it occupies in the log; the cont
+	// extents are freed separately by supersedeOldLocked, not counted as log dead space.
+	valLen := int(e.loc.length())
 	headerStart := e.loc.addr - int64(durableValOffFor(keyLen, valLen))
 	pid := headerStart / int64(sh.pageSize)
 	if pid < 0 || pid >= int64(len(sh.deadBytes)) {
@@ -1048,7 +1088,7 @@ func (sh *shard) delete(key []byte) error {
 	if old == nil {
 		return nil
 	}
-	sh.creditDeadLocked(old)
+	sh.supersedeOldLocked(old)
 	sh.indexDeleteLocked(thash, key)
 	sh.rollFor(rl)
 	ps := sh.pages.Load()
@@ -1390,6 +1430,12 @@ func (sh *shard) getLocked(key []byte) ([]byte, bool, error) {
 		return nil, false, nil
 	}
 	ps := sh.pages.Load()
+	// An oversize value's bytes span a cont chain, not one page, so assemble it from the
+	// chain (M9, doc 03 section 7). The marker is one already-loaded bit, so an inline read
+	// pays only this single branch before slicing as before.
+	if loc.isOversize() {
+		return sh.readOversizeLocked(ps, loc)
+	}
 	pid := loc.addr / int64(sh.pageSize)
 	off := int(loc.addr % int64(sh.pageSize))
 	if page := ps.pages[pid]; page != nil {

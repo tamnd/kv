@@ -168,8 +168,19 @@ func (sh *shard) relocateData(lsn uint64, flags byte, key, value []byte, oldValu
 
 	sh.mu.Lock()
 	newValueAddr, newPid, encLen := sh.appendRelocated(lsn, flags, key, value)
+	// An oversize home record carries the 24-byte descriptor as its value and the oversize
+	// marker in its index entry. Relocating it copies the home record verbatim, descriptor
+	// and all, so the moved record still points at the same in-place cont chain; the repoint
+	// must carry the marker forward or the read would slice the descriptor as an inline value
+	// (M9, doc 03 section 7). The cont extents are not moved here: a live value's chain stays
+	// put and is freed only when the value is finally overwritten or deleted, so a home-page
+	// compaction never rewrites the large value bytes.
+	newVlen := uint32(len(value))
+	if flags&flagOversize != 0 {
+		newVlen = valLocOversizeBit | oversizeDescriptorLen
+	}
 	if e := sh.index.Load().lookupEntry(thash, key); e != nil && e.loc.addr == oldValueAddr {
-		sh.indexRepointLocked(thash, key, valLoc{addr: newValueAddr, vlen: uint32(len(value))})
+		sh.indexRepointLocked(thash, key, valLoc{addr: newValueAddr, vlen: newVlen})
 		sh.store.relocatedRecords.Add(1)
 		sh.store.copiedBytes.Add(int64(encLen))
 	} else {
