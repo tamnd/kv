@@ -30,17 +30,22 @@
 //     (read-copy-update), so the bytes a reader already holds never change under
 //     it.
 //
-// This file is the memory-only, full-resident core (the in-memory ceiling). The
-// larger-than-memory spill path and the durable single-file layout build on top
-// of it in later files, behind the same Tunables hashlog uses, so an adapter can
-// open either engine through the same knobs.
+// The engine has exactly two profiles, chosen by whether Path is set:
+//
+//   - memory-only (no Path): the full-resident in-memory ceiling. Every page
+//     stays in RAM, nothing syncs, nothing is reread from disk.
+//   - single file (Path set): one file does both larger-than-memory and
+//     durability. ResidentPagesPerShard bounds how much of each shard's log stays
+//     in RAM (an evicted page is just a page already written to the file, reread
+//     by offset), and the Durability dial decides when the file is fsynced. There
+//     is no separate scratch design: the same file that holds an evicted page is
+//     the one a crash recovers from.
 package f2
 
 import (
 	"errors"
-	"fmt"
 	"os"
-	"path/filepath"
+	"sync/atomic"
 )
 
 // Durability is the per-store durability dial, the same contract hashlog uses so
@@ -75,18 +80,16 @@ type Tunables struct {
 	PageSize int
 
 	// ResidentPagesPerShard caps how many log pages each shard keeps in RAM before
-	// the oldest spills to disk. Zero means unbounded (nothing ever spills), the
-	// full-resident, fastest, RAM-bound mode. Honored by the spill path; the
-	// memory-only core treats every value as resident.
+	// the oldest is evicted (dropped from RAM, reread from its file block on
+	// demand). Zero means unbounded: nothing is evicted, the full-resident mode.
+	// Honored only with a Path; a memory-only store has nowhere to evict to and
+	// requires zero. A single-file store with a budget must keep at least the tail
+	// page resident, so a non-zero budget is at least one.
 	ResidentPagesPerShard int
 
-	// Dir is where each shard writes its spill file in the larger-than-memory,
-	// non-durable mode. Empty keeps the store memory-only.
-	Dir string
-
-	// Path selects the durable single-file mode: one file that survives a crash
-	// with no lost acknowledged write. Empty keeps the memory-only mode, the
-	// benchmarked ceiling. Mutually exclusive with Dir.
+	// Path selects the single-file mode: one file that is both the
+	// larger-than-memory backing and, at Normal or Full, the crash-recoverable
+	// store. Empty keeps the memory-only mode, the benchmarked ceiling.
 	Path string
 
 	// Durability is the durability dial. It is meaningful only when a Path is set;
@@ -103,16 +106,18 @@ type Tunables struct {
 // 1 MiB pages, no spill. This is the in-memory ceiling shape, matching hashlog's
 // default so the two engines are compared on the same geometry.
 func DefaultTunables() Tunables {
-	return Tunables{Shards: 256, PageSize: 1 << 20, ResidentPagesPerShard: 0, Dir: ""}
+	return Tunables{Shards: 256, PageSize: 1 << 20, ResidentPagesPerShard: 0}
 }
 
+// defaultCheckpointBytes is the durable-mode checkpoint interval when Tunables
+// leaves CheckpointBytes zero: a checkpoint fsyncs sealed pages and advances the
+// superblock, bounding how much a crash must replay.
+const defaultCheckpointBytes = 256 << 20
+
 var (
-	errBadTunables = errors.New("f2: invalid tunables")
-	errValueTooBig = errors.New("f2: record does not fit in a page")
-	// errDurableUnbuilt guards the modes layered on top of this core until their
-	// files land, so opening one fails loudly rather than silently running
-	// memory-only.
-	errDurableUnbuilt = errors.New("f2: durable single-file mode not built yet")
+	errBadTunables  = errors.New("f2: invalid tunables")
+	errValueTooBig  = errors.New("f2: record does not fit in a page")
+	errPageMismatch = errors.New("f2: file page size or shard count differs from tunables")
 )
 
 // Stats reports the engine's space accounting, the data a memory and scalability
@@ -124,7 +129,7 @@ type Stats struct {
 	LogBytes    int64 // bytes appended to the logs (live plus stranded)
 	DeadBytes   int64 // bytes stranded by overwrites and deletes
 	ResidentLog int64 // log bytes held in RAM (all of LogBytes in memory-only mode)
-	SpilledLog  int64 // log bytes spilled to scratch files in larger-than-memory mode
+	EvictedLog  int64 // log bytes dropped from RAM, present only in the file
 	ResidentMem int64 // total resident footprint estimate: IndexBytes + ResidentLog
 }
 
@@ -142,17 +147,20 @@ func (s Stats) BytesPerKey() float64 {
 // own write lock and the shard for a key is fixed by the key's hash.
 type Store struct {
 	shards []*shard
-	files  []*os.File // per-shard scratch files in spill mode, nil otherwise
-	dir    string     // scratch directory to remove on close, empty otherwise
+	df     *durableFile // the one shared file in single-file mode, nil in memory-only
 	mask   uint64
 	t      Tunables
+
+	ckptBytes int64        // checkpoint interval, 0 disables auto-checkpoint
+	sinceCkpt atomic.Int64 // durable bytes appended since the last checkpoint
 }
 
-// New opens a Store with the given tunables. With neither Dir nor Path set it is
-// the full-resident, memory-only core. With Dir set it is the larger-than-memory
-// mode: each shard keeps ResidentPagesPerShard pages in RAM and spills the rest
-// to a scratch file under Dir. Path selects the durable single-file mode, which a
-// later file builds.
+// New opens a Store with the given tunables. With no Path it is the
+// full-resident, memory-only core. With a Path it is the single-file mode: one
+// file that is both the larger-than-memory backing (bounded by
+// ResidentPagesPerShard) and, under a Normal or Full dial, the crash-recoverable
+// store. Opening an existing file replays it: the compact index is rebuilt from
+// the file's records, so the store comes back with every key it acknowledged.
 func New(t Tunables) (*Store, error) {
 	if t.Shards <= 0 || t.Shards&(t.Shards-1) != 0 {
 		return nil, errBadTunables
@@ -160,40 +168,70 @@ func New(t Tunables) (*Store, error) {
 	if t.PageSize <= 0 {
 		return nil, errBadTunables
 	}
-	if t.Path != "" {
-		return nil, errDurableUnbuilt
+	if t.Path == "" {
+		// Memory-only: nothing to sync and nowhere to evict to.
+		if t.Durability != DurabilityNone || t.ResidentPagesPerShard != 0 {
+			return nil, errBadTunables
+		}
+		return newMemory(t), nil
 	}
-	if t.Durability != DurabilityNone {
-		return nil, errBadTunables // nowhere to sync without a Path
+	if t.ResidentPagesPerShard != 0 && t.ResidentPagesPerShard < 1 {
+		return nil, errBadTunables
 	}
-	if t.Dir != "" && t.ResidentPagesPerShard < 1 {
-		return nil, errBadTunables // a spill mode must keep at least the tail resident
-	}
+	return newDurable(t)
+}
+
+// newMemory builds the memory-only store: no file, every page resident.
+func newMemory(t Tunables) *Store {
 	s := &Store{
 		shards: make([]*shard, t.Shards),
 		mask:   uint64(t.Shards - 1),
 		t:      t,
 	}
-	if t.Dir != "" {
-		if err := os.MkdirAll(t.Dir, 0o755); err != nil {
+	for i := range s.shards {
+		s.shards[i] = newShard(t.PageSize, nil, i, 0)
+	}
+	return s
+}
+
+// newDurable opens or creates the single file, builds the shards over it, and
+// replays an existing file into the index. A fresh file gets an initial
+// superblock so a later open always finds one.
+func newDurable(t Tunables) (*Store, error) {
+	f, err := os.OpenFile(t.Path, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	ckpt := t.CheckpointBytes
+	if ckpt == 0 {
+		ckpt = defaultCheckpointBytes
+	}
+	s := &Store{
+		shards:    make([]*shard, t.Shards),
+		mask:      uint64(t.Shards - 1),
+		t:         t,
+		ckptBytes: ckpt,
+	}
+	df := &durableFile{f: f, pageSize: int64(t.PageSize), shards: t.Shards, dial: t.Durability}
+	s.df = df
+
+	sb := readSuperblock(f)
+	if sb.valid && (sb.pageSize != df.pageSize || sb.shards != df.shards) {
+		_ = f.Close()
+		return nil, errPageMismatch
+	}
+	df.seq = sb.seq
+	for i := range s.shards {
+		s.shards[i] = newShard(t.PageSize, df, i, t.ResidentPagesPerShard)
+	}
+	if sb.valid {
+		if err := s.recover(); err != nil {
+			_ = f.Close()
 			return nil, err
 		}
-		s.dir = t.Dir
-		s.files = make([]*os.File, t.Shards)
-	}
-	for i := range s.shards {
-		var f *os.File
-		if s.files != nil {
-			path := filepath.Join(t.Dir, fmt.Sprintf("f2-shard-%05d.spill", i))
-			var err error
-			f, err = os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
-			if err != nil {
-				_ = s.Close()
-				return nil, err
-			}
-			s.files[i] = f
-		}
-		s.shards[i] = newShard(t.PageSize, f, t.ResidentPagesPerShard)
+	} else if err := df.writeSuperblock(); err != nil { // stamp a fresh file
+		_ = f.Close()
+		return nil, err
 	}
 	return s, nil
 }
@@ -210,13 +248,31 @@ func (s *Store) Get(key []byte) ([]byte, bool, error) {
 }
 
 // Set stores value under key, appending a new record and repointing the index
-// slot. value is copied into the log, so the caller may reuse its buffer.
+// slot. value is copied into the log, so the caller may reuse its buffer. In
+// durable mode the record carries a CRC and, past the checkpoint interval, the
+// write triggers a checkpoint so recovery replay stays bounded.
 func (s *Store) Set(key, value []byte) error {
-	if recordLen(key, value) > s.t.PageSize {
-		return errValueTooBig
+	var n int
+	if s.df != nil {
+		n = durableRecordLen(key, value)
+		if n > s.t.PageSize-blockHeaderSize {
+			return errValueTooBig
+		}
+	} else {
+		n = recordLen(key, value)
+		if n > s.t.PageSize {
+			return errValueTooBig
+		}
 	}
 	h := hash64(key)
-	return s.shardFor(h).set(h, key, value)
+	if err := s.shardFor(h).set(h, key, value); err != nil {
+		return err
+	}
+	if s.df != nil && s.ckptBytes > 0 && s.sinceCkpt.Add(int64(n)) >= s.ckptBytes {
+		s.sinceCkpt.Store(0)
+		return s.Checkpoint()
+	}
+	return nil
 }
 
 // Delete removes key. It is a no-op if the key is absent.
@@ -227,24 +283,50 @@ func (s *Store) Delete(key []byte) error {
 }
 
 // Checkpoint is a durability barrier. In the memory-only core there is nothing to
-// flush, so it is a no-op; the durable mode overrides the work behind it.
-func (s *Store) Checkpoint() error { return nil }
-
-// Close releases the store. In spill mode it closes and removes the per-shard
-// scratch files, which are not meant to outlive the process; the memory-only core
-// holds no OS resources and only drops its shards.
-func (s *Store) Close() error {
-	for _, f := range s.files {
-		if f != nil {
-			_ = f.Close()
-			_ = os.Remove(f.Name())
+// flush, so it is a no-op. In single-file mode it flushes every shard's tail page
+// to the file and advances the superblock to the current allocator high-water, so
+// recovery after this point replays only what follows. Under a non-None dial the
+// flush and the superblock are fsynced.
+func (s *Store) Checkpoint() error {
+	if s.df == nil {
+		return nil
+	}
+	for _, sh := range s.shards {
+		sh.mu.Lock()
+		sh.log.flushTail()
+		sh.mu.Unlock()
+	}
+	if s.df.dial != DurabilityNone {
+		if err := s.df.f.Sync(); err != nil {
+			return err
 		}
 	}
-	if s.dir != "" {
-		_ = os.Remove(s.dir) // succeeds only if now empty, which is the intent
+	return s.df.writeSuperblock()
+}
+
+// Close releases the store. In single-file mode it checkpoints first so a clean
+// shutdown loses nothing even under the None dial, then closes the file. The file
+// is the durable store and is never removed. The memory-only core holds no OS
+// resources and only drops its shards.
+func (s *Store) Close() error {
+	if s.df != nil {
+		// Flush and stamp the superblock even under None, so a clean close is always
+		// fully recoverable; only a crash exposes the dial's loss window.
+		for _, sh := range s.shards {
+			sh.mu.Lock()
+			sh.log.flushTail()
+			sh.mu.Unlock()
+		}
+		_ = s.df.f.Sync()
+		if err := s.df.writeSuperblock(); err != nil {
+			return err
+		}
+		err := s.df.f.Close()
+		s.shards = nil
+		s.df = nil
+		return err
 	}
 	s.shards = nil
-	s.files = nil
 	return nil
 }
 
@@ -259,9 +341,13 @@ func (s *Store) Stats() Stats {
 		st.IndexSlots += int64(len(t.slots))
 		st.LogBytes += int64(sh.logBytes)
 		st.DeadBytes += int64(sh.deadBytes)
-		spilled := int64(sh.log.evict) * sh.log.pageSize
-		st.SpilledLog += spilled
-		st.ResidentLog += int64(sh.logBytes) - spilled
+		evicted := int64(sh.log.evict) * sh.log.pageSize
+		resident := int64(sh.logBytes) - evicted
+		if resident < 0 {
+			resident = 0
+		}
+		st.EvictedLog += evicted
+		st.ResidentLog += resident
 		sh.mu.RUnlock()
 	}
 	st.IndexBytes = st.IndexSlots * 8

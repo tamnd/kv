@@ -1,7 +1,6 @@
 package f2
 
 import (
-	"os"
 	"sync"
 	"sync/atomic"
 )
@@ -30,8 +29,11 @@ type shard struct {
 	_ [24]byte // pad the struct toward a cache line
 }
 
-func newShard(pageSize int, spill *os.File, budget int) *shard {
-	s := &shard{log: newLog(pageSize, spill, budget)}
+// newShard builds a shard. df is nil for the memory-only core and the shared
+// durable file in single-file mode; shardID names this shard's blocks in that
+// file; budget is the resident page cap (zero unbounded).
+func newShard(pageSize int, df *durableFile, shardID, budget int) *shard {
+	s := &shard{log: newLog(pageSize, df, shardID, budget)}
 	s.index.Store(newIndex(minIndexSlots))
 	return s
 }
@@ -70,7 +72,7 @@ func (s *shard) set(h uint64, key, value []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	off, n := s.log.append(key, value)
+	off, n := s.log.append(key, value, false)
 	s.logBytes += int64(n)
 
 	idx := s.index.Load()
@@ -116,28 +118,59 @@ func (s *shard) put(idx *index, h uint64, key []byte, off int64, n int) {
 // del marks the key's slot as a tombstone if present. The record stays in the log
 // (it is reclaimed only by compaction), but the slot no longer resolves to it.
 // A tombstone is not an empty slot, so it does not break a probe chain that runs
-// through it.
+// through it. In durable mode a delete of a present key also appends a tombstone
+// record, so recovery sees the deletion and does not resurrect the key from its
+// earlier value record. An absent key logs nothing.
 func (s *shard) del(h uint64, key []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	idx := s.index.Load()
+	if !s.delLocked(s.index.Load(), h, key) {
+		return // absent: nothing to mark, nothing to log
+	}
+	if s.log.df != nil {
+		_, n := s.log.append(key, nil, true)
+		s.logBytes += int64(n)
+	}
+}
+
+// delLocked tombstones the slot for h/key in idx, returning whether the key was
+// present and live. It is the index half of del, shared with recovery replay. The
+// caller holds mu.
+func (s *shard) delLocked(idx *index, h uint64, key []byte) bool {
 	tag := tagOf(h)
 	mask := idx.mask
 	i := (h ^ (h >> 15)) & mask
 	for {
 		slot := idx.slots[i].Load()
 		if slot == 0 {
-			return // not present
+			return false // not present
 		}
 		if slot&slotTombstone == 0 && slotTag(slot) == tag && s.keyAt(slot, key) {
 			idx.slots[i].Store(slot | slotTombstone)
 			idx.live--
 			s.deadBytes += int64(s.log.recordBytes(slotAddr(slot)))
-			return
+			return true
 		}
 		i = (i + 1) & mask
 	}
+}
+
+// recoverApply replays one already-logged record into the index during recovery:
+// a value record installs or repoints the key's slot, a tombstone marks it
+// deleted. The record bytes are already in the log at off, so this only edits the
+// index, growing it first when the load factor demands. The caller holds mu (or
+// runs single-threaded during open).
+func (s *shard) recoverApply(h uint64, key []byte, off int64, n int, tombstone bool) {
+	idx := s.index.Load()
+	if idx.shouldGrow() {
+		idx = s.grow(idx)
+	}
+	if tombstone {
+		s.delLocked(idx, h, key)
+		return
+	}
+	s.put(idx, h, key, off, n)
 }
 
 // keyAt reports whether the record a slot points at carries key. The caller holds

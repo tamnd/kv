@@ -2,6 +2,7 @@ package f2
 
 import (
 	"fmt"
+	"path/filepath"
 	"testing"
 
 	"github.com/tamnd/kv/hashlog"
@@ -31,6 +32,29 @@ func fillHashlog(b *testing.B, n int) *hashlog.Store {
 	for i := 0; i < n; i++ {
 		if err := s.Set(tkey(i), tval(i)); err != nil {
 			b.Fatalf("hashlog Set: %v", err)
+		}
+	}
+	return s
+}
+
+// fillF2Durable preloads a single-file store with n keys. budget is the resident
+// page cap (0 unbounded); dial is the durability regime. It is the larger-than-
+// memory and durable read setup for benchmarks.
+func fillF2Durable(b *testing.B, n, pageSize, budget int, dial Durability) *Store {
+	b.Helper()
+	s, err := New(Tunables{
+		Shards:                256,
+		PageSize:              pageSize,
+		ResidentPagesPerShard: budget,
+		Path:                  filepath.Join(b.TempDir(), "f2.db"),
+		Durability:            dial,
+	})
+	if err != nil {
+		b.Fatalf("New: %v", err)
+	}
+	for i := 0; i < n; i++ {
+		if err := s.Set(tkey(i), tval(i)); err != nil {
+			b.Fatalf("Set: %v", err)
 		}
 	}
 	return s
@@ -97,6 +121,52 @@ func BenchmarkF2GetParallel(b *testing.B) {
 
 func BenchmarkHashlogGetParallel(b *testing.B) {
 	s := fillHashlog(b, benchKeys)
+	defer s.Close()
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			_, _, _ = s.Get(tkey(i % benchKeys))
+			i++
+		}
+	})
+}
+
+// BenchmarkF2SetDurableNone measures the single-file write path under the None
+// dial against the memory ceiling: it pays the CRC and the in-RAM page write but
+// never fsyncs, so the gap over BenchmarkF2Set is the cost of the durable record
+// format and the page header, not of disk latency.
+func BenchmarkF2SetDurableNone(b *testing.B) {
+	s := fillF2Durable(b, 0, 1<<20, 0, DurabilityNone)
+	defer s.Close()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = s.Set(tkey(i%benchKeys), tval(i))
+	}
+}
+
+// BenchmarkF2GetDurableResident reads a single-file store whose pages are all
+// resident (unbounded budget). A resident read aliases its page exactly as the
+// memory core does, so this should land on the in-memory Get ceiling: the file
+// backing costs nothing on a read that does not have to touch disk.
+func BenchmarkF2GetDurableResident(b *testing.B) {
+	s := fillF2Durable(b, benchKeys, 1<<20, 0, DurabilityNone)
+	defer s.Close()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _, _ = s.Get(tkey(i % benchKeys))
+	}
+}
+
+// BenchmarkF2GetDurableEvicted reads a larger-than-memory store with a tiny
+// resident budget, so almost every read misses RAM and preads its record from the
+// file. It is the cold read cost, the price of holding a working set far past RAM;
+// the gap over the resident read is one pread plus an owned-buffer copy.
+func BenchmarkF2GetDurableEvicted(b *testing.B) {
+	s := fillF2Durable(b, benchKeys, 4096, 4, DurabilityNone)
 	defer s.Close()
 	b.ReportAllocs()
 	b.ResetTimer()
