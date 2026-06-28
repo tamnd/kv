@@ -30,14 +30,22 @@ import (
 // without trusting any in-memory directory, which is what lets a Full crash
 // recover writes the last superblock never knew about.
 const (
-	blockHeaderSize = 16
+	// blockHeaderV1 is the original block header: magic, shard, page index, and a
+	// CRC over the first twelve bytes. A file written before generations existed
+	// carries these, and recovery still reads them, treating every such block as
+	// generation zero.
+	blockHeaderV1 = 16
+	// blockHeaderSize is the current block header: the v1 fields plus a generation,
+	// with the CRC over the first sixteen bytes. It is the size new pages reserve at
+	// the front, so records start at this offset in a freshly written page.
+	blockHeaderSize = 20
 	sbSize          = 4096
 	numSuperblocks  = 2
 	dataStart       = int64(sbSize * numSuperblocks)
 
 	sbMagic    uint32 = 0x32424446 // "FDB2"
 	bhMagic    uint32 = 0x32485046 // "FPH2"
-	durVersion uint32 = 1
+	durVersion uint32 = 2          // 2 added the per-block generation; 1 files still open
 )
 
 // durableFile owns the one file and hands out blocks. The mutex guards the block
@@ -50,43 +58,78 @@ type durableFile struct {
 	dial     Durability
 
 	mu        sync.Mutex
-	allocHigh int64 // next free data block
+	allocHigh int64   // next never-used data block
+	free      []int64 // blocks a compaction retired, available for reuse
 	seq       uint64
 }
 
 // blockOffset is the byte offset of data block b in the file.
 func (d *durableFile) blockOffset(b int64) int64 { return dataStart + b*d.pageSize }
 
-// allocBlock reserves the next data block. It is the only cross-shard write-side
-// contention point and is taken once per page, not once per record.
+// allocBlock reserves a data block, reusing one a compaction retired before
+// extending the high-water. Reuse keeps the file from growing past the live page
+// count under steady overwrite once compaction is freeing blocks. It is the only
+// cross-shard write-side contention point and is taken once per page, not once per
+// record. Popping a freed block before bumping allocHigh is the alloc-before-free
+// ordering recovery relies on: every block id below allocHigh is either live in a
+// surviving generation or sitting on the free list, never both and never lost.
 func (d *durableFile) allocBlock() int64 {
 	d.mu.Lock()
+	defer d.mu.Unlock()
+	if n := len(d.free); n > 0 {
+		b := d.free[n-1]
+		d.free = d.free[:n-1]
+		return b
+	}
 	b := d.allocHigh
 	d.allocHigh++
-	d.mu.Unlock()
 	return b
 }
 
+// freeBlock returns a block to the free list. The compactor calls it only after
+// the epoch gate has cleared, so no lock-free reader can still be holding bytes
+// from the block, which is what makes reuse safe (doc 06 section 6.2).
+func (d *durableFile) freeBlock(b int64) {
+	d.mu.Lock()
+	d.free = append(d.free, b)
+	d.mu.Unlock()
+}
+
 // writeBlockHeader stamps a page buffer's first bytes with the magic, the owning
-// shard, the page index, and a header checksum, so recovery can attribute the
-// block to a shard and reject a block that was allocated but never written.
-func writeBlockHeader(buf []byte, shardID, pageIndex int) {
+// shard, the page index, the generation, and a header checksum, so recovery can
+// attribute the block to a shard and generation and reject a block that was
+// allocated but never written. The generation is what a whole-shard compaction
+// bumps so recovery can prefer a rewritten generation over the one it replaced.
+func writeBlockHeader(buf []byte, shardID, pageIndex int, gen uint32) {
 	binary.LittleEndian.PutUint32(buf[0:], bhMagic)
 	binary.LittleEndian.PutUint32(buf[4:], uint32(shardID))
 	binary.LittleEndian.PutUint32(buf[8:], uint32(pageIndex))
-	binary.LittleEndian.PutUint32(buf[12:], crc32.Checksum(buf[0:12], crcTable))
+	binary.LittleEndian.PutUint32(buf[12:], gen)
+	binary.LittleEndian.PutUint32(buf[16:], crc32.Checksum(buf[0:16], crcTable))
 }
 
 // parseBlockHeader reads a block header back, reporting ok=false for a block that
-// is unallocated (zero), garbage, or has a bad header checksum.
-func parseBlockHeader(buf []byte) (shardID, pageIndex int, ok bool) {
-	if len(buf) < blockHeaderSize || binary.LittleEndian.Uint32(buf[0:]) != bhMagic {
-		return 0, 0, false
+// is unallocated (zero), garbage, or has a bad header checksum. It accepts both
+// the current layout (with a generation) and the original one (no generation),
+// returning the header's byte length so recovery knows where records start in the
+// block, and the generation, which is zero for an original-layout block. The
+// current layout is tried first; its CRC covers four more bytes, so a stray match
+// against an original-layout block is a 2^-32 event the fallback would catch.
+func parseBlockHeader(buf []byte) (shardID, pageIndex int, gen uint32, hdrLen int, ok bool) {
+	if len(buf) < blockHeaderV1 || binary.LittleEndian.Uint32(buf[0:]) != bhMagic {
+		return 0, 0, 0, 0, false
 	}
-	if binary.LittleEndian.Uint32(buf[12:]) != crc32.Checksum(buf[0:12], crcTable) {
-		return 0, 0, false
+	if len(buf) >= blockHeaderSize &&
+		binary.LittleEndian.Uint32(buf[16:]) == crc32.Checksum(buf[0:16], crcTable) {
+		return int(binary.LittleEndian.Uint32(buf[4:])),
+			int(binary.LittleEndian.Uint32(buf[8:])),
+			binary.LittleEndian.Uint32(buf[12:]), blockHeaderSize, true
 	}
-	return int(binary.LittleEndian.Uint32(buf[4:])), int(binary.LittleEndian.Uint32(buf[8:])), true
+	if binary.LittleEndian.Uint32(buf[12:]) == crc32.Checksum(buf[0:12], crcTable) {
+		return int(binary.LittleEndian.Uint32(buf[4:])),
+			int(binary.LittleEndian.Uint32(buf[8:])), 0, blockHeaderV1, true
+	}
+	return 0, 0, 0, 0, false
 }
 
 // writeSuperblock advances the sequence and writes the current allocator
