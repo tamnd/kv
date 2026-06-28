@@ -108,6 +108,44 @@ func BenchmarkDurableDialSet(b *testing.B) {
 	}
 }
 
+// BenchmarkCheckpoint measures one checkpoint over a populated store: capture every
+// shard's cut, encode the snapshot, write and barrier its extents, and flip the
+// superblock. It is the cost of the periodic durability artifact, amortized over the
+// CheckpointBytes of appends between checkpoints, so it is paid rarely. Reported per op
+// where one op is one full checkpoint. Numbers stay local until the M10 hardware gate.
+func BenchmarkCheckpoint(b *testing.B) {
+	path := filepath.Join(b.TempDir(), "ckpt.hlog")
+	t := Tunables{
+		Shards:                8,
+		PageSize:              4096,
+		ExtentSize:            4096,
+		ResidentPagesPerShard: 8,
+		Path:                  path,
+		Durability:            DurabilityNormal,
+	}
+	s, err := New(t)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer s.Close()
+
+	const keys = 50000
+	v := benchValue(64)
+	for i := 0; i < keys; i++ {
+		if err := s.Set(benchKey(i), v); err != nil {
+			b.Fatal(err)
+		}
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := s.Checkpoint(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // BenchmarkResidentCeilingGet is the memory-only path the durable work must never
 // slow. It mirrors the resident config the head-to-head bench uses, so a drift here
 // flags that the durable branch leaked cost into the full-resident GET.

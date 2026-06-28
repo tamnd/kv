@@ -1,6 +1,9 @@
 package hashlog
 
-import "sync"
+import (
+	"sort"
+	"sync"
+)
 
 // allocator owns the extent pool (doc 03 section 4). It hands out extents to shards
 // that are appending and to checkpoints that are writing snapshots, and it takes
@@ -47,6 +50,61 @@ func (a *allocator) alloc() (id int64, grew bool) {
 	id = a.count
 	a.count++
 	return id, true
+}
+
+// allocRun returns the first id of n contiguous extents, for a caller that wants one
+// contiguous byte region (the index snapshot, doc 05 section 4: written across a run
+// and read back as one region, no extent chain). It first looks for a run of n
+// consecutive free ids and carves it out; failing that it grows the pool by n from the
+// tail. grew reports whether the pool grew, so the caller knows it must extend the
+// file. A contiguous run keeps the snapshot a single ReadAt at recovery and a single
+// WriteAt at checkpoint.
+func (a *allocator) allocRun(n int64) (first int64, grew bool) {
+	if n <= 0 {
+		n = 1
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if int64(len(a.free)) >= n {
+		sorted := append([]int64(nil), a.free...)
+		sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+		runStart := 0
+		for i := 1; i <= len(sorted); i++ {
+			if i < len(sorted) && sorted[i] == sorted[i-1]+1 {
+				continue
+			}
+			if int64(i-runStart) >= n {
+				first = sorted[runStart]
+				drop := make(map[int64]struct{}, n)
+				for k := int64(0); k < n; k++ {
+					drop[first+k] = struct{}{}
+				}
+				kept := make([]int64, 0, len(a.free)-int(n))
+				for _, id := range a.free {
+					if _, ok := drop[id]; !ok {
+						kept = append(kept, id)
+					}
+				}
+				a.free = kept
+				return first, false
+			}
+			runStart = i
+		}
+	}
+	first = a.count
+	a.count += n
+	return first, true
+}
+
+// freeRun pushes a contiguous run of n extent ids back onto the free stack. The caller
+// guarantees the run holds no live reference (the checkpoint frees a superseded
+// snapshot's extents, which no live reader ever reads, doc 05 section 4).
+func (a *allocator) freeRun(first, count int64) {
+	a.mu.Lock()
+	for k := int64(0); k < count; k++ {
+		a.free = append(a.free, first+k)
+	}
+	a.mu.Unlock()
 }
 
 // freeExtent pushes an extent id back onto the free stack, making it eligible for a
