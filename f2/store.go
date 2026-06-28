@@ -54,6 +54,7 @@ package f2
 
 import (
 	"errors"
+	"math/bits"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -85,7 +86,11 @@ const (
 type Tunables struct {
 	// Shards is the number of independent index+log shards. Must be a power of two
 	// so the shard for a key is a mask of its hash. More shards cut write-lock
-	// contention.
+	// contention and shrink each shard's table, so a grow touches fewer slots. The
+	// selector takes the top log2(Shards) hash bits, so any power of two scales
+	// (256 is the historical default, larger counts serve billions of keys without
+	// any one shard's table approaching the read-free grow range; see the package
+	// doc on the ceiling).
 	Shards int
 
 	// PageSize is the byte size of one log page. A record must fit in a page.
@@ -183,11 +188,12 @@ func (s Stats) BytesPerKey() float64 {
 // Store is the f2 engine. It is safe for concurrent use: each shard carries its
 // own write lock and the shard for a key is fixed by the key's hash.
 type Store struct {
-	shards []*shard
-	df     *durableFile // the one shared file in single-file mode, nil in memory-only
-	ep     *epochs      // shared epoch state in durable mode, nil in memory-only
-	mask   uint64
-	t      Tunables
+	shards     []*shard
+	df         *durableFile // the one shared file in single-file mode, nil in memory-only
+	ep         *epochs      // shared epoch state in durable mode, nil in memory-only
+	mask       uint64
+	shardShift uint // right-shift that selects a shard from a key's top hash bits
+	t          Tunables
 
 	ckptBytes int64        // checkpoint interval, 0 disables auto-checkpoint
 	sinceCkpt atomic.Int64 // durable bytes appended since the last checkpoint
@@ -229,9 +235,10 @@ func New(t Tunables) (*Store, error) {
 // newMemory builds the memory-only store: no file, every page resident.
 func newMemory(t Tunables) *Store {
 	s := &Store{
-		shards: make([]*shard, t.Shards),
-		mask:   uint64(t.Shards - 1),
-		t:      t,
+		shards:     make([]*shard, t.Shards),
+		mask:       uint64(t.Shards - 1),
+		shardShift: shardShiftFor(t.Shards),
+		t:          t,
 	}
 	for i := range s.shards {
 		s.shards[i] = newShard(t.PageSize, nil, i, 0, nil)
@@ -258,10 +265,11 @@ func newDurable(t Tunables) (*Store, error) {
 		ckpt = defaultCheckpointBytes
 	}
 	s := &Store{
-		shards:    make([]*shard, t.Shards),
-		mask:      uint64(t.Shards - 1),
-		t:         t,
-		ckptBytes: ckpt,
+		shards:     make([]*shard, t.Shards),
+		mask:       uint64(t.Shards - 1),
+		shardShift: shardShiftFor(t.Shards),
+		t:          t,
+		ckptBytes:  ckpt,
 	}
 	df := &durableFile{f: f, pageSize: int64(t.PageSize), shards: t.Shards, dial: t.Durability}
 	s.df = df
@@ -320,7 +328,20 @@ func (s *Store) compactLoop(interval time.Duration) {
 	}
 }
 
-func (s *Store) shardFor(h uint64) *shard { return s.shards[(h>>shardShift)&s.mask] }
+// shardShiftFor returns the right-shift that drops a key's top log2(shards) hash
+// bits into the low position the shard mask reads. Shards is a power of two, so it
+// is 64 - log2(shards): 256 shards keep the historical shift of 56, and a larger
+// count simply consumes more of the high bits, so Shards scales past 256 instead
+// of leaving every shard above the 256th empty. The selector takes the top bits
+// while the index home reads the low bits of the hash mix, so the two stay
+// independent for any shard count whose bits do not reach down into the index's
+// range (true for any practical count: a 2^24-slot index uses the low 39 hash
+// bits, so independence holds up to 2^25 shards, far past a useful number).
+func shardShiftFor(shards int) uint {
+	return 64 - uint(bits.TrailingZeros(uint(shards)))
+}
+
+func (s *Store) shardFor(h uint64) *shard { return s.shards[(h>>s.shardShift)&s.mask] }
 
 // Get returns the value for key and whether it was found. The returned slice may
 // alias the log page, so the caller must not mutate it. In the memory-only
