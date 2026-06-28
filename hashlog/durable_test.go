@@ -150,7 +150,7 @@ func TestExtentByteOffsetAligned(t *testing.T) {
 	}
 }
 
-func TestGrowFile(t *testing.T) {
+func TestGrowExtent(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "store.hlog")
 	d, err := openDurableFile(path, 16, 1<<20)
 	if err != nil {
@@ -158,7 +158,7 @@ func TestGrowFile(t *testing.T) {
 	}
 	defer d.Close()
 	id, _ := d.alloc.alloc()
-	if err := d.growFile(id); err != nil {
+	if err := d.growExtent(id); err != nil {
 		t.Fatal(err)
 	}
 	fi, err := d.f.Stat()
@@ -168,6 +168,19 @@ func TestGrowFile(t *testing.T) {
 	want := extentByteOffset(d.sbSize, d.extentSize, id) + d.extentSize
 	if fi.Size() != want {
 		t.Fatalf("file size after grow %d, want %d", fi.Size(), want)
+	}
+	// Growing a lower extent after a higher one must not shrink the file.
+	id2, _ := d.alloc.alloc()
+	if err := d.growExtent(id2); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.growExtent(id); err != nil { // re-grow the lower id
+		t.Fatal(err)
+	}
+	fi, _ = d.f.Stat()
+	want2 := extentByteOffset(d.sbSize, d.extentSize, id2) + d.extentSize
+	if fi.Size() != want2 {
+		t.Fatalf("file shrank: size %d, want %d", fi.Size(), want2)
 	}
 }
 
