@@ -259,6 +259,93 @@ func (l *log) ensureCap(n int) *pageDir {
 	return nd
 }
 
+// packResident appends one record into a fresh generation under construction,
+// keeping every page resident and touching no disk. A compaction builds the whole
+// new log this way and then writes it out in one pass, so the shard lock is held
+// for an in-memory copy rather than a record-by-record disk write. It mirrors
+// append's no-straddle page jump and returns the record's logical address. The
+// caller holds the shard write lock and the log is single-file (df set).
+func (l *log) packResident(key, value []byte) int64 {
+	n := durableRecordLen(key, value)
+	off := l.tail
+	within := off % l.pageSize
+	if within+int64(n) > l.pageSize {
+		off += l.pageSize - within // to the next page boundary
+		off += l.hdr               // past its header
+	}
+	pi := int(off / l.pageSize)
+	for l.npages <= pi {
+		l.addPageResident()
+	}
+	page := l.dir.Load().refs[pi].Load().mem
+	w := off % l.pageSize
+	encodeDurable(page[w:], key, value, false)
+	l.tail = off + int64(n)
+	return off
+}
+
+// addPageResident appends one fresh resident page to a generation under
+// construction, allocating its file block and stamping its header but writing
+// nothing to disk and never evicting. It is the build-time counterpart of addPage,
+// which seals and may evict as it goes; here the whole generation is held resident
+// until commitGeneration writes it and evictToBudget trims it. The caller holds the
+// shard write lock.
+func (l *log) addPageResident() {
+	d := l.ensureCap(l.npages + 1)
+	buf := make([]byte, l.pageSize)
+	pi := l.npages
+	block := l.df.allocBlock()
+	l.pageBlock = append(l.pageBlock, block)
+	writeBlockHeader(buf, l.shardID, pi, l.gen)
+	d.refs[pi].Store(&pageRef{mem: buf})
+	l.npages++
+}
+
+// commitGeneration writes a freshly built generation to disk with page 0 last:
+// pages 1..m are written and fsynced first, then page 0 is written and fsynced, so
+// a durable page 0 proves every page of this generation already reached disk and is
+// the commit marker recovery keys on. Under the None dial it writes in the same
+// order but skips the fsyncs, since None makes no crash promise. The caller holds
+// the shard write lock.
+func (l *log) commitGeneration() error {
+	d := l.dir.Load()
+	for pi := 1; pi < l.npages; pi++ {
+		buf := d.refs[pi].Load().mem
+		if _, err := l.df.f.WriteAt(buf, l.df.blockOffset(l.pageBlock[pi])); err != nil {
+			return err
+		}
+	}
+	if l.npages > 1 && l.df.dial != DurabilityNone {
+		if err := platformSyncData(l.df.f); err != nil {
+			return err
+		}
+	}
+	buf0 := d.refs[0].Load().mem
+	if _, err := l.df.f.WriteAt(buf0, l.df.blockOffset(l.pageBlock[0])); err != nil {
+		return err
+	}
+	if l.df.dial != DurabilityNone {
+		return platformSyncData(l.df.f)
+	}
+	return nil
+}
+
+// evictToBudget trims a freshly committed generation down to the resident budget,
+// dropping the front pages from RAM. The pages are already on disk from
+// commitGeneration, so eviction only repoints the ref to the block offset. With no
+// budget it keeps every page resident. The caller holds the shard write lock.
+func (l *log) evictToBudget() {
+	if l.budget <= 0 {
+		return
+	}
+	d := l.dir.Load()
+	for l.npages-l.evict > l.budget {
+		fileOff := l.df.blockOffset(l.pageBlock[l.evict])
+		d.refs[l.evict].Store(&pageRef{fileOff: fileOff})
+		l.evict++
+	}
+}
+
 // read returns the key and value of the record at addr. For a resident page the
 // slices alias the page and must not be mutated; for an evicted page they are
 // owned copies. Either way no shard lock is taken.

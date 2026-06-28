@@ -45,7 +45,9 @@ package f2
 import (
 	"errors"
 	"os"
+	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // Durability is the per-store durability dial, the same contract hashlog uses so
@@ -100,6 +102,18 @@ type Tunables struct {
 	// CheckpointBytes bounds the durable record bytes appended before a checkpoint
 	// is due, capping recovery replay. Zero defaults to 256 MiB in durable mode.
 	CheckpointBytes int64
+
+	// CompactionThreshold is the dead fraction at which a shard is rewritten to
+	// reclaim its stranded bytes. Zero defaults to 0.5 (half the shard's log bytes
+	// dead). It bounds steady-state space at the cost of rewrite work; a higher
+	// value tolerates more dead space for less rewriting.
+	CompactionThreshold float64
+
+	// CompactionInterval, when positive in durable mode, runs a background loop that
+	// calls Compact at that period so the file stays bounded under churn without an
+	// operator calling it. Zero leaves compaction manual, which is the default so a
+	// benchmark is never perturbed by a background rewrite.
+	CompactionInterval time.Duration
 }
 
 // DefaultTunables returns a full-resident, memory-only configuration: 256 shards,
@@ -168,6 +182,9 @@ type Store struct {
 	ckptBytes int64        // checkpoint interval, 0 disables auto-checkpoint
 	sinceCkpt atomic.Int64 // durable bytes appended since the last checkpoint
 	closed    atomic.Bool  // set once by Close, makes later calls return errClosed
+
+	bgStop chan struct{}  // closed by Close to stop the background compactor
+	bgWG   sync.WaitGroup // waits for the background compactor to exit
 }
 
 // New opens a Store with the given tunables. With no Path it is the
@@ -264,7 +281,33 @@ func newDurable(t Tunables) (*Store, error) {
 			return nil, err
 		}
 	}
+	if t.CompactionInterval > 0 {
+		s.bgStop = make(chan struct{})
+		s.bgWG.Add(1)
+		go s.compactLoop(t.CompactionInterval)
+	}
 	return s, nil
+}
+
+// compactLoop runs Compact every interval until Close stops it, keeping the file
+// bounded under churn. A Compact error is dropped rather than crashing the store: a
+// background reclaim that fails (a transient write error) leaves the store correct,
+// just not yet reclaimed, and the next tick retries.
+func (s *Store) compactLoop(interval time.Duration) {
+	defer s.bgWG.Done()
+	tk := time.NewTicker(interval)
+	defer tk.Stop()
+	for {
+		select {
+		case <-s.bgStop:
+			return
+		case <-tk.C:
+			if s.closed.Load() {
+				return
+			}
+			_ = s.Compact()
+		}
+	}
 }
 
 func (s *Store) shardFor(h uint64) *shard { return s.shards[(h>>shardShift)&s.mask] }
@@ -389,6 +432,12 @@ func (s *Store) Checkpoint() error {
 func (s *Store) Close() error {
 	if s.closed.Swap(true) {
 		return nil // idempotent: a second Close is a no-op, not a double free
+	}
+	// Stop the background compactor and wait for it to exit before touching the
+	// file, so a final Compact never races the close that follows.
+	if s.bgStop != nil {
+		close(s.bgStop)
+		s.bgWG.Wait()
 	}
 	if s.df != nil {
 		// Flush and stamp the superblock even under None, so a clean close is always
