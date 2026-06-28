@@ -77,21 +77,22 @@ func (s *shard) getGuarded(h uint64, key []byte, stripe uint64) ([]byte, bool, e
 	return v, ok, err
 }
 
-// lookup loads the current index without a lock, probes by tag, and for each tag
-// match reads the candidate record from the log and compares the full key. A hit
-// returns a slice aliasing the log page, which is immutable in the full-resident
-// profile, so no copy and no lock are needed.
+// lookup loads the current index without a lock, probes by fingerprint, and for
+// each fingerprint match reads the candidate record from the log and compares the
+// full key. A hit returns a slice aliasing the log page, which is immutable in the
+// full-resident profile, so no copy and no lock are needed.
 func (s *shard) lookup(h uint64, key []byte) ([]byte, bool, error) {
 	idx := s.index.Load()
-	tag := tagOf(h)
+	mix := mixOf(h)
+	fp := fpOf(mix)
 	mask := idx.mask
-	i := (h ^ (h >> 15)) & mask // spread the home slot away from the shard bits
+	i := mix & mask
 	for {
 		slot := idx.slots[i].Load()
 		if slot == 0 {
 			return nil, false, nil // empty slot ends the probe chain
 		}
-		if slot&slotTombstone == 0 && slotTag(slot) == tag {
+		if slot&slotTombstone == 0 && slotFP(slot) == fp {
 			off := slotAddr(slot)
 			rkey, rval := idx.log.read(off)
 			if bytesEqual(rkey, key) {
@@ -154,32 +155,48 @@ func (s *shard) set(h uint64, key, value []byte) error {
 // put installs the address for h/key into idx, either claiming a fresh slot for a
 // new key or repointing the slot an existing key already holds. The caller holds
 // mu. It runs after any needed grow, so a free slot is guaranteed.
+//
+// A fingerprint match on a live slot is confirmed against the key before the slot
+// is repointed. A fingerprint match on a tombstone is only a candidate home, not a
+// confirmed one: the key may still hold a live slot further down the chain (it was
+// placed past this slot while this slot was occupied by another key, which was then
+// deleted). So the probe remembers the first tombstone but keeps going, reusing it
+// only on reaching an empty slot. Stopping at the tombstone would leave the live
+// slot behind as a duplicate, and a later delete of the new slot would resurrect
+// the old value from it.
 func (s *shard) put(idx *index, h uint64, key []byte, off int64, n int) {
-	tag := tagOf(h)
+	mix := mixOf(h)
+	fp := fpOf(mix)
 	mask := idx.mask
-	i := (h ^ (h >> 15)) & mask
+	i := mix & mask
+	firstTomb := -1
 	for {
 		slot := idx.slots[i].Load()
 		if slot == 0 {
-			idx.slots[i].Store(makeSlot(tag, off))
+			if firstTomb >= 0 {
+				idx.slots[firstTomb].Store(makeSlot(fp, off))
+				idx.live++ // a tombstone slot coming back to life; used already counts it
+				return
+			}
+			idx.slots[i].Store(makeSlot(fp, off))
 			idx.live++
 			idx.used++
 			return
 		}
-		// A tombstone slot or a tag+key match is the same key's old home: reuse it.
-		if slotTag(slot) == tag {
+		if slotFP(slot) == fp {
 			if slot&slotTombstone != 0 {
-				idx.slots[i].Store(makeSlot(tag, off))
-				idx.live++ // a tombstone slot coming back to life
-				return
-			}
-			// Read the old record once: it both confirms the key and gives the
-			// stranded-byte count, so an overwrite touches the log a single time.
-			rkey, rval := s.log.read(slotAddr(slot))
-			if bytesEqual(rkey, key) {
-				idx.slots[i].Store(makeSlot(tag, off))
-				s.deadBytes += int64(s.log.recordLenKV(rkey, rval))
-				return
+				if firstTomb < 0 {
+					firstTomb = int(i)
+				}
+			} else {
+				// Read the old record once: it both confirms the key and gives the
+				// stranded-byte count, so an overwrite touches the log a single time.
+				rkey, rval := s.log.read(slotAddr(slot))
+				if bytesEqual(rkey, key) {
+					idx.slots[i].Store(makeSlot(fp, off))
+					s.deadBytes += int64(s.log.recordLenKV(rkey, rval))
+					return
+				}
 			}
 		}
 		i = (i + 1) & mask
@@ -213,15 +230,16 @@ func (s *shard) del(h uint64, key []byte) error {
 // present and live. It is the index half of del, shared with recovery replay. The
 // caller holds mu.
 func (s *shard) delLocked(idx *index, h uint64, key []byte) bool {
-	tag := tagOf(h)
+	mix := mixOf(h)
+	fp := fpOf(mix)
 	mask := idx.mask
-	i := (h ^ (h >> 15)) & mask
+	i := mix & mask
 	for {
 		slot := idx.slots[i].Load()
 		if slot == 0 {
 			return false // not present
 		}
-		if slot&slotTombstone == 0 && slotTag(slot) == tag {
+		if slot&slotTombstone == 0 && slotFP(slot) == fp {
 			// One read confirms the key and sizes its stranded bytes.
 			rkey, rval := s.log.read(slotAddr(slot))
 			if bytesEqual(rkey, key) {
@@ -257,19 +275,30 @@ func (s *shard) recoverApply(h uint64, key []byte, off int64, n int, tombstone b
 // store, so a concurrent reader either finishes against the old table (still
 // valid, it is not mutated during the replay) or sees the complete new one. The
 // caller holds mu.
+//
+// The replay needs no log read. The slot's fingerprint is the low bits of the home
+// hash, so for any table no wider than 2^slotFPBits slots the new home position is
+// fingerprint & mask, taken straight from the slot. On a budgeted shard this turns
+// what was a pread per live key under the write lock, a rehash latency cliff, into
+// pure arithmetic. Past 2^slotFPBits slots the fingerprint no longer spans the mask
+// and the replay falls back to rehashing the key from the log; that is beyond the
+// documented per-shard key ceiling and effectively unreached in a supported store.
 func (s *shard) grow(old *index) *index {
 	ni := newIndex(len(old.slots) * 2)
 	ni.log = old.log // a grow moves the slots, never the log they point into
+	readFree := ni.mask <= slotFPValueMask
 	for i := range old.slots {
 		slot := old.slots[i].Load()
 		if slot == 0 || slot&slotTombstone != 0 {
 			continue
 		}
-		// Recover the home slot from the record's key hash, since the tag alone is
-		// not enough to recompute the home position in the larger table.
-		rkey, _ := s.log.read(slotAddr(slot))
-		h := hash64(rkey)
-		j := (h ^ (h >> 15)) & ni.mask
+		var j uint64
+		if readFree {
+			j = slotFP(slot) & ni.mask
+		} else {
+			rkey, _ := s.log.read(slotAddr(slot))
+			j = mixOf(hash64(rkey)) & ni.mask
+		}
 		for ni.slots[j].Load() != 0 {
 			j = (j + 1) & ni.mask
 		}

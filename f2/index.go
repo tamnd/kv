@@ -8,21 +8,31 @@ import "sync/atomic"
 //
 //	bit  63      tombstone: the key was deleted, the slot still occupies its
 //	            probe chain but resolves to nothing
-//	bits 48..62 15-bit tag: a cheap hash fingerprint that lets a reader reject
-//	            the overwhelming majority of non-matching slots without touching
-//	            the log at all
-//	bits 0..47  log address plus one: the byte offset of the record in the
-//	            shard's log, biased by one so an all-zero word reads as empty
+//	bits 39..62 24-bit fingerprint: the low bits of the key's home hash. It lets a
+//	            reader reject the overwhelming majority of non-matching slots
+//	            without touching the log, and because it is the home hash's own low
+//	            bits it also lets a grow recompute an entry's new home position from
+//	            the slot alone, with no log read (see shard.grow).
+//	bits 0..38  log address plus one: the byte offset of the record in the shard's
+//	            log, biased by one so an all-zero word reads as an empty slot.
 //
-// A 48-bit address covers 256 TiB of log per shard, far past any resident store.
-// The tag plus the key-verify-from-log is what lets the key bytes leave RAM: a
-// reader matches the tag, then confirms the full key against the record, so a
-// rare tag collision costs one extra log read, never a wrong answer.
+// A 39-bit address covers 512 GiB of log per shard per generation, which a store
+// with compaction keeps bounded; an append past it returns errLogFull rather than
+// truncating an address. The fingerprint plus the key-verify-from-log is what lets
+// the key bytes leave RAM: a reader matches the fingerprint, then confirms the full
+// key against the record, so a rare fingerprint collision costs one extra log read,
+// never a wrong answer.
 const (
 	slotTombstone uint64 = 1 << 63
-	slotTagShift         = 48
-	slotTagMask   uint64 = 0x7fff << slotTagShift
-	slotAddrMask  uint64 = (1 << slotTagShift) - 1
+
+	// slotFPBits is the fingerprint width and slotFPShift its position, which is
+	// also the address width below it. The fingerprint is the low slotFPBits of the
+	// home hash, so for any table no wider than 2^slotFPBits slots the home position
+	// is fingerprint & mask: a grow reads it straight from the slot.
+	slotFPBits             = 24
+	slotFPShift            = 39
+	slotFPValueMask uint64 = (1 << slotFPBits) - 1
+	slotAddrMask    uint64 = (1 << slotFPShift) - 1
 
 	// minIndexSlots is the smallest table a shard starts with, a power of two. A
 	// store with thousands of shards keeps this modest so an empty store stays
@@ -35,16 +45,21 @@ const (
 	loadDen = 10
 )
 
-// tagOf extracts the 15-bit fingerprint from a key's hash. It takes middle bits,
-// clear of the high byte the shard selector uses and the low bits the home slot
-// uses, so the tag is statistically independent of both.
-func tagOf(h uint64) uint64 { return (h >> 24) & 0x7fff }
+// mixOf folds a key hash into the value that places its home slot. Both the home
+// position (mix & mask) and the stored fingerprint (its low bits) derive from this
+// one value, which is why a grow can relocate an entry from the fingerprint without
+// rehashing the key. The fold spreads the home away from the high bits the shard
+// selector uses.
+func mixOf(h uint64) uint64 { return h ^ (h >> 15) }
 
-func makeSlot(tag uint64, off int64) uint64 {
-	return (tag << slotTagShift) | (uint64(off+1) & slotAddrMask)
+// fpOf is the fingerprint stored in a slot: the low slotFPBits of the mix.
+func fpOf(mix uint64) uint64 { return mix & slotFPValueMask }
+
+func makeSlot(fp uint64, off int64) uint64 {
+	return (fp << slotFPShift) | (uint64(off+1) & slotAddrMask)
 }
 
-func slotTag(slot uint64) uint64 { return (slot >> slotTagShift) & 0x7fff }
+func slotFP(slot uint64) uint64  { return (slot >> slotFPShift) & slotFPValueMask }
 func slotAddr(slot uint64) int64 { return int64(slot&slotAddrMask) - 1 }
 
 // index is one shard's open-addressing table. slots is read lock-free with atomic
