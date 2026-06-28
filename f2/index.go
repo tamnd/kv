@@ -39,9 +39,15 @@ const (
 	// cheap; it doubles on demand.
 	minIndexSlots = 1024
 
-	// loadNum/loadDen is the 0.7 grow threshold as a fraction, kept in integer
-	// math to avoid a float compare on the write path.
-	loadNum = 7
+	// loadNum/loadDen is the grow threshold as a fraction, kept in integer math to
+	// avoid a float compare on the write path. It is 0.8: the index never evicts, so
+	// resident RAM is bound by slot count, and a higher fill packs more keys into the
+	// same slots. 0.8 trades a longer probe chain (cheaper than it sounds, since the
+	// 24-bit fingerprint rejects a non-matching slot without a log read) for about an
+	// eighth less index RAM than 0.7 across a doubling cycle, the cheap interim RAM
+	// cut before a future evictable index. Above ~0.85 linear-probe chains lengthen
+	// faster than the RAM saved, so this is the practical ceiling.
+	loadNum = 8
 	loadDen = 10
 )
 
