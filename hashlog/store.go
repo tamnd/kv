@@ -39,7 +39,12 @@
 //   - SET appends a new record to the tail page under the shard write lock and
 //     publishes the index slot with one atomic store. When the tail page fills it is
 //     sealed and a fresh page begins; when the resident budget is exceeded the oldest
-//     page spills.
+//     page spills. In the durable eviction-possible profile a same-size SET to a key
+//     whose record is still in the mutable tail window overwrites the value in place and
+//     re-stamps the record LSN instead of appending, so a hot same-size key does not
+//     grow the log (FASTER's overwrite win); the full-resident lock-free profile always
+//     appends, because its reader aliases the page and an in-place overwrite would mutate
+//     bytes under it.
 //
 // This is the read path Valkey has (one probe to the value) without giving up the
 // larger-than-memory property the tree cores gave kv: only the resident page
@@ -125,6 +130,15 @@ type Tunables struct {
 	// checkpoint when the threshold is crossed is a later milestone, so at M4 a
 	// checkpoint is taken by calling Checkpoint.
 	CheckpointBytes int64
+
+	// MutableWindowPages is how many trailing log pages stay mutable (eligible for an
+	// in-place same-size overwrite) in the durable eviction-possible profile (doc 04
+	// section 1.3, the ReadOnlyAddress boundary). A record older than this window has
+	// begun flushing and must be updated by append, never in place (doc 04 section 7.2).
+	// Zero defaults to 1, the conservative window of the tail page alone. A larger window
+	// admits more in-place updates at the cost of a larger volatile region a crash can
+	// lose under the looser dials. It is meaningful only in durable mode.
+	MutableWindowPages int
 }
 
 // DefaultTunables returns a full-resident, memory-only configuration: 256 shards,
@@ -158,6 +172,13 @@ type Store struct {
 	globalEpoch atomic.Uint64
 	slots       *slotPool
 	nextStripe  atomic.Uint64
+
+	// inPlaceUpdates counts SETs resolved by an in-place same-size overwrite instead of
+	// an append (M7, doc 04 section 7). It is observability: a test or an operator can
+	// confirm a hot same-size workload is taking the in-place path that keeps the log
+	// from growing, rather than silently falling through to append. It stays zero in the
+	// memory-only and full-resident profiles, which never overwrite in place.
+	inPlaceUpdates atomic.Int64
 }
 
 // New builds a Store. It returns an error if the tunables are invalid, when a Dir is
@@ -287,6 +308,15 @@ func (s *Store) Spilled() int {
 		sh.mu.RUnlock()
 	}
 	return n
+}
+
+// InPlaceUpdates returns how many SETs the store resolved by a same-size in-place
+// overwrite instead of an append (M7, doc 04 section 7). It is zero in the memory-only
+// and full-resident profiles, which always append. A hot same-size workload should show
+// it climbing while the log stays small, which is the FASTER overwrite win at the
+// log-growth level (doc 04 section 7.3).
+func (s *Store) InPlaceUpdates() int64 {
+	return s.inPlaceUpdates.Load()
 }
 
 // CheckpointStats reports the checkpoint observability counters (doc 08 section 1.4):
@@ -439,14 +469,25 @@ func newIdxTable(min int) *idxTable {
 // lookup probes for key and returns its location. It does atomic loads only, so it
 // is safe to call without any lock concurrently with a writer publishing slots.
 func (t *idxTable) lookup(thash uint64, key []byte) (valLoc, bool) {
+	if e := t.lookupEntry(thash, key); e != nil {
+		return e.loc, true
+	}
+	return valLoc{}, false
+}
+
+// lookupEntry probes for key and returns its published *entry, or nil if absent. It
+// does atomic loads only, so it is safe without any lock concurrently with a writer. The
+// in-place fast path (tryInPlace) uses it to read the current location and value length
+// under the shard write lock before deciding whether a same-size overwrite qualifies.
+func (t *idxTable) lookupEntry(thash uint64, key []byte) *entry {
 	i := thash & t.mask
 	for {
 		e := t.slots[i].Load()
 		if e == nil {
-			return valLoc{}, false
+			return nil
 		}
 		if e != tombstone && e.thash == thash && bytes.Equal(e.key, key) {
-			return e.loc, true
+			return e
 		}
 		i = (i + 1) & t.mask
 	}
@@ -502,7 +543,12 @@ type shard struct {
 	pageSize    int
 	residentCap int // ResidentPagesPerShard; 0 means unbounded
 	evicts      bool
-	file        *os.File
+	// inPlace gates the durable same-size in-place overwrite (M7, doc 04 section 7); it
+	// is true only on the durable eviction-possible profile. mutableWindow is how many
+	// trailing pages stay in-place-eligible, the ReadOnlyAddress lag (doc 04 section 1.3).
+	inPlace       bool
+	mutableWindow int
+	file          *os.File
 	fileEnd     int64  // next free byte offset in the scratch log file (Dir mode)
 	scratch     []byte // reusable record-encode buffer, only touched under mu
 
@@ -542,13 +588,18 @@ type shard struct {
 }
 
 func newShard(t Tunables, df *durableFile, shardID int) (*shard, error) {
+	mutableWindow := t.MutableWindowPages
+	if mutableWindow <= 0 {
+		mutableWindow = 1
+	}
 	sh := &shard{
-		pageSize:    t.PageSize,
-		residentCap: t.ResidentPagesPerShard,
-		scratch:     make([]byte, 0, 256),
-		df:          df,
-		shardID:     shardID,
-		durability:  t.Durability,
+		pageSize:      t.PageSize,
+		residentCap:   t.ResidentPagesPerShard,
+		scratch:       make([]byte, 0, 256),
+		df:            df,
+		shardID:       shardID,
+		durability:    t.Durability,
+		mutableWindow: mutableWindow,
 	}
 	sh.index.Store(newIdxTable(1024))
 	// Page 0 starts resident and empty.
@@ -566,6 +617,12 @@ func newShard(t Tunables, df *durableFile, shardID int) (*shard, error) {
 		sh.file = f
 	}
 	sh.evicts = sh.residentCap > 0 && (sh.file != nil || df != nil)
+	// In-place same-size update is enabled only on the durable eviction-possible profile
+	// (doc 04 section 7.3): the reader there copies the value out (under the epoch guard),
+	// so an in-place overwrite never mutates bytes a reader still aliases. The full-resident
+	// lock-free profile (evicts false) aliases the page on read and always appends, and the
+	// Dir scratch profile (df nil) is not a recovery journal so re-stamping an LSN is moot.
+	sh.inPlace = sh.evicts && df != nil
 	return sh, nil
 }
 
@@ -645,6 +702,17 @@ func (sh *shard) set(key, value []byte) error {
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
 
+	// In-place fast case (M7, doc 04 section 7, D7): a same-size SET to a key whose record
+	// is still in the mutable tail window overwrites the value bytes and re-stamps the LSN
+	// instead of appending, so a hot same-size key does not grow the log. It is gated to the
+	// durable eviction-possible profile (sh.inPlace), where the reader copies the value out
+	// rather than aliasing the page. A miss (absent key, different size, or a record that has
+	// fallen out of the mutable window) falls through to the append path unchanged.
+	if sh.inPlace && sh.tryInPlace(key, value) {
+		sh.store.inPlaceUpdates.Add(1)
+		return nil
+	}
+
 	sh.rollFor(rl)
 	ps := sh.pages.Load()
 	page := ps.pages[sh.tailPage]
@@ -677,6 +745,61 @@ func (sh *shard) set(key, value []byte) error {
 		sh.flushDurable(true)
 	}
 	return nil
+}
+
+// readOnlyAddress is the lowest logical address still eligible for an in-place update
+// (doc 04 section 1.3, FASTER's ReadOnlyAddress). It is the start of the oldest page in
+// the mutable window: the tail page and the mutableWindow-1 pages behind it. A record at
+// or above it is purely resident and not yet flushing, so an in-place overwrite cannot
+// race a flush or diverge from a durable copy (doc 04 section 7.2). It is a pure function
+// of the tail page and the window, computed under the shard write lock, no stored state.
+func (sh *shard) readOnlyAddress() int64 {
+	lo := sh.tailPage - int64(sh.mutableWindow-1)
+	if lo < 0 {
+		lo = 0
+	}
+	return lo * int64(sh.pageSize)
+}
+
+// tryInPlace attempts the same-size in-place overwrite of key's current record and
+// reports whether it took it (doc 04 section 7.1, the decision procedure). It runs under
+// the shard write lock. It overwrites only when the key is present, the new value is
+// exactly the current size, the record is in the mutable window (at or above
+// readOnlyAddress), and the record's bytes are not already flushed to disk (so the Full
+// dial, which syncs the tail per write, naturally never qualifies, doc 04 section 7.2).
+// On a hit it re-encodes the record in place with a fresh LSN (which rewrites the value
+// and the CRC over the same byte span, since the key and value size are unchanged) and
+// advances the page's max LSN. The index entry already points at this value's location,
+// which an in-place overwrite leaves unchanged, so there is nothing to republish: the read
+// path serializes against this write with the shard read lock (doc 04 section 7.3), so the
+// write lock's release publishes the rewritten bytes to a reader's acquiring read lock.
+func (sh *shard) tryInPlace(key, value []byte) bool {
+	thash := tableHash(key)
+	e := sh.index.Load().lookupEntry(thash, key)
+	if e == nil || int(e.loc.vlen) != len(value) {
+		return false
+	}
+	headerStart := e.loc.addr - int64(durableValOff(key, value))
+	if headerStart < sh.readOnlyAddress() {
+		return false
+	}
+	pid := headerStart / int64(sh.pageSize)
+	off := int(headerStart % int64(sh.pageSize))
+	if off < sh.pageFlushed[pid] {
+		// The record's bytes are already on disk; overwriting them in place would be the
+		// forbidden in-place durable mutation (doc 04 section 7.2). Append instead.
+		return false
+	}
+	page := sh.pages.Load().pages[pid]
+	if page == nil {
+		return false
+	}
+	lsn := sh.df.nextLSN()
+	encodeDurableRecord(page[off:], lsn, key, value, 0)
+	if int64(lsn) > sh.pageMaxLSN[pid] {
+		sh.pageMaxLSN[pid] = int64(lsn)
+	}
+	return true
 }
 
 // indexPut publishes a key/location into the index, growing the table first when it
@@ -1052,13 +1175,25 @@ func (sh *shard) get(key []byte) ([]byte, bool, error) {
 // offset cannot be recycled; M8 adds the post-ReadAt index re-check when compaction can
 // free the extent under a resolved offset (doc 07 section 10.1).
 func (sh *shard) getGuarded(key []byte, stripe uint64) ([]byte, bool, error) {
+	if sh.inPlace {
+		// In-place profile: a same-size overwrite rewrites live value bytes under the write
+		// lock, so a lock-free read of those bytes is a genuine data race, not just a formal
+		// one (doc 04 section 7.3). Take the shard read lock for the read, the formally clean
+		// alternative the spec sanctions: it excludes the in-place writer and the evictor
+		// (both hold the write lock), so the bytes are stable for the copy and no page buffer
+		// can be reclaimed underneath, which is why this path needs no epoch guard. A
+		// lock-free in-place read (a record seqlock) is the M10 optimization; correctness
+		// comes first here. Off this profile the read stays the M6 lock-free epoch path below.
+		return sh.getLocked(key)
+	}
 	thash := tableHash(key)
 	g := sh.store.slots.enter(&sh.store.globalEpoch, stripe)
-	loc, ok := sh.index.Load().lookup(thash, key)
-	if !ok {
+	e := sh.index.Load().lookupEntry(thash, key)
+	if e == nil {
 		g.leave()
 		return nil, false, nil
 	}
+	loc := e.loc
 	ps := sh.pages.Load()
 	pid := loc.addr / int64(sh.pageSize)
 	off := int(loc.addr % int64(sh.pageSize))
@@ -1078,6 +1213,44 @@ func (sh *shard) getGuarded(key []byte, stripe uint64) ([]byte, bool, error) {
 		f = sh.df.f
 	}
 	g.leave()
+	if f == nil {
+		return nil, false, errors.New("hashlog: address neither resident nor on disk")
+	}
+	val := make([]byte, loc.vlen)
+	nr, err := f.ReadAt(val, dOff+int64(off))
+	if err != nil && nr == 0 {
+		return nil, false, err
+	}
+	return val[:nr], true, nil
+}
+
+// getLocked reads a key under the shard read lock, the in-place-profile read path. The
+// read lock holds off the single writer (which mutates value bytes in place and rolls or
+// evicts pages only under the write lock), so the resident copy is race free and any page
+// it touches stays resident for the copy. The spilled branch reads from disk while still
+// holding the read lock; the writer is briefly excluded, which is acceptable on this cold
+// path and keeps the directory snapshot and the file offset consistent.
+func (sh *shard) getLocked(key []byte) ([]byte, bool, error) {
+	thash := tableHash(key)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+	loc, ok := sh.index.Load().lookup(thash, key)
+	if !ok {
+		return nil, false, nil
+	}
+	ps := sh.pages.Load()
+	pid := loc.addr / int64(sh.pageSize)
+	off := int(loc.addr % int64(sh.pageSize))
+	if page := ps.pages[pid]; page != nil {
+		val := make([]byte, loc.vlen)
+		copy(val, page[off:off+int(loc.vlen)])
+		return val, true, nil
+	}
+	dOff := ps.diskOff[pid]
+	f := sh.file
+	if sh.df != nil {
+		f = sh.df.f
+	}
 	if f == nil {
 		return nil, false, errors.New("hashlog: address neither resident nor on disk")
 	}
