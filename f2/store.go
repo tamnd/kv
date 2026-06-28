@@ -161,6 +161,7 @@ func (s Stats) BytesPerKey() float64 {
 type Store struct {
 	shards []*shard
 	df     *durableFile // the one shared file in single-file mode, nil in memory-only
+	ep     *epochs      // shared epoch state in durable mode, nil in memory-only
 	mask   uint64
 	t      Tunables
 
@@ -206,7 +207,7 @@ func newMemory(t Tunables) *Store {
 		t:      t,
 	}
 	for i := range s.shards {
-		s.shards[i] = newShard(t.PageSize, nil, i, 0)
+		s.shards[i] = newShard(t.PageSize, nil, i, 0, nil)
 	}
 	return s
 }
@@ -237,6 +238,7 @@ func newDurable(t Tunables) (*Store, error) {
 	}
 	df := &durableFile{f: f, pageSize: int64(t.PageSize), shards: t.Shards, dial: t.Durability}
 	s.df = df
+	s.ep = newEpochs()
 
 	sb := readSuperblock(f)
 	if sb.valid && (sb.pageSize != df.pageSize || sb.shards != df.shards) {
@@ -245,7 +247,7 @@ func newDurable(t Tunables) (*Store, error) {
 	}
 	df.seq = sb.seq
 	for i := range s.shards {
-		s.shards[i] = newShard(t.PageSize, df, i, t.ResidentPagesPerShard)
+		s.shards[i] = newShard(t.PageSize, df, i, t.ResidentPagesPerShard, s.ep)
 	}
 	if sb.valid {
 		if err := s.recover(); err != nil {

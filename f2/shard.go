@@ -22,6 +22,17 @@ type shard struct {
 	index atomic.Pointer[index]
 	log   *log
 
+	// ep is the shared epoch state, set in durable mode and nil in memory-only. A
+	// lock-free reader enters an epoch through it so a later compaction never reuses
+	// a file block out from under the read; a memory-only shard frees nothing and
+	// leaves it nil, keeping the hot path free of the guard.
+	ep *epochs
+
+	// deferred holds file blocks a compaction retired, each waiting behind the safe
+	// epoch before it returns to the allocator. Guarded by mu. Empty until the
+	// compactor (a later increment) populates it.
+	deferred []deferredFree
+
 	// logBytes and deadBytes are write-side accounting, read under mu by Stats.
 	logBytes  int64
 	deadBytes int64
@@ -31,18 +42,44 @@ type shard struct {
 
 // newShard builds a shard. df is nil for the memory-only core and the shared
 // durable file in single-file mode; shardID names this shard's blocks in that
-// file; budget is the resident page cap (zero unbounded).
-func newShard(pageSize int, df *durableFile, shardID, budget int) *shard {
-	s := &shard{log: newLog(pageSize, df, shardID, budget)}
+// file; budget is the resident page cap (zero unbounded); ep is the shared epoch
+// state in durable mode, nil in memory-only.
+func newShard(pageSize int, df *durableFile, shardID, budget int, ep *epochs) *shard {
+	s := &shard{log: newLog(pageSize, df, shardID, budget), ep: ep}
 	s.index.Store(newIndex(minIndexSlots))
 	return s
 }
 
-// get is the lock-free read path. It loads the current index without a lock,
-// probes by tag, and for each tag match reads the candidate record from the log
-// and compares the full key. A hit returns a slice aliasing the log page, which
-// is immutable in the full-resident profile, so no copy and no lock are needed.
+// get is the lock-free read path. In memory-only mode it probes directly; in
+// durable mode it pins an epoch first so a concurrent compaction never reuses a
+// file block while this read is resolving an address or preading it. The bare
+// path draws a fresh stripe per call; a hot durable read loop should hold a
+// Reader, which caches one.
 func (s *shard) get(h uint64, key []byte) ([]byte, bool, error) {
+	if s.ep == nil {
+		return s.lookup(h, key)
+	}
+	return s.getGuarded(h, key, s.ep.nextStripe.Add(1))
+}
+
+// getGuarded pins the epoch on the given stripe for the duration of the lookup,
+// then leaves. The guard must span the directory load and any pread inside lookup:
+// an evicted read returns an owned copy made while the guard was held, and a
+// resident read returns a slice into page RAM the garbage collector keeps alive,
+// so leaving once lookup returns is safe in both cases. The guard's job is only to
+// keep a file block from being reused while lookup was computing or reading it.
+func (s *shard) getGuarded(h uint64, key []byte, stripe uint64) ([]byte, bool, error) {
+	g := s.ep.slots.enter(&s.ep.global, stripe)
+	v, ok, err := s.lookup(h, key)
+	g.leave()
+	return v, ok, err
+}
+
+// lookup loads the current index without a lock, probes by tag, and for each tag
+// match reads the candidate record from the log and compares the full key. A hit
+// returns a slice aliasing the log page, which is immutable in the full-resident
+// profile, so no copy and no lock are needed.
+func (s *shard) lookup(h uint64, key []byte) ([]byte, bool, error) {
 	idx := s.index.Load()
 	tag := tagOf(h)
 	mask := idx.mask
