@@ -410,8 +410,7 @@ func (sh *shard) rebuild(d *durableFile, pageSize int64, chain []extentRef, sec 
 		}
 	}
 
-	sh.pages.Store(&pageSet{pages: pages})
-	sh.diskOff = diskOff
+	sh.pages.Store(&pageSet{pages: pages, diskOff: diskOff})
 	sh.pageExtent = pageExtent
 	sh.pageFill = pageFill
 	sh.pageFlushed = pageFlushed
