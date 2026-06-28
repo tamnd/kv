@@ -67,6 +67,47 @@ func BenchmarkDurableSpillGet(b *testing.B) {
 	})
 }
 
+// BenchmarkDurableDialSet measures the SET cost at each durability dial so the price
+// of the barrier is visible: None pays nothing, Normal pays a barrier per seal, Full
+// pays a true device flush before every SET returns. The gap between them is the dial
+// doing its job, not a regression. Numbers stay local until the M10 hardware gate.
+func BenchmarkDurableDialSet(b *testing.B) {
+	dials := []struct {
+		name string
+		d    Durability
+	}{
+		{"None", DurabilityNone},
+		{"Normal", DurabilityNormal},
+		{"Full", DurabilityFull},
+	}
+	v := benchValue(64)
+	for _, dl := range dials {
+		b.Run(dl.name, func(b *testing.B) {
+			path := filepath.Join(b.TempDir(), "dial.hlog")
+			t := Tunables{
+				Shards:                8,
+				PageSize:              4096,
+				ExtentSize:            4096,
+				ResidentPagesPerShard: 8,
+				Path:                  path,
+				Durability:            dl.d,
+			}
+			s, err := New(t)
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer s.Close()
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if err := s.Set(benchKey(i), v); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
 // BenchmarkResidentCeilingGet is the memory-only path the durable work must never
 // slow. It mirrors the resident config the head-to-head bench uses, so a drift here
 // flags that the durable branch leaked cost into the full-resident GET.
