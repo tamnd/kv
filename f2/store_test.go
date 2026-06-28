@@ -278,9 +278,9 @@ func TestScaleMemory(t *testing.T) {
 	if st.Keys != n {
 		t.Fatalf("Keys = %d, want %d", st.Keys, n)
 	}
-	// At a 0.7 load factor the table is between 0.35 and 0.7 full, so 8 bytes per
-	// slot is between ~11.4 and ~22.9 bytes per key. Anything above 24 means the
-	// index is not the flat-8-bytes-per-slot structure it claims to be.
+	// At the 0.8 load factor the table is between 0.4 and 0.8 full, so 8 bytes per
+	// slot is between 10 and 20 bytes per key. Anything above 24 means the index is
+	// not the flat-8-bytes-per-slot structure it claims to be.
 	bpk := st.BytesPerKey()
 	if bpk < 8 || bpk > 24 {
 		t.Fatalf("index bytes per key = %.1f, want within [8,24]", bpk)

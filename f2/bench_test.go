@@ -138,6 +138,36 @@ func BenchmarkF2GrowEvicted(b *testing.B) {
 	}
 }
 
+// BenchmarkF2GetNearBoundary measures the load-factor tradeoff at the key count
+// where it bites hardest. A single shard is filled to 800,000 keys: that sits above
+// 0.7 of a 2^20-slot table but below 0.8 of it, so a 0.7 store has already doubled
+// to 2^21 slots (about half full, short probes, ~21 bytes/key) while a 0.8 store
+// holds the smaller table (about three-quarters full, longer probes, ~10 bytes/key).
+// Running it on the old and new load factor shows both sides at once: the index RAM
+// roughly halves at this count, and the read pays only the extra fingerprint-rejected
+// probes, never an extra log read. The reported bytes/key metric is the RAM side.
+func BenchmarkF2GetNearBoundary(b *testing.B) {
+	const keys = 800_000
+	s, err := New(Tunables{Shards: 1, PageSize: 1 << 20})
+	if err != nil {
+		b.Fatalf("New: %v", err)
+	}
+	defer s.Close()
+	for i := 0; i < keys; i++ {
+		if err := s.Set(tkey(i), tval(i)); err != nil {
+			b.Fatalf("Set: %v", err)
+		}
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _, _ = s.Get(tkey(i % keys))
+	}
+	// After ResetTimer, which clears user metrics: report the RAM side of the
+	// tradeoff alongside the read latency.
+	b.ReportMetric(s.Stats().BytesPerKey(), "index-bytes/key")
+}
+
 func BenchmarkF2Get(b *testing.B) {
 	s := fillF2(b, benchKeys)
 	defer s.Close()

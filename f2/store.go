@@ -7,14 +7,24 @@
 // hashlog stores a full index entry per live key (the key bytes, a 64-bit hash,
 // and a value location), so a billion 16-byte keys cost tens of gigabytes of RAM
 // in the index alone before a single value is held. f2 follows FASTER and stores
-// only an eight-byte atomic word per slot: a 15-bit tag and a 48-bit logical
-// offset into the shard's log. The key itself is not resident; a lookup probes
-// by tag, reads the candidate record from the log, and verifies the full key
-// there. The record is self-describing (it already carries its key for recovery
-// and compaction), so the verify costs nothing the read was not already paying.
-// At a 0.7 load factor that is about 11 bytes of index per key regardless of key
-// length, roughly a sixth of hashlog's cost on realistic keys, which is the
-// difference between a billion keys fitting in ~11 GiB and not fitting at all.
+// only an eight-byte atomic word per slot: a 24-bit fingerprint and a 39-bit
+// logical offset into the shard's log. The key itself is not resident; a lookup
+// probes by fingerprint, reads the candidate record from the log, and verifies
+// the full key there. The record is self-describing (it already carries its key
+// for recovery and compaction), so the verify costs nothing the read was not
+// already paying. At the 0.8 load factor that is roughly 10 to 13 bytes of index
+// per key regardless of key length (8 bytes per slot, the spread is where a
+// shard's table sits in its doubling cycle), roughly a sixth of hashlog's cost on
+// realistic keys: the difference between a billion keys fitting in around 15 GiB
+// and not fitting at all.
+//
+// The index never evicts, so resident RAM scales with the live key count, and
+// that is what sets the practical ceiling: about a billion keys is the supported
+// target (~15 GiB of index), and the default 256 shards hold roughly 11.7M keys
+// each before a shard's table passes the 2^24-slot read-free grow range. A store
+// aiming past a billion keys should raise Shards so no single shard approaches
+// that range; ten billion keys is reachable on a large host (~150 GiB of index)
+// but is past the routinely exercised envelope.
 //
 // The model, per shard, mirrors hashlog so the two are a fair comparison:
 //
