@@ -38,6 +38,7 @@ type log struct {
 
 	df        *durableFile // the one shared file in single-file mode, nil in memory-only
 	shardID   int
+	gen       uint32  // generation stamped into new page headers, bumped by compaction
 	pageBlock []int64 // page index to file block, single-file mode only
 	budget    int     // resident page budget, 0 means unbounded
 	evict     int     // index of the next page to evict, the front of the window
@@ -151,7 +152,7 @@ func (l *log) addPage() error {
 	if l.df != nil {
 		block := l.df.allocBlock()
 		l.pageBlock = append(l.pageBlock, block)
-		writeBlockHeader(buf, l.shardID, pi)
+		writeBlockHeader(buf, l.shardID, pi, l.gen)
 		if l.df.dial == DurabilityFull {
 			// The header must reach disk before any record acknowledged from this
 			// page, so a Full crash never leaves a record in an unheadered block.
