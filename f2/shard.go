@@ -46,7 +46,9 @@ type shard struct {
 // state in durable mode, nil in memory-only.
 func newShard(pageSize int, df *durableFile, shardID, budget int, ep *epochs) *shard {
 	s := &shard{log: newLog(pageSize, df, shardID, budget), ep: ep}
-	s.index.Store(newIndex(minIndexSlots))
+	idx := newIndex(minIndexSlots)
+	idx.log = s.log
+	s.index.Store(idx)
 	return s
 }
 
@@ -91,7 +93,7 @@ func (s *shard) lookup(h uint64, key []byte) ([]byte, bool, error) {
 		}
 		if slot&slotTombstone == 0 && slotTag(slot) == tag {
 			off := slotAddr(slot)
-			rkey, rval := s.log.read(off)
+			rkey, rval := idx.log.read(off)
 			if bytesEqual(rkey, key) {
 				return rval, true, nil
 			}
@@ -115,7 +117,7 @@ func (s *shard) scan(fn func(key, value []byte) bool) bool {
 		if slot == 0 || slot&slotTombstone != 0 {
 			continue
 		}
-		key, val := s.log.read(slotAddr(slot))
+		key, val := idx.log.read(slotAddr(slot))
 		if key == nil {
 			continue // a torn or unreadable record, skip rather than report garbage
 		}
@@ -257,6 +259,7 @@ func (s *shard) recoverApply(h uint64, key []byte, off int64, n int, tombstone b
 // caller holds mu.
 func (s *shard) grow(old *index) *index {
 	ni := newIndex(len(old.slots) * 2)
+	ni.log = old.log // a grow moves the slots, never the log they point into
 	for i := range old.slots {
 		slot := old.slots[i].Load()
 		if slot == 0 || slot&slotTombstone != 0 {

@@ -52,11 +52,20 @@ func slotAddr(slot uint64) int64 { return int64(slot&slotAddrMask) - 1 }
 // used counts every occupied slot including tombstones and drives the grow
 // decision, because a chain clogged with tombstones probes as slowly as a full
 // one; live counts only resolvable keys and feeds Stats.
+//
+// log is the log this table's addresses point into. It is immutable once the
+// table is published and is what makes a compaction's swap atomic for a lock-free
+// reader: a reader loads the index pointer once and resolves addresses through
+// that same index's log, so it sees a whole generation (this table and its log)
+// or the next one, never a new table reading an old log. A grow keeps the log
+// (only the slots move); a compaction publishes a new table whose log is the
+// freshly rewritten generation.
 type index struct {
 	slots []atomic.Uint64
 	mask  uint64
 	live  int
 	used  int
+	log   *log
 }
 
 func newIndex(n int) *index {
