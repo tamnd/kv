@@ -5,11 +5,6 @@ import (
 	"sync/atomic"
 )
 
-// shardShift selects the bits of a hash used to pick a shard. We take the high
-// byte so the shard choice is independent of the low bits the index uses to pick
-// a slot, which keeps both distributions clean.
-const shardShift = 56
-
 // A shard owns one index and one log. Reads take no lock; writes take mu. The
 // index is published behind an atomic pointer so a reader always sees a complete
 // table even while a writer is swapping in a larger one during a grow.

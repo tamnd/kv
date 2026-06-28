@@ -218,7 +218,7 @@ func TestHashDistribution(t *testing.T) {
 	for i := 0; i < keys; i++ {
 		h := hash64(tkey(i))
 		low[h&255]++
-		high[(h>>shardShift)&255]++
+		high[(h>>shardShiftFor(256))&255]++
 	}
 	mean := float64(keys) / 256
 	check := func(name string, c []int) {
@@ -230,6 +230,51 @@ func TestHashDistribution(t *testing.T) {
 	}
 	check("low", low)
 	check("high", high)
+}
+
+// TestShardsAbove256Distribute guards the widened shard selector. The selector
+// once took a single hash byte, so any store with more than 256 shards left every
+// shard past the 256th empty: the keys all piled into the first 256. With the
+// selector scaled to log2(Shards) bits, a store with 1024 shards must spread keys
+// across all 1024, none empty and none wildly hot.
+func TestShardsAbove256Distribute(t *testing.T) {
+	const shards = 1024
+	s, err := New(Tunables{Shards: shards, PageSize: 1 << 16})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer s.Close()
+
+	const keys = shards * 256 // 256 keys per shard on average
+	for i := 0; i < keys; i++ {
+		if err := s.Set(tkey(i), tval(i)); err != nil {
+			t.Fatalf("Set %d: %v", i, err)
+		}
+	}
+
+	mean := float64(keys) / shards
+	min, max := 1<<62, 0
+	empties := 0
+	for i := range s.shards {
+		n := s.shards[i].index.Load().live
+		if n == 0 {
+			empties++
+		}
+		if n < min {
+			min = n
+		}
+		if n > max {
+			max = n
+		}
+	}
+	if empties != 0 {
+		t.Fatalf("%d of %d shards hold no keys: selector is not using the wide range", empties, shards)
+	}
+	// A uniform hash over 256 keys per shard stays well inside a factor of two; a
+	// looser band than the distribution test because the per-shard count is smaller.
+	if float64(min) < mean*0.5 || float64(max) > mean*1.5 {
+		t.Fatalf("shard load min=%d max=%d mean=%.0f: keys cluster", min, max, mean)
+	}
 }
 
 // TestRecordTooBig pins the page-fit contract: a record larger than a page is

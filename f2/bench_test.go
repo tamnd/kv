@@ -3,6 +3,7 @@ package f2
 import (
 	"fmt"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 
 	"github.com/tamnd/kv/hashlog"
@@ -166,6 +167,37 @@ func BenchmarkF2GetNearBoundary(b *testing.B) {
 	// After ResetTimer, which clears user metrics: report the RAM side of the
 	// tradeoff alongside the read latency.
 	b.ReportMetric(s.Stats().BytesPerKey(), "index-bytes/key")
+}
+
+// BenchmarkF2SetParallelShards measures concurrent write throughput as the shard
+// count rises. Each goroutine writes a disjoint key range so writes spread across
+// shards, and more shards mean two goroutines collide on the same shard write lock
+// less often. It also exercises counts past 256, which the old single-byte selector
+// could not use at all. The win flattens once shards comfortably exceed the core
+// count, which is the point: 256 already suffices on a 10-core host, and the value
+// of the wider selector is at the billions-of-keys end (smaller per-shard tables,
+// cheaper grows), not extra contention headroom here.
+func BenchmarkF2SetParallelShards(b *testing.B) {
+	for _, shards := range []int{64, 256, 1024, 4096} {
+		b.Run(fmt.Sprintf("shards=%d", shards), func(b *testing.B) {
+			s, err := New(Tunables{Shards: shards, PageSize: 1 << 16})
+			if err != nil {
+				b.Fatalf("New: %v", err)
+			}
+			defer s.Close()
+			var g atomic.Int64
+			b.ReportAllocs()
+			b.ResetTimer()
+			b.RunParallel(func(pb *testing.PB) {
+				base := int(g.Add(1)) << 32 // a disjoint key range per goroutine
+				i := 0
+				for pb.Next() {
+					_ = s.Set(tkey(base+i), tval(i))
+					i++
+				}
+			})
+		})
+	}
 }
 
 func BenchmarkF2Get(b *testing.B) {

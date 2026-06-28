@@ -1,11 +1,12 @@
 package f2
 
 // hash64 maps a key to a 64-bit hash whose bits are well mixed in every region,
-// because three different parts of the store slice different bit ranges out of
-// it: the high byte picks the shard, middle bits form the index tag, and low bits
-// pick the home slot. A weak hash that left any of those regions correlated would
-// cluster one of the three. This is FNV-1a for the byte mixing followed by a
-// splitmix64 finalizer that avalanches every input bit across the whole word.
+// because two different parts of the store slice different bit ranges out of it:
+// the top log2(Shards) bits pick the shard, and the low bits of the hash mix pick
+// the index home slot and its fingerprint. A weak hash that left those regions
+// correlated would cluster one of the two. This is FNV-1a for the byte mixing
+// followed by a splitmix64 finalizer that avalanches every input bit across the
+// whole word, so even the top bits are sound as a shard selector at any count.
 func hash64(b []byte) uint64 {
 	const (
 		offset = 1469598103934665603
