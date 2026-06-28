@@ -139,6 +139,15 @@ type Tunables struct {
 	// admits more in-place updates at the cost of a larger volatile region a crash can
 	// lose under the looser dials. It is meaningful only in durable mode.
 	MutableWindowPages int
+
+	// CompactionThreshold is the dead-byte fraction at which a sealed extent becomes
+	// eligible for compaction (doc 06 section 4.2). At the default 0.5 the compactor
+	// copies one live byte for every byte it frees (write amplification about 1.0, total
+	// store about 2x), the balanced point between copy cost and space overhead. A higher
+	// value compacts more lazily (less copying, more dead space carried); a lower value
+	// compacts more eagerly (more copying, tighter file). Zero or out of (0,1] defaults
+	// to 0.5. It is meaningful only in durable mode.
+	CompactionThreshold float64
 }
 
 // DefaultTunables returns a full-resident, memory-only configuration: 256 shards,
@@ -179,6 +188,28 @@ type Store struct {
 	// from growing, rather than silently falling through to append. It stays zero in the
 	// memory-only and full-resident profiles, which never overwrite in place.
 	inPlaceUpdates atomic.Int64
+
+	// Compaction observability (M8, doc 06 section 10, doc 08 section 1). compactedExtents
+	// counts extents retired by a compaction pass; freedExtents counts those returned to
+	// the allocator once the checkpoint that captured their repoint committed;
+	// relocatedRecords and copiedBytes count the live records (and their source bytes)
+	// copied forward; abandonedCopies counts copies a racing overwrite stranded (the
+	// compare-and-publish abandoned them, doc 06 section 5.4); discardedTombstones counts
+	// tombstones the compactor dropped under the section 3.4 rule. All stay zero on the
+	// memory-only and full-resident profiles, which never compact.
+	compactedExtents    atomic.Int64
+	freedExtents        atomic.Int64
+	relocatedRecords    atomic.Int64
+	copiedBytes         atomic.Int64
+	abandonedCopies     atomic.Int64
+	discardedTombstones atomic.Int64
+
+	// pendingRetry holds extents a compaction retired but a checkpoint could not durably
+	// free this round (a commit error, or the inline free list was full, doc 06 section
+	// 7.3). The next checkpoint retries them. They stay holes in their shard's directory
+	// until freed, so they are not leaked and not reused early. Touched only by
+	// Checkpoint, which is not called concurrently with itself.
+	pendingRetry []int64
 }
 
 // New builds a Store. It returns an error if the tunables are invalid, when a Dir is
@@ -319,6 +350,33 @@ func (s *Store) InPlaceUpdates() int64 {
 	return s.inPlaceUpdates.Load()
 }
 
+// CompactionStats reports the compaction observability counters (M8, doc 06 section 10).
+// CompactedExtents is how many extents compaction retired; FreedExtents how many of those
+// a checkpoint returned to the allocator; RelocatedRecords and CopiedBytes the live
+// records (and their source bytes) copied forward; AbandonedCopies the copies a racing
+// overwrite stranded (the compare-and-publish abandoned them); DiscardedTombstones the
+// tombstones dropped under the discard rule. It is the zero value for a memory-only store.
+type CompactionStats struct {
+	CompactedExtents    int64
+	FreedExtents        int64
+	RelocatedRecords    int64
+	CopiedBytes         int64
+	AbandonedCopies     int64
+	DiscardedTombstones int64
+}
+
+// CompactionStats returns the current compaction counters.
+func (s *Store) CompactionStats() CompactionStats {
+	return CompactionStats{
+		CompactedExtents:    s.compactedExtents.Load(),
+		FreedExtents:        s.freedExtents.Load(),
+		RelocatedRecords:    s.relocatedRecords.Load(),
+		CopiedBytes:         s.copiedBytes.Load(),
+		AbandonedCopies:     s.abandonedCopies.Load(),
+		DiscardedTombstones: s.discardedTombstones.Load(),
+	}
+}
+
 // CheckpointStats reports the checkpoint observability counters (doc 08 section 1.4):
 // the committed checkpoint generation, the last snapshot's byte size, and the durable
 // bytes appended since that checkpoint (which drives the cadence). It is the zero value
@@ -373,20 +431,43 @@ func (s *Store) Checkpoint() error {
 	}
 	sections := make([]snapSection, len(s.shards))
 	frontiers := make([]shardFrontier, len(s.shards))
+	// Extents compaction retired and a prior checkpoint could not yet durably free are
+	// retried first, ahead of this round's freshly retired ones (doc 06 section 7.3).
+	pending := s.pendingRetry
+	s.pendingRetry = nil
 	for i, sh := range s.shards {
-		sections[i], frontiers[i] = sh.captureCut()
+		var pf []int64
+		sections[i], frontiers[i], pf = sh.captureCut()
+		pending = append(pending, pf...)
 	}
 	barrier := s.t.Durability != DurabilityNone
 	stream := encodeSnapshot(len(s.shards), s.df.sb.generation+1, sections)
 	root, err := s.df.writeSnapshot(stream, barrier)
 	if err != nil {
+		// The commit was not attempted; keep the retired extents pending so a later
+		// checkpoint frees them. They remain holes in their directories, not leaked.
+		s.pendingRetry = pending
 		return err
 	}
 	sync := s.df.f.Sync
 	if barrier {
 		sync = s.df.syncData
 	}
-	return s.df.commitCheckpoint(root, uint64(len(stream)), frontiers, sync)
+	overflow, err := s.df.commitCheckpoint(root, uint64(len(stream)), frontiers, pending, sync)
+	if err != nil {
+		s.pendingRetry = pending
+		return err
+	}
+	// The checkpoint committed: record each shard's durable frontier as the lower bound a
+	// tombstone discard checks against (doc 06 section 3.4), count the extents this
+	// checkpoint freed to the allocator, and carry forward any the inline free list could
+	// not hold for the next checkpoint to retry.
+	for i, sh := range s.shards {
+		sh.ckptFrontier.Store(int64(frontiers[i].frontierLSN))
+	}
+	s.freedExtents.Add(int64(len(pending) - len(overflow)))
+	s.pendingRetry = overflow
+	return nil
 }
 
 // captureCut takes shard sh's consistent cut for a checkpoint (doc 05 section 3): it
@@ -400,7 +481,7 @@ func (s *Store) Checkpoint() error {
 // barriered, matching the dial's no-per-write-sync contract while still leaving a clean
 // reopen recoverable. The copy form gives an exact as-of-F_shard view with no post-cut
 // bleed.
-func (sh *shard) captureCut() (snapSection, shardFrontier) {
+func (sh *shard) captureCut() (snapSection, shardFrontier, []int64) {
 	sh.mu.Lock()
 	if sh.df != nil {
 		sh.flushDurable(sh.durability != DurabilityNone)
@@ -420,8 +501,16 @@ func (sh *shard) captureCut() (snapSection, shardFrontier) {
 		tailOff:     uint64(sh.pageFill[sh.tailPage]),
 	}
 	sec := snapSection{shard: sh.shardID, frontierLSN: fr.frontierLSN, tuples: tuples}
+	// Gather the extents compaction retired since the last checkpoint under the same cut
+	// lock that captured the snapshot above (M8, doc 06 section 7.3). Both reflect the same
+	// moment: every retired extent has had its records repointed off in the index this
+	// snapshot records, so the checkpoint that durably frees these extents is the same one
+	// that captured the index moving off them, the interlock that excludes the
+	// dangling-pointer case (doc 06 section 7.2).
+	pending := sh.pendingFree
+	sh.pendingFree = nil
 	sh.mu.Unlock()
-	return sec, fr
+	return sec, fr, pending
 }
 
 // valLoc points the index straight at a value in the log: addr is the logical
@@ -561,6 +650,23 @@ type shard struct {
 	shardID    int
 	pageExtent []int64
 
+	// Compaction state (M8, doc 06). deadBytes is the per-page in-memory dead-byte tally
+	// (parallel to pageExtent), credited under the write lock by the writer that kills a
+	// record (an overwrite or a delete, doc 06 section 2) and recomputed exactly on
+	// recovery; it drives which sealed extent to compact. compactionThreshold is the dead
+	// fraction at which a sealed extent is eligible. pendingFree holds extents this shard
+	// retired by compaction that are not yet durably free: they are holes in the directory
+	// and the next checkpoint commits their free (doc 06 section 7.3). ckptFrontier is the
+	// frontier LSN of the last committed checkpoint for this shard, the safe lower bound a
+	// tombstone discard checks against (doc 06 section 3.4). compactMu serialises
+	// compaction passes on this shard so two never retire the same extent. All are unused
+	// on the memory-only and full-resident profiles.
+	deadBytes           []int64
+	compactionThreshold float64
+	pendingFree         []int64
+	ckptFrontier        atomic.Int64
+	compactMu           sync.Mutex
+
 	// Durable frontier state (M3, doc 04 section 4). durability is the dial; frontier
 	// is the highest LSN known to sit in a synced extent of this shard, advanced only
 	// after a real fsync. The parallel per-page arrays track, for each page, how many
@@ -592,14 +698,19 @@ func newShard(t Tunables, df *durableFile, shardID int) (*shard, error) {
 	if mutableWindow <= 0 {
 		mutableWindow = 1
 	}
+	threshold := t.CompactionThreshold
+	if threshold <= 0 || threshold > 1 {
+		threshold = 0.5
+	}
 	sh := &shard{
-		pageSize:      t.PageSize,
-		residentCap:   t.ResidentPagesPerShard,
-		scratch:       make([]byte, 0, 256),
-		df:            df,
-		shardID:       shardID,
-		durability:    t.Durability,
-		mutableWindow: mutableWindow,
+		pageSize:            t.PageSize,
+		residentCap:         t.ResidentPagesPerShard,
+		scratch:             make([]byte, 0, 256),
+		df:                  df,
+		shardID:             shardID,
+		durability:          t.Durability,
+		mutableWindow:       mutableWindow,
+		compactionThreshold: threshold,
 	}
 	sh.index.Store(newIdxTable(1024))
 	// Page 0 starts resident and empty.
@@ -608,6 +719,7 @@ func newShard(t Tunables, df *durableFile, shardID int) (*shard, error) {
 	sh.pageFill = append(sh.pageFill, 0)
 	sh.pageFlushed = append(sh.pageFlushed, 0)
 	sh.pageMaxLSN = append(sh.pageMaxLSN, 0)
+	sh.deadBytes = append(sh.deadBytes, 0)
 	sh.residentOrder = append(sh.residentOrder, 0)
 	if df == nil && t.Dir != "" {
 		f, err := os.CreateTemp(t.Dir, "hashlog-shard-*.log")
@@ -680,6 +792,7 @@ func (sh *shard) rollFor(rl int) {
 	sh.pageFill = append(sh.pageFill, 0)
 	sh.pageFlushed = append(sh.pageFlushed, 0)
 	sh.pageMaxLSN = append(sh.pageMaxLSN, 0)
+	sh.deadBytes = append(sh.deadBytes, 0)
 	sh.residentOrder = append(sh.residentOrder, sh.tailPage)
 	sh.evictIfNeeded()
 }
@@ -713,6 +826,16 @@ func (sh *shard) set(key, value []byte) error {
 		return nil
 	}
 
+	thash := tableHash(key)
+	// In durable mode an overwrite kills the previous record: before the index repoints
+	// off it, credit its bytes to its extent's dead tally (M8, doc 06 section 2.1). The
+	// old entry is still in the index here (indexPut below republishes it), and it carries
+	// the key and the old value length, which size the dead record with no value read.
+	if durable {
+		if old := sh.index.Load().lookupEntry(thash, key); old != nil {
+			sh.creditDeadLocked(old)
+		}
+	}
 	sh.rollFor(rl)
 	ps := sh.pages.Load()
 	page := ps.pages[sh.tailPage]
@@ -737,7 +860,7 @@ func (sh *shard) set(key, value []byte) error {
 		sh.tailPos += n
 		valOff = uvarintLen(uint64(len(key))) + len(key) + uvarintLen(uint64(len(value)))
 	}
-	sh.indexPut(tableHash(key), key, valLoc{addr: recStart + int64(valOff), vlen: uint32(len(value))})
+	sh.indexPut(thash, key, valLoc{addr: recStart + int64(valOff), vlen: uint32(len(value))})
 	// Under Full the SET does not return until its record is in a synced extent: flush
 	// the tail's new bytes and fsync, which advances the frontier past this LSN (doc 04
 	// section 5.4). Under None and Normal the SET returns here without a per-write sync.
@@ -745,6 +868,24 @@ func (sh *shard) set(key, value []byte) error {
 		sh.flushDurable(true)
 	}
 	return nil
+}
+
+// creditDeadLocked adds the byte length of the record entry e points at to its page's
+// dead tally (M8, doc 06 section 2.1). It is called by the writer that kills the record,
+// an overwrite or a delete, under the shard write lock. The record's geometry comes from
+// the key and the stored value length alone, so no value byte is read: the header offset
+// recovers the record start from the value pointer, and the record length is the fixed
+// overhead plus the key and value. A location outside the current page range is ignored
+// rather than panicking, so a stale or relocated entry never indexes out of bounds.
+func (sh *shard) creditDeadLocked(e *entry) {
+	keyLen := len(e.key)
+	valLen := int(e.loc.vlen)
+	headerStart := e.loc.addr - int64(durableValOffFor(keyLen, valLen))
+	pid := headerStart / int64(sh.pageSize)
+	if pid < 0 || pid >= int64(len(sh.deadBytes)) {
+		return
+	}
+	sh.deadBytes[pid] += int64(durableRecordLenFor(keyLen, valLen))
 }
 
 // readOnlyAddress is the lowest logical address still eligible for an in-place update
@@ -900,9 +1041,15 @@ func (sh *shard) delete(key []byte) error {
 	}
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
-	if !sh.indexDeleteLocked(thash, key) {
+	// Credit the data record this delete kills to its extent's dead tally before dropping
+	// the index entry (M8, doc 06 section 2.1). A delete of an absent key has no record to
+	// kill and nothing to make durable, so it appends no tombstone.
+	old := sh.index.Load().lookupEntry(thash, key)
+	if old == nil {
 		return nil
 	}
+	sh.creditDeadLocked(old)
+	sh.indexDeleteLocked(thash, key)
 	sh.rollFor(rl)
 	ps := sh.pages.Load()
 	page := ps.pages[sh.tailPage]
@@ -1038,8 +1185,12 @@ func (sh *shard) reclaimLocked() {
 			if d.kind == retirePageBuf {
 				sh.freeBufs = append(sh.freeBufs, d.buf)
 			}
-			// retireExtent is freed back to the allocator at M8, where compaction is the
-			// first writer to retire extents.
+			// Compaction (M8) frees its retired extents through the checkpoint-gated
+			// pending-free path (compact.go and Checkpoint), not this epoch deferred list:
+			// on the durable evicting profile reads take the shard read lock, so a retired
+			// extent has no in-flight lock-free reader and needs no epoch drain (doc 06
+			// section 6). The retireExtent deferred kind stays reserved for a future
+			// lock-free-profile compactor.
 			continue
 		}
 		kept = append(kept, d)
