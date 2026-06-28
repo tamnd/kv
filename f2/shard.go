@@ -63,6 +63,32 @@ func (s *shard) get(h uint64, key []byte) ([]byte, bool, error) {
 	}
 }
 
+// scan visits every live key in this shard, calling fn with the key and value of
+// each. It is lock-free, like get: it loads the current index once and walks its
+// slots, and because a grow publishes a complete new table atomically and never
+// mutates the old one, the walk sees a consistent snapshot of whatever table was
+// current when it started. A concurrent overwrite or delete may make a key show
+// its old or its new state, the same visibility get gives. fn returning false
+// stops the walk; scan then returns false so the store can stop the whole scan.
+// The key and value alias the log page and must not be mutated or retained.
+func (s *shard) scan(fn func(key, value []byte) bool) bool {
+	idx := s.index.Load()
+	for i := range idx.slots {
+		slot := idx.slots[i].Load()
+		if slot == 0 || slot&slotTombstone != 0 {
+			continue
+		}
+		key, val := s.log.read(slotAddr(slot))
+		if key == nil {
+			continue // a torn or unreadable record, skip rather than report garbage
+		}
+		if !fn(key, val) {
+			return false
+		}
+	}
+	return true
+}
+
 // set appends a record and publishes its address in the index. It runs under the
 // shard write lock so two writers never race on the same probe chain or the tail.
 // An overwrite of an existing key repoints the slot with a single atomic store

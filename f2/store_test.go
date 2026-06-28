@@ -29,6 +29,80 @@ func get(t *testing.T, s *Store, k []byte) ([]byte, bool) {
 	return v, ok
 }
 
+// TestScan checks that Scan visits exactly the live keys, with their latest
+// values, after a run of inserts, overwrites and deletes that crosses a grow.
+// Order is unspecified, so it collects into a map and compares against the oracle.
+func TestScan(t *testing.T) {
+	s := mustOpen(t)
+	const n = 5000
+	want := map[string]string{}
+	for i := 0; i < n; i++ {
+		if err := s.Set(tkey(i), tval(i)); err != nil {
+			t.Fatalf("Set: %v", err)
+		}
+		want[string(tkey(i))] = string(tval(i))
+	}
+	for i := 0; i < n; i += 2 { // overwrite the evens
+		if err := s.Set(tkey(i), tval(i+n)); err != nil {
+			t.Fatalf("Set overwrite: %v", err)
+		}
+		want[string(tkey(i))] = string(tval(i + n))
+	}
+	for i := 0; i < n; i += 5 { // delete every fifth
+		if err := s.Delete(tkey(i)); err != nil {
+			t.Fatalf("Delete: %v", err)
+		}
+		delete(want, string(tkey(i)))
+	}
+
+	got := map[string]string{}
+	err := s.Scan(func(k, v []byte) bool {
+		got[string(k)] = string(v)
+		return true
+	})
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("Scan visited %d keys, want %d", len(got), len(want))
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Fatalf("Scan key %q: got %q want %q", k, got[k], v)
+		}
+	}
+
+	// Early stop: returning false must end the scan promptly.
+	count := 0
+	_ = s.Scan(func(k, v []byte) bool { count++; return count < 10 })
+	if count != 10 {
+		t.Fatalf("early-stop Scan visited %d, want 10", count)
+	}
+}
+
+// TestGetCopy checks that GetCopy returns an owned slice the caller can mutate
+// without disturbing the stored value, unlike the aliasing Get.
+func TestGetCopy(t *testing.T) {
+	s := mustOpen(t)
+	if err := s.Set([]byte("k"), []byte("value")); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	cp, ok, err := s.GetCopy([]byte("k"))
+	if err != nil || !ok {
+		t.Fatalf("GetCopy: ok=%v err=%v", ok, err)
+	}
+	for i := range cp {
+		cp[i] = 'x' // mutate the copy
+	}
+	v, _ := get(t, s, []byte("k"))
+	if string(v) != "value" {
+		t.Fatalf("stored value changed after mutating the copy: %q", v)
+	}
+	if _, ok, _ := s.GetCopy([]byte("absent")); ok {
+		t.Fatal("GetCopy reported a missing key as found")
+	}
+}
+
 // TestOracle drives the store against a Go map and checks every read back: first
 // writes, overwrites that must win, and deletes that must vanish. It pushes past
 // the initial table size so a grow runs mid-test, which is where a botched slot
