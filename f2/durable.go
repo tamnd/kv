@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"hash/crc32"
 	"os"
+	"path/filepath"
 	"sync"
 )
 
@@ -108,9 +109,22 @@ func (d *durableFile) writeSuperblock() error {
 		return err
 	}
 	if d.dial != DurabilityNone {
-		return d.f.Sync()
+		return platformSyncData(d.f)
 	}
 	return nil
+}
+
+// syncDir fsyncs the directory holding path so a freshly created file's directory
+// entry is itself durable. Without it a crash right after create can lose the
+// entry that names the file, and recovery would then find no file and silently
+// treat the store as brand new, losing the whole acknowledged workload.
+func syncDir(path string) error {
+	dir, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
 }
 
 // superblock is the parsed content of a superblock slot.

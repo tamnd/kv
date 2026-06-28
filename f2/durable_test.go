@@ -32,6 +32,30 @@ func mustOpenT(t *testing.T, tn Tunables) *Store {
 	return s
 }
 
+// TestDurableWriteErrorSurfaces proves the D2 fix: a failed durable write returns
+// an error to the caller instead of acknowledging a write that never reached
+// disk. The old path swallowed every WriteAt/Sync error. We close the backing
+// file underneath a Full-dial store so the next write-through hits a closed fd,
+// and require Set to report it. A Full Set writes through on every call, so the
+// first Set after the close must fail.
+func TestDurableWriteErrorSurfaces(t *testing.T) {
+	s := mustOpenT(t, durableTunables(t, DurabilityFull))
+	if err := s.Set(tkey(0), tval(0)); err != nil {
+		t.Fatalf("Set before close: %v", err)
+	}
+	_ = s.df.f.Close() // pull the file out from under the store
+	var sawErr bool
+	for i := 1; i < 4096; i++ {
+		if err := s.Set(tkey(i), tval(i)); err != nil {
+			sawErr = true
+			break
+		}
+	}
+	if !sawErr {
+		t.Fatal("Set acknowledged a write after the backing file was closed")
+	}
+}
+
 // TestDurableOracle is the oracle test under eviction: with most pages evicted to
 // the file, every surviving key must still read back its newest value, including
 // keys whose records left RAM and must be preadded. It overwrites and deletes so

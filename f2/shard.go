@@ -72,7 +72,10 @@ func (s *shard) set(h uint64, key, value []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	off, n := s.log.append(key, value, false)
+	off, n, err := s.log.append(key, value, false)
+	if err != nil {
+		return err
+	}
 	s.logBytes += int64(n)
 
 	idx := s.index.Load()
@@ -124,17 +127,21 @@ func (s *shard) put(idx *index, h uint64, key []byte, off int64, n int) {
 // through it. In durable mode a delete of a present key also appends a tombstone
 // record, so recovery sees the deletion and does not resurrect the key from its
 // earlier value record. An absent key logs nothing.
-func (s *shard) del(h uint64, key []byte) {
+func (s *shard) del(h uint64, key []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if !s.delLocked(s.index.Load(), h, key) {
-		return // absent: nothing to mark, nothing to log
+		return nil // absent: nothing to mark, nothing to log
 	}
 	if s.log.df != nil {
-		_, n := s.log.append(key, nil, true)
+		_, n, err := s.log.append(key, nil, true)
+		if err != nil {
+			return err
+		}
 		s.logBytes += int64(n)
 	}
+	return nil
 }
 
 // delLocked tombstones the slot for h/key in idx, returning whether the key was

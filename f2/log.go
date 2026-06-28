@@ -83,7 +83,7 @@ func (l *log) maxRecord() int { return int(l.pageSize - l.hdr) }
 // record never straddles a page: if it would not fit in what is left of the
 // current page, the tail jumps to the next page boundary, past that page's
 // header, first. The caller holds the shard write lock.
-func (l *log) append(key, value []byte, tombstone bool) (int64, int) {
+func (l *log) append(key, value []byte, tombstone bool) (int64, int, error) {
 	var n int
 	if l.df != nil {
 		n = durableRecordLen(key, value)
@@ -97,12 +97,17 @@ func (l *log) append(key, value []byte, tombstone bool) (int64, int) {
 		off += l.hdr               // past its header
 	}
 	pi := int(off / l.pageSize)
-	page := l.pageFor(pi)
+	page, err := l.pageFor(pi)
+	if err != nil {
+		return 0, 0, err
+	}
 	w := off % l.pageSize
 
 	if l.df != nil {
 		encodeDurable(page[w:], key, value, tombstone)
-		l.writeThrough(pi, page, int(w), n)
+		if err := l.writeThrough(pi, page, int(w), n); err != nil {
+			return 0, 0, err
+		}
 	} else {
 		ww := w
 		ww += int64(binary.PutUvarint(page[ww:], uint64(len(key))))
@@ -113,27 +118,31 @@ func (l *log) append(key, value []byte, tombstone bool) (int64, int) {
 	}
 
 	l.tail = off + int64(n)
-	return off, n
+	return off, n, nil
 }
 
 // pageFor returns the resident byte buffer for page pi, allocating new pages up
 // to pi and, when a budget is set, evicting the front of the window to stay
 // inside it. Because records never straddle pages, pi is the current page or the
 // next one. The caller holds the shard write lock.
-func (l *log) pageFor(pi int) []byte {
+func (l *log) pageFor(pi int) ([]byte, error) {
 	for l.npages <= pi {
-		l.addPage()
+		if err := l.addPage(); err != nil {
+			return nil, err
+		}
 	}
 	d := l.dir.Load()
-	return d.refs[pi].Load().mem
+	return d.refs[pi].Load().mem, nil
 }
 
 // addPage seals the current tail page (single-file Normal/None flush it to disk),
 // appends one fresh resident page, and evicts the front while over budget. The
 // caller holds the shard write lock.
-func (l *log) addPage() {
+func (l *log) addPage() error {
 	if l.df != nil && l.npages > 0 {
-		l.sealPage(l.npages - 1) // flush the page we are leaving
+		if err := l.sealPage(l.npages - 1); err != nil { // flush the page we are leaving
+			return err
+		}
 	}
 	d := l.ensureCap(l.npages + 1)
 	buf := make([]byte, l.pageSize)
@@ -145,8 +154,12 @@ func (l *log) addPage() {
 		if l.df.dial == DurabilityFull {
 			// The header must reach disk before any record acknowledged from this
 			// page, so a Full crash never leaves a record in an unheadered block.
-			_, _ = l.df.f.WriteAt(buf[:blockHeaderSize], l.df.blockOffset(block))
-			_ = l.df.f.Sync()
+			if _, err := l.df.f.WriteAt(buf[:blockHeaderSize], l.df.blockOffset(block)); err != nil {
+				return err
+			}
+			if err := platformSyncData(l.df.f); err != nil {
+				return err
+			}
 		}
 	}
 	ref := &pageRef{mem: buf}
@@ -155,53 +168,60 @@ func (l *log) addPage() {
 	for l.budget > 0 && l.npages-l.evict > l.budget {
 		l.evictFront()
 	}
+	return nil
 }
 
 // writeThrough flushes a single record to disk and, under Full, fsyncs it, so an
 // acknowledged Set is on stable storage before it returns. Under Normal and None
 // the bytes wait in the resident page and reach disk when the page is sealed. The
 // caller holds the shard write lock.
-func (l *log) writeThrough(pi int, page []byte, w, n int) {
+func (l *log) writeThrough(pi int, page []byte, w, n int) error {
 	if l.df.dial != DurabilityFull {
-		return
+		return nil
 	}
 	off := l.df.blockOffset(l.pageBlock[pi]) + int64(w)
-	_, _ = l.df.f.WriteAt(page[w:w+n], off)
-	_ = l.df.f.Sync()
+	if _, err := l.df.f.WriteAt(page[w:w+n], off); err != nil {
+		return err
+	}
+	return platformSyncData(l.df.f)
 }
 
 // sealPage writes a full page to its block and, under Normal, fsyncs it. Sealing
 // happens when the writer moves on to the next page, so the page is complete. The
 // caller holds the shard write lock.
-func (l *log) sealPage(pi int) {
+func (l *log) sealPage(pi int) error {
 	if l.df.dial == DurabilityFull {
-		return // already written through
+		return nil // already written through
 	}
 	d := l.dir.Load()
 	ref := d.refs[pi].Load()
 	if ref.mem == nil {
-		return // already evicted, hence already on disk
+		return nil // already evicted, hence already on disk
 	}
-	_, _ = l.df.f.WriteAt(ref.mem, l.df.blockOffset(l.pageBlock[pi]))
+	if _, err := l.df.f.WriteAt(ref.mem, l.df.blockOffset(l.pageBlock[pi])); err != nil {
+		return err
+	}
 	if l.df.dial == DurabilityNormal {
-		_ = l.df.f.Sync()
+		return platformSyncData(l.df.f)
 	}
+	return nil
 }
 
 // flushTail writes the current tail page to disk, used by Checkpoint and Close so
 // records sitting only in the resident tail page reach stable storage. The caller
 // holds the shard write lock.
-func (l *log) flushTail() {
+func (l *log) flushTail() error {
 	if l.df == nil || l.npages == 0 {
-		return
+		return nil
 	}
 	pi := l.npages - 1
 	d := l.dir.Load()
 	ref := d.refs[pi].Load()
 	if ref.mem == nil {
-		return
+		return nil
 	}
-	_, _ = l.df.f.WriteAt(ref.mem, l.df.blockOffset(l.pageBlock[pi]))
+	_, err := l.df.f.WriteAt(ref.mem, l.df.blockOffset(l.pageBlock[pi]))
+	return err
 }
 
 // evictFront drops the front resident page from RAM. The page is already on disk
