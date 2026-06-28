@@ -267,16 +267,49 @@ func newDurable(t Tunables) (*Store, error) {
 
 func (s *Store) shardFor(h uint64) *shard { return s.shards[(h>>shardShift)&s.mask] }
 
-// Get returns the value for key and whether it was found. In the full-resident
-// profile the returned slice aliases the log page and the caller must not mutate
-// it; it stays valid as long as the store is open because resident pages are
-// never freed or rewritten in this profile.
+// Get returns the value for key and whether it was found. The returned slice may
+// alias the log page, so the caller must not mutate it. In the memory-only
+// profile the slice stays valid for the life of the store because resident pages
+// are never freed or rewritten; in the single-file profile a page can be evicted,
+// so a slice held across later calls is not guaranteed to stay valid. Use GetCopy
+// when the value must be retained or mutated.
 func (s *Store) Get(key []byte) ([]byte, bool, error) {
 	if s.closed.Load() {
 		return nil, false, errClosed
 	}
 	h := hash64(key)
 	return s.shardFor(h).get(h, key)
+}
+
+// GetCopy is Get returning a freshly allocated copy of the value that the caller
+// owns outright: safe to mutate and to keep for the life of the store regardless
+// of eviction. It trades one allocation for that freedom, so prefer Get on a hot
+// read path that consumes the value before the next call.
+func (s *Store) GetCopy(key []byte) ([]byte, bool, error) {
+	v, ok, err := s.Get(key)
+	if err != nil || !ok {
+		return nil, ok, err
+	}
+	return append([]byte(nil), v...), true, nil
+}
+
+// Scan calls fn for every live key in the store, in an unspecified order, until
+// fn returns false or every key has been visited. It is the only enumeration the
+// engine offers: a hash index has no key order, so this is not a range or sorted
+// scan. The key and value passed to fn alias the log page and must not be mutated
+// or retained past the call; copy what you need to keep. Scan is lock-free per
+// shard and reflects writes concurrent with it the same way Get does, so it is a
+// near-consistent snapshot, not a point-in-time one.
+func (s *Store) Scan(fn func(key, value []byte) bool) error {
+	if s.closed.Load() {
+		return errClosed
+	}
+	for _, sh := range s.shards {
+		if !sh.scan(fn) {
+			return nil
+		}
+	}
+	return nil
 }
 
 // Set stores value under key, appending a new record and repointing the index
