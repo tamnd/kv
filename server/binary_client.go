@@ -196,21 +196,6 @@ func (c *Client) Checkpoint() error {
 	return nil
 }
 
-// Compact runs one bounded maintenance round and returns the pages reclaimed.
-func (c *Client) Compact(budget int) (int, error) {
-	e := encoder{buf: []byte{byte(opCompact)}}
-	e.uint64(uint64(budget))
-	resp, err := c.roundTrip(e.buf)
-	if err != nil {
-		return 0, err
-	}
-	d := newDecoder(resp)
-	if st := status(d.byte()); st != statusOK {
-		return 0, decodeError(d, st)
-	}
-	return int(d.uint64()), nil
-}
-
 // versionCall performs a request whose success response is a single commit version, the shared
 // tail of every write method.
 func (c *Client) versionCall(body []byte) (uint64, error) {
@@ -223,60 +208,6 @@ func (c *Client) versionCall(body []byte) (uint64, error) {
 		return 0, decodeError(d, st)
 	}
 	return d.uint64(), nil
-}
-
-// Scan streams a range scan, calling yield once per pair in key order until the range is
-// exhausted, the server reports an error, or yield returns an error. It holds the connection for
-// the scan's duration, so it serializes with other calls on the same Client. value is nil in
-// KeysOnly mode. If yield returns an error the scan stops early and the connection is closed,
-// since frames the server already queued would otherwise be read by the next call; a caller that
-// stops a scan early should treat the Client as spent. A clean completion leaves the connection
-// reusable.
-func (c *Client) Scan(opts ScanOptions, yield func(key, value []byte) error) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	e := encoder{buf: []byte{byte(opScan)}}
-	e.bytes(opts.Lower)
-	e.bytes(opts.Upper)
-	e.bytes(opts.Prefix)
-	e.byte(boolByte(opts.Reverse))
-	e.byte(boolByte(opts.KeysOnly))
-	e.uint64(uint64(opts.Limit))
-	if err := writeFrame(c.w, e.buf); err != nil {
-		return err
-	}
-	if err := c.w.Flush(); err != nil {
-		return err
-	}
-	for {
-		frame, err := readFrame(c.r)
-		if err != nil {
-			return err
-		}
-		d := newDecoder(frame)
-		switch streamTag(d.byte()) {
-		case streamItem:
-			key := d.bytes()
-			value := d.bytes()
-			if d.err != nil {
-				return d.err
-			}
-			if opts.KeysOnly {
-				value = nil
-			}
-			if e := yield(key, value); e != nil {
-				c.conn.Close()
-				return e
-			}
-		case streamEnd:
-			return nil
-		case streamError:
-			st := status(d.byte())
-			return decodeError(d, st)
-		default:
-			return errUnknownStreamTag
-		}
-	}
 }
 
 // Watch streams committed changes whose key has the given prefix, calling yield once per change
@@ -333,7 +264,7 @@ func (c *Client) Watch(ctx context.Context, prefix []byte, since uint64, yield f
 	}
 }
 
-// boolByte encodes a bool as a wire byte, the encoding the scan options use for their flags.
+// boolByte encodes a bool as a wire byte, the encoding the begin-txn flag uses.
 func boolByte(b bool) byte {
 	if b {
 		return 1

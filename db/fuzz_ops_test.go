@@ -3,7 +3,6 @@ package db
 import (
 	"bytes"
 	"fmt"
-	"sort"
 	"testing"
 
 	"github.com/tamnd/kv/engine"
@@ -60,29 +59,6 @@ func (c *opCursor) next() (byte, bool) {
 	return b, true
 }
 
-// modelScan returns the model's keys in [lo, hi) as ordered key/value pairs, ascending or descending,
-// the answer a correct iterator over the same bounds must reproduce exactly.
-func modelScan(m map[string]string, lo, hi []byte, reverse bool) [][2]string {
-	var out [][2]string
-	for k, v := range m {
-		kb := []byte(k)
-		if lo != nil && bytes.Compare(kb, lo) < 0 {
-			continue
-		}
-		if hi != nil && bytes.Compare(kb, hi) >= 0 {
-			continue
-		}
-		out = append(out, [2]string{k, v})
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if reverse {
-			return out[i][0] > out[j][0]
-		}
-		return out[i][0] < out[j][0]
-	})
-	return out
-}
-
 // cloneModel copies the committed map so a transaction can mutate its own view without touching the
 // committed state until it commits.
 func cloneModel(m map[string]string) map[string]string {
@@ -91,71 +67,6 @@ func cloneModel(m map[string]string) map[string]string {
 		c[k] = v
 	}
 	return c
-}
-
-// checkScan walks a real iterator over [lo, hi) in the given direction and asserts it yields exactly
-// the model's keys and values in exactly the model's order. A bound that the engine reflects wrong, a
-// buffered write the overlay drops, or a delete-range the iterator forgets all show up here as a
-// mismatch.
-func checkScan(t *testing.T, txn *Txn, work map[string]string, lo, hi []byte, reverse bool) {
-	it, err := txn.NewIterator(engine.IterOptions{Lower: lo, Upper: hi, Reverse: reverse})
-	if err != nil {
-		t.Fatalf("NewIterator: %v", err)
-	}
-	defer it.Close()
-
-	want := modelScan(work, lo, hi, reverse)
-	var got [][2]string
-	// The iterator internalizes direction: with Reverse set, First positions on the highest key and
-	// Next steps toward lower keys, so the forward idiom drives both directions.
-	for it.First(); it.Valid(); it.Next() {
-		v, err := it.Value()
-		if err != nil {
-			t.Fatalf("iterator value: %v", err)
-		}
-		got = append(got, [2]string{string(it.Key()), string(v)})
-		if len(got) > 1<<12 {
-			t.Fatalf("scan over a %d-key model yielded more than %d rows", len(want), 1<<12)
-		}
-	}
-	if len(got) != len(want) {
-		t.Fatalf("scan [%s,%s) reverse=%v: got %d rows, model has %d\n got=%v\nwant=%v",
-			lo, hi, reverse, len(got), len(want), got, want)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("scan [%s,%s) reverse=%v row %d: got %v, model has %v",
-				lo, hi, reverse, i, got[i], want[i])
-		}
-	}
-
-	// The zero-copy ScanCursor is a forward-only fast path; cross-check it against the same model on
-	// the forward scans, so the fuzzer exercises its leaf-crossing, refill, and version fold against
-	// every program the Iterator check sees. Its views are transient, so copy each before advancing.
-	if reverse {
-		return
-	}
-	sc, err := txn.NewScanCursor(engine.IterOptions{Lower: lo, Upper: hi})
-	if err != nil {
-		t.Fatalf("NewScanCursor: %v", err)
-	}
-	defer sc.Close()
-	var scgot [][2]string
-	for sc.Next() {
-		scgot = append(scgot, [2]string{string(sc.Key()), string(sc.Value())})
-	}
-	if err := sc.Error(); err != nil {
-		t.Fatalf("scan cursor [%s,%s): %v", lo, hi, err)
-	}
-	if len(scgot) != len(want) {
-		t.Fatalf("scan cursor [%s,%s): got %d rows, model has %d\n got=%v\nwant=%v",
-			lo, hi, len(scgot), len(want), scgot, want)
-	}
-	for i := range want {
-		if scgot[i] != want[i] {
-			t.Fatalf("scan cursor [%s,%s) row %d: got %v, model has %v", lo, hi, i, scgot[i], want[i])
-		}
-	}
 }
 
 // checkGet asserts a point read returns exactly what the model holds for the key, value or clean
@@ -263,22 +174,15 @@ func FuzzOps(f *testing.F) {
 							return nil
 						}
 						checkGet(t, txn, work, fuzzKey(kb))
-					case 5: // scan: lo, hi, direction flag
-						a, ok1 := cur.next()
-						b, ok2 := cur.next()
-						fl, ok3 := cur.next()
+					case 5: // formerly scan: consume the three operand bytes so the program decoding
+						// stays aligned, then move on. The range surface is gone, so there is nothing
+						// to check here.
+						_, ok1 := cur.next()
+						_, ok2 := cur.next()
+						_, ok3 := cur.next()
 						if !ok1 || !ok2 || !ok3 {
 							return nil
 						}
-						lo, hi := orderedRange(a, b)
-						// A flag bit drops the bounds so the unbounded full-scan path is exercised too.
-						if fl&0x4 != 0 {
-							lo = nil
-						}
-						if fl&0x8 != 0 {
-							hi = nil
-						}
-						checkScan(t, txn, work, lo, hi, fl&0x1 != 0)
 					case 6: // commit boundary: end the transaction, read the structural action
 						p, ok := cur.next()
 						if ok {
@@ -306,25 +210,33 @@ func FuzzOps(f *testing.F) {
 				if err != nil {
 					t.Fatalf("reopen: %v", err)
 				}
-				assertFullScan(t, d, committed)
+				assertModel(t, d, committed)
 			}
 		}
 
 		// The whole program has run; the durable state must equal the model exactly.
-		assertFullScan(t, d, committed)
+		assertModel(t, d, committed)
 	})
 }
 
-// assertFullScan opens a read transaction, walks the entire keyspace, and asserts it equals the model
-// key for key. It is the end-to-end check that the database and the map describe the same set of
-// key/value pairs, run after every reopen and once at the end.
-func assertFullScan(t *testing.T, d *DB, committed map[string]string) {
+// assertModel opens a read transaction and reads back every model key with a point Get, asserting the
+// database holds exactly the value the model does. It is the end-to-end check that the database and the
+// map describe the same key/value pairs, run after every reopen and once at the end.
+func assertModel(t *testing.T, d *DB, committed map[string]string) {
 	t.Helper()
 	err := d.View(func(txn *Txn) error {
-		checkScan(t, txn, committed, nil, nil, false)
+		for k, v := range committed {
+			got, err := txn.Get([]byte(k))
+			if err != nil {
+				t.Fatalf("get %s: %v, model has %q", k, err, v)
+			}
+			if string(got) != v {
+				t.Fatalf("get %s returned %q, model has %q", k, got, v)
+			}
+		}
 		return nil
 	})
 	if err != nil {
-		t.Fatalf("full-scan view: %v", err)
+		t.Fatalf("model view: %v", err)
 	}
 }

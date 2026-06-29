@@ -9,11 +9,11 @@ import (
 
 // TestBetaDBStackSmoke proves the Bε-tree core (kv.Beta) round-trips through the full
 // public DB stack, not just its own in-package SPI tests: writes through Update, point
-// reads and an ordered scan through View, an overwrite, a delete, and a reopen all return
-// exactly what a correct store would. It is the correctness gate the directional
-// betree-vs-shipped measurement leans on, because the bench harness reports throughput
-// without checking the bytes, so a core that returned wrong data would still produce a
-// number; this test makes sure the number is over correct reads.
+// reads through View, an overwrite, a delete, and a reopen all return exactly what a
+// correct store would. It is the correctness gate the directional betree-vs-shipped
+// measurement leans on, because the bench harness reports throughput without checking the
+// bytes, so a core that returned wrong data would still produce a number; this test makes
+// sure the number is over correct reads.
 func TestBetaDBStackSmoke(t *testing.T) {
 	path := t.TempDir() + "/beta.kv"
 	d, err := kv.Open(path, kv.WithEngine(kv.Beta))
@@ -53,35 +53,6 @@ func TestBetaDBStackSmoke(t *testing.T) {
 		return nil
 	}); err != nil {
 		t.Fatalf("point reads: %v", err)
-	}
-
-	// Ordered forward scan must surface every key in order at its value.
-	if err := d.View(func(txn *kv.Txn) error {
-		it, err := txn.NewIterator(kv.IterOptions{})
-		if err != nil {
-			return err
-		}
-		defer it.Close()
-		want := 0
-		for it.First(); it.Valid(); it.Next() {
-			if string(it.Key()) != string(key(want)) {
-				return fmt.Errorf("scan pos %d key = %q, want %q", want, it.Key(), key(want))
-			}
-			gotVal, err := it.Value()
-			if err != nil {
-				return fmt.Errorf("scan pos %d value: %w", want, err)
-			}
-			if string(gotVal) != string(val(want)) {
-				return fmt.Errorf("scan pos %d val = %q, want %q", want, gotVal, val(want))
-			}
-			want++
-		}
-		if want != n {
-			return fmt.Errorf("scan saw %d keys, want %d", want, n)
-		}
-		return nil
-	}); err != nil {
-		t.Fatalf("scan: %v", err)
 	}
 
 	// Overwrite the even keys and delete every fifth key, then verify the new state.

@@ -41,7 +41,7 @@ func TestConcurrentRunAccounting(t *testing.T) {
 					t.Fatalf("no ops completed")
 				}
 				// A read-only workload can never conflict, so it must drop nothing.
-				if w.ReadFraction >= 1 && !w.RMW && w.ScanLength == 0 && res.Dropped != 0 {
+				if w.ReadFraction >= 1 && !w.RMW && res.Dropped != 0 {
 					t.Fatalf("read-only workload dropped %d ops", res.Dropped)
 				}
 				checkLatency(t, "reads", res.Reads)

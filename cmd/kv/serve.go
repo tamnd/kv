@@ -33,7 +33,6 @@ func cmdServe(args []string) int {
 	maxKeySize := fs.Int("max-key-size", defaults.MaxKeySize, "largest key in bytes (0 disables)")
 	maxValueSize := fs.Int("max-value-size", defaults.MaxValueSize, "largest value in bytes (0 disables)")
 	maxBatchOps := fs.Int("max-batch-ops", defaults.MaxBatchOps, "most ops in a batch or transaction (0 disables)")
-	maxScanLimit := fs.Int("max-scan-limit", defaults.MaxScanLimit, "most pairs one scan returns (0 disables)")
 	// Overload guardrails (spec 17 §4, §6): caps on how many connections, how many concurrent
 	// requests, and how fast one caller may send, plus a final checkpoint on shutdown. Each is off
 	// by default (zero), so a database on a trusted socket pays nothing; an exposed one sets them to
@@ -76,7 +75,6 @@ func cmdServe(args []string) int {
 		MaxKeySize:   *maxKeySize,
 		MaxValueSize: *maxValueSize,
 		MaxBatchOps:  *maxBatchOps,
-		MaxScanLimit: *maxScanLimit,
 	}
 
 	// Resolve the authenticator before opening the database so a malformed auth file, an unreadable

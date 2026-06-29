@@ -7,7 +7,6 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"strconv"
 	"time"
 
 	"github.com/tamnd/kv"
@@ -169,7 +168,6 @@ func (srv *Server) httpHandler() http.Handler {
 		writeJSON(w, http.StatusOK, versionResponse{Version: version})
 	})
 
-	mux.HandleFunc("GET /v1/scan", srv.handleScan)
 	mux.HandleFunc("GET /v1/watch", srv.handleWatch)
 
 	mux.HandleFunc("GET /v1/stats", func(w http.ResponseWriter, r *http.Request) {
@@ -197,27 +195,6 @@ func (srv *Server) httpHandler() http.Handler {
 			return
 		}
 		writeJSON(w, http.StatusOK, okResponse{OK: true})
-	})
-	mux.HandleFunc("POST /v1/compact", func(w http.ResponseWriter, r *http.Request) {
-		if err := srv.authorize(r, isAdmin); err != nil {
-			writeServiceErr(w, err)
-			return
-		}
-		budget := 0
-		if b := r.URL.Query().Get("budget"); b != "" {
-			n, err := strconv.Atoi(b)
-			if err != nil {
-				writeErr(w, http.StatusBadRequest, err)
-				return
-			}
-			budget = n
-		}
-		reclaimed, err := s.Compact(budget)
-		if err != nil {
-			writeServiceErr(w, err)
-			return
-		}
-		writeJSON(w, http.StatusOK, compactResponse{Reclaimed: reclaimed})
 	})
 
 	// Operational endpoints: liveness and the Prometheus metrics surface, the same numbers
@@ -270,16 +247,12 @@ func parseTTL(r *http.Request) (time.Duration, error) {
 	return time.ParseDuration(t)
 }
 
-// versionResponse, okResponse, and compactResponse are the small JSON results of the write
-// and ops endpoints.
+// versionResponse and okResponse are the small JSON results of the write and ops endpoints.
 type versionResponse struct {
 	Version uint64 `json:"version"`
 }
 type okResponse struct {
 	OK bool `json:"ok"`
-}
-type compactResponse struct {
-	Reclaimed int `json:"reclaimed"`
 }
 
 // jsonOp is the wire form of an Op: byte fields are base64 strings since JSON has no raw-byte

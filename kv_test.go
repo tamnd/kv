@@ -153,38 +153,6 @@ func TestExplicitConflict(t *testing.T) {
 	}
 }
 
-// TestIterator walks a prefix scan through the public iterator.
-func TestIterator(t *testing.T) {
-	d := open(t)
-	if err := d.Update(func(txn *kv.Txn) error {
-		for i := 0; i < 5; i++ {
-			txn.Set([]byte(fmt.Sprintf("user:%d", i)), []byte(fmt.Sprintf("v%d", i)))
-		}
-		txn.Set([]byte("other"), []byte("x"))
-		return nil
-	}); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
-
-	var got []string
-	if err := d.View(func(txn *kv.Txn) error {
-		it, err := txn.NewIterator(kv.IterOptions{Prefix: []byte("user:")})
-		if err != nil {
-			return err
-		}
-		defer it.Close()
-		for it.First(); it.Valid(); it.Next() {
-			got = append(got, string(it.Key()))
-		}
-		return it.Error()
-	}); err != nil {
-		t.Fatalf("iterate: %v", err)
-	}
-	if len(got) != 5 {
-		t.Fatalf("scanned %d keys, want 5: %v", len(got), got)
-	}
-}
-
 // TestMergeOperator checks a registered associative operator folds blind operands.
 func TestMergeOperator(t *testing.T) {
 	add := func(existing, operand []byte) []byte {

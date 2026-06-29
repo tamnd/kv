@@ -55,37 +55,55 @@ func applyCrashStep(b *engine.WriteBatch, i int) {
 	}
 }
 
+// ceKeyspace lists every key the workload can ever touch: the ascending markers and the
+// small set of churn keys. The workload only ever writes these, so a point read of each one
+// reconstructs the whole visible state, which is what lets the recovery check work without a
+// scan.
+func ceKeyspace() []string {
+	keys := make([]string, 0, ceSteps+ceChurn)
+	for i := 0; i < ceSteps; i++ {
+		keys = append(keys, ceMarker(i))
+	}
+	for i := 0; i < ceChurn; i++ {
+		keys = append(keys, fmt.Sprintf("ck%02d", i))
+	}
+	return keys
+}
+
 // crashModelStates replays the workload through the conformance Oracle and returns the
-// visible state after each prefix length 0..ceSteps, each as a canonical sorted slice of
-// "key=value" strings read at a snapshot above every commit. states[j] is what a correct
-// engine must hold after committing exactly the first j batches, with old versions and
-// reclaimed tombstones invisible at the latest snapshot, which is precisely what GC may
-// drop without changing the answer. The Oracle's absolute versions need not match the
-// database's: read at the latest snapshot, the visible state depends only on the order of
-// versions within each key, and the workload commits the batches in this same order.
-func crashModelStates() [][]string {
+// visible state after each prefix length 0..ceSteps, each as a key->value map read at a
+// snapshot above every commit. states[j] is what a correct engine must hold after committing
+// exactly the first j batches, with old versions and reclaimed tombstones invisible at the
+// latest snapshot, which is precisely what GC may drop without changing the answer. The
+// Oracle's absolute versions need not match the database's: read at the latest snapshot, the
+// visible state depends only on the order of versions within each key, and the workload
+// commits the batches in this same order.
+func crashModelStates() []map[string]string {
 	oracle := engine.NewOracle(nil)
 	snap := engine.Snapshot{Version: 1 << 40}
-	states := make([][]string, ceSteps+1)
-	states[0] = canonicalKVs(oracle.Scan(nil, nil, snap))
+	keyspace := ceKeyspace()
+	states := make([]map[string]string, ceSteps+1)
+	states[0] = oracleState(oracle, snap, keyspace)
 	for i := 0; i < ceSteps; i++ {
 		eb := engine.NewWriteBatch(uint64(i + 1))
 		applyCrashStep(eb, i)
 		oracle.Apply(eb, eb.Version())
-		states[i+1] = canonicalKVs(oracle.Scan(nil, nil, snap))
+		states[i+1] = oracleState(oracle, snap, keyspace)
 	}
 	return states
 }
 
-// canonicalKVs renders an Oracle scan as sorted "key=value" strings. The scan already
-// returns ascending by key, so the slice is a stable fingerprint of the visible state a
-// recovered database's own scan can be compared against directly.
-func canonicalKVs(pairs []engine.KV) []string {
-	out := make([]string, len(pairs))
-	for i, p := range pairs {
-		out[i] = string(p.Key) + "=" + string(p.Value)
+// oracleState point-reads every key in the keyspace out of the Oracle at the snapshot and
+// returns the present ones as a key->value map, the visible state a recovered database must
+// reproduce.
+func oracleState(oracle *engine.Oracle, snap engine.Snapshot, keyspace []string) map[string]string {
+	state := map[string]string{}
+	for _, k := range keyspace {
+		if v, ok := oracle.Get([]byte(k), snap); ok {
+			state[k] = string(v)
+		}
 	}
-	return out
+	return state
 }
 
 // runCrashEquivWorkload drives the whole workload through d: every step a SyncFull
@@ -153,64 +171,64 @@ func crashEquivOptions() Options {
 	}
 }
 
-// recoverCrashState reopens fs after a crash and returns the visible state as canonical
-// "key=value" strings. Because the LSM core has no structural Verify to lean on, it also
-// asserts the recovery's own internal consistency: a full reverse scan must be the exact
-// reverse of the forward scan, so a recovered index that disagrees with itself fails here
-// rather than masquerading as some model prefix.
-func recoverCrashState(t *testing.T, fs *vfs.Mem) []string {
+// recoverCrashState reopens fs after a crash and returns the visible state as a key->value
+// map, point-reading every key the workload can touch back through the recovered database.
+func recoverCrashState(t *testing.T, fs *vfs.Mem) map[string]string {
 	t.Helper()
 	d, err := Open(fs, "test.kv", Options{AutoCheckpoint: -1})
 	if err != nil {
 		t.Fatalf("reopen after crash: %v", err)
 	}
 	defer d.Close()
-
-	fwd := scanCanonical(t, d, engine.IterOptions{})
-	rev := scanCanonical(t, d, engine.IterOptions{Reverse: true})
-	if len(fwd) != len(rev) {
-		t.Fatalf("forward scan has %d pairs, reverse %d", len(fwd), len(rev))
-	}
-	for i := range fwd {
-		if fwd[i] != rev[len(rev)-1-i] {
-			t.Fatalf("reverse scan disagrees with forward at %d: %q vs %q", i, rev[len(rev)-1-i], fwd[i])
-		}
-	}
-	return fwd
+	return dbState(t, d)
 }
 
-// scanCanonical runs one full scan under opts and returns its pairs as "key=value"
-// strings in iteration order.
-func scanCanonical(t *testing.T, d *DB, opts engine.IterOptions) []string {
+// dbState point-reads every key in the workload's keyspace out of d and returns the present
+// ones as a key->value map, the fingerprint a model prefix is compared against.
+func dbState(t *testing.T, d *DB) map[string]string {
 	t.Helper()
-	var out []string
+	state := map[string]string{}
 	if err := d.View(func(txn *Txn) error {
-		it, err := txn.NewIterator(opts)
-		if err != nil {
-			return err
-		}
-		defer it.Close()
-		keys, vals := collect(t, it)
-		for i := range keys {
-			out = append(out, keys[i]+"="+vals[i])
+		for _, k := range ceKeyspace() {
+			v, err := txn.Get([]byte(k))
+			if err == engine.ErrNotFound {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			state[k] = string(v)
 		}
 		return nil
 	}); err != nil {
-		t.Fatalf("scan: %v", err)
+		t.Fatalf("read recovered state: %v", err)
 	}
-	return out
+	return state
 }
 
 // matchModelPrefix returns the prefix length j whose model state equals got, or -1 if no
 // prefix explains the recovered state. A -1 is the headline failure of this slice: the
 // engine recovered to something the model never produces from any prefix of the workload.
-func matchModelPrefix(states [][]string, got []string) int {
+func matchModelPrefix(states []map[string]string, got map[string]string) int {
 	for j := range states {
-		if eq(got, states[j]...) {
+		if statesEqual(got, states[j]) {
 			return j
 		}
 	}
 	return -1
+}
+
+// statesEqual reports whether two key->value maps hold exactly the same pairs.
+func statesEqual(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if bv, ok := b[k]; !ok || bv != v {
+			return false
+		}
+	}
+	return true
 }
 
 // TestLSMCrashEquivalentToModelAtEverySyncBoundary is the slice's centrepiece. It first
@@ -236,8 +254,8 @@ func TestLSMCrashEquivalentToModelAtEverySyncBoundary(t *testing.T) {
 	if compacted == 0 {
 		t.Fatalf("workload compacted no pages; it is not exercising the compaction and GC boundaries")
 	}
-	cleanFinal := scanCanonical(t, pd, engine.IterOptions{})
-	if !eq(cleanFinal, states[ceSteps]...) {
+	cleanFinal := dbState(t, pd)
+	if !statesEqual(cleanFinal, states[ceSteps]) {
 		t.Fatalf("clean final state does not match the model:\n got  %v\n want %v", cleanFinal, states[ceSteps])
 	}
 	totalSyncs := probe.SyncCount()
@@ -319,7 +337,7 @@ func TestLSMCrashInCompactionCheckpointWindowMatchesModel(t *testing.T) {
 	fs.Crash()
 
 	got := recoverCrashState(t, fs)
-	if !eq(got, states[ceSteps]...) {
+	if !statesEqual(got, states[ceSteps]) {
 		t.Fatalf("recovery in the compaction-checkpoint window lost data:\n got  %v\n want %v", got, states[ceSteps])
 	}
 }

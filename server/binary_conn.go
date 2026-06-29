@@ -99,15 +99,12 @@ func (srv *Server) serveBinaryConn(conn net.Conn) {
 }
 
 // handleBinaryFrame dispatches one already-admitted request frame and reports whether the
-// connection loop should continue. The streaming opcodes write many frames for one request, so they
-// are handled before the unary dispatch, which writes exactly one: a scan returns to the loop after
-// its end frame, while a watch takes over the connection for its life and so ends the loop. A write
-// error on the response ends the connection.
+// connection loop should continue. The watch opcode writes many frames for one request, so it is
+// handled before the unary dispatch, which writes exactly one: a watch takes over the connection
+// for its life and so ends the loop. A write error on the response ends the connection.
 func (srv *Server) handleBinaryFrame(conn net.Conn, w *bufio.Writer, body []byte, sess *binarySession) bool {
 	if len(body) > 0 {
 		switch opcode(body[0]) {
-		case opScan:
-			return srv.serveBinaryScan(w, body, sess) == nil
 		case opWatch:
 			srv.serveBinaryWatch(conn, w, body, sess)
 			return false
@@ -328,22 +325,6 @@ func (srv *Server) dispatchBinary(body []byte, sess *binarySession) []byte {
 			return errResponse(err)
 		}
 		return []byte{byte(statusOK)}
-
-	case opCompact:
-		budget := int(d.uint64())
-		if d.err != nil {
-			return decodeErrResponse()
-		}
-		if err := srv.authorizeBinary(sess, isAdmin); err != nil {
-			return errResponse(err)
-		}
-		reclaimed, err := s.Compact(budget)
-		if err != nil {
-			return errResponse(err)
-		}
-		e := encoder{buf: []byte{byte(statusOK)}}
-		e.uint64(uint64(reclaimed))
-		return e.buf
 
 	case opBeginTxn:
 		writable := d.byte() == 1

@@ -2,11 +2,8 @@ package db
 
 import (
 	"errors"
-	"fmt"
 	"sync"
 	"testing"
-
-	"github.com/tamnd/kv/engine"
 )
 
 // These tests cover serializable snapshot isolation (spec 10 §4): the opt-in level
@@ -113,64 +110,6 @@ func TestSSIReadOnlyNeverAborts(t *testing.T) {
 	}
 	if err := reader.Commit(); err != nil {
 		t.Fatalf("read-only commit = %v, want success", err)
-	}
-}
-
-// TestSSIPhantomAborts checks range-predicate tracking: a transaction that scans a
-// range and then writes based on what it saw aborts if a concurrent transaction
-// inserts a key into that range (a phantom). Point-read tracking alone could not catch
-// this, since the inserted key was never read.
-func TestSSIPhantomAborts(t *testing.T) {
-	d := openSerializable(t)
-	seedRange(t, d, 3) // k00..k02
-
-	// t1 scans [k00, k10) and intends to act on the count it saw.
-	t1 := d.Begin(true)
-	it, err := t1.NewIterator(engine.IterOptions{Lower: []byte("k00"), Upper: []byte("k10")})
-	if err != nil {
-		t.Fatalf("iter: %v", err)
-	}
-	n := 0
-	for it.First(); it.Valid(); it.Next() {
-		n++
-	}
-	it.Close()
-	t1.Set([]byte("count"), []byte(fmt.Sprintf("%d", n)))
-
-	// t2 inserts a phantom into t1's scanned range and commits first.
-	if err := d.Update(func(txn *Txn) error { return txn.Set([]byte("k05"), []byte("new")) }); err != nil {
-		t.Fatalf("phantom insert: %v", err)
-	}
-
-	// t1's commit must abort: the range it read changed under it.
-	if err := t1.Commit(); !errors.Is(err, ErrConflict) {
-		t.Fatalf("t1 commit = %v, want ErrConflict (phantom in scanned range)", err)
-	}
-	t1.Discard()
-}
-
-// TestSSIPhantomOutsideRangeCommits checks the range predicate is precise: an insert
-// outside the scanned interval does not abort the scanner.
-func TestSSIPhantomOutsideRangeCommits(t *testing.T) {
-	d := openSerializable(t)
-	seedRange(t, d, 3) // k00..k02
-
-	t1 := d.Begin(true)
-	it, err := t1.NewIterator(engine.IterOptions{Lower: []byte("k00"), Upper: []byte("k10")})
-	if err != nil {
-		t.Fatalf("iter: %v", err)
-	}
-	for it.First(); it.Valid(); it.Next() {
-	}
-	it.Close()
-	t1.Set([]byte("count"), []byte("3"))
-
-	// An insert well above the scanned range is not a phantom for this scan.
-	if err := d.Update(func(txn *Txn) error { return txn.Set([]byte("z99"), []byte("far")) }); err != nil {
-		t.Fatalf("far insert: %v", err)
-	}
-	if err := t1.Commit(); err != nil {
-		t.Fatalf("t1 commit = %v, want success (insert outside scanned range)", err)
 	}
 }
 

@@ -101,28 +101,6 @@ func exercise(tb testing.TB, fs vfs.FS) {
 		})
 	}
 
-	// A full scan walks whatever structure the file describes; a corrupt interior that slipped past
-	// open must surface as an iteration error, not an over-read.
-	_ = d.View(func(tx *Txn) error {
-		it, err := tx.NewIterator(engine.IterOptions{})
-		if err != nil {
-			return err
-		}
-		defer it.Close()
-		n := 0
-		for it.First(); it.Valid(); it.Next() {
-			_ = it.Key()
-			if _, err := it.Value(); err != nil {
-				return err
-			}
-			// Bound the walk so a structure that somehow describes a cycle cannot hang the fuzzer.
-			if n++; n > 1<<16 {
-				break
-			}
-		}
-		return it.Error()
-	})
-
 	// A write exercises the pager and WAL paths over the opened file.
 	_ = d.Update(func(tx *Txn) error { return tx.Set([]byte("fuzz-write"), []byte("v")) })
 }

@@ -174,10 +174,6 @@ func (sh *shell) bare(toks []string) error {
 		return sh.cmdExists(args)
 	case "merge":
 		return sh.cmdMerge(args)
-	case "scan":
-		return sh.cmdScan(args)
-	case "count":
-		return sh.cmdCount(args)
 	default:
 		return fmt.Errorf("unknown command %q (try .help)", verb)
 	}
@@ -327,101 +323,6 @@ func (sh *shell) cmdMerge(args []string) error {
 		return fmt.Errorf("bad operand: %w", err)
 	}
 	return sh.write(func(txn *kv.Txn) error { return txn.Merge(key, operand) })
-}
-
-func (sh *shell) cmdScan(args []string) error {
-	fs := flag.NewFlagSet("scan", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	e := sh.shellEnc(fs)
-	spec := bindScanFlags(fs)
-	keysOnly := fs.Bool("keys-only", false, "print keys only, skip values")
-	if err := parseArgs(fs, args); err != nil {
-		return err
-	}
-	if fs.NArg() != 0 {
-		return fmt.Errorf("usage: scan [--prefix P | --from LO --to HI] [--reverse] [--limit N] [--keys-only]")
-	}
-	opts, err := spec.options(e, *keysOnly)
-	if err != nil {
-		return fmt.Errorf("bad bound: %w", err)
-	}
-	// In the shell the output device is the shell's out; auto resolves the same way the
-	// scan command does, table when interactive and jsonl when piped.
-	resolved := sh.format
-	if resolved == fmtAuto {
-		if sh.interactive {
-			resolved = fmtTable
-		} else {
-			resolved = fmtJSONL
-		}
-	}
-	w := newRecordWriter(sh.out, resolved, e, *keysOnly)
-	scanErr := sh.read(func(txn *kv.Txn) error {
-		it, err := txn.NewIterator(opts)
-		if err != nil {
-			return err
-		}
-		defer it.Close()
-		n := 0
-		for it.First(); it.Valid(); it.Next() {
-			var val []byte
-			if !*keysOnly {
-				v, err := it.Value()
-				if err != nil {
-					return err
-				}
-				val = v
-			}
-			if err := w.write(it.Key(), val, *keysOnly); err != nil {
-				return err
-			}
-			n++
-			if spec.limit > 0 && n >= spec.limit {
-				break
-			}
-		}
-		return it.Error()
-	})
-	if scanErr != nil {
-		return scanErr
-	}
-	return w.close()
-}
-
-func (sh *shell) cmdCount(args []string) error {
-	fs := flag.NewFlagSet("count", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	e := sh.shellEnc(fs)
-	spec := bindScanFlags(fs)
-	if err := parseArgs(fs, args); err != nil {
-		return err
-	}
-	if fs.NArg() != 0 {
-		return fmt.Errorf("usage: count [--prefix P | --from LO --to HI] [--limit N]")
-	}
-	opts, err := spec.options(e, true)
-	if err != nil {
-		return fmt.Errorf("bad bound: %w", err)
-	}
-	count := 0
-	if err := sh.read(func(txn *kv.Txn) error {
-		it, err := txn.NewIterator(opts)
-		if err != nil {
-			return err
-		}
-		defer it.Close()
-		for it.First(); it.Valid(); it.Next() {
-			count++
-			if spec.limit > 0 && count >= spec.limit {
-				break
-			}
-		}
-		return it.Error()
-	}); err != nil {
-		return err
-	}
-	fmt.Fprintln(sh.out, count)
-	return nil
 }
 
 // dot runs a meta-command and reports whether the loop should exit.
@@ -617,8 +518,6 @@ func (sh *shell) help() {
   del-range <lo> <hi>       range-delete [lo, hi)
   exists <key>              print true or false
   merge <key> <operand>     record a merge operand
-  scan [--prefix P | --from LO --to HI] [--reverse] [--limit N] [--keys-only]
-  count [--prefix P | --from LO --to HI] [--limit N]
   (all accept --hex or --base64 for binary keys and values)
 
 Meta-commands:
@@ -629,7 +528,7 @@ Meta-commands:
   .checkpoint               fold the WAL into the main file
   .vacuum [N]               return up to N trailing free pages to the OS (0 = all)
   .pragma <name>[=<value>]  read or set a configuration knob (.pragma help lists them)
-  .format <fmt>             set scan output: table, jsonl, json, raw, auto
+  .format <fmt>             set output format: table, jsonl, json, raw, auto
   .encoding <enc>           set default key/value encoding: text, hex, base64
   .timer [on|off]           toggle per-statement timing
   .begin / .commit / .rollback   explicit multi-statement transaction

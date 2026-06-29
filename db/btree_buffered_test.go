@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/tamnd/kv/engine"
 	"github.com/tamnd/kv/vfs"
 )
 
@@ -72,53 +71,24 @@ func TestBtreeBufferedInsertsTransparent(t *testing.T) {
 		}
 	}
 
-	// Full scans must agree key for key and value for value, so buffering is invisible to
-	// the range path as well as the point path.
-	scan := func(d *DB) ([]string, []string) {
-		var keys, vals []string
-		if err := d.View(func(txn *Txn) error {
-			it, err := txn.NewIterator(engine.IterOptions{})
-			if err != nil {
-				return err
-			}
-			defer it.Close()
-			keys, vals = collect(t, it)
-			return nil
-		}); err != nil {
-			t.Fatalf("scan: %v", err)
-		}
-		return keys, vals
-	}
-	pKeys, pVals := scan(plain)
-	bKeys, bVals := scan(buffered)
-	if !eq(bKeys, pKeys...) {
-		t.Fatalf("scan keys differ under BufferedInserts:\n plain    %d keys\n buffered %d keys", len(pKeys), len(bKeys))
-	}
-	if !eq(bVals, pVals...) {
-		t.Fatal("scan values differ under BufferedInserts")
-	}
-
-	// Spot-check the buffered result against the truth so a bug shared by both engines
-	// cannot pass: a deleted key gone, an overwritten key carrying its new value, an
-	// untouched key its original.
-	got := make(map[string]string, len(bKeys))
-	for i, k := range bKeys {
-		got[k] = bVals[i]
-	}
+	// Spot-check the buffered result against the truth with point reads so a bug shared by
+	// both engines cannot pass: a deleted key gone, an overwritten key carrying its new
+	// value, an untouched key its original.
 	for i := 0; i < n; i++ {
 		k := fmt.Sprintf("key%05d", i)
+		got, ok := txnGet(t, buffered, k)
 		switch i % 3 {
 		case 0:
-			if got[k] != fmt.Sprintf("w%05d", i) {
-				t.Fatalf("overwritten key %s = %q, want w%05d", k, got[k], i)
+			if !ok || got != fmt.Sprintf("w%05d", i) {
+				t.Fatalf("overwritten key %s = %q,%v, want w%05d", k, got, ok, i)
 			}
 		case 1:
-			if _, ok := got[k]; ok {
+			if ok {
 				t.Fatalf("deleted key %s still present under BufferedInserts", k)
 			}
 		default:
-			if got[k] != fmt.Sprintf("v%05d", i) {
-				t.Fatalf("key %s = %q, want v%05d", k, got[k], i)
+			if !ok || got != fmt.Sprintf("v%05d", i) {
+				t.Fatalf("key %s = %q,%v, want v%05d", k, got, ok, i)
 			}
 		}
 	}

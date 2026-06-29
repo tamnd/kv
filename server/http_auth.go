@@ -161,33 +161,7 @@ func (srv *Server) authorizeOps(r *http.Request, asserts []Assert, ops []Op) err
 	})
 }
 
-// isAdmin is the authorize predicate for the operational endpoints (stats, info, checkpoint,
-// compact), which act on the whole database rather than a key range and so require an admin
-// identity. It is a named function so the ops handlers read the same as the keyed ones.
+// isAdmin is the authorize predicate for the operational endpoints (stats, info, checkpoint),
+// which act on the whole database rather than a key range and so require an admin identity. It is
+// a named function so the ops handlers read the same as the keyed ones.
 func isAdmin(id *Identity) bool { return id.Admin }
-
-// scanAuthPrefix derives the key prefix a scan is confined to, for authorizing it against a read
-// grant. An explicit prefix is that confinement directly. Otherwise every key the scan can return
-// lies in [from, to), whose keys all share the longest common prefix of from and to, so that common
-// prefix is a sound (if sometimes conservative) bound: a grant covering it covers every key the
-// scan could yield. With neither a prefix nor bounds the scan spans the whole keyspace and the
-// common prefix is empty, which only a global read grant covers.
-func scanAuthPrefix(prefix, from, to []byte) []byte {
-	if len(prefix) > 0 {
-		return prefix
-	}
-	return commonPrefix(from, to)
-}
-
-// commonPrefix returns the longest byte prefix shared by a and b.
-func commonPrefix(a, b []byte) []byte {
-	n := len(a)
-	if len(b) < n {
-		n = len(b)
-	}
-	i := 0
-	for i < n && a[i] == b[i] {
-		i++
-	}
-	return a[:i]
-}

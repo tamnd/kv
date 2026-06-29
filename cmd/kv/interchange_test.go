@@ -8,33 +8,19 @@ import (
 	"testing"
 )
 
-// seedDB writes a small set of key/value pairs into a fresh database via the CLI.
-func seedDB(t *testing.T, p string, pairs [][2]string) {
-	t.Helper()
-	for _, kv := range pairs {
-		if code := run([]string{"set", p, kv[0], kv[1]}); code != exitOK {
-			t.Fatalf("seed set %q: exit %d", kv[0], code)
-		}
-	}
-}
-
-// TestExportJSONLRoundTrip exports a database to JSONL and re-imports it into a
-// second database, then verifies every key lands at the right value.
-func TestExportJSONLRoundTrip(t *testing.T) {
-	src := dbPath(t)
+// TestImportJSONL imports a JSONL file and verifies every key lands at the right value.
+func TestImportJSONL(t *testing.T) {
 	pairs := [][2]string{{"alpha", "1"}, {"beta", "2"}, {"gamma", "3"}}
-	seedDB(t, src, pairs)
-
-	out := filepath.Join(t.TempDir(), "export.jsonl")
-	if code := run([]string{"export", src, "--format", "jsonl", "--output", out}); code != exitOK {
-		t.Fatalf("export jsonl: exit %d", code)
+	in := filepath.Join(t.TempDir(), "data.jsonl")
+	jsonl := `{"key":"alpha","value":"1"}` + "\n" +
+		`{"key":"beta","value":"2"}` + "\n" +
+		`{"key":"gamma","value":"3"}` + "\n"
+	if err := writeFile(in, jsonl); err != nil {
+		t.Fatalf("write jsonl: %v", err)
 	}
 
-	dst := filepath.Join(t.TempDir(), "dst.kv")
-	if code := run([]string{"create", dst}); code != exitOK {
-		t.Fatalf("create dst: exit %d", code)
-	}
-	if code := run([]string{"import", dst, "--format", "jsonl", "--input", out}); code != exitOK {
+	dst := dbPath(t)
+	if code := run([]string{"import", dst, "--format", "jsonl", "--input", in}); code != exitOK {
 		t.Fatalf("import jsonl: exit %d", code)
 	}
 
@@ -46,22 +32,16 @@ func TestExportJSONLRoundTrip(t *testing.T) {
 	}
 }
 
-// TestExportCSVRoundTrip exports a database as CSV and re-imports it.
-func TestExportCSVRoundTrip(t *testing.T) {
-	src := dbPath(t)
+// TestImportCSV imports a two-column CSV and verifies every key lands at the right value.
+func TestImportCSV(t *testing.T) {
 	pairs := [][2]string{{"a", "apple"}, {"b", "banana"}, {"c", "cherry"}}
-	seedDB(t, src, pairs)
-
-	out := filepath.Join(t.TempDir(), "export.csv")
-	if code := run([]string{"export", src, "--format", "csv", "--output", out}); code != exitOK {
-		t.Fatalf("export csv: exit %d", code)
+	in := filepath.Join(t.TempDir(), "data.csv")
+	if err := writeFile(in, "a,apple\nb,banana\nc,cherry\n"); err != nil {
+		t.Fatalf("write csv: %v", err)
 	}
 
-	dst := filepath.Join(t.TempDir(), "dst.kv")
-	if code := run([]string{"create", dst}); code != exitOK {
-		t.Fatalf("create dst: exit %d", code)
-	}
-	if code := run([]string{"import", dst, "--format", "csv", "--input", out}); code != exitOK {
+	dst := dbPath(t)
+	if code := run([]string{"import", dst, "--format", "csv", "--input", in}); code != exitOK {
 		t.Fatalf("import csv: exit %d", code)
 	}
 
@@ -73,22 +53,16 @@ func TestExportCSVRoundTrip(t *testing.T) {
 	}
 }
 
-// TestExportTSVRoundTrip exports a database as TSV and re-imports it.
-func TestExportTSVRoundTrip(t *testing.T) {
-	src := dbPath(t)
+// TestImportTSV imports a two-column TSV and verifies every key lands at the right value.
+func TestImportTSV(t *testing.T) {
 	pairs := [][2]string{{"x", "10"}, {"y", "20"}}
-	seedDB(t, src, pairs)
-
-	out := filepath.Join(t.TempDir(), "export.tsv")
-	if code := run([]string{"export", src, "--format", "tsv", "--output", out}); code != exitOK {
-		t.Fatalf("export tsv: exit %d", code)
+	in := filepath.Join(t.TempDir(), "data.tsv")
+	if err := writeFile(in, "x\t10\ny\t20\n"); err != nil {
+		t.Fatalf("write tsv: %v", err)
 	}
 
-	dst := filepath.Join(t.TempDir(), "dst.kv")
-	if code := run([]string{"create", dst}); code != exitOK {
-		t.Fatalf("create dst: exit %d", code)
-	}
-	if code := run([]string{"import", dst, "--format", "tsv", "--input", out}); code != exitOK {
+	dst := dbPath(t)
+	if code := run([]string{"import", dst, "--format", "tsv", "--input", in}); code != exitOK {
 		t.Fatalf("import tsv: exit %d", code)
 	}
 
@@ -97,47 +71,6 @@ func TestExportTSVRoundTrip(t *testing.T) {
 		if got != p[1] {
 			t.Fatalf("key %q: got %q, want %q", p[0], got, p[1])
 		}
-	}
-}
-
-// TestExportPrefix exports only keys with a given prefix.
-func TestExportPrefix(t *testing.T) {
-	src := dbPath(t)
-	seedDB(t, src, [][2]string{{"foo/a", "1"}, {"foo/b", "2"}, {"bar/c", "3"}})
-
-	out := capture(t, func() {
-		if code := run([]string{"export", src, "--format", "jsonl", "--prefix", "foo/"}); code != exitOK {
-			t.Fatalf("export with prefix: exit %d", code)
-		}
-	})
-
-	lines := strings.Split(strings.TrimSpace(out), "\n")
-	if len(lines) != 2 {
-		t.Fatalf("expected 2 lines, got %d:\n%s", len(lines), out)
-	}
-	for _, l := range lines {
-		if !strings.Contains(l, "foo/") {
-			t.Fatalf("unexpected line (no foo/ prefix): %s", l)
-		}
-	}
-}
-
-// TestExportUsageErrors covers format mismatches and missing db arguments.
-func TestExportUsageErrors(t *testing.T) {
-	p := dbPath(t)
-	cases := []struct {
-		name string
-		args []string
-	}{
-		{"no-args", []string{"export"}},
-		{"bad-format", []string{"export", p, "--format", "xml"}},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if code := run(tc.args); code != exitUsage {
-				t.Fatalf("expected exitUsage, got %d", code)
-			}
-		})
 	}
 }
 
@@ -162,40 +95,23 @@ func TestImportUsageErrors(t *testing.T) {
 	}
 }
 
-// TestImportBase64 checks that binary keys encoded as base64 survive the round-trip.
+// TestImportBase64 checks that binary keys encoded as base64 survive an import.
 func TestImportBase64(t *testing.T) {
-	src := dbPath(t)
 	rawKey := []byte{0x00, 0x01, 0x02, 0x03}
 	rawVal := []byte("bin-val")
 	bk := base64.StdEncoding.EncodeToString(rawKey)
 	bv := base64.StdEncoding.EncodeToString(rawVal)
 
-	// Export as JSONL with base64 encoding.
-	seedDB(t, src, [][2]string{{string(rawKey), string(rawVal)}})
-	exported := capture(t, func() {
-		if code := run([]string{"export", src, "--format", "jsonl", "--base64"}); code != exitOK {
-			t.Fatalf("export base64: exit %d", code)
-		}
-	})
-
-	// Exported line must contain base64-encoded key and value.
-	if !strings.Contains(exported, bk) {
-		t.Fatalf("exported line %q does not contain base64 key %q", exported, bk)
-	}
-	if !strings.Contains(exported, bv) {
-		t.Fatalf("exported line %q does not contain base64 value %q", exported, bv)
+	// Build the JSONL input the way a base64 export would: both fields base64-encoded.
+	importFile := filepath.Join(t.TempDir(), "data.jsonl")
+	line := `{"key":"` + bk + `","value":"` + bv + `"}` + "\n"
+	if err := writeFile(importFile, line); err != nil {
+		t.Fatalf("write jsonl: %v", err)
 	}
 
-	// Re-import with base64 decoding into a new DB.
-	dst := filepath.Join(t.TempDir(), "dst.kv")
-	if code := run([]string{"create", dst}); code != exitOK {
-		t.Fatalf("create dst: exit %d", code)
-	}
-	exportFile := filepath.Join(t.TempDir(), "data.jsonl")
-	if code := run([]string{"export", src, "--format", "jsonl", "--base64", "--output", exportFile}); code != exitOK {
-		t.Fatalf("export to file: exit %d", code)
-	}
-	if code := run([]string{"import", dst, "--format", "jsonl", "--base64", "--input", exportFile}); code != exitOK {
+	// Import with base64 decoding into a fresh DB.
+	dst := dbPath(t)
+	if code := run([]string{"import", dst, "--format", "jsonl", "--base64", "--input", importFile}); code != exitOK {
 		t.Fatalf("import base64: exit %d", code)
 	}
 

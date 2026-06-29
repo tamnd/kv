@@ -240,16 +240,13 @@ func TestBinaryStats(t *testing.T) {
 	}
 }
 
-func TestBinaryCheckpointAndCompact(t *testing.T) {
+func TestBinaryCheckpoint(t *testing.T) {
 	cl := newBinaryServer(t)
 	if _, err := cl.Set([]byte("k"), []byte("v"), 0); err != nil {
 		t.Fatalf("set: %v", err)
 	}
 	if err := cl.Checkpoint(); err != nil {
 		t.Fatalf("checkpoint: %v", err)
-	}
-	if _, err := cl.Compact(0); err != nil {
-		t.Fatalf("compact: %v", err)
 	}
 }
 
@@ -261,93 +258,6 @@ func TestBinaryTTL(t *testing.T) {
 	_, found, err := cl.Get([]byte("eph"))
 	if err != nil || !found {
 		t.Fatalf("get within ttl: found=%v err=%v", found, err)
-	}
-}
-
-func TestBinaryScan(t *testing.T) {
-	cl := newBinaryServer(t)
-	for _, k := range []string{"a", "b", "c", "d", "e"} {
-		if _, err := cl.Set([]byte(k), []byte("v-"+k), 0); err != nil {
-			t.Fatalf("set %s: %v", k, err)
-		}
-	}
-
-	// A full forward scan yields every pair in key order with its value.
-	var got []string
-	err := cl.Scan(ScanOptions{}, func(key, value []byte) error {
-		got = append(got, string(key)+"="+string(value))
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("scan: %v", err)
-	}
-	want := []string{"a=v-a", "b=v-b", "c=v-c", "d=v-d", "e=v-e"}
-	if len(got) != len(want) {
-		t.Fatalf("scan got %v, want %v", got, want)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("scan[%d] = %q, want %q", i, got[i], want[i])
-		}
-	}
-}
-
-func TestBinaryScanBoundsAndLimit(t *testing.T) {
-	cl := newBinaryServer(t)
-	for _, k := range []string{"a", "b", "c", "d", "e"} {
-		cl.Set([]byte(k), []byte("v"), 0)
-	}
-
-	// A bounded scan [b, e) yields b, c, d.
-	var keys []string
-	cl.Scan(ScanOptions{Lower: []byte("b"), Upper: []byte("e")}, func(key, _ []byte) error {
-		keys = append(keys, string(key))
-		return nil
-	})
-	if len(keys) != 3 || keys[0] != "b" || keys[2] != "d" {
-		t.Fatalf("bounded scan = %v, want [b c d]", keys)
-	}
-
-	// A limit caps the count.
-	keys = nil
-	cl.Scan(ScanOptions{Limit: 2}, func(key, _ []byte) error {
-		keys = append(keys, string(key))
-		return nil
-	})
-	if len(keys) != 2 {
-		t.Fatalf("limited scan = %v, want 2 keys", keys)
-	}
-}
-
-func TestBinaryScanKeysOnly(t *testing.T) {
-	cl := newBinaryServer(t)
-	cl.Set([]byte("k"), []byte("value"), 0)
-	err := cl.Scan(ScanOptions{KeysOnly: true}, func(key, value []byte) error {
-		if string(key) != "k" {
-			t.Fatalf("key = %q, want k", key)
-		}
-		if value != nil {
-			t.Fatalf("keys-only value = %q, want nil", value)
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("scan keys-only: %v", err)
-	}
-}
-
-func TestBinaryScanReverse(t *testing.T) {
-	cl := newBinaryServer(t)
-	for _, k := range []string{"a", "b", "c"} {
-		cl.Set([]byte(k), []byte("v"), 0)
-	}
-	var keys []string
-	cl.Scan(ScanOptions{Reverse: true}, func(key, _ []byte) error {
-		keys = append(keys, string(key))
-		return nil
-	})
-	if len(keys) != 3 || keys[0] != "c" || keys[2] != "a" {
-		t.Fatalf("reverse scan = %v, want [c b a]", keys)
 	}
 }
 

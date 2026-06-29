@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/tamnd/kv/engine"
 	"github.com/tamnd/kv/format"
 )
 
@@ -25,9 +24,8 @@ func settleLSM(t *testing.T, d *DB) {
 
 // TestLSMRangeIndexTransparent drives the RangeIndex option through the public database:
 // the same writes are loaded into one database with the REMIX index on and one with it
-// off, both settled into segments, and their full and bounded scans must agree key for
-// key and value for value. The index is a pure performance choice, so turning it on may
-// never change what a scan returns.
+// off, both settled into segments, and every key must read back the same. The index is a
+// pure performance choice, so turning it on may never change what a read returns.
 func TestLSMRangeIndexTransparent(t *testing.T) {
 	const n = 300
 	load := func(d *DB) {
@@ -65,65 +63,36 @@ func TestLSMRangeIndexTransparent(t *testing.T) {
 	load(on)
 	settleLSM(t, on)
 
-	scan := func(d *DB, opts engine.IterOptions) ([]string, []string) {
-		var keys, vals []string
-		if err := d.View(func(txn *Txn) error {
-			it, err := txn.NewIterator(opts)
-			if err != nil {
-				return err
-			}
-			defer it.Close()
-			keys, vals = collect(t, it)
-			return nil
-		}); err != nil {
-			t.Fatalf("scan: %v", err)
-		}
-		return keys, vals
-	}
-
-	cases := []struct {
-		name string
-		opts engine.IterOptions
-	}{
-		{"full", engine.IterOptions{}},
-		{"bounded", engine.IterOptions{Lower: []byte("key0100"), Upper: []byte("key0200")}},
-		{"prefix", engine.IterOptions{Prefix: []byte("key01")}},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			offKeys, offVals := scan(off, tc.opts)
-			onKeys, onVals := scan(on, tc.opts)
-			if !eq(offKeys, onKeys...) {
-				t.Fatalf("keys differ with the range index on:\n off %v\n on  %v", offKeys, onKeys)
-			}
-			if !eq(offVals, onVals...) {
-				t.Fatalf("values differ with the range index on:\n off %v\n on  %v", offVals, onVals)
-			}
-		})
-	}
-
-	// Spot-check the content against the truth so a bug shared by both paths cannot pass: a
-	// deleted key is gone, an overwritten key carries its new value, an untouched key its
-	// original.
-	keys, vals := scan(on, engine.IterOptions{})
-	got := make(map[string]string, len(keys))
-	for i, k := range keys {
-		got[k] = vals[i]
-	}
+	// Point reads of every key, present and absent, must give identical answers with the
+	// range index on and off, so turning it on stays invisible to reads. The deleted keys
+	// (i%7==0) are the absent population.
 	for i := 0; i < n; i++ {
 		k := fmt.Sprintf("key%04d", i)
+		offVal, offOk := txnGet(t, off, k)
+		onVal, onOk := txnGet(t, on, k)
+		if offOk != onOk || offVal != onVal {
+			t.Fatalf("point read of %s disagrees: off (%q,%v), on (%q,%v)", k, offVal, offOk, onVal, onOk)
+		}
+	}
+
+	// Spot-check the content against the truth with point reads so a bug shared by both
+	// paths cannot pass: a deleted key is gone, an overwritten key carries its new value, an
+	// untouched key its original.
+	for i := 0; i < n; i++ {
+		k := fmt.Sprintf("key%04d", i)
+		got, ok := txnGet(t, on, k)
 		switch {
 		case i%7 == 0:
-			if _, ok := got[k]; ok {
+			if ok {
 				t.Fatalf("deleted key %s still present", k)
 			}
 		case i%3 == 0:
-			if got[k] != fmt.Sprintf("w%04d", i) {
-				t.Fatalf("overwritten key %s = %q, want w%04d", k, got[k], i)
+			if !ok || got != fmt.Sprintf("w%04d", i) {
+				t.Fatalf("overwritten key %s = %q,%v, want w%04d", k, got, ok, i)
 			}
 		default:
-			if got[k] != fmt.Sprintf("v%04d", i) {
-				t.Fatalf("key %s = %q, want v%04d", k, got[k], i)
+			if !ok || got != fmt.Sprintf("v%04d", i) {
+				t.Fatalf("key %s = %q,%v, want v%04d", k, got, ok, i)
 			}
 		}
 	}

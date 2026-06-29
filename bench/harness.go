@@ -341,7 +341,7 @@ func runPhase(db *kv.DB, cfg Config, w Workload) (runResult, error) {
 	return rr, nil
 }
 
-// runConcurrentInto drives the standard read/write/scan/RMW workloads, optionally spread across
+// runConcurrentInto drives the standard read/write/RMW workloads, optionally spread across
 // cfg.Concurrency goroutines, and folds every worker's histograms and counts into rr. With one
 // worker it runs inline; with more it fans out and merges under a barrier so the run's
 // percentiles are true global percentiles.
@@ -469,11 +469,6 @@ func runWorker(db *kv.DB, cfg Config, w Workload, worker, ops int) (workerResult
 				return wr, e
 			}
 			wr.logicalRead++ // an RMW reads before it writes
-		case w.ScanLength > 0:
-			if e := scanOp(db, kbuf, w.ScanLength, wr.reads); e != nil {
-				return wr, e
-			}
-			wr.logicalRead++ // a scan is one logical read that touches many keys
 		case w.isWrite(coinVal):
 			if e := writeOp(db, kbuf, keyGen.Value(idx), wr.writes); e != nil {
 				if e == kv.ErrConflict {
@@ -539,29 +534,6 @@ func rmwOp(db *kv.DB, key []byte, gen *Generator, idx uint64, reads, writes *His
 	// An RMW touches both paths; charge it to both histograms so neither tail is hidden.
 	reads.Record(d)
 	writes.Record(d)
-	return err
-}
-
-// scanOp times a forward range scan of up to length keys starting at key, the YCSB-E
-// iteration pattern.
-func scanOp(db *kv.DB, key []byte, length int, h *Histogram) error {
-	start := time.Now()
-	err := db.View(func(txn *kv.Txn) error {
-		it, e := txn.NewIterator(kv.IterOptions{})
-		if e != nil {
-			return e
-		}
-		defer it.Close()
-		seen := 0
-		for ok := it.SeekGE(key); ok && seen < length; ok = it.Next() {
-			if _, e := it.Value(); e != nil {
-				return e
-			}
-			seen++
-		}
-		return it.Error()
-	})
-	h.Record(time.Since(start))
 	return err
 }
 

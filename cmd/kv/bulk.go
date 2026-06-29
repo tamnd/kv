@@ -12,51 +12,6 @@ import (
 	"github.com/tamnd/kv"
 )
 
-// cmdDump streams every key/value pair to stdout as JSONL, the canonical interchange
-// form load reads back. It uses the streaming record writer so a large database dumps in
-// flat memory (spec 16 §4).
-func cmdDump(args []string) int {
-	fs := flag.NewFlagSet("dump", flag.ContinueOnError)
-	e := encFlags(fs)
-	if err := parseArgs(fs, args); err != nil {
-		return exitUsage
-	}
-	if fs.NArg() != 1 {
-		return usageErr("usage: kv dump <db> [--hex | --base64]")
-	}
-	d, code := openDB(fs.Arg(0))
-	if code != exitOK {
-		return code
-	}
-	defer d.Close()
-
-	w := newRecordWriter(os.Stdout, fmtJSONL, e, false)
-	dumpErr := d.View(func(txn *kv.Txn) error {
-		it, err := txn.NewIterator(kv.IterOptions{})
-		if err != nil {
-			return err
-		}
-		defer it.Close()
-		for it.First(); it.Valid(); it.Next() {
-			v, err := it.Value()
-			if err != nil {
-				return err
-			}
-			if err := w.write(it.Key(), v, false); err != nil {
-				return err
-			}
-		}
-		return it.Error()
-	})
-	if dumpErr != nil {
-		return fail(dumpErr)
-	}
-	if err := w.close(); err != nil {
-		return fail(err)
-	}
-	return exitOK
-}
-
 // cmdLoad bulk-loads JSONL key/value records from a file or stdin through db.Load, the
 // sorted fast path: on a fresh database it builds the tree bottom-up and makes it durable
 // with one checkpoint, far faster than inserting key by key, and on a database that

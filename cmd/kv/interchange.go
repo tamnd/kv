@@ -12,77 +12,6 @@ import (
 	"github.com/tamnd/kv"
 )
 
-// cmdExport streams key/value pairs in a human-readable interchange format: CSV, TSV,
-// or JSONL (spec 16 §3). Export is the counterpart of dump; it supports the same scan
-// filters (prefix, range) but targets formats that other tools—spreadsheets, awk,
-// Python scripts—can read without a kv-specific decoder.
-func cmdExport(args []string) int {
-	fs := flag.NewFlagSet("export", flag.ContinueOnError)
-	e := encFlags(fs)
-	spec := bindScanFlags(fs)
-	format := fs.String("format", "jsonl", "output format: csv, tsv, jsonl")
-	output := fs.String("output", "-", "write to this file (- for stdout)")
-	if err := parseArgs(fs, args); err != nil {
-		return exitUsage
-	}
-	if fs.NArg() != 1 {
-		return usageErr("usage: kv export <db> [--format csv|tsv|jsonl] [--output F] [--prefix P | --from LO --to HI] [--base64]")
-	}
-
-	xfmt, err := parseXFormat(*format)
-	if err != nil {
-		return usageErr("%v", err)
-	}
-
-	d, code := openDB(fs.Arg(0))
-	if code != exitOK {
-		return code
-	}
-	defer d.Close()
-
-	iterOpts, err := spec.options(e, false)
-	if err != nil {
-		return usageErr("invalid scan option: %v", err)
-	}
-
-	var out io.Writer = os.Stdout
-	if *output != "-" {
-		f, ferr := os.Create(*output)
-		if ferr != nil {
-			return fail(ferr)
-		}
-		defer f.Close()
-		out = f
-	}
-
-	exportErr := d.View(func(txn *kv.Txn) error {
-		it, err := txn.NewIterator(iterOpts)
-		if err != nil {
-			return err
-		}
-		defer it.Close()
-
-		xw := newXWriter(out, xfmt, e)
-		for it.First(); it.Valid(); it.Next() {
-			v, err := it.Value()
-			if err != nil {
-				return err
-			}
-			if err := xw.writeRow(it.Key(), v); err != nil {
-				return err
-			}
-		}
-		if err := it.Error(); err != nil {
-			return err
-		}
-		return xw.close()
-	})
-	if exportErr != nil {
-		return fail(exportErr)
-	}
-	return exitOK
-}
-
 // cmdImport loads key/value pairs from CSV, TSV, or JSONL into the database (spec 16 §3).
 // For CSV/TSV the key is taken from --key-col (default 0) and the value from --val-col
 // (default 1). For JSONL the standard {"key":"...","value":"..."} encoding is used, the
@@ -172,54 +101,6 @@ func parseXFormat(s string) (xFormat, error) {
 	default:
 		return xfmtJSONL, fmt.Errorf("unknown interchange format %q (want csv, tsv, or jsonl)", s)
 	}
-}
-
-// xWriter emits rows in the chosen interchange format.
-type xWriter struct {
-	cw  *csv.Writer
-	bw  *bufio.Writer
-	enc *enc
-	fmt xFormat
-}
-
-func newXWriter(w io.Writer, f xFormat, e *enc) *xWriter {
-	bw := bufio.NewWriter(w)
-	switch f {
-	case xfmtCSV:
-		cw := csv.NewWriter(bw)
-		return &xWriter{cw: cw, bw: bw, enc: e, fmt: f}
-	case xfmtTSV:
-		cw := csv.NewWriter(bw)
-		cw.Comma = '\t'
-		return &xWriter{cw: cw, bw: bw, enc: e, fmt: f}
-	default:
-		return &xWriter{bw: bw, enc: e, fmt: xfmtJSONL}
-	}
-}
-
-func (xw *xWriter) writeRow(key, value []byte) error {
-	k := xw.enc.encode(key)
-	v := xw.enc.encode(value)
-	if xw.cw != nil {
-		return xw.cw.Write([]string{k, v})
-	}
-	// JSONL: same record layout as dump so export|import round-trips.
-	b, err := json.Marshal(record{Key: k, Value: v})
-	if err != nil {
-		return err
-	}
-	xw.bw.Write(b)
-	return xw.bw.WriteByte('\n')
-}
-
-func (xw *xWriter) close() error {
-	if xw.cw != nil {
-		xw.cw.Flush()
-		if err := xw.cw.Error(); err != nil {
-			return err
-		}
-	}
-	return xw.bw.Flush()
 }
 
 // importJSONL reads the standard {"key":"...","value":"..."} JSONL format (same as

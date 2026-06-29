@@ -72,7 +72,7 @@ func TestRunInvariants(t *testing.T) {
 				}
 				// A workload with reads reports a real, non-negative read amplification from
 				// the pager counter; a write-only workload leaves the not-measured sentinel.
-				hasReads := w.ReadFraction > 0 || w.RMW || w.ScanLength > 0 || w.ReadLatest
+				hasReads := w.ReadFraction > 0 || w.RMW || w.ReadLatest
 				if hasReads {
 					if amp.Read < 0 {
 						t.Fatalf("read workload should report read amplification, got sentinel %v", amp.Read)
@@ -254,11 +254,4 @@ func BenchmarkMixedBTree(b *testing.B) {
 }
 func BenchmarkMixedLSM(b *testing.B) {
 	runMicro(b, kv.LSM, Workload{Name: "ycsb-a", Dist: Zipfian, ReadFraction: 0.5})
-}
-
-func BenchmarkScanBTree(b *testing.B) {
-	runMicro(b, kv.BTree, Workload{Name: "ycsb-e", Dist: Zipfian, ReadFraction: 1, ScanLength: scanLenE})
-}
-func BenchmarkScanLSM(b *testing.B) {
-	runMicro(b, kv.LSM, Workload{Name: "ycsb-e", Dist: Zipfian, ReadFraction: 1, ScanLength: scanLenE})
 }

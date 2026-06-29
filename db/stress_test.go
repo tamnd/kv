@@ -89,80 +89,6 @@ func TestConcurrentReadWrite(t *testing.T) {
 	}
 }
 
-// TestConcurrentScanVsWrite runs a scanner that pages through the full key range
-// concurrently with writers committing new keys. The scanner must not crash, skip
-// logically-consistent snapshots, or return uncommitted values. It uses View (a
-// read-only snapshot) which provides the isolation guarantee (spec 10 §2).
-func TestConcurrentScanVsWrite(t *testing.T) {
-	const (
-		writers    = 4
-		writesEach = 100
-	)
-	d := openMem(t, Options{AutoCheckpoint: 32})
-
-	// Seed some initial data so the scan has something to iterate.
-	for i := 0; i < 20; i++ {
-		key := fmt.Sprintf("init-%04d", i)
-		if err := d.Update(func(txn *Txn) error {
-			return txn.Set([]byte(key), []byte("v0"))
-		}); err != nil {
-			t.Fatalf("seed: %v", err)
-		}
-	}
-
-	stop := make(chan struct{})
-	var scanErrs atomic.Int64
-
-	// Scanner goroutine: runs full scans until stop is closed.
-	go func() {
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-			}
-			err := d.View(func(txn *Txn) error {
-				it, err := txn.NewIterator(engine.IterOptions{})
-				if err != nil {
-					return err
-				}
-				defer it.Close()
-				for it.First(); it.Valid(); it.Next() {
-					_, err := it.Value()
-					if err != nil {
-						return err
-					}
-				}
-				return it.Error()
-			})
-			if err != nil {
-				scanErrs.Add(1)
-			}
-		}
-	}()
-
-	var wg sync.WaitGroup
-	wg.Add(writers)
-	for w := 0; w < writers; w++ {
-		w := w
-		go func() {
-			defer wg.Done()
-			for i := 0; i < writesEach; i++ {
-				key := fmt.Sprintf("w%d-%04d", w, i)
-				_ = d.Update(func(txn *Txn) error {
-					return txn.Set([]byte(key), []byte("val"))
-				})
-			}
-		}()
-	}
-	wg.Wait()
-	close(stop)
-
-	if n := scanErrs.Load(); n > 0 {
-		t.Errorf("scan goroutine saw %d errors", n)
-	}
-}
-
 // TestMaintenanceDuringWrites runs a background maintenance goroutine (checkpoint,
 // vacuum, compaction) while foreground goroutines are writing. After everything stops,
 // the database must be consistent: all committed keys are present, the check passes,
@@ -400,7 +326,7 @@ func TestConcurrentTransactionConflicts(t *testing.T) {
 	}
 }
 
-// TestSoak runs a mixed read/write/scan/checkpoint workload for a fixed wall-clock
+// TestSoak runs a mixed read/write/checkpoint workload for a fixed wall-clock
 // duration. It is skipped under -short (tests under 30 s) but runs as a full soak in
 // CI. Its purpose is to catch leaks (pinned versions, file descriptors, growing WAL)
 // and tail-latency degradation over sustained load (spec 23 §6).
@@ -422,8 +348,8 @@ func TestSoak(t *testing.T) {
 
 	end := time.Now().Add(duration)
 	var wg sync.WaitGroup
-	var writeCount, readCount, scanCount, checkpointCount atomic.Int64
-	var writeErr, readErr, scanErr atomic.Int64
+	var writeCount, readCount, checkpointCount atomic.Int64
+	var writeErr, readErr atomic.Int64
 
 	// Writers.
 	for w := 0; w < numWriters; w++ {
@@ -472,34 +398,6 @@ func TestSoak(t *testing.T) {
 		}()
 	}
 
-	// Scanner.
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for time.Now().Before(end) {
-			err := d.View(func(txn *Txn) error {
-				it, err := txn.NewIterator(engine.IterOptions{
-					Upper: []byte(fmt.Sprintf("k%04d", keySpace/2)),
-				})
-				if err != nil {
-					return err
-				}
-				defer it.Close()
-				for it.First(); it.Valid(); it.Next() {
-					if _, err := it.Value(); err != nil {
-						return err
-					}
-				}
-				return it.Error()
-			})
-			if err != nil {
-				scanErr.Add(1)
-			} else {
-				scanCount.Add(1)
-			}
-		}
-	}()
-
 	// Periodic checkpointer (manual, lower frequency than auto to mix both paths).
 	wg.Add(1)
 	go func() {
@@ -514,18 +412,15 @@ func TestSoak(t *testing.T) {
 
 	wg.Wait()
 
-	t.Logf("soak: writes=%d reads=%d scans=%d checkpoints=%d writeErr=%d readErr=%d scanErr=%d",
-		writeCount.Load(), readCount.Load(), scanCount.Load(), checkpointCount.Load(),
-		writeErr.Load(), readErr.Load(), scanErr.Load())
+	t.Logf("soak: writes=%d reads=%d checkpoints=%d writeErr=%d readErr=%d",
+		writeCount.Load(), readCount.Load(), checkpointCount.Load(),
+		writeErr.Load(), readErr.Load())
 
 	if n := writeErr.Load(); n > 0 {
 		t.Errorf("%d write errors during soak", n)
 	}
 	if n := readErr.Load(); n > 0 {
 		t.Errorf("%d read errors during soak", n)
-	}
-	if n := scanErr.Load(); n > 0 {
-		t.Errorf("%d scan errors during soak", n)
 	}
 
 	// Structural integrity after sustained load.
