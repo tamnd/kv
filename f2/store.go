@@ -305,7 +305,7 @@ func newDurable(t Tunables) (*Store, error) {
 		t:          t,
 		ckptBytes:  ckpt,
 	}
-	df := &durableFile{f: f, pageSize: int64(t.PageSize), shards: t.Shards, dial: t.Durability}
+	df := &durableFile{f: f, pageSize: int64(t.PageSize), shards: t.Shards, dial: t.Durability, snapRoot: -1}
 	s.df = df
 	s.ep = newEpochs()
 
@@ -463,10 +463,13 @@ func (s *Store) Delete(key []byte) error {
 }
 
 // Checkpoint is a durability barrier. In the memory-only core there is nothing to
-// flush, so it is a no-op. In single-file mode it flushes every shard's tail page
-// to the file and advances the superblock to the current allocator high-water, so
-// recovery after this point replays only what follows. Under a non-None dial the
-// flush and the superblock are fsynced.
+// flush, so it is a no-op. In single-file mode it flushes every shard's tail page to
+// the file, captures each shard's live index slots and frontier as the cut, then writes
+// a durable index snapshot and advances the superblock to point at it. Recovery after
+// this point loads the index from the snapshot and replays only the records appended
+// past each shard's frontier, so a reopen costs the live key count rather than the whole
+// operation history since the last compaction. Under a non-None dial the tail flush, the
+// snapshot chain, and the superblock are each fsynced.
 func (s *Store) Checkpoint() error {
 	if s.closed.Load() {
 		return errClosed
@@ -474,20 +477,30 @@ func (s *Store) Checkpoint() error {
 	if s.df == nil {
 		return nil
 	}
-	for _, sh := range s.shards {
+	// Flush each shard's tail and capture its section under the same lock, so the
+	// frontier names bytes already on disk and the slots match that frontier. The
+	// per-shard captures are independent, the same non-atomic cut the high-water has
+	// always taken, because recovery rebuilds each shard on its own.
+	snaps := make([]shardSnap, len(s.shards))
+	for i, sh := range s.shards {
 		sh.mu.Lock()
 		err := sh.log.flushTail()
+		if err == nil {
+			snaps[i] = sh.captureSnap()
+		}
 		sh.mu.Unlock()
 		if err != nil {
 			return err
 		}
 	}
+	// Barrier the tail pages before the snapshot records frontiers that name them, so a
+	// crash cannot leave a snapshot pointing past bytes that never reached disk.
 	if s.df.dial != DurabilityNone {
 		if err := s.df.sync(); err != nil {
 			return err
 		}
 	}
-	return s.df.writeSuperblock()
+	return s.df.commitSnapshot(snaps)
 }
 
 // Close releases the store. In single-file mode it checkpoints first so a clean
