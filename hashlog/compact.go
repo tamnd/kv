@@ -108,18 +108,18 @@ func (sh *shard) compactExtent(pid int64) error {
 	pageBytes := int64(sh.pageSize)
 
 	sh.mu.RLock()
-	ps := sh.pages.Load()
 	if pid >= int64(len(sh.pageExtent)) || sh.pageExtent[pid] < 0 {
 		sh.mu.RUnlock()
 		return nil // retired or evicted out from under the selection; nothing to do
 	}
 	fill := sh.pageFill[pid]
 	src := make([]byte, fill)
-	if page := ps.pages[pid]; page != nil {
-		copy(src, page[:fill])
+	ref := sh.pages.Load().refs[pid].Load()
+	if ref.mem != nil {
+		copy(src, ref.mem[:fill])
 		sh.mu.RUnlock()
 	} else {
-		dOff := ps.diskOff[pid]
+		dOff := ref.diskOff
 		f := sh.df.f
 		sh.mu.RUnlock()
 		if _, err := f.ReadAt(src, dOff); err != nil {
@@ -244,8 +244,7 @@ func (sh *shard) appendRelocated(lsn uint64, flags byte, key, value []byte) (val
 		// extent's compaction and the data is intact (D5).
 		return 0, 0, 0, err
 	}
-	ps := sh.pages.Load()
-	page := ps.pages[sh.tailPage]
+	page := sh.pages.Load().refs[sh.tailPage].Load().mem
 	recStart := sh.tailPage*int64(sh.pageSize) + int64(sh.tailPos)
 	if err := addrInRange(recStart, rl); err != nil {
 		return 0, 0, 0, err
@@ -303,15 +302,12 @@ func (sh *shard) retireCompactedExtent(pid int64) {
 		sh.mu.Unlock()
 		return
 	}
-	ps := sh.pages.Load()
-	np := make([][]byte, len(ps.pages))
-	copy(np, ps.pages)
-	nd := make([]int64, len(ps.diskOff))
-	copy(nd, ps.diskOff)
-	resident := np[pid]
-	np[pid] = nil
-	nd[pid] = -1
-	sh.pages.Store(&pageSet{pages: np, diskOff: nd})
+	d := sh.pages.Load()
+	resident := d.refs[pid].Load().mem
+	// Repoint the slot to a hole ref (mem nil, diskOff -1: neither resident nor on disk) in
+	// one atomic store, no directory copy. The write lock excludes every reader on this
+	// profile, so no reader is mid-read of the page.
+	d.refs[pid].Store(&pageRef{diskOff: -1})
 
 	if resident != nil {
 		for k, rp := range sh.residentOrder {

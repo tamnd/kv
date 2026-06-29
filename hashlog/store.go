@@ -631,9 +631,11 @@ func (s *Store) Stats() Stats {
 		for _, pf := range sh.pageFill {
 			st.LiveExtentBytes += int64(pf)
 		}
-		if ps := sh.pages.Load(); ps != nil {
-			for _, p := range ps.pages {
-				if p != nil {
+		if d := sh.pages.Load(); d != nil {
+			// Count only the live pages (len(pageFill)); the directory may carry spare
+			// capacity past them whose refs are nil.
+			for pid := 0; pid < len(sh.pageFill); pid++ {
+				if d.refs[pid].Load().mem != nil {
 					st.ResidentPages++
 				}
 			}
@@ -928,22 +930,31 @@ func (t *idxTable) lookupEntry(thash uint64, key []byte) *entry {
 	}
 }
 
-// pageSet is the log's page directory, published behind an atomic pointer so the
-// lock-free read path can index it without holding the shard lock. A structural
-// change (rolling a new page, or nil-ing a spilled one) builds a fresh pageSet and
-// stores it; writing record bytes into an existing page does not, and is made
-// visible to readers by the atomic store of the index entry that points at it.
-//
-// diskOff is parallel to pages: where pages[pid] is nil (the page was spilled),
-// diskOff[pid] is the byte offset in the backing file where the page's bytes live, so
-// a lock-free evicting read resolves a spilled value's offset from the same immutable
-// snapshot it read the page directory from (M6). A resident page's diskOff entry is
-// unread (the reader uses the buffer), and it is published only when eviction nils the
-// page, after which it is immutable because a spilled page's offset never moves (page
-// ids are never reused and an extent's offset is fixed once allocated).
-type pageSet struct {
-	pages   [][]byte
-	diskOff []int64
+// pageRef is one page's directory entry. It is immutable once published: a resident page
+// has mem set; a spilled page has mem nil and diskOff naming the byte offset in the
+// backing file where the page's bytes live (-1 for a hole left by compaction, which is
+// neither resident nor on disk). A lock-free reader loads a ref with one atomic load and
+// reads a consistent resident-or-spilled pair from it: mem and diskOff never disagree
+// within a ref because eviction and retirement replace the whole ref rather than mutate
+// one in place. A spilled page's offset never moves (page ids are never reused and an
+// extent's offset is fixed once allocated), so the ref stays valid for the page's life.
+type pageRef struct {
+	mem     []byte
+	diskOff int64
+}
+
+// pageDir is the log's page directory: one atomic ref per page id, published behind an
+// atomic pointer so the lock-free read path indexes it without the shard lock. The refs
+// slice is replaced only when it must grow to hold more pages (growDir doubles and
+// republishes, copying the live refs across); rolling a new page, spilling one on
+// eviction, or retiring one in compaction stores a single ref into its slot, so the
+// common structural change is one atomic store rather than a rebuild of the whole
+// directory (audit L6). A reader holding an older directory keeps reading the refs it
+// already had; growth only ever adds capacity for pages that do not exist yet, and a slot
+// a reader can reach is published before the index entry that points into its page.
+// This mirrors the f2 engine's directory.
+type pageDir struct {
+	refs []atomic.Pointer[pageRef]
 }
 
 // shard is one index+log partition. The log bookkeeping is guarded by mu; the index
@@ -960,11 +971,11 @@ type shard struct {
 	idxLive int
 	idxOcc  int
 
-	// pages is the log's page directory behind an atomic pointer; pageID indexes it and
-	// a nil entry means the page was spilled (its file offset is in the same pageSet's
+	// pages is the log's page directory behind an atomic pointer; pageID indexes it and a
+	// ref whose mem is nil means the page was spilled (its file offset is the ref's
 	// diskOff). store is the back-pointer to the owning Store, for the global epoch and
 	// the slot pool; it is set once in New before the store serves a request.
-	pages atomic.Pointer[pageSet]
+	pages atomic.Pointer[pageDir]
 	store *Store
 
 	tailPage int64 // pageID currently being appended to
@@ -1077,7 +1088,9 @@ func newShard(t Tunables, df *durableFile, shardID int) (*shard, error) {
 	}
 	sh.index.Store(newIdxTable(1024))
 	// Page 0 starts resident and empty.
-	sh.pages.Store(&pageSet{pages: [][]byte{make([]byte, t.PageSize)}, diskOff: []int64{0}})
+	dir0 := &pageDir{refs: make([]atomic.Pointer[pageRef], 1)}
+	dir0.refs[0].Store(&pageRef{mem: make([]byte, t.PageSize)})
+	sh.pages.Store(dir0)
 	sh.pageExtent = append(sh.pageExtent, -1)
 	sh.pageFill = append(sh.pageFill, 0)
 	sh.pageFlushed = append(sh.pageFlushed, 0)
@@ -1141,6 +1154,31 @@ func encodeRecord(dst, key, value []byte) int {
 // sealed page that the recovery scan trusts as complete, breaking the invariant that
 // every non-final sealed page is fully synced (D5). The tail is left where it is and the
 // caller propagates the error instead of acknowledging the write.
+// growDir returns a page directory whose refs slice has room for n pages, doubling and
+// republishing it when the current one is too small and copying the live refs across. The
+// caller holds the shard write lock. A reader holding the old directory keeps reading the
+// refs it already had; growth only adds capacity for pages that do not exist yet, so the
+// pre-growth slots a reader can reach are unchanged. It mirrors the f2 engine's ensureCap.
+func (sh *shard) growDir(n int) *pageDir {
+	d := sh.pages.Load()
+	if n <= len(d.refs) {
+		return d
+	}
+	newLen := len(d.refs) * 2
+	if newLen < 8 {
+		newLen = 8
+	}
+	for newLen < n {
+		newLen *= 2
+	}
+	nd := &pageDir{refs: make([]atomic.Pointer[pageRef], newLen)}
+	for i := range d.refs {
+		nd.refs[i].Store(d.refs[i].Load())
+	}
+	sh.pages.Store(nd)
+	return nd
+}
+
 func (sh *shard) rollFor(rl int) error {
 	if sh.tailPos+rl <= sh.pageSize {
 		return nil
@@ -1150,15 +1188,13 @@ func (sh *shard) rollFor(rl int) error {
 			return err
 		}
 	}
-	ps := sh.pages.Load()
 	sh.tailPage++
 	sh.tailPos = 0
-	np := make([][]byte, len(ps.pages)+1)
-	copy(np, ps.pages)
-	np[sh.tailPage] = sh.newPageBuf()
-	nd := make([]int64, len(ps.diskOff)+1)
-	copy(nd, ps.diskOff)
-	sh.pages.Store(&pageSet{pages: np, diskOff: nd})
+	// Publish the fresh resident page as one slot store into a directory grown to fit it.
+	// The store happens before the parallel page arrays grow below, so an under-lock reader
+	// that sees the new page count also sees its ref.
+	d := sh.growDir(int(sh.tailPage) + 1)
+	d.refs[sh.tailPage].Store(&pageRef{mem: sh.newPageBuf()})
 	sh.pageExtent = append(sh.pageExtent, -1)
 	sh.pageFill = append(sh.pageFill, 0)
 	sh.pageFlushed = append(sh.pageFlushed, 0)
@@ -1224,8 +1260,7 @@ func (sh *shard) set(key, value []byte) error {
 	if err := sh.rollFor(rl); err != nil {
 		return err
 	}
-	ps := sh.pages.Load()
-	page := ps.pages[sh.tailPage]
+	page := sh.pages.Load().refs[sh.tailPage].Load().mem
 	recStart := sh.tailPage*int64(sh.pageSize) + int64(sh.tailPos)
 	if err := addrInRange(recStart, rl); err != nil {
 		return err
@@ -1329,7 +1364,7 @@ func (sh *shard) tryInPlace(key, value []byte) bool {
 		// forbidden in-place durable mutation (doc 04 section 7.2). Append instead.
 		return false
 	}
-	page := sh.pages.Load().pages[pid]
+	page := sh.pages.Load().refs[pid].Load().mem
 	if page == nil {
 		return false
 	}
@@ -1455,8 +1490,7 @@ func (sh *shard) delete(key []byte) error {
 	if err := sh.rollFor(rl); err != nil {
 		return err
 	}
-	ps := sh.pages.Load()
-	page := ps.pages[sh.tailPage]
+	page := sh.pages.Load().refs[sh.tailPage].Load().mem
 	lsn := sh.df.nextLSN()
 	n := encodeDurableRecord(page[sh.tailPos:], lsn, key, nil, flagTombstone)
 	sh.tailPos += n
@@ -1488,8 +1522,8 @@ func (sh *shard) evictIfNeeded() {
 	evicted := false
 	for len(sh.residentOrder) > sh.residentCap {
 		pid := sh.residentOrder[0]
-		ps := sh.pages.Load()
-		page := ps.pages[pid]
+		d := sh.pages.Load()
+		page := d.refs[pid].Load().mem
 		if page == nil {
 			sh.residentOrder = sh.residentOrder[1:]
 			continue
@@ -1518,19 +1552,13 @@ func (sh *shard) evictIfNeeded() {
 			dOff = off
 		}
 
-		// Publish the page directory with this page nilled and its disk offset filled, in
-		// one atomic store: a reader that loads the new pageSet sees nil at pid and the
-		// offset in the same snapshot, and a reader that loaded the old pageSet still sees
-		// the resident buffer. Publish before the retire (doc 07 section 6.1) so no new
-		// reader can reach the buffer when it is retired; only readers that loaded the old
-		// directory can still slice it, and those are exactly the readers the epoch waits on.
-		np := make([][]byte, len(ps.pages))
-		copy(np, ps.pages)
-		nd := make([]int64, len(ps.diskOff))
-		copy(nd, ps.diskOff)
-		np[pid] = nil
-		nd[pid] = dOff
-		sh.pages.Store(&pageSet{pages: np, diskOff: nd})
+		// Repoint the page's directory slot to a spilled ref in one atomic store: a reader
+		// that loads the new ref sees nil mem and the disk offset together, and a reader that
+		// loaded the old ref still sees the resident buffer. Publish before the retire (doc 07
+		// section 6.1) so no new reader can reach the buffer when it is retired; only readers
+		// that loaded the old ref can still slice it, and those are exactly the readers the
+		// epoch waits on. This is one slot store rather than a copy of the whole directory.
+		d.refs[pid].Store(&pageRef{diskOff: dOff})
 		sh.retirePageBufLocked(page)
 		sh.residentOrder = sh.residentOrder[1:]
 		sh.spilledPages++
@@ -1668,7 +1696,7 @@ func (sh *shard) writePageRemainder(pid int64, page []byte) (int64, error) {
 // acknowledges a write whose bytes did not reach the device (D4): on an error the
 // frontier is left where it was, so what is reported durable still matches the file.
 func (sh *shard) flushDurable(doSync bool) error {
-	ps := sh.pages.Load()
+	d := sh.pages.Load()
 	maxLSN := sh.frontier.Load()
 	// Scan only the dirty suffix [firstDirty, tail] (L3). Pages below firstDirty were
 	// fully written by an earlier barrier flush, and that flush also folded their LSN
@@ -1682,7 +1710,7 @@ func (sh *shard) flushDurable(doSync bool) error {
 		if sh.pageMaxLSN[pid] > maxLSN {
 			maxLSN = sh.pageMaxLSN[pid]
 		}
-		page := ps.pages[pid]
+		page := d.refs[pid].Load().mem
 		if page == nil || sh.pageFlushed[pid] >= sh.pageFill[pid] {
 			continue
 		}
@@ -1722,10 +1750,9 @@ func (sh *shard) get(key []byte) ([]byte, bool, error) {
 		if !ok {
 			return nil, false, nil
 		}
-		pages := sh.pages.Load().pages
 		pid := loc.addr / int64(sh.pageSize)
 		off := int(loc.addr % int64(sh.pageSize))
-		page := pages[pid]
+		page := sh.pages.Load().refs[pid].Load().mem
 		return page[off : off+int(loc.vlen)], true, nil
 	}
 	// Eviction is possible, so a concurrent evictor can recycle a page out from under
@@ -1764,20 +1791,20 @@ func (sh *shard) getGuarded(key []byte, stripe uint64) ([]byte, bool, error) {
 		return nil, false, nil
 	}
 	loc := e.loadLoc()
-	ps := sh.pages.Load()
 	pid := loc.addr / int64(sh.pageSize)
 	off := int(loc.addr % int64(sh.pageSize))
-	if page := ps.pages[pid]; page != nil {
+	ref := sh.pages.Load().refs[pid].Load()
+	if ref.mem != nil {
 		val := make([]byte, loc.vlen)
-		copy(val, page[off:off+int(loc.vlen)])
+		copy(val, ref.mem[off:off+int(loc.vlen)])
 		g.leave()
 		return val, true, nil
 	}
 	// Spilled: the page is on disk at a stable offset (an extent's offset is fixed once
-	// allocated and page ids are never reused), read from the same immutable pageSet
-	// snapshot the page directory came from. Resolve under the epoch, then leave before
-	// the syscall. In durable mode the file is the shared one; in Dir mode the scratch.
-	dOff := ps.diskOff[pid]
+	// allocated and page ids are never reused), read from the same immutable ref the page
+	// directory handed back. Resolve under the epoch, then leave before the syscall. In
+	// durable mode the file is the shared one; in Dir mode the scratch.
+	dOff := ref.diskOff
 	f := sh.file
 	if sh.df != nil {
 		f = sh.df.f
@@ -1808,21 +1835,22 @@ func (sh *shard) getLocked(key []byte) ([]byte, bool, error) {
 	if !ok {
 		return nil, false, nil
 	}
-	ps := sh.pages.Load()
+	d := sh.pages.Load()
 	// An oversize value's bytes span a cont chain, not one page, so assemble it from the
 	// chain (M9, doc 03 section 7). The marker is one already-loaded bit, so an inline read
 	// pays only this single branch before slicing as before.
 	if loc.isOversize() {
-		return sh.readOversizeLocked(ps, loc)
+		return sh.readOversizeLocked(d, loc)
 	}
 	pid := loc.addr / int64(sh.pageSize)
 	off := int(loc.addr % int64(sh.pageSize))
-	if page := ps.pages[pid]; page != nil {
+	ref := d.refs[pid].Load()
+	if ref.mem != nil {
 		val := make([]byte, loc.vlen)
-		copy(val, page[off:off+int(loc.vlen)])
+		copy(val, ref.mem[off:off+int(loc.vlen)])
 		return val, true, nil
 	}
-	dOff := ps.diskOff[pid]
+	dOff := ref.diskOff
 	f := sh.file
 	if sh.df != nil {
 		f = sh.df.f
