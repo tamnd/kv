@@ -228,6 +228,14 @@ type Store struct {
 	sinceCkpt atomic.Int64 // durable bytes appended since the last checkpoint
 	closed    atomic.Bool  // set once by Close, makes later calls return errClosed
 
+	// ckptMu serializes checkpoints so the background loop, an explicit Checkpoint, and
+	// the close-time checkpoint never run two commits at once (which would race the
+	// snapshot chain's allocate-and-free). ckptSig is a depth-1 trigger: the Set that
+	// crosses the byte threshold pokes it without blocking, so the checkpoint runs off
+	// the write path and many crossings coalesce into one queued run (single-flight).
+	ckptMu  sync.Mutex
+	ckptSig chan struct{}
+
 	// recoverNanos and recoverRecords record what the open-time recovery did, so Stats
 	// can report the replay cost. Both are 0 for a memory-only store and a fresh file.
 	recoverNanos   atomic.Int64
@@ -333,12 +341,40 @@ func newDurable(t Tunables) (*Store, error) {
 			return nil, err
 		}
 	}
-	if t.CompactionInterval > 0 {
+	if t.CompactionInterval > 0 || (df != nil && s.ckptBytes > 0) {
 		s.bgStop = make(chan struct{})
+	}
+	if t.CompactionInterval > 0 {
 		s.bgWG.Add(1)
 		go s.compactLoop(t.CompactionInterval)
 	}
+	if df != nil && s.ckptBytes > 0 {
+		s.ckptSig = make(chan struct{}, 1)
+		s.bgWG.Add(1)
+		go s.checkpointLoop()
+	}
 	return s, nil
+}
+
+// checkpointLoop runs a checkpoint whenever the write path signals the byte threshold was
+// crossed, until Close stops it. Keeping the checkpoint off the crossing Set removes the
+// periodic latency spike that an inline checkpoint puts on one unlucky writer. A failed
+// background checkpoint is dropped, the same as a failed background compaction: the data
+// is no less durable (a checkpoint only bounds recovery replay, it never acknowledges a
+// write), so the only cost of a miss is a longer replay, and the next trigger retries.
+func (s *Store) checkpointLoop() {
+	defer s.bgWG.Done()
+	for {
+		select {
+		case <-s.bgStop:
+			return
+		case <-s.ckptSig:
+			if s.closed.Load() {
+				return
+			}
+			_ = s.checkpoint()
+		}
+	}
 }
 
 // compactLoop runs Compact every interval until Close stops it, keeping the file
@@ -448,7 +484,13 @@ func (s *Store) Set(key, value []byte) error {
 	}
 	if s.df != nil && s.ckptBytes > 0 && s.sinceCkpt.Add(int64(n)) >= s.ckptBytes {
 		s.sinceCkpt.Store(0)
-		return s.Checkpoint()
+		// Poke the background checkpoint without blocking this writer. A full channel
+		// means a checkpoint is already queued or running, so this crossing coalesces
+		// into it (single-flight) rather than stacking a second one.
+		select {
+		case s.ckptSig <- struct{}{}:
+		default:
+		}
 	}
 	return nil
 }
@@ -474,9 +516,18 @@ func (s *Store) Checkpoint() error {
 	if s.closed.Load() {
 		return errClosed
 	}
+	return s.checkpoint()
+}
+
+// checkpoint is the checkpoint body without the closed guard, shared by the public
+// Checkpoint, the background loop, and Close. ckptMu makes it single-flight: at most one
+// commit runs at a time, so two triggers never race the snapshot chain's allocate-and-free.
+func (s *Store) checkpoint() error {
 	if s.df == nil {
 		return nil
 	}
+	s.ckptMu.Lock()
+	defer s.ckptMu.Unlock()
 	// Flush each shard's tail and capture its section under the same lock, so the
 	// frontier names bytes already on disk and the slots match that frontier. The
 	// per-shard captures are independent, the same non-atomic cut the high-water has
@@ -511,27 +562,18 @@ func (s *Store) Close() error {
 	if s.closed.Swap(true) {
 		return nil // idempotent: a second Close is a no-op, not a double free
 	}
-	// Stop the background compactor and wait for it to exit before touching the
-	// file, so a final Compact never races the close that follows.
+	// Stop the background compactor and checkpoint loop and wait for them to exit before
+	// touching the file, so the final checkpoint never races a background one.
 	if s.bgStop != nil {
 		close(s.bgStop)
 		s.bgWG.Wait()
 	}
 	if s.df != nil {
-		// Flush and stamp the superblock even under None, so a clean close is always
-		// fully recoverable; only a crash exposes the dial's loss window.
-		for _, sh := range s.shards {
-			sh.mu.Lock()
-			ferr := sh.log.flushTail()
-			sh.mu.Unlock()
-			if ferr != nil {
-				return ferr
-			}
-		}
-		if err := s.df.sync(); err != nil {
-			return err
-		}
-		if err := s.df.writeSuperblock(); err != nil {
+		// A final checkpoint flushes every tail and writes a fresh index snapshot even
+		// under None, so a clean close is always fully recoverable and the reopen is
+		// delta-bound rather than replaying the whole generation; only a crash exposes
+		// the dial's loss window.
+		if err := s.checkpoint(); err != nil {
 			return err
 		}
 		unlockFile(s.df.f)

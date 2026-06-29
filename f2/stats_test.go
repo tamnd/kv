@@ -131,9 +131,11 @@ func TestStatsAuditRecovery(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := first.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
+	// Flush every tail to disk, then crash without a clean close. A clean close would
+	// write an index snapshot and the reopen would replay nothing; crashing with no
+	// snapshot forces the full replay this test measures.
+	flushTails(t, first)
+	crash(t, first)
 
 	reopened := mustOpenT(t, tn)
 	st := reopened.Stats()
