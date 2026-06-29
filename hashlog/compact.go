@@ -169,7 +169,7 @@ func (sh *shard) compactExtent(pid int64) error {
 // bytes credited dead in the output page so the accounting stays exact (ABANDONED).
 func (sh *shard) relocateData(lsn uint64, flags byte, key, value []byte, oldValueAddr int64) error {
 	thash := tableHash(key)
-	if e := sh.index.Load().lookupEntry(thash, key); e == nil || e.loc.addr != oldValueAddr {
+	if e := sh.index.Load().lookupEntry(thash, key); e == nil || e.loadLoc().addr != oldValueAddr {
 		return nil
 	}
 
@@ -190,7 +190,7 @@ func (sh *shard) relocateData(lsn uint64, flags byte, key, value []byte, oldValu
 	if flags&flagOversize != 0 {
 		newVlen = valLocOversizeBit | oversizeDescriptorLen
 	}
-	if e := sh.index.Load().lookupEntry(thash, key); e != nil && e.loc.addr == oldValueAddr {
+	if e := sh.index.Load().lookupEntry(thash, key); e != nil && e.loadLoc().addr == oldValueAddr {
 		sh.indexRepointLocked(thash, key, valLoc{addr: newValueAddr, vlen: newVlen})
 		sh.store.relocatedRecords.Add(1)
 		sh.store.copiedBytes.Add(int64(encLen))
@@ -247,6 +247,9 @@ func (sh *shard) appendRelocated(lsn uint64, flags byte, key, value []byte) (val
 	ps := sh.pages.Load()
 	page := ps.pages[sh.tailPage]
 	recStart := sh.tailPage*int64(sh.pageSize) + int64(sh.tailPos)
+	if err := addrInRange(recStart, rl); err != nil {
+		return 0, 0, 0, err
+	}
 	n := encodeDurableRecord(page[sh.tailPos:], lsn, key, value, flags)
 	sh.tailPos += n
 	sh.pageFill[sh.tailPage] = sh.tailPos
@@ -272,7 +275,11 @@ func (sh *shard) indexRepointLocked(thash uint64, key []byte, loc valLoc) {
 			return
 		}
 		if e != tombstone && e.thash == thash && bytes.Equal(e.key, key) {
-			t.slots[i].Store(&entry{thash: thash, key: e.key, loc: loc})
+			// Repoint the existing entry in place (L2): same key, new location, one atomic
+			// store. A concurrent lock-free reader sees either the pre- or post-relocation
+			// address; the old extent is retired only after this pass under the epoch guard,
+			// so both name live bytes.
+			e.loc.Store(packLoc(loc))
 			return
 		}
 		i = (i + 1) & t.mask

@@ -228,6 +228,12 @@ func New(t Tunables) (*Store, error) {
 	if t.PageSize <= 64 {
 		return nil, errors.New("hashlog: PageSize too small")
 	}
+	if t.PageSize > 1<<inlineLenBits {
+		// An inline value is bounded by the page, and the index slot encodes its length in
+		// inlineLenBits; a page larger than that field could hold an inline value whose
+		// length would not fit, so cap the page rather than truncate a length.
+		return nil, errors.New("hashlog: PageSize larger than the inline value length field")
+	}
 	if t.Durability != DurabilityNone && t.Path == "" {
 		return nil, errors.New("hashlog: Normal or Full durability needs a Path")
 	}
@@ -539,7 +545,7 @@ func (sh *shard) captureCut() (snapSection, shardFrontier, []int64, error) {
 		if e == nil || e == tombstone {
 			continue
 		}
-		tuples = append(tuples, snapTuple{key: append([]byte(nil), e.key...), loc: e.loc})
+		tuples = append(tuples, snapTuple{key: append([]byte(nil), e.key...), loc: e.loadLoc()})
 	}
 	fr := shardFrontier{
 		frontierLSN: uint64(sh.frontier.Load()),
@@ -562,22 +568,97 @@ func (sh *shard) captureCut() (snapSection, shardFrontier, []int64, error) {
 // valLoc points the index straight at a value in the log: addr is the logical
 // address of the value's first byte, vlen its length. Pointing at the value
 // instead of the record header lets a resident GET return the value with no varint
-// decode.
+// decode. It is the unpacked, in-memory form; the index slot stores it packed into a
+// single 64-bit word (packLoc) so an overwrite is one atomic store.
 type valLoc struct {
 	addr int64
 	vlen uint32
 }
 
-// entry is one published index slot. It is immutable once stored: an overwrite or a
-// delete stores a fresh *entry (or the tombstone) into the slot rather than
-// mutating this one, so a lock-free reader that loaded the pointer always sees a
-// consistent key/loc pair. thash is the table hash, kept inline so a probe rejects
-// a non-matching slot without touching the key bytes.
+const (
+	// logAddrBits is the width of the logical value address an index slot encodes. 39
+	// bits covers 512 GiB of log per shard, matching f2's per-shard ceiling; a store
+	// with compaction keeps the live set well under it. An append whose address would
+	// pass the ceiling returns errLogFull (addrInRange) rather than truncate the address
+	// into a wrong location.
+	logAddrBits = 39
+	maxLogAddr  = int64(1) << logAddrBits
+	logAddrMask = uint64(maxLogAddr - 1)
+
+	// inlineLenBits is the width of the inline value length packed above the address. 24
+	// bits (16 MiB) exceeds any inline value, which is bounded by the page size; an
+	// oversize value carries its true length on disk and stores only the fixed 24-byte
+	// descriptor length here, so this field never has to hold the spanning length.
+	inlineLenBits = 24
+	inlineLenMask = uint32(1<<inlineLenBits) - 1
+
+	// locOversizeBit is the packed oversize marker, the top bit of the slot word. It
+	// mirrors valLoc's valLocOversizeBit, which lives at bit 31 of the unpacked vlen.
+	locOversizeBit = uint64(1) << 63
+)
+
+// errLogFull is returned when a shard's log address would pass the 39-bit ceiling the
+// index slot can encode. It signals the store should be compacted; the write is refused
+// rather than wrapped to a wrong address.
+var errLogFull = errors.New("hashlog: shard log address space exhausted, compact the store")
+
+// packLoc encodes a valLoc into the single 64-bit word an index slot stores: the 39-bit
+// address in the low bits, the 24-bit inline length above it, the oversize marker in the
+// top bit. The caller has checked the address is in range (addrInRange), so the pack
+// never truncates.
+func packLoc(l valLoc) uint64 {
+	w := uint64(l.addr) & logAddrMask
+	w |= uint64(l.vlen&inlineLenMask) << logAddrBits
+	if l.vlen&valLocOversizeBit != 0 {
+		w |= locOversizeBit
+	}
+	return w
+}
+
+// unpackLoc is the inverse of packLoc, recovering the in-memory valLoc the rest of the
+// code works with so the .addr/.vlen/.length()/.isOversize() helpers are unchanged.
+func unpackLoc(w uint64) valLoc {
+	vlen := uint32(w>>logAddrBits) & inlineLenMask
+	if w&locOversizeBit != 0 {
+		vlen |= valLocOversizeBit
+	}
+	return valLoc{addr: int64(w & logAddrMask), vlen: vlen}
+}
+
+// addrInRange reports whether a record of length rl starting at recStart fits under the
+// 39-bit address ceiling, returning errLogFull if it would not. The slot encodes the
+// value address in 39 bits, so an address past the ceiling cannot be represented and the
+// write is refused rather than wrapped.
+func addrInRange(recStart int64, rl int) error {
+	if recStart+int64(rl) > maxLogAddr {
+		return errLogFull
+	}
+	return nil
+}
+
+// entry is one published index slot. Its thash and key are immutable once stored; loc is
+// packed (packLoc) and mutated in place on an overwrite (L2), so a hot same-key Set is one
+// atomic store with no allocation. A lock-free reader loads the pointer, matches the
+// immutable key, then loads loc atomically, so it always sees a consistent key with either
+// the pre- or post-overwrite location, both of which name live bytes. thash is kept inline
+// so a probe rejects a non-matching slot without touching the key bytes.
 type entry struct {
 	thash uint64
 	key   []byte
-	loc   valLoc
+	loc   atomic.Uint64
 }
+
+// newEntry builds a slot entry pointing at loc. It is the only way to construct an entry
+// with a location, since loc is an atomic that cannot be set in a composite literal.
+func newEntry(thash uint64, key []byte, l valLoc) *entry {
+	e := &entry{thash: thash, key: key}
+	e.loc.Store(packLoc(l))
+	return e
+}
+
+// loadLoc returns the entry's current location, unpacked. It loads the slot word
+// atomically, so it is safe to call without a lock concurrently with an in-place overwrite.
+func (e *entry) loadLoc() valLoc { return unpackLoc(e.loc.Load()) }
 
 // tombstone marks a slot whose key was deleted. It keeps the open-addressing probe
 // chain intact (a lookup must not stop on it) until the next grow drops it.
@@ -605,7 +686,7 @@ func newIdxTable(min int) *idxTable {
 // is safe to call without any lock concurrently with a writer publishing slots.
 func (t *idxTable) lookup(thash uint64, key []byte) (valLoc, bool) {
 	if e := t.lookupEntry(thash, key); e != nil {
-		return e.loc, true
+		return e.loadLoc(), true
 	}
 	return valLoc{}, false
 }
@@ -927,6 +1008,9 @@ func (sh *shard) set(key, value []byte) error {
 	ps := sh.pages.Load()
 	page := ps.pages[sh.tailPage]
 	recStart := sh.tailPage*int64(sh.pageSize) + int64(sh.tailPos)
+	if err := addrInRange(recStart, rl); err != nil {
+		return err
+	}
 	// Encode the record and compute the value's offset from the record start. The
 	// value sits after the header and the key, so point the index straight at it and
 	// reads skip the record decode. The index publish (an atomic store) is the release
@@ -966,11 +1050,12 @@ func (sh *shard) set(key, value []byte) error {
 // rather than panicking, so a stale or relocated entry never indexes out of bounds.
 func (sh *shard) creditDeadLocked(e *entry) {
 	keyLen := len(e.key)
+	loc := e.loadLoc()
 	// length() masks the oversize marker, so an oversize home record is sized by its 24-byte
 	// descriptor (its inline value), exactly the bytes it occupies in the log; the cont
 	// extents are freed separately by supersedeOldLocked, not counted as log dead space.
-	valLen := int(e.loc.length())
-	headerStart := e.loc.addr - int64(durableValOffFor(keyLen, valLen))
+	valLen := int(loc.length())
+	headerStart := loc.addr - int64(durableValOffFor(keyLen, valLen))
 	pid := headerStart / int64(sh.pageSize)
 	if pid < 0 || pid >= int64(len(sh.deadBytes)) {
 		return
@@ -1007,10 +1092,14 @@ func (sh *shard) readOnlyAddress() int64 {
 func (sh *shard) tryInPlace(key, value []byte) bool {
 	thash := tableHash(key)
 	e := sh.index.Load().lookupEntry(thash, key)
-	if e == nil || int(e.loc.vlen) != len(value) {
+	if e == nil {
 		return false
 	}
-	headerStart := e.loc.addr - int64(durableValOff(key, value))
+	loc := e.loadLoc()
+	if int(loc.vlen) != len(value) {
+		return false
+	}
+	headerStart := loc.addr - int64(durableValOff(key, value))
 	if headerStart < sh.readOnlyAddress() {
 		return false
 	}
@@ -1051,7 +1140,7 @@ func (sh *shard) indexPut(thash uint64, key []byte, loc valLoc) {
 			} else {
 				sh.idxOcc++
 			}
-			t.slots[slot].Store(&entry{thash: thash, key: append([]byte(nil), key...), loc: loc})
+			t.slots[slot].Store(newEntry(thash, append([]byte(nil), key...), loc))
 			sh.idxLive++
 			return
 		}
@@ -1060,8 +1149,12 @@ func (sh *shard) indexPut(thash uint64, key []byte, loc valLoc) {
 				firstTomb = int64(i)
 			}
 		} else if e.thash == thash && bytes.Equal(e.key, key) {
-			// Overwrite: republish with the new location, reusing the stored key.
-			t.slots[i].Store(&entry{thash: thash, key: e.key, loc: loc})
+			// Overwrite (L2): repoint the existing entry in place with one atomic store,
+			// no new *entry and no key copy. The key and thash are unchanged, so a
+			// concurrent lock-free reader matching this key sees either the old or the new
+			// location, both naming live bytes (the superseded record stays in the log until
+			// compaction). The store is the release that publishes the freshly written value.
+			e.loc.Store(packLoc(loc))
 			return
 		}
 		i = (i + 1) & t.mask
@@ -1451,7 +1544,7 @@ func (sh *shard) getGuarded(key []byte, stripe uint64) ([]byte, bool, error) {
 		g.leave()
 		return nil, false, nil
 	}
-	loc := e.loc
+	loc := e.loadLoc()
 	ps := sh.pages.Load()
 	pid := loc.addr / int64(sh.pageSize)
 	off := int(loc.addr % int64(sh.pageSize))
