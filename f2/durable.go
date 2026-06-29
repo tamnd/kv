@@ -3,11 +3,11 @@ package f2
 import (
 	"encoding/binary"
 	"hash/crc32"
-	"os"
-	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/tamnd/kv/vfs"
 )
 
 // The single durable file is the only on-disk design. It does two jobs at once.
@@ -61,7 +61,7 @@ const (
 // allocator, the sequence counter, and the superblock writes, all of which are
 // rare (a page boundary or a checkpoint), so it never sits on the per-record path.
 type durableFile struct {
-	f        *os.File
+	f        vfs.File
 	pageSize int64
 	shards   int
 	dial     Durability
@@ -83,11 +83,11 @@ type durableFile struct {
 
 	// syncCount counts device barriers issued and syncNanos accumulates their wall
 	// time, so Stats can report whether the Full dial is disk-bound. Both are read
-	// without the lock, so they are atomics. syncHook, when set, replaces the platform
+	// without the lock, so they are atomics. syncHook, when set, replaces the device
 	// barrier in a test so a benchmark or a counter assertion does not pay F_FULLFSYNC.
 	syncCount atomic.Int64
 	syncNanos atomic.Int64
-	syncHook  func(*os.File) error
+	syncHook  func(vfs.File) error
 
 	// Group commit (audit L4). Under the Full dial every shard fsyncs the shared file
 	// once per record, yet one device barrier flushes every shard's pending writes, so
@@ -159,7 +159,9 @@ func (d *durableFile) barrier() error {
 	if d.syncHook != nil {
 		err = d.syncHook(d.f)
 	} else {
-		err = platformSyncData(d.f)
+		// SyncData is the data-durability barrier: fdatasync on Linux, F_FULLFSYNC on
+		// macOS. The vfs backend owns the platform detail, so f2 asks for the level.
+		err = d.f.Sync(vfs.SyncData)
 	}
 	d.syncNanos.Add(int64(time.Since(start)))
 	return err
@@ -266,19 +268,6 @@ func (d *durableFile) writeSuperblock() error {
 	return nil
 }
 
-// syncDir fsyncs the directory holding path so a freshly created file's directory
-// entry is itself durable. Without it a crash right after create can lose the
-// entry that names the file, and recovery would then find no file and silently
-// treat the store as brand new, losing the whole acknowledged workload.
-func syncDir(path string) error {
-	dir, err := os.Open(filepath.Dir(path))
-	if err != nil {
-		return err
-	}
-	defer dir.Close()
-	return dir.Sync()
-}
-
 // superblock is the parsed content of a superblock slot.
 type superblock struct {
 	pageSize  int64
@@ -299,7 +288,7 @@ type superblock struct {
 
 // readSuperblock returns the newest valid superblock across the two slots, or an
 // invalid zero value when neither slot checksums (a fresh or destroyed file).
-func readSuperblock(f *os.File) superblock {
+func readSuperblock(f vfs.File) superblock {
 	var best superblock
 	for i := int64(0); i < numSuperblocks; i++ {
 		buf := make([]byte, sbSize)
@@ -338,11 +327,10 @@ func readSuperblock(f *os.File) superblock {
 // recovery to scan past the last superblock's high-water and find pages a Full
 // write fsynced after the last checkpoint.
 func (d *durableFile) fileBlocks() (int64, error) {
-	fi, err := d.f.Stat()
+	size, err := d.f.Size()
 	if err != nil {
 		return 0, err
 	}
-	size := fi.Size()
 	if size <= dataStart {
 		return 0, nil
 	}
