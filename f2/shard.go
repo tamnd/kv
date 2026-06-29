@@ -23,6 +23,15 @@ type shard struct {
 	// leaves it nil, keeping the hot path free of the guard.
 	ep *epochs
 
+	// budgeted is true when this shard's log evicts and recycles page buffers. A
+	// budgeted read must not alias a buffer a writer could recycle, so it reads under
+	// the shard read lock (getLocked) and copies its value out, excluding the evictor,
+	// which holds the write lock. The memory-only and unbudgeted-durable profiles never
+	// recycle and stay lock-free. It is fixed at construction (the budget is invariant
+	// across compaction generations), so reading it lock-free to pick the path is
+	// race-free.
+	budgeted bool
+
 	// deferred holds file blocks a compaction retired, each waiting behind the safe
 	// epoch before it returns to the allocator. Guarded by mu. Empty until the
 	// compactor (a later increment) populates it.
@@ -40,31 +49,57 @@ type shard struct {
 // file; budget is the resident page cap (zero unbounded); ep is the shared epoch
 // state in durable mode, nil in memory-only.
 func newShard(pageSize int, df *durableFile, shardID, budget int, ep *epochs) *shard {
-	s := &shard{log: newLog(pageSize, df, shardID, budget), ep: ep}
+	s := &shard{log: newLog(pageSize, df, shardID, budget), ep: ep, budgeted: budget > 0}
 	idx := newIndex(minIndexSlots)
 	idx.log = s.log
 	s.index.Store(idx)
 	return s
 }
 
-// get is the lock-free read path. In memory-only mode it probes directly; in
-// durable mode it pins an epoch first so a concurrent compaction never reuses a
-// file block while this read is resolving an address or preading it. The bare
-// path draws a fresh stripe per call; a hot durable read loop should hold a
-// Reader, which caches one.
+// get is the read path. A budgeted shard recycles page buffers, so it reads under
+// the shard read lock and copies the value out (getLocked), excluding the evictor.
+// A memory-only shard probes directly with no lock. An unbudgeted durable shard pins
+// an epoch first so a concurrent compaction never reuses a file block while this read
+// is resolving an address or preading it; the bare path draws a fresh stripe per
+// call, so a hot durable read loop should hold a Reader, which caches one.
 func (s *shard) get(h uint64, key []byte) ([]byte, bool, error) {
+	if s.budgeted {
+		return s.getLocked(h, key)
+	}
 	if s.ep == nil {
 		return s.lookup(h, key)
 	}
 	return s.getGuarded(h, key, s.ep.nextStripe.Add(1))
 }
 
+// getLocked reads a budgeted shard under the shard read lock and returns an owned
+// copy of the value. The read lock excludes the evictor (it holds the write lock),
+// so the page buffer the value is read from cannot be recycled mid-read; copying the
+// value out before releasing the lock means the returned bytes never alias a buffer
+// a later eviction could wipe and reuse. This mirrors the sibling hashlog engine's
+// durable evicting profile, which reads the same way for the same reason. An evicted
+// hit's value is already an owned copy from readEvicted, so the copy here is redundant
+// for it, but a single branch-free copy on every budgeted hit is simpler than tracking
+// which hits aliased a resident buffer, and it costs a few hundred nanoseconds against
+// the microseconds of a pread.
+func (s *shard) getLocked(h uint64, key []byte) ([]byte, bool, error) {
+	s.mu.RLock()
+	v, ok, err := s.lookup(h, key)
+	if ok && v != nil {
+		v = append([]byte(nil), v...)
+	}
+	s.mu.RUnlock()
+	return v, ok, err
+}
+
 // getGuarded pins the epoch on the given stripe for the duration of the lookup,
 // then leaves. The guard must span the directory load and any pread inside lookup:
 // an evicted read returns an owned copy made while the guard was held, and a
-// resident read returns a slice into page RAM the garbage collector keeps alive,
-// so leaving once lookup returns is safe in both cases. The guard's job is only to
-// keep a file block from being reused while lookup was computing or reading it.
+// resident read returns a slice into page RAM. The guard keeps a file block from
+// being reused while lookup is computing or reading it. This path serves only the
+// unbudgeted durable profile, which never evicts, so a resident hit's slice into page
+// RAM stays valid (the garbage collector keeps the buffer alive) and is returned as
+// is, preserving the zero-copy resident read.
 func (s *shard) getGuarded(h uint64, key []byte, stripe uint64) ([]byte, bool, error) {
 	g := s.ep.slots.enter(&s.ep.global, stripe)
 	v, ok, err := s.lookup(h, key)

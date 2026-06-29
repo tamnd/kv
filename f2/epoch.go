@@ -162,6 +162,9 @@ func (r *Reader) Get(key []byte) (value []byte, found bool, err error) {
 	}
 	h := hash64(key)
 	sh := r.s.shardFor(h)
+	if sh.budgeted {
+		return sh.getLocked(h, key)
+	}
 	if sh.ep == nil {
 		return sh.get(h, key)
 	}
