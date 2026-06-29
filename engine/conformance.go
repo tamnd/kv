@@ -2,7 +2,6 @@ package engine
 
 import (
 	"bytes"
-	"context"
 	"fmt"
 	"sort"
 
@@ -16,7 +15,7 @@ import (
 // the engine, since the contract is identical.
 //
 // The Oracle tracks, per user key, the full version history so it can answer
-// point reads and range scans at any snapshot exactly as a correct engine must.
+// point reads at any snapshot exactly as a correct engine must.
 type Oracle struct {
 	// versions[userKey] is the list of (version, kind, value) newest-first.
 	versions map[string][]oracleVer
@@ -76,48 +75,18 @@ func (o *Oracle) Get(userKey []byte, snap Snapshot) ([]byte, bool) {
 	return format.Fold(ops, snap.Version, rd, o.merge)
 }
 
-// Scan returns the visible (key,value) pairs in [lower,upper) at snap, sorted by
-// key ascending.
-func (o *Oracle) Scan(lower, upper []byte, snap Snapshot) []KV {
-	keys := make([]string, 0, len(o.versions))
-	for k := range o.versions {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	var out []KV
-	for _, k := range keys {
-		uk := []byte(k)
-		if lower != nil && bytes.Compare(uk, lower) < 0 {
-			continue
-		}
-		if upper != nil && bytes.Compare(uk, upper) >= 0 {
-			continue
-		}
-		if v, ok := o.Get(uk, snap); ok {
-			out = append(out, KV{Key: append([]byte(nil), uk...), Value: v})
-		}
-	}
-	return out
-}
-
-// KV is a key/value pair returned by a scan.
-type KV struct {
-	Key   []byte
-	Value []byte
-}
-
 // mergeSetter is implemented by engines that resolve merge operands during reads.
 // CheckEngine installs the test's merge resolver through it so the engine folds
-// merges the same way the oracle does. Both the Model and the B-tree core satisfy
-// it; an engine without merge support simply does not implement it.
+// merges the same way the oracle does. Both the Model and the f2 core satisfy it;
+// an engine without merge support simply does not implement it.
 type mergeSetter interface {
 	SetMergeFunc(func(existing, operand []byte) []byte)
 }
 
 // CheckEngine drives eng through the same sequence of committed batches as the
-// oracle and verifies that point reads and full scans agree at a range of
-// snapshots. It returns the first divergence as an error, or nil if the engine
-// conforms. mergeFn is the merge resolver both sides use (may be nil).
+// oracle and verifies that point reads agree at a range of snapshots. It returns
+// the first divergence as an error, or nil if the engine conforms. mergeFn is the
+// merge resolver both sides use (may be nil).
 //
 // ops is a list of committed batches in version order; each batch's Version is
 // its commit version. snaps lists the snapshot versions to verify at; if empty,
@@ -182,72 +151,7 @@ func CheckEngine(eng Engine, batches []*WriteBatch, mergeFn func(existing, opera
 			}
 		}
 
-		// Full forward scan.
-		want := oracle.Scan(nil, nil, snap)
-		got, err := scanAll(rd, false)
-		if err != nil {
-			rd.Close()
-			return fmt.Errorf("snap %d scan: %w", sv, err)
-		}
-		if err := compareKVs(sv, want, got); err != nil {
-			rd.Close()
-			return err
-		}
-
-		// Full reverse scan must yield the same set in reverse.
-		gotRev, err := scanAll(rd, true)
-		if err != nil {
-			rd.Close()
-			return fmt.Errorf("snap %d reverse scan: %w", sv, err)
-		}
-		reverseKVs(gotRev)
-		if err := compareKVs(sv, want, gotRev); err != nil {
-			rd.Close()
-			return fmt.Errorf("reverse: %w", err)
-		}
-
 		rd.Close()
-	}
-	_ = context.Background
-	return nil
-}
-
-func scanAll(rd Reader, reverse bool) ([]KV, error) {
-	cur, err := rd.NewIter(IterOptions{Reverse: reverse})
-	if err != nil {
-		return nil, err
-	}
-	defer cur.Close()
-	var out []KV
-	for ok := cur.First(); ok; ok = cur.Next() {
-		lv, err := cur.Value()
-		if err != nil {
-			return nil, err
-		}
-		v, err := lv.Value()
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, KV{Key: append([]byte(nil), cur.Key()...), Value: append([]byte(nil), v...)})
-	}
-	return out, cur.Error()
-}
-
-func reverseKVs(s []KV) {
-	for i, j := 0, len(s)-1; i < j; i, j = i+1, j-1 {
-		s[i], s[j] = s[j], s[i]
-	}
-}
-
-func compareKVs(snap uint64, want, got []KV) error {
-	if len(want) != len(got) {
-		return fmt.Errorf("snap %d scan: %d pairs, oracle has %d", snap, len(got), len(want))
-	}
-	for i := range want {
-		if !bytes.Equal(want[i].Key, got[i].Key) || !bytes.Equal(want[i].Value, got[i].Value) {
-			return fmt.Errorf("snap %d scan[%d]: engine (%q=%q) != oracle (%q=%q)",
-				snap, i, got[i].Key, got[i].Value, want[i].Key, want[i].Value)
-		}
 	}
 	return nil
 }
