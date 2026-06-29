@@ -36,23 +36,19 @@ import (
 type OpKind string
 
 const (
-	OpGet         OpKind = "get"
-	OpExists      OpKind = "exists"
-	OpSet         OpKind = "set"
-	OpDelete      OpKind = "delete"
-	OpDeleteRange OpKind = "delete_range"
-	OpMerge       OpKind = "merge"
+	OpGet    OpKind = "get"
+	OpExists OpKind = "exists"
+	OpSet    OpKind = "set"
+	OpDelete OpKind = "delete"
+	OpMerge  OpKind = "merge"
 )
 
-// Op is one operation in a transaction or batch request. Lo and Hi carry the bounds of a
-// delete_range; Key/Value carry a point op's operands; TTL, when positive, makes a set a
-// SetWithTTL. The fields a kind does not use are ignored.
+// Op is one operation in a transaction or batch request. Key/Value carry a point op's operands;
+// TTL, when positive, makes a set a SetWithTTL. The fields a kind does not use are ignored.
 type Op struct {
 	Kind  OpKind
 	Key   []byte
 	Value []byte
-	Lo    []byte
-	Hi    []byte
 	TTL   time.Duration
 }
 
@@ -188,17 +184,6 @@ func (s *Service) Delete(key []byte) (uint64, error) {
 	return s.db.UpdateVersion(func(txn *kv.Txn) error { return txn.Delete(key) })
 }
 
-// DeleteRange removes every key in [lo, hi) and returns the commit version.
-func (s *Service) DeleteRange(lo, hi []byte) (uint64, error) {
-	if err := s.limits.checkKey(lo); err != nil {
-		return 0, err
-	}
-	if err := s.limits.checkKey(hi); err != nil {
-		return 0, err
-	}
-	return s.db.UpdateVersion(func(txn *kv.Txn) error { return txn.DeleteRange(lo, hi) })
-}
-
 // Merge applies the registered merge operator to a key and returns the commit version.
 func (s *Service) Merge(key, operand []byte) (uint64, error) {
 	if err := s.limits.checkKey(key); err != nil {
@@ -331,8 +316,6 @@ func applyOp(txn *kv.Txn, op Op, reads *[]ReadResult) error {
 		return txn.Set(op.Key, op.Value)
 	case OpDelete:
 		return txn.Delete(op.Key)
-	case OpDeleteRange:
-		return txn.DeleteRange(op.Lo, op.Hi)
 	case OpMerge:
 		return txn.Merge(op.Key, op.Value)
 	default:

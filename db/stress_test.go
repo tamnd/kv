@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/tamnd/kv/engine"
-	"github.com/tamnd/kv/format"
 )
 
 // TestConcurrentReadWrite runs N goroutines doing interleaved reads and writes on
@@ -183,78 +182,6 @@ func TestMaintenanceDuringWrites(t *testing.T) {
 	}
 	if !rep.OK() {
 		t.Fatalf("structural check: %v", rep.Problems)
-	}
-}
-
-// TestMaintenanceDuringWritesLSM runs the same maintenance-vs-foreground race but on
-// the LSM engine, which has its own background flush and compaction paths.
-func TestMaintenanceDuringWritesLSM(t *testing.T) {
-	const (
-		writers  = 4
-		opsEach  = 150
-		keySpace = 50
-	)
-	d := openMem(t, Options{Engine: format.EngineLSM, MemtableSize: 32 * 1024, AutoCheckpoint: 0})
-
-	var committed sync.Map
-
-	var wg sync.WaitGroup
-	wg.Add(writers)
-	for w := 0; w < writers; w++ {
-		w := w
-		go func() {
-			defer wg.Done()
-			rng := rand.New(rand.NewSource(int64(w * 10007)))
-			for op := 0; op < opsEach; op++ {
-				key := fmt.Sprintf("k%04d", rng.Intn(keySpace))
-				val := fmt.Sprintf("w%d-op%d", w, op)
-				if err := d.Update(func(txn *Txn) error {
-					return txn.Set([]byte(key), []byte(val))
-				}); err == nil {
-					committed.Store(key, val)
-				}
-			}
-		}()
-	}
-
-	stopMaint := make(chan struct{})
-	var maintErrs atomic.Int64
-	go func() {
-		tick := time.NewTicker(3 * time.Millisecond)
-		defer tick.Stop()
-		for {
-			select {
-			case <-stopMaint:
-				return
-			case <-tick.C:
-				if _, err := d.Maintain(16); err != nil {
-					maintErrs.Add(1)
-				}
-			}
-		}
-	}()
-
-	wg.Wait()
-	close(stopMaint)
-
-	if err := d.CheckpointMode(CheckpointFull); err != nil {
-		t.Fatalf("final checkpoint: %v", err)
-	}
-	if n := maintErrs.Load(); n > 0 {
-		t.Errorf("LSM maintenance saw %d errors", n)
-	}
-
-	var lost int
-	committed.Range(func(k, _ any) bool {
-		key := k.(string)
-		if _, ok := txnGet(t, d, key); !ok {
-			t.Errorf("key %q committed but absent", key)
-			lost++
-		}
-		return true
-	})
-	if lost > 0 {
-		t.Fatalf("%d key(s) lost in LSM maintenance stress", lost)
 	}
 }
 

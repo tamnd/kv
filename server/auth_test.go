@@ -80,32 +80,6 @@ func TestACLScan(t *testing.T) {
 	}
 }
 
-func TestACLRangeWrite(t *testing.T) {
-	w := writerOn("t/")
-	global := &Identity{Name: "g", Grants: []Grant{{Prefix: nil, Write: true}}}
-
-	// A range wholly inside the grant is allowed.
-	if !w.canWriteRange([]byte("t/a"), []byte("t/z")) {
-		t.Fatalf("range inside grant denied")
-	}
-	// A range whose upper bound escapes the grant's prefix is refused.
-	if w.canWriteRange([]byte("t/a"), []byte("u")) {
-		t.Fatalf("range escaping grant allowed")
-	}
-	// An unbounded upper (empty hi) runs to the end of the keyspace, so a bounded grant must not
-	// authorize it, but a global write grant must.
-	if w.canWriteRange([]byte("t/a"), nil) {
-		t.Fatalf("bounded grant authorized an unbounded range delete")
-	}
-	if !global.canWriteRange([]byte("t/a"), nil) {
-		t.Fatalf("global writer denied an unbounded range delete")
-	}
-	// A read-only grant never authorizes a range delete.
-	if readerOn("t/").canWriteRange([]byte("t/a"), []byte("t/z")) {
-		t.Fatalf("read-only grant authorized a range delete")
-	}
-}
-
 func TestACLDoOp(t *testing.T) {
 	id := &Identity{Name: "m", Grants: []Grant{
 		{Prefix: []byte("ro/")},
@@ -120,39 +94,12 @@ func TestACLDoOp(t *testing.T) {
 		{Op{Kind: OpSet, Key: []byte("ro/x")}, false}, // write to read-only prefix
 		{Op{Kind: OpSet, Key: []byte("rw/x")}, true},
 		{Op{Kind: OpDelete, Key: []byte("other/x")}, false},
-		{Op{Kind: OpDeleteRange, Lo: []byte("rw/a"), Hi: []byte("rw/z")}, true},
-		{Op{Kind: OpDeleteRange, Lo: []byte("rw/a"), Hi: []byte("zz")}, false},
 		{Op{Kind: OpMerge, Key: []byte("rw/x")}, true},
 		{Op{Kind: OpGet, Key: []byte("nope")}, false},
 	}
 	for _, c := range cases {
 		if got := id.canDoOp(c.op); got != c.want {
 			t.Fatalf("canDoOp(%s %q) = %v, want %v", c.op.Kind, c.op.Key, got, c.want)
-		}
-	}
-}
-
-func TestPrefixUpperBound(t *testing.T) {
-	cases := []struct {
-		in   string
-		want string // empty string means nil
-		nilv bool
-	}{
-		{"abc", "abd", false},
-		{"ab\xff", "ac", false}, // trailing 0xff dropped, prior byte incremented
-		{"", "", true},          // empty prefix has no upper bound
-		{"\xff\xff", "", true},  // all 0xff has no upper bound
-	}
-	for _, c := range cases {
-		got := prefixUpperBound([]byte(c.in))
-		if c.nilv {
-			if got != nil {
-				t.Fatalf("prefixUpperBound(%q) = %q, want nil", c.in, got)
-			}
-			continue
-		}
-		if string(got) != c.want {
-			t.Fatalf("prefixUpperBound(%q) = %q, want %q", c.in, got, c.want)
 		}
 	}
 }

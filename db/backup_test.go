@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"github.com/tamnd/kv/engine"
-	"github.com/tamnd/kv/format"
 	"github.com/tamnd/kv/vfs"
 	"github.com/tamnd/kv/wal"
 )
@@ -66,39 +65,6 @@ func TestBackupRestoreRoundTrip(t *testing.T) {
 	}
 	if len(rep.Problems) != 0 {
 		t.Fatalf("restored database not sound: %v", rep.Problems)
-	}
-}
-
-// TestBackupRestoreLSM confirms the LSM path, where a checkpoint can leave a WAL tail past
-// the engine's durable point: the backup must carry that tail so the restore replays it.
-// MemtableSize is tiny and AutoCheckpoint is off so unflushed data is the common case.
-func TestBackupRestoreLSM(t *testing.T) {
-	fs := vfs.NewMem()
-	opts := Options{PageSize: 4096, Engine: format.EngineLSM, MemtableSize: 256, AutoCheckpoint: -1}
-	d, err := Open(fs, "src.kv", opts)
-	if err != nil {
-		t.Fatalf("create: %v", err)
-	}
-	for i := 0; i < 300; i++ {
-		k := []byte{'k', byte(i), byte(i >> 8)}
-		v := bytes.Repeat([]byte{byte(i)}, 20)
-		if _, err := d.Write(func(b *engine.WriteBatch) { b.Set(k, v) }); err != nil {
-			t.Fatalf("write %d: %v", i, err)
-		}
-	}
-
-	r := backupAndRestore(t, d, fs, "dst.kv", Options{Engine: format.EngineLSM, MemtableSize: 256, AutoCheckpoint: -1})
-	defer r.Close()
-	if err := d.Close(); err != nil {
-		t.Fatalf("close src: %v", err)
-	}
-	for i := 0; i < 300; i++ {
-		k := []byte{'k', byte(i), byte(i >> 8)}
-		want := bytes.Repeat([]byte{byte(i)}, 20)
-		got, err := r.Get(k)
-		if err != nil || !bytes.Equal(got, want) {
-			t.Fatalf("restored key %d = %q,%v, want %q", i, got, err, want)
-		}
 	}
 }
 

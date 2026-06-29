@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"github.com/tamnd/kv/engine"
-	"github.com/tamnd/kv/format"
 	"github.com/tamnd/kv/vfs"
 )
 
@@ -129,11 +128,12 @@ func TestTTLReadYourWrites(t *testing.T) {
 	}
 }
 
-// TestTTLSweepReclaims checks the db-level maintenance sweep reclaims an expired TTL
-// key's value through the database clock: after the clock advances past the deadline, a
-// Maintain pass reports the key swept and bytes reclaimed, the key stays absent, and a
-// still-live TTL key survives.
-func TestTTLSweepReclaims(t *testing.T) {
+// TestTTLExpiredKeyReclaimedLazily checks the f2 core hides an expired TTL key once the
+// clock advances past its deadline while a still-live TTL key survives. f2 has no eager
+// sweep: it folds expiry lazily on read and reclaims the stranded bytes through its own
+// compaction rather than a host-driven Maintain pass, so this asserts the visible
+// behavior rather than a swept-key count.
+func TestTTLExpiredKeyReclaimedLazily(t *testing.T) {
 	clk := &testClock{}
 	clk.set(10)
 	d := openMemClock(t, clk, Options{})
@@ -142,19 +142,8 @@ func TestTTLSweepReclaims(t *testing.T) {
 	setTTL(t, d, "live", "stay", 1000)
 
 	clk.set(200)
-	rep, err := d.Maintain(0)
-	if err != nil {
-		t.Fatalf("maintain: %v", err)
-	}
-	if rep.ExpiredSwept != 1 {
-		t.Fatalf("swept = %d, want 1", rep.ExpiredSwept)
-	}
-	if rep.BytesReclaimed <= 0 {
-		t.Fatalf("bytes reclaimed = %d, want > 0", rep.BytesReclaimed)
-	}
-
 	if _, ok := txnGet(t, d, "dead"); ok {
-		t.Fatalf("swept key still present")
+		t.Fatalf("expired key still present")
 	}
 	if v, ok := txnGet(t, d, "live"); !ok || v != "stay" {
 		t.Fatalf("live ttl key = %q,%v, want stay", v, ok)
@@ -217,44 +206,33 @@ func (c *countingClock) now() uint64 {
 // TestTTLClockSkippedWithoutTTL pins the lazy clock: a point read of a key carrying no TTL
 // never consults the wall clock, while a read that folds a TTL cell does. It drives d.Get
 // directly rather than a transaction, since beginning a transaction reads the clock for its
-// read timestamp, which is unrelated to the TTL fold under test. Both engine cores fold
-// through the same lazy resolver, so both are checked.
+// read timestamp, which is unrelated to the TTL fold under test.
 func TestTTLClockSkippedWithoutTTL(t *testing.T) {
-	for _, eng := range []struct {
-		name string
-		kind format.EngineKind
-	}{
-		{"btree", format.EngineBTree},
-		{"lsm", format.EngineLSM},
-	} {
-		t.Run(eng.name, func(t *testing.T) {
-			clk := &countingClock{}
-			d := openMem(t, Options{Engine: eng.kind, Clock: clk.now, MemtableSize: 1 << 20})
+	clk := &countingClock{}
+	d := openMem(t, Options{Clock: clk.now})
 
-			if err := d.Update(func(txn *Txn) error {
-				return txn.Set([]byte("plain"), []byte("v"))
-			}); err != nil {
-				t.Fatalf("set plain: %v", err)
-			}
-			setTTL(t, d, "ttl", "v", 1<<60) // expiry well past the clock, so it reads live
+	if err := d.Update(func(txn *Txn) error {
+		return txn.Set([]byte("plain"), []byte("v"))
+	}); err != nil {
+		t.Fatalf("set plain: %v", err)
+	}
+	setTTL(t, d, "ttl", "v", 1<<60) // expiry well past the clock, so it reads live
 
-			// A no-TTL read folds only KindSet cells, so it must consult the clock zero times.
-			clk.reads.Store(0)
-			if v, err := d.Get([]byte("plain")); err != nil || string(v) != "v" {
-				t.Fatalf("get plain = %q,%v", v, err)
-			}
-			if n := clk.reads.Load(); n != 0 {
-				t.Fatalf("no-TTL read consulted the clock %d times, want 0", n)
-			}
+	// A no-TTL read folds only KindSet cells, so it must consult the clock zero times.
+	clk.reads.Store(0)
+	if v, err := d.Get([]byte("plain")); err != nil || string(v) != "v" {
+		t.Fatalf("get plain = %q,%v", v, err)
+	}
+	if n := clk.reads.Load(); n != 0 {
+		t.Fatalf("no-TTL read consulted the clock %d times, want 0", n)
+	}
 
-			// A read that folds a TTL cell must consult the clock to evaluate expiry.
-			clk.reads.Store(0)
-			if v, err := d.Get([]byte("ttl")); err != nil || string(v) != "v" {
-				t.Fatalf("get ttl = %q,%v", v, err)
-			}
-			if n := clk.reads.Load(); n == 0 {
-				t.Fatalf("TTL read did not consult the clock, want >= 1")
-			}
-		})
+	// A read that folds a TTL cell must consult the clock to evaluate expiry.
+	clk.reads.Store(0)
+	if v, err := d.Get([]byte("ttl")); err != nil || string(v) != "v" {
+		t.Fatalf("get ttl = %q,%v", v, err)
+	}
+	if n := clk.reads.Load(); n == 0 {
+		t.Fatalf("TTL read did not consult the clock, want >= 1")
 	}
 }

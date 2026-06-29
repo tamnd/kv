@@ -191,8 +191,8 @@ func TestDBWriteMetricsIsWellFormed(t *testing.T) {
 	if !sawVersion {
 		t.Error("commit version should have advanced past zero after 50 writes")
 	}
-	if !strings.Contains(buf.String(), `kv_engine_info{engine="btree"} 1`) {
-		t.Error("metrics should carry the btree engine label for a default database")
+	if !strings.Contains(buf.String(), `kv_engine_info{engine="f2"} 1`) {
+		t.Error("metrics should carry the f2 engine label for a default database")
 	}
 }
 

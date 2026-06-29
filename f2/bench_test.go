@@ -5,8 +5,6 @@ import (
 	"path/filepath"
 	"sync/atomic"
 	"testing"
-
-	"github.com/tamnd/kv/hashlog"
 )
 
 // fillF2 returns a store preloaded with n keys, for read benchmarks.
@@ -19,20 +17,6 @@ func fillF2(b *testing.B, n int) *Store {
 	for i := 0; i < n; i++ {
 		if err := s.Set(tkey(i), tval(i)); err != nil {
 			b.Fatalf("Set: %v", err)
-		}
-	}
-	return s
-}
-
-func fillHashlog(b *testing.B, n int) *hashlog.Store {
-	b.Helper()
-	s, err := hashlog.New(hashlog.Tunables{Shards: 256, PageSize: 1 << 20})
-	if err != nil {
-		b.Fatalf("hashlog.New: %v", err)
-	}
-	for i := 0; i < n; i++ {
-		if err := s.Set(tkey(i), tval(i)); err != nil {
-			b.Fatalf("hashlog Set: %v", err)
 		}
 	}
 	return s
@@ -73,32 +57,12 @@ func BenchmarkF2Set(b *testing.B) {
 	}
 }
 
-func BenchmarkHashlogSet(b *testing.B) {
-	s, _ := hashlog.New(hashlog.Tunables{Shards: 256, PageSize: 1 << 20})
-	defer s.Close()
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_ = s.Set(tkey(i%benchKeys), tval(i))
-	}
-}
-
 // BenchmarkF2Overwrite isolates the overwrite path: a prefilled store, every Set
 // repointing an existing key. This is the path that reads the old record to verify
 // the key and account its stranded bytes; folding that to a single read is the
 // write-side win measured here, and the ycsb-a/overwrite kvbench gain it drives.
 func BenchmarkF2Overwrite(b *testing.B) {
 	s := fillF2(b, benchKeys)
-	defer s.Close()
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_ = s.Set(tkey(i%benchKeys), tval(i))
-	}
-}
-
-func BenchmarkHashlogOverwrite(b *testing.B) {
-	s := fillHashlog(b, benchKeys)
 	defer s.Close()
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -210,35 +174,11 @@ func BenchmarkF2Get(b *testing.B) {
 	}
 }
 
-func BenchmarkHashlogGet(b *testing.B) {
-	s := fillHashlog(b, benchKeys)
-	defer s.Close()
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, _, _ = s.Get(tkey(i % benchKeys))
-	}
-}
-
 // BenchmarkF2GetParallel exercises the lock-free read path under contention, the
 // regime f2 is built for: every goroutine probes with atomic loads only, so the
 // aggregate should scale with cores rather than collapse on a shared lock.
 func BenchmarkF2GetParallel(b *testing.B) {
 	s := fillF2(b, benchKeys)
-	defer s.Close()
-	b.ReportAllocs()
-	b.ResetTimer()
-	b.RunParallel(func(pb *testing.PB) {
-		i := 0
-		for pb.Next() {
-			_, _, _ = s.Get(tkey(i % benchKeys))
-			i++
-		}
-	})
-}
-
-func BenchmarkHashlogGetParallel(b *testing.B) {
-	s := fillHashlog(b, benchKeys)
 	defer s.Close()
 	b.ReportAllocs()
 	b.ResetTimer()

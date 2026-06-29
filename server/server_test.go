@@ -96,24 +96,6 @@ func TestGetMissingIs404(t *testing.T) {
 	}
 }
 
-func TestRangeDelete(t *testing.T) {
-	hs, _ := newTestServer(t)
-	for _, k := range []string{"a", "b", "c", "d"} {
-		do(t, http.MethodPut, hs.URL+"/v1/kv/"+k, strings.NewReader("v"))
-	}
-	// Delete [b, d): removes b and c, leaves a and d.
-	code, _ := do(t, http.MethodDelete, hs.URL+"/v1/kv?from=b&to=d", nil)
-	if code != http.StatusOK {
-		t.Fatalf("range delete status = %d", code)
-	}
-	for k, want := range map[string]int{"a": 200, "b": 404, "c": 404, "d": 200} {
-		code, _ := do(t, http.MethodGet, hs.URL+"/v1/kv/"+k, nil)
-		if code != want {
-			t.Fatalf("get %s status = %d, want %d", k, code, want)
-		}
-	}
-}
-
 func TestBatch(t *testing.T) {
 	hs, _ := newTestServer(t)
 	req := jsonBatchRequest{Ops: []jsonOp{

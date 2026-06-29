@@ -37,9 +37,9 @@ var ErrForbidden = errors.New("kv: forbidden")
 
 // Grant authorizes access to every key under Prefix. Write distinguishes a read-only grant from
 // a read-write one: a read-only grant lets the identity get, exists, scan, and watch under the
-// prefix, and a write grant additionally lets it set, delete, range-delete, and merge there. An
-// empty Prefix covers the whole keyspace, so a read-only grant on the empty prefix is a global
-// reader and a write grant on it is a global writer.
+// prefix, and a write grant additionally lets it set, delete, and merge there. An empty Prefix
+// covers the whole keyspace, so a read-only grant on the empty prefix is a global reader and a
+// write grant on it is a global writer.
 type Grant struct {
 	Prefix []byte
 	Write  bool
@@ -102,53 +102,16 @@ func (id *Identity) canReadScan(prefix []byte) bool {
 	return false
 }
 
-// canWriteRange reports whether the identity may delete every key in [lo, hi). It is allowed when
-// some write grant fully contains the range: the grant's prefix is a prefix of lo, and hi does
-// not pass the grant's upper bound, so no key outside the grant can be deleted. An admin always
-// may. A range that no single grant contains is refused even if several grants together would
-// cover it, since a partial grant must not authorize deleting keys it does not cover.
-func (id *Identity) canWriteRange(lo, hi []byte) bool {
-	if id.Admin {
-		return true
-	}
-	for _, g := range id.Grants {
-		if !g.Write {
-			continue
-		}
-		if !bytes.HasPrefix(lo, g.Prefix) {
-			continue
-		}
-		// hi must not exceed the grant's prefix range. The exclusive upper bound of a prefix is
-		// the prefix with its last non-0xff byte incremented; an empty prefix has no upper bound,
-		// covering everything. A grant on the empty prefix therefore contains any range whose lo
-		// it covers, regardless of hi.
-		ub := prefixUpperBound(g.Prefix)
-		if ub == nil {
-			return true
-		}
-		// An empty hi means the range runs to the end of the keyspace, so only an unbounded grant
-		// (handled above) contains it; a bounded grant does not. A non-empty hi at or below the
-		// grant's upper bound keeps the whole range inside the grant.
-		if len(hi) > 0 && bytes.Compare(hi, ub) <= 0 {
-			return true
-		}
-	}
-	return false
-}
-
 // canDoOp reports whether the identity may perform one operation from a transaction or batch: a
-// read op needs read access to its key, a point write needs write access to its key, and a range
-// delete needs write access across its whole range. An unrecognized kind is left to pass here and
-// be rejected by the Service, so authorization never has to invent a verdict for an op it cannot
-// classify.
+// read op needs read access to its key and a point write needs write access to its key. An
+// unrecognized kind is left to pass here and be rejected by the Service, so authorization never
+// has to invent a verdict for an op it cannot classify.
 func (id *Identity) canDoOp(op Op) bool {
 	switch op.Kind {
 	case OpGet, OpExists:
 		return id.canRead(op.Key)
 	case OpSet, OpDelete, OpMerge:
 		return id.canWrite(op.Key)
-	case OpDeleteRange:
-		return id.canWriteRange(op.Lo, op.Hi)
 	default:
 		return true
 	}
@@ -172,22 +135,6 @@ func (id *Identity) canDoTxn(asserts []Assert, ops []Op) bool {
 		}
 	}
 	return true
-}
-
-// prefixUpperBound returns the smallest key that is greater than every key having the given
-// prefix, or nil if the prefix has no upper bound (it is empty or all 0xff), meaning it covers
-// keys without limit. It is the standard prefix-to-range-end transform: drop trailing 0xff bytes,
-// then increment the last remaining byte.
-func prefixUpperBound(prefix []byte) []byte {
-	for i := len(prefix) - 1; i >= 0; i-- {
-		if prefix[i] != 0xff {
-			ub := make([]byte, i+1)
-			copy(ub, prefix[:i+1])
-			ub[i]++
-			return ub
-		}
-	}
-	return nil
 }
 
 // Authenticator turns the credential a request carries into an Identity. It is the pluggable seam

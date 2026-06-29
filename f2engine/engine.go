@@ -26,6 +26,7 @@ import (
 	"github.com/tamnd/kv/engine"
 	"github.com/tamnd/kv/f2"
 	"github.com/tamnd/kv/format"
+	"github.com/tamnd/kv/vfs"
 )
 
 // ErrUnsupported is returned for the range operations an unordered hash index cannot
@@ -37,7 +38,11 @@ var ErrUnsupported = fmt.Errorf("kv: operation not supported by the f2 engine (n
 // a Path is the single-file, self-durable mode the database opens. Zero fields take f2's
 // defaults.
 type Config struct {
-	Path                  string
+	Path string
+	// FS is the filesystem the sidecar file opens on. The host passes its own vfs backend
+	// so the f2 file lands on the same filesystem as the main database: the in-memory
+	// backend for a test, the OS backend in production. A nil FS defaults to the OS backend.
+	FS                    vfs.FS
 	PageSize              int
 	Shards                int
 	ResidentPagesPerShard int
@@ -89,6 +94,7 @@ func New(cfg Config) (*Engine, error) {
 		PageSize:              pageSize,
 		ResidentPagesPerShard: cfg.ResidentPagesPerShard,
 		Path:                  cfg.Path,
+		FS:                    cfg.FS,
 		Durability:            cfg.Durability,
 		CheckpointBytes:       cfg.CheckpointBytes,
 		Crypto:                cfg.Crypto,
@@ -248,6 +254,24 @@ func (e *Engine) Stats() engine.EngineStats {
 // Reclaim implements engine.Engine. f2 reclaims stranded bytes through its own compaction
 // rather than a page freelist, so there is nothing for the host vacuum to drive here.
 func (e *Engine) Reclaim(budget int) (int, error) { return 0, nil }
+
+// Verify implements engine.Verifier. f2 has no key order to walk as a tree, so its check is
+// an integrity pass over the live set: it re-reads the record every live index slot points
+// at and confirms it decodes and passes its CRC, reporting any that does not. A torn or
+// bit-rotted record in the durable log surfaces as a problem rather than a silently dropped
+// key. There is no page-reachability or ordering class to report, so a sound store comes
+// back with the key and page counts and an empty problem list.
+func (e *Engine) Verify() (*engine.VerifyReport, error) {
+	res := e.s.Verify()
+	rep := &engine.VerifyReport{
+		Keys:         res.Keys,
+		PagesVisited: res.Pages,
+	}
+	for _, p := range res.Problems {
+		rep.Add("structure", 0, p.Detail)
+	}
+	return rep, nil
+}
 
 // RecoverFinished implements engine.Engine. f2 recovers itself on open, so there is no
 // in-memory index for the host to ask it to rebuild after WAL replay.

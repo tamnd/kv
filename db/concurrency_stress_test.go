@@ -9,7 +9,6 @@ import (
 	"testing"
 
 	"github.com/tamnd/kv/engine"
-	"github.com/tamnd/kv/format"
 )
 
 // This is the concurrency stress harness (spec 23 §6). The earlier concurrency tests run readers and
@@ -29,21 +28,10 @@ import (
 // more than the extra coverage, because it turns a subtle consistency bug into an inequality that fails.
 
 func TestConcurrentMaintenanceStress(t *testing.T) {
-	for _, eng := range []struct {
-		name string
-		kind format.EngineKind
-	}{
-		{"btree", format.EngineBTree},
-		{"lsm", format.EngineLSM},
-	} {
-		t.Run(eng.name, func(t *testing.T) {
-			// A tiny memtable on the LSM side forces frequent flushes and so frequent compactions, putting
-			// real background work in flight against the foreground. On the B-tree side the same loop drives
-			// checkpoints folding the WAL against live commits.
-			d := openMem(t, Options{Engine: eng.kind, MemtableSize: 4096})
-			runMaintenanceStress(t, d)
-		})
-	}
+	// A small auto-checkpoint interval keeps the f2 fold running against live commits, so
+	// background work is in flight against the foreground throughout the run.
+	d := openMem(t, Options{AutoCheckpoint: 1})
+	runMaintenanceStress(t, d)
 }
 
 func runMaintenanceStress(t *testing.T, d *DB) {

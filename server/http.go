@@ -96,32 +96,6 @@ func (srv *Server) httpHandler() http.Handler {
 		writeJSON(w, http.StatusOK, versionResponse{Version: version})
 	})
 
-	// Range delete shares the /v1/kv path with no key segment, selected by the from/to
-	// query bounds, matching the spec's DELETE /v1/kv?from=&to= mapping.
-	mux.HandleFunc("DELETE /v1/kv", func(w http.ResponseWriter, r *http.Request) {
-		enc := r.URL.Query().Get("encoding")
-		lo, err := decodeBytes(r.URL.Query().Get("from"), enc)
-		if err != nil {
-			writeErr(w, http.StatusBadRequest, err)
-			return
-		}
-		hi, err := decodeBytes(r.URL.Query().Get("to"), enc)
-		if err != nil {
-			writeErr(w, http.StatusBadRequest, err)
-			return
-		}
-		if err := srv.authorize(r, func(id *Identity) bool { return id.canWriteRange(lo, hi) }); err != nil {
-			writeServiceErr(w, err)
-			return
-		}
-		version, err := s.DeleteRange(lo, hi)
-		if err != nil {
-			writeServiceErr(w, err)
-			return
-		}
-		writeJSON(w, http.StatusOK, versionResponse{Version: version})
-	})
-
 	mux.HandleFunc("POST /v1/txn", func(w http.ResponseWriter, r *http.Request) {
 		var req jsonTxnRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -261,8 +235,6 @@ type jsonOp struct {
 	Kind  string `json:"kind"`
 	Key   string `json:"key,omitempty"`
 	Value string `json:"value,omitempty"`
-	Lo    string `json:"lo,omitempty"`
-	Hi    string `json:"hi,omitempty"`
 	TTLMs int64  `json:"ttl_ms,omitempty"`
 }
 
@@ -327,20 +299,10 @@ func decodeOps(in []jsonOp) ([]Op, error) {
 		if err != nil {
 			return nil, err
 		}
-		lo, err := base64.StdEncoding.DecodeString(o.Lo)
-		if err != nil {
-			return nil, err
-		}
-		hi, err := base64.StdEncoding.DecodeString(o.Hi)
-		if err != nil {
-			return nil, err
-		}
 		out = append(out, Op{
 			Kind:  OpKind(o.Kind),
 			Key:   key,
 			Value: val,
-			Lo:    lo,
-			Hi:    hi,
 			TTL:   time.Duration(o.TTLMs) * time.Millisecond,
 		})
 	}

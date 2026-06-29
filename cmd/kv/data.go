@@ -22,13 +22,12 @@ func encFlags(fs *flag.FlagSet) *enc {
 // an error: create never clobbers.
 func cmdCreate(args []string) int {
 	fs := flag.NewFlagSet("create", flag.ContinueOnError)
-	engine := fs.String("engine", "btree", "storage core: btree or lsm")
 	pageSize := fs.Int("page-size", 0, "page size in bytes (0 = default)")
 	if err := parseArgs(fs, args); err != nil {
 		return exitUsage
 	}
 	if fs.NArg() != 1 {
-		return usageErr("usage: kv create <db> [--engine btree|lsm] [--page-size N]")
+		return usageErr("usage: kv create <db> [--page-size N]")
 	}
 	path := fs.Arg(0)
 	if _, err := os.Stat(path); err == nil {
@@ -36,14 +35,6 @@ func cmdCreate(args []string) int {
 	}
 
 	var opts []kv.Option
-	switch *engine {
-	case "btree":
-		opts = append(opts, kv.WithEngine(kv.BTree))
-	case "lsm":
-		opts = append(opts, kv.WithEngine(kv.LSM))
-	default:
-		return usageErr("unknown engine %q (want btree or lsm)", *engine)
-	}
 	if *pageSize > 0 {
 		opts = append(opts, kv.WithPageSize(*pageSize))
 	}
@@ -178,36 +169,6 @@ func cmdDel(args []string) int {
 		return usageErr("bad key: %v", err)
 	}
 	if err := d.Update(func(txn *kv.Txn) error { return txn.Delete(key) }); err != nil {
-		return fail(err)
-	}
-	return exitOK
-}
-
-// cmdDelRange range-deletes [lo, hi).
-func cmdDelRange(args []string) int {
-	fs := flag.NewFlagSet("del-range", flag.ContinueOnError)
-	e := encFlags(fs)
-	if err := parseArgs(fs, args); err != nil {
-		return exitUsage
-	}
-	if fs.NArg() != 3 {
-		return usageErr("usage: kv del-range <db> <lo> <hi>")
-	}
-	d, code := openDB(fs.Arg(0))
-	if code != exitOK {
-		return code
-	}
-	defer d.Close()
-
-	lo, err := e.decode(fs.Arg(1))
-	if err != nil {
-		return usageErr("bad lo: %v", err)
-	}
-	hi, err := e.decode(fs.Arg(2))
-	if err != nil {
-		return usageErr("bad hi: %v", err)
-	}
-	if err := d.Update(func(txn *kv.Txn) error { return txn.DeleteRange(lo, hi) }); err != nil {
 		return fail(err)
 	}
 	return exitOK

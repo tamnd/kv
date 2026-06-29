@@ -233,8 +233,8 @@ func TestStatsReportsSpaceAndVersion(t *testing.T) {
 		}
 	}
 	s := d.Stats()
-	if s.Engine != kv.BTree {
-		t.Fatalf("engine = %v, want btree", s.Engine)
+	if s.Engine.String() != "f2" {
+		t.Fatalf("engine = %v, want f2", s.Engine)
 	}
 	if s.Version != 20 {
 		t.Fatalf("version = %d, want 20", s.Version)
@@ -285,7 +285,9 @@ func TestAutoCheckpointBoundsWAL(t *testing.T) {
 }
 
 // TestCheckReportsSound writes a spread of keys and confirms the public Check returns a
-// sound report: no problems, a positive key count, and balanced page accounting.
+// sound report: no problems, the full key count, and a structure that was actually walked.
+// The f2 core is a hash index over its own record log, not a page tree, so Check verifies
+// every live record reads back rather than reconciling a page-and-freelist accounting.
 func TestCheckReportsSound(t *testing.T) {
 	d := open(t)
 	for i := 0; i < 200; i++ {
@@ -308,8 +310,8 @@ func TestCheckReportsSound(t *testing.T) {
 	if rep.Keys != 200 {
 		t.Fatalf("check keys = %d, want 200", rep.Keys)
 	}
-	if got := 1 + rep.PagesVisited + rep.FreePages; uint32(got) != rep.PageCount {
-		t.Fatalf("accounting 1+%d+%d = %d != page count %d", rep.PagesVisited, rep.FreePages, got, rep.PageCount)
+	if rep.PagesVisited == 0 {
+		t.Fatalf("check visited 0 records, want the structure walked")
 	}
 }
 

@@ -76,9 +76,6 @@ func TestLimitsServiceRejectsOversizedWrites(t *testing.T) {
 	if _, err := svc.Delete(big); !errors.Is(err, ErrLimitExceeded) {
 		t.Fatalf("delete with big key err = %v, want ErrLimitExceeded", err)
 	}
-	if _, err := svc.DeleteRange(big, big); !errors.Is(err, ErrLimitExceeded) {
-		t.Fatalf("delete range with big bound err = %v, want ErrLimitExceeded", err)
-	}
 
 	// A request within the bounds still works, so the limit gates the oversized case only.
 	if _, err := svc.Set([]byte("k"), []byte("v"), 0); err != nil {

@@ -121,14 +121,6 @@ func (c *Client) Delete(key []byte) (uint64, error) {
 	return c.versionCall(e.buf)
 }
 
-// DeleteRange removes [lo, hi) and returns the commit version.
-func (c *Client) DeleteRange(lo, hi []byte) (uint64, error) {
-	e := encoder{buf: []byte{byte(opDeleteRange)}}
-	e.bytes(lo)
-	e.bytes(hi)
-	return c.versionCall(e.buf)
-}
-
 // Merge applies the merge operator to a key and returns the commit version.
 func (c *Client) Merge(key, operand []byte) (uint64, error) {
 	e := encoder{buf: []byte{byte(opMerge)}}
@@ -340,15 +332,6 @@ func (h *TxnHandle) Delete(key []byte) error {
 	return h.statusCall(e.buf)
 }
 
-// DeleteRange buffers a range delete inside the transaction.
-func (h *TxnHandle) DeleteRange(lo, hi []byte) error {
-	e := encoder{buf: []byte{byte(opTxnDeleteRange)}}
-	e.uint64(h.id)
-	e.bytes(lo)
-	e.bytes(hi)
-	return h.statusCall(e.buf)
-}
-
 // Merge buffers a merge inside the transaction.
 func (h *TxnHandle) Merge(key, operand []byte) error {
 	e := encoder{buf: []byte{byte(opTxnMerge)}}
@@ -396,8 +379,6 @@ func encodeOpList(e *encoder, ops []Op) {
 		e.byte(opKindToByte(op.Kind))
 		e.bytes(op.Key)
 		e.bytes(op.Value)
-		e.bytes(op.Lo)
-		e.bytes(op.Hi)
 		e.uint64(uint64(op.TTL / time.Millisecond))
 	}
 }
