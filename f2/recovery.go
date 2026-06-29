@@ -1,6 +1,9 @@
 package f2
 
-import "sort"
+import (
+	"sort"
+	"time"
+)
 
 // recover rebuilds every shard's log structure and compact index from the file
 // alone, after a crash or a clean reopen. It trusts nothing in RAM: the file's
@@ -37,6 +40,12 @@ import "sort"
 // list, so the space a crash mid-compaction stranded is reclaimed on reopen rather
 // than leaked.
 func (s *Store) recover() error {
+	start := time.Now()
+	var replayed int64
+	defer func() {
+		s.recoverRecords.Store(replayed)
+		s.recoverNanos.Store(int64(time.Since(start)))
+	}()
 	df := s.df
 	nblocks, err := df.fileBlocks()
 	if err != nil {
@@ -166,6 +175,7 @@ func (s *Store) recover() error {
 				sh.recoverApply(h, key, base+within, rn, tomb)
 				sh.logBytes += int64(rn)
 				within += int64(rn)
+				replayed++
 			}
 			if pi == n-1 {
 				lastWithin = within

@@ -170,7 +170,7 @@ func (l *log) addPage() error {
 			if _, err := l.df.f.WriteAt(buf[:blockHeaderSize], l.df.blockOffset(block)); err != nil {
 				return err
 			}
-			if err := platformSyncData(l.df.f); err != nil {
+			if err := l.df.sync(); err != nil {
 				return err
 			}
 		}
@@ -196,7 +196,7 @@ func (l *log) writeThrough(pi int, page []byte, w, n int) error {
 	if _, err := l.df.f.WriteAt(page[w:w+n], off); err != nil {
 		return err
 	}
-	return platformSyncData(l.df.f)
+	return l.df.sync()
 }
 
 // sealPage writes a full page to its block and, under Normal, fsyncs it. Sealing
@@ -215,7 +215,7 @@ func (l *log) sealPage(pi int) error {
 		return err
 	}
 	if l.df.dial == DurabilityNormal {
-		return platformSyncData(l.df.f)
+		return l.df.sync()
 	}
 	return nil
 }
@@ -327,7 +327,7 @@ func (l *log) commitGeneration() error {
 		}
 	}
 	if l.npages > 1 && l.df.dial != DurabilityNone {
-		if err := platformSyncData(l.df.f); err != nil {
+		if err := l.df.sync(); err != nil {
 			return err
 		}
 	}
@@ -336,7 +336,7 @@ func (l *log) commitGeneration() error {
 		return err
 	}
 	if l.df.dial != DurabilityNone {
-		return platformSyncData(l.df.f)
+		return l.df.sync()
 	}
 	return nil
 }
