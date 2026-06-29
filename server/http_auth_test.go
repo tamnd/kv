@@ -132,18 +132,6 @@ func TestHTTPAuthOpsEndpointsAdminOnly(t *testing.T) {
 	}
 }
 
-func TestHTTPAuthRangeDeleteEnforced(t *testing.T) {
-	ts := newAuthHTTPServer(t)
-	// A range delete inside the grant is allowed.
-	if status, _ := doAuth(t, "rw", http.MethodDelete, ts+"/v1/kv?from=t1-a&to=t1-z", nil); status != http.StatusOK {
-		t.Fatalf("rw range delete in-prefix status = %d, want 200", status)
-	}
-	// One that escapes the grant is forbidden.
-	if status, _ := doAuth(t, "rw", http.MethodDelete, ts+"/v1/kv?from=t1-a&to=u", nil); status != http.StatusForbidden {
-		t.Fatalf("rw range delete escaping prefix status = %d, want 403", status)
-	}
-}
-
 func TestHTTPAuthBatchAllOrNothing(t *testing.T) {
 	ts := newAuthHTTPServer(t)
 	// A batch mixing an allowed and a forbidden key is rejected as a whole, before any write, so

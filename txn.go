@@ -58,10 +58,6 @@ func (t *Txn) SetWithTTL(key, value []byte, ttl time.Duration) error {
 // Delete buffers a tombstone for key, applied at commit.
 func (t *Txn) Delete(key []byte) error { return wrap(t.t.Delete(key)) }
 
-// DeleteRange buffers a deletion of the half-open interval [lo, hi), applied at commit
-// as a single range-delete marker (spec 11 §4).
-func (t *Txn) DeleteRange(lo, hi []byte) error { return wrap(t.t.DeleteRange(lo, hi)) }
-
 // Merge buffers a merge operand for key, folded through the registered operator at read
 // and commit time (spec 15 §5). It needs no read, so a contended counter becomes blind
 // appends the engine collapses.

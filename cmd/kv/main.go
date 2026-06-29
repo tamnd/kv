@@ -47,7 +47,6 @@ func commands() []command {
 		{"get", "print the value for a key", cmdGet},
 		{"set", "upsert a key to a value", cmdSet},
 		{"del", "delete one key", cmdDel},
-		{"del-range", "range-delete [lo, hi)", cmdDelRange},
 		{"exists", "exit 0 if a key is present, 1 if absent", cmdExists},
 		{"merge", "apply the registered merge operator to a key", cmdMerge},
 		{"load", "bulk-load key/value pairs from stdin or a file", cmdLoad},

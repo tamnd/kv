@@ -37,7 +37,7 @@ func TestLoggingLifecycleEvents(t *testing.T) {
 	out := buf.String()
 	for _, want := range []string{
 		`msg="kv: database opened"`,
-		`engine=btree`,
+		`engine=f2`,
 		`msg="kv: checkpoint folded wal"`,
 		`msg="kv: database closed"`,
 	} {

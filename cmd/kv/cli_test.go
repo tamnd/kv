@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -73,7 +72,7 @@ func TestCLIMetrics(t *testing.T) {
 	// The output must be valid Prometheus exposition: the engine label, a HELP/TYPE pair, and a
 	// counter line are enough to prove the surface is wired and well-formed.
 	for _, want := range []string{
-		`kv_engine_info{engine="btree"} 1`,
+		`kv_engine_info{engine="f2"} 1`,
 		"# TYPE kv_fsync_total counter",
 		"# HELP kv_page_count ",
 		"kv_cache_hit_ratio ",
@@ -102,26 +101,27 @@ func TestCLIExists(t *testing.T) {
 	}
 }
 
-func TestCLIDelAndDelRange(t *testing.T) {
+func TestCLIDel(t *testing.T) {
 	p := dbPath(t)
 	for _, k := range []string{"a", "b", "c", "d"} {
 		run([]string{"set", p, k, k})
 	}
 	if code := run([]string{"del", p, "a"}); code != exitOK {
-		t.Fatalf("del: exit %d", code)
+		t.Fatalf("del a: exit %d", code)
 	}
-	// del-range [b, d) removes b and c, leaves d.
-	if code := run([]string{"del-range", p, "b", "d"}); code != exitOK {
-		t.Fatalf("del-range: exit %d", code)
+	if code := run([]string{"del", p, "b"}); code != exitOK {
+		t.Fatalf("del b: exit %d", code)
 	}
-	// a, b, c are gone; only d survives.
-	for _, k := range []string{"a", "b", "c"} {
+	// a and b are gone; c and d survive.
+	for _, k := range []string{"a", "b"} {
 		if code := run([]string{"get", p, k}); code != exitNotFound {
 			t.Fatalf("get %q after deletes = exit %d, want %d", k, code, exitNotFound)
 		}
 	}
-	if code := run([]string{"exists", p, "d"}); code != exitOK {
-		t.Fatalf("exists d after deletes = exit %d, want %d", code, exitOK)
+	for _, k := range []string{"c", "d"} {
+		if code := run([]string{"exists", p, k}); code != exitOK {
+			t.Fatalf("exists %q after deletes = exit %d, want %d", k, code, exitOK)
+		}
 	}
 }
 
@@ -321,7 +321,7 @@ func TestCLIInfo(t *testing.T) {
 			t.Fatalf("info: exit %d", code)
 		}
 	})
-	if !strings.Contains(out, "engine") || !strings.Contains(out, "btree") {
+	if !strings.Contains(out, "engine") || !strings.Contains(out, "f2") {
 		t.Fatalf("info output missing engine line:\n%s", out)
 	}
 	if !strings.Contains(out, "commit version") {
@@ -341,8 +341,8 @@ func TestCLIStatsJSON(t *testing.T) {
 	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &s); err != nil {
 		t.Fatalf("stats output not JSON: %v\n%s", err, out)
 	}
-	if s.Engine != "btree" {
-		t.Fatalf("stats engine = %q, want btree", s.Engine)
+	if s.Engine != "f2" {
+		t.Fatalf("stats engine = %q, want f2", s.Engine)
 	}
 	if s.Version != 1 {
 		t.Fatalf("stats version = %d, want 1", s.Version)
@@ -440,8 +440,8 @@ func TestCLICheckJSON(t *testing.T) {
 		}
 	})
 	var got struct {
-		OK        bool `json:"ok"`
-		PageCount int  `json:"page_count"`
+		OK   bool  `json:"ok"`
+		Keys int64 `json:"keys"`
 	}
 	if err := json.Unmarshal([]byte(out), &got); err != nil {
 		t.Fatalf("decode %q: %v", out, err)
@@ -449,78 +449,8 @@ func TestCLICheckJSON(t *testing.T) {
 	if !got.OK {
 		t.Fatalf("check json ok = false, want true: %q", out)
 	}
-	if got.PageCount == 0 {
-		t.Fatalf("check json page_count = 0, want positive")
-	}
-}
-
-// TestCLICheckDetectsCorruption is the M3 exit-gate test at the command boundary: a
-// populated file whose data page bit-rots on disk makes `kv check` exit exitCorrupt(4)
-// and report the checksum class, while the same file before corruption exits 0. It drives
-// the whole stack the way a release gate or a CI soundness check does, through the real OS
-// filesystem (spec 02 §3.2, spec 23 §3, spec 24 M3).
-func TestCLICheckDetectsCorruption(t *testing.T) {
-	p := dbPath(t)
-	for i := 0; i < 20; i++ {
-		k := fmt.Sprintf("k%02d", i)
-		if code := run([]string{"set", p, k, "value"}); code != exitOK {
-			t.Fatalf("set %s: exit %d", k, code)
-		}
-	}
-	// Fold the writes into the main file so the data pages carry stamped checksums on disk.
-	if code := run([]string{"checkpoint", p}); code != exitOK {
-		t.Fatalf("checkpoint: exit %d", code)
-	}
-	// A sound file passes.
-	if code := run([]string{"check", p}); code != exitOK {
-		t.Fatalf("check on a sound file = exit %d, want %d", code, exitOK)
-	}
-
-	// Corrupt the first data page (page 2) directly on the OS file, behind the database.
-	const pageSize = 4096
-	corruptCLIPage(t, p, 2, pageSize)
-
-	// check must now flag the file and exit with the corruption code.
-	if code := run([]string{"check", p}); code != exitCorrupt {
-		t.Fatalf("check on a bit-rotted file = exit %d, want %d", code, exitCorrupt)
-	}
-	// The machine-readable form reports ok=false so a script can gate on it.
-	out := capture(t, func() {
-		if code := run([]string{"check", p, "-f", "json"}); code != exitCorrupt {
-			t.Fatalf("check -f json on a corrupt file = exit %d, want %d", code, exitCorrupt)
-		}
-	})
-	var got struct {
-		OK bool `json:"ok"`
-	}
-	if err := json.Unmarshal([]byte(out), &got); err != nil {
-		t.Fatalf("decode %q: %v", out, err)
-	}
-	if got.OK {
-		t.Fatalf("check json ok = true on a corrupt file: %q", out)
-	}
-}
-
-// corruptCLIPage flips one content byte of a page directly in the on-disk file, modelling
-// bit rot under the real OS filesystem the CLI runs on.
-func corruptCLIPage(t *testing.T, path string, pgno int, pageSize int) {
-	t.Helper()
-	f, err := os.OpenFile(path, os.O_RDWR, 0)
-	if err != nil {
-		t.Fatalf("open %s: %v", path, err)
-	}
-	defer f.Close()
-	buf := make([]byte, pageSize)
-	off := int64(pgno-1) * int64(pageSize)
-	if _, err := f.ReadAt(buf, off); err != nil {
-		t.Fatalf("read page %d: %v", pgno, err)
-	}
-	buf[pageSize/2] ^= 0xFF
-	if _, err := f.WriteAt(buf, off); err != nil {
-		t.Fatalf("write page %d: %v", pgno, err)
-	}
-	if err := f.Sync(); err != nil {
-		t.Fatalf("sync: %v", err)
+	if got.Keys == 0 {
+		t.Fatalf("check json keys = 0, want the written key counted")
 	}
 }
 
@@ -670,8 +600,8 @@ func TestShellOpensOnlyExistingFile(t *testing.T) {
 // would do the same), proving the value is durable.
 func TestPragmaReadAndPersistentSet(t *testing.T) {
 	p := dbPath(t)
-	if got := strings.TrimSpace(capture(t, func() { run([]string{"pragma", p, "engine"}) })); got != "btree" {
-		t.Fatalf("pragma engine = %q, want btree", got)
+	if got := strings.TrimSpace(capture(t, func() { run([]string{"pragma", p, "engine"}) })); got != "f2" {
+		t.Fatalf("pragma engine = %q, want f2", got)
 	}
 	if code := run([]string{"pragma", p, "application_id=305419896"}); code != exitOK {
 		t.Fatalf("set application_id: exit %d", code)

@@ -30,27 +30,25 @@ import (
 type opcode byte
 
 const (
-	opGet         opcode = 1
-	opExists      opcode = 2
-	opSet         opcode = 3
-	opDelete      opcode = 4
-	opDeleteRange opcode = 5
-	opMerge       opcode = 6
-	opTxn         opcode = 7
-	opBatch       opcode = 8
-	opStats       opcode = 9
-	opCheckpoint  opcode = 10
-	opWatch       opcode = 13
+	opGet        opcode = 1
+	opExists     opcode = 2
+	opSet        opcode = 3
+	opDelete     opcode = 4
+	opMerge      opcode = 6
+	opTxn        opcode = 7
+	opBatch      opcode = 8
+	opStats      opcode = 9
+	opCheckpoint opcode = 10
+	opWatch      opcode = 13
 
-	opBeginTxn       opcode = 14
-	opTxnGet         opcode = 15
-	opTxnExists      opcode = 16
-	opTxnSet         opcode = 17
-	opTxnDelete      opcode = 18
-	opTxnDeleteRange opcode = 19
-	opTxnMerge       opcode = 20
-	opTxnCommit      opcode = 21
-	opTxnDiscard     opcode = 22
+	opBeginTxn   opcode = 14
+	opTxnGet     opcode = 15
+	opTxnExists  opcode = 16
+	opTxnSet     opcode = 17
+	opTxnDelete  opcode = 18
+	opTxnMerge   opcode = 20
+	opTxnCommit  opcode = 21
+	opTxnDiscard opcode = 22
 
 	opAuth opcode = 23 // authenticate the connection, binding an identity for later ops
 )

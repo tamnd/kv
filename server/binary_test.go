@@ -100,27 +100,6 @@ func TestBinaryExists(t *testing.T) {
 	}
 }
 
-func TestBinaryRangeDelete(t *testing.T) {
-	cl := newBinaryServer(t)
-	for _, k := range []string{"a", "b", "c", "d"} {
-		if _, err := cl.Set([]byte(k), []byte("v"), 0); err != nil {
-			t.Fatalf("set %s: %v", k, err)
-		}
-	}
-	if _, err := cl.DeleteRange([]byte("b"), []byte("d")); err != nil {
-		t.Fatalf("delete range: %v", err)
-	}
-	for k, wantFound := range map[string]bool{"a": true, "b": false, "c": false, "d": true} {
-		_, found, err := cl.Get([]byte(k))
-		if err != nil {
-			t.Fatalf("get %s: %v", k, err)
-		}
-		if found != wantFound {
-			t.Fatalf("get %s found=%v, want %v", k, found, wantFound)
-		}
-	}
-}
-
 func TestBinaryBatch(t *testing.T) {
 	cl := newBinaryServer(t)
 	_, err := cl.Batch([]Op{
@@ -395,7 +374,7 @@ func TestBinaryInteractiveTxnUnknownID(t *testing.T) {
 	}
 }
 
-func TestBinaryInteractiveTxnRangeAndMerge(t *testing.T) {
+func TestBinaryInteractiveTxnMerge(t *testing.T) {
 	cl := newBinaryServer(t)
 	for _, k := range []string{"a", "b", "c"} {
 		cl.Set([]byte(k), []byte("v"), 0)
@@ -404,8 +383,8 @@ func TestBinaryInteractiveTxnRangeAndMerge(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	if err := txn.DeleteRange([]byte("a"), []byte("c")); err != nil {
-		t.Fatalf("delete range: %v", err)
+	if err := txn.Delete([]byte("a")); err != nil {
+		t.Fatalf("delete: %v", err)
 	}
 	if err := txn.Merge([]byte("counter"), []byte("1")); err != nil {
 		t.Fatalf("merge: %v", err)
@@ -413,7 +392,7 @@ func TestBinaryInteractiveTxnRangeAndMerge(t *testing.T) {
 	if _, err := txn.Commit(); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
-	// a and b removed by the range delete, c survives.
+	// a removed by the delete, c survives.
 	if _, found, _ := cl.Get([]byte("a")); found {
 		t.Fatalf("a should be deleted")
 	}

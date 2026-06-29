@@ -21,14 +21,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/tamnd/kv/betree"
-	"github.com/tamnd/kv/btree"
 	"github.com/tamnd/kv/crypto"
 	"github.com/tamnd/kv/engine"
 	"github.com/tamnd/kv/f2"
 	"github.com/tamnd/kv/f2engine"
 	"github.com/tamnd/kv/format"
-	"github.com/tamnd/kv/lsm"
 	"github.com/tamnd/kv/pager"
 	"github.com/tamnd/kv/vfs"
 	"github.com/tamnd/kv/wal"
@@ -221,7 +218,7 @@ func (o Options) pageSize() int {
 
 func (o Options) engineKind() format.EngineKind {
 	if o.Engine == 0 {
-		return format.EngineBTree
+		return format.EngineF2
 	}
 	return o.Engine
 }
@@ -481,7 +478,7 @@ func create(fs vfs.FS, path string, opts Options) (*DB, error) {
 		pgr.Close()
 		return nil, err
 	}
-	eng, err := newEngine(opts.engineKind(), pgr, path, opts.sync(), enc)
+	eng, err := newEngine(opts.engineKind(), fs, pgr, path, opts.sync(), enc)
 	if err != nil {
 		w.Close()
 		pgr.Close()
@@ -517,7 +514,7 @@ func openExisting(fs vfs.FS, path string, opts Options) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	eng, err := newEngine(pgr.Header().Engine, pgr, path, opts.sync(), enc)
+	eng, err := newEngine(pgr.Header().Engine, fs, pgr, path, opts.sync(), enc)
 	if err != nil {
 		pgr.Close()
 		return nil, err
@@ -677,27 +674,21 @@ func (d *DB) redo(rec wal.RecoverResult) (uint64, error) {
 	return maxVer, nil
 }
 
-// newEngine constructs the storage core for a kind. The pager-backed cores live in the
-// pager's pages; the f2 core is self-durable and persists into its own sidecar file next
-// to the main file, so it takes the database path and the durability level rather than the
-// pager.
-func newEngine(kind format.EngineKind, pgr *pager.Pager, path string, sync wal.Sync, enc *crypto.Scheme) (engine.Engine, error) {
-	switch kind {
-	case format.EngineBTree:
-		return btree.New(pgr), nil
-	case format.EngineLSM:
-		return lsm.New(pgr), nil
-	case format.EngineBeta:
-		return betree.New(pgr), nil
-	case format.EngineF2:
-		return f2engine.New(f2engine.Config{
-			Path:       path + f2Suffix,
-			Durability: f2Durability(sync),
-			Crypto:     enc,
-		})
-	default:
-		return nil, fmt.Errorf("kv: unknown engine kind %d", kind)
+// newEngine constructs the storage core for a kind. f2 is the only core: it is self-durable
+// and persists into its own sidecar file next to the main file, so it takes the database
+// path and the durability level rather than the host pager. A file recorded with any other
+// engine kind (an older database from before f2 became the sole core) is refused rather than
+// opened on the wrong core.
+func newEngine(kind format.EngineKind, fs vfs.FS, pgr *pager.Pager, path string, sync wal.Sync, enc *crypto.Scheme) (engine.Engine, error) {
+	if kind != format.EngineF2 {
+		return nil, fmt.Errorf("kv: unsupported engine kind %d (this build runs only the f2 core)", kind)
 	}
+	return f2engine.New(f2engine.Config{
+		Path:       path + f2Suffix,
+		FS:         fs,
+		Durability: f2Durability(sync),
+		Crypto:     enc,
+	})
 }
 
 // f2Durability maps the host WAL sync level onto the f2 core's durability. The host WAL is
@@ -1335,9 +1326,14 @@ func (d *DB) maybeCheckpoint() {
 	}
 	// An engine that has not yet persisted past the folded point (an LSM core whose
 	// memtable has not flushed) cannot reclaim any WAL, so a wakeup would fold nothing
-	// and reset nothing. Skip it until a flush advances the durable LSN.
-	if dl, tracked := d.engineDurableLSN(); tracked && dl <= folded {
-		return
+	// and reset nothing. Skip it until a flush advances the durable LSN. A self-durable
+	// core (the f2 core) is the opposite case: its durable point advances inside the
+	// checkpoint's own flushEngine step, so the wakeup is exactly what moves it forward.
+	// Skipping it there would deadlock the backlog, since nothing else advances the mark.
+	if _, selfDurable := d.eng.(interface{ Flush() error }); !selfDurable {
+		if dl, tracked := d.engineDurableLSN(); tracked && dl <= folded {
+			return
+		}
 	}
 	select {
 	case d.ckptSig <- struct{}{}:

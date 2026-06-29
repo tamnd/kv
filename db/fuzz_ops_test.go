@@ -32,16 +32,6 @@ const fuzzKeyspace = 16
 func fuzzKey(b byte) []byte { return []byte(fmt.Sprintf("k%02d", int(b)%fuzzKeyspace)) }
 func fuzzVal(b byte) []byte { return []byte(fmt.Sprintf("v%02d", int(b)%100)) }
 
-// orderedRange turns two key-selector bytes into a half-open [lo, hi) user-key range, ordering the
-// pair so lo <= hi. lo == hi is an empty range, which is itself worth exercising.
-func orderedRange(a, b byte) (lo, hi []byte) {
-	lo, hi = fuzzKey(a), fuzzKey(b)
-	if bytes.Compare(lo, hi) > 0 {
-		lo, hi = hi, lo
-	}
-	return lo, hi
-}
-
 // opCursor reads an operation program out of the fuzzer's byte slice. A read past the end reports
 // not-ok, which ends the program wherever it runs dry, so a truncated operand simply stops the run
 // rather than failing it.
@@ -152,21 +142,13 @@ func FuzzOps(f *testing.F) {
 							t.Fatalf("delete: %v", err)
 						}
 						delete(work, string(k))
-					case 3: // delete-range: lo, hi
-						a, ok1 := cur.next()
-						b, ok2 := cur.next()
+					case 3: // formerly delete-range: consume the two operand bytes so the program
+						// decoding stays aligned, then move on. f2 has no key order, so range delete
+						// is unsupported and there is nothing to apply to the database or the model.
+						_, ok1 := cur.next()
+						_, ok2 := cur.next()
 						if !ok1 || !ok2 {
 							return nil
-						}
-						lo, hi := orderedRange(a, b)
-						if err := txn.DeleteRange(lo, hi); err != nil {
-							t.Fatalf("delete-range: %v", err)
-						}
-						for k := range work {
-							kb := []byte(k)
-							if bytes.Compare(kb, lo) >= 0 && bytes.Compare(kb, hi) < 0 {
-								delete(work, k)
-							}
 						}
 					case 4: // get: key (read-your-writes check)
 						kb, ok := cur.next()

@@ -2,6 +2,7 @@ package db
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -114,6 +115,55 @@ func TestF2ReopenNoCheckpoint(t *testing.T) {
 		if v, ok := get(t, d2, f2Key(i)); !ok || v != f2Val(i) {
 			t.Fatalf("key %d = %q,%v after no-checkpoint reopen, want %q", i, v, ok, f2Val(i))
 		}
+	}
+}
+
+// TestF2BitRotDropsTornRecord flips bytes through the f2 sidecar's data region after a
+// checkpoint, then reopens. f2 has no main-file data pages for the pager to checksum: it
+// guards each record with its own CRC, so a torn record is dropped on recovery rather than
+// decoded into torn bytes. A corrupted key must therefore read absent (or the open must
+// fail) and never return its original value, the unencrypted sibling of the AEAD tamper
+// case. A still-untouched key in the same store stays readable.
+func TestF2BitRotDropsTornRecord(t *testing.T) {
+	fs, path := f2TestPath(t)
+	d, err := Open(fs, path, Options{PageSize: 4096, Engine: format.EngineF2})
+	if err != nil {
+		t.Fatalf("create f2: %v", err)
+	}
+	if _, err := d.Write(func(b *engine.WriteBatch) { b.Set([]byte("k"), []byte("original-value")) }); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := d.Checkpoint(); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	sidecar := path + f2Suffix
+	raw, err := os.ReadFile(sidecar)
+	if err != nil {
+		t.Fatalf("read sidecar: %v", err)
+	}
+	// Corrupt bytes throughout the data region (past the two 4096-byte superblocks), inside
+	// the records and their CRC trailers, leaving the plaintext block headers alone.
+	const dataStart = 4096 * 2
+	const blockHeader = 20
+	for off := dataStart + blockHeader; off < len(raw); off += 64 {
+		raw[off] ^= 0xff
+	}
+	if err := os.WriteFile(sidecar, raw, 0o600); err != nil {
+		t.Fatalf("write corrupted sidecar: %v", err)
+	}
+
+	d2, err := Open(fs, path, Options{})
+	if err != nil {
+		// A clean open failure is an acceptable outcome: the torn record was caught.
+		return
+	}
+	defer d2.Close()
+	if v, ok := get(t, d2, "k"); ok && v == "original-value" {
+		t.Fatal("corrupted record returned its original value, the record CRC did not catch the bit rot")
 	}
 }
 

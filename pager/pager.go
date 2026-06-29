@@ -327,7 +327,7 @@ func Create(fs vfs.FS, path string, opts Options) (*Pager, error) {
 	}
 	engine := opts.Engine
 	if engine == 0 {
-		engine = format.EngineBTree
+		engine = format.EngineF2
 	}
 	checksum := opts.Checksum
 	h := format.NewHeader(ps, engine, opts.Flags, checksum)

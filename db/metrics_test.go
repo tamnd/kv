@@ -2,8 +2,6 @@ package db
 
 import (
 	"testing"
-
-	"github.com/tamnd/kv/format"
 )
 
 // TestStatsOldestSnapshotAge checks the leaked-reader gauge (spec 19 §1.6): with no live
@@ -55,32 +53,5 @@ func TestStatsOldestSnapshotAge(t *testing.T) {
 	}
 	if age := d.Stats().OldestSnapshotAgeNanos; age != 0 {
 		t.Errorf("after closing all readers, age = %d, want 0", age)
-	}
-}
-
-// TestStatsLSMLevels checks the LSM engine fills the per-level shape and a compaction score
-// into Stats (spec 19 §1.5): after enough writes to flush at least one on-disk segment, the
-// level view is non-empty and reports a positive segment count.
-func TestStatsLSMLevels(t *testing.T) {
-	// A small memtable forces flushes quickly, so a modest write count produces segments.
-	d := openMem(t, Options{Engine: format.EngineLSM, MemtableSize: 4 << 10})
-
-	for i := range 2000 {
-		k := []byte{byte(i), byte(i >> 8)}
-		if err := d.Update(func(txn *Txn) error { return txn.Set(k, []byte("value")) }); err != nil {
-			t.Fatalf("set: %v", err)
-		}
-	}
-
-	s := d.Stats()
-	if len(s.Levels) == 0 {
-		t.Fatal("LSM Stats reported no levels after 2000 writes")
-	}
-	var segs int
-	for _, lv := range s.Levels {
-		segs += lv.Segments
-	}
-	if segs == 0 {
-		t.Errorf("LSM Stats reported zero segments across %d levels", len(s.Levels))
 	}
 }

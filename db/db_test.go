@@ -17,6 +17,31 @@ func concatMerge(existing, operand []byte) []byte {
 	return append(append([]byte(nil), existing...), operand...)
 }
 
+// putN commits value v for key in its own transaction, advancing the version, and
+// returns the new commit version.
+func putN(t *testing.T, d *DB, key, v string) uint64 {
+	t.Helper()
+	if err := d.Update(func(txn *Txn) error {
+		return txn.Set([]byte(key), []byte(v))
+	}); err != nil {
+		t.Fatalf("put %s=%s: %v", key, v, err)
+	}
+	return d.Version()
+}
+
+// seedRange writes keys k00..k{n-1} with values v00..v{n-1} in a single transaction.
+func seedRange(t *testing.T, d *DB, n int) {
+	t.Helper()
+	if err := d.Update(func(txn *Txn) error {
+		for i := 0; i < n; i++ {
+			txn.Set([]byte(fmt.Sprintf("k%02d", i)), []byte(fmt.Sprintf("v%02d", i)))
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+}
+
 func get(t *testing.T, d *DB, key string) (string, bool) {
 	t.Helper()
 	v, err := d.Get([]byte(key))

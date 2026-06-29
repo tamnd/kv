@@ -69,15 +69,10 @@ func (l Limits) checkBatch(n int) error {
 	return nil
 }
 
-// checkOp validates one operation's operands against the size limits. A range delete bounds both
-// ends; a write bounds the value too. The kinds that carry no value skip the value check.
+// checkOp validates one operation's operands against the size limits. A write bounds the value
+// too. The kinds that carry no value skip the value check.
 func (l Limits) checkOp(op Op) error {
 	switch op.Kind {
-	case OpDeleteRange:
-		if err := l.checkKey(op.Lo); err != nil {
-			return err
-		}
-		return l.checkKey(op.Hi)
 	case OpSet, OpMerge:
 		if err := l.checkKey(op.Key); err != nil {
 			return err

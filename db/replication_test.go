@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"github.com/tamnd/kv/engine"
-	"github.com/tamnd/kv/format"
 	"github.com/tamnd/kv/vfs"
 )
 
@@ -257,12 +256,12 @@ func TestShipApplyEncrypted(t *testing.T) {
 	}
 }
 
-// TestShipApplyLSM confirms WAL shipping works for the LSM core, whose checkpoint can keep
-// an unflushed memtable tail in the WAL: the shipped generation carries it and the follower
-// applies it.
-func TestShipApplyLSM(t *testing.T) {
+// TestShipApplyManyKeys confirms WAL shipping carries a full batch of commits: the shipped
+// generation replays on the follower and every key lands. Auto-checkpoint is off so the
+// commits stay in the WAL the primary ships rather than being folded away early.
+func TestShipApplyManyKeys(t *testing.T) {
 	fs := vfs.NewMem()
-	opts := Options{PageSize: 4096, Engine: format.EngineLSM, MemtableSize: 256, AutoCheckpoint: -1}
+	opts := Options{PageSize: 4096, AutoCheckpoint: -1}
 	p, err := Open(fs, "primary.kv", opts)
 	if err != nil {
 		t.Fatalf("open primary: %v", err)

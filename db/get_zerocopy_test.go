@@ -6,58 +6,46 @@ import (
 	"testing"
 
 	"github.com/tamnd/kv/engine"
-	"github.com/tamnd/kv/format"
 	"github.com/tamnd/kv/vfs"
 )
 
-// TestGetZeroCopyParity checks GetZeroCopy resolves identically to Get across both engines
-// and every MVCC shape: a plain value, an overwrite (multi-version group), a delete
-// (tombstone folds to absent), a merge (folds operands over the base), and a missing key.
-// The B-tree engine serves these through its ZeroCopyReader; the LSM engine has no such
-// capability, so the same calls exercise the copying fallback and must still agree.
-func TestGetZeroCopyParity(t *testing.T) {
-	for _, eng := range []struct {
-		name string
-		kind format.EngineKind
-	}{
-		{"btree", format.EngineBTree},
-		{"lsm", format.EngineLSM},
-	} {
-		t.Run(eng.name, func(t *testing.T) {
-			fs := vfs.NewMem()
-			d, err := Open(fs, "test.kv", Options{PageSize: 4096, Engine: eng.kind, Merge: concatMerge})
-			if err != nil {
-				t.Fatalf("open: %v", err)
-			}
-			defer d.Close()
+// TestGetZeroCopyMatchesGet checks GetZeroCopy resolves identically to Get across every MVCC
+// shape: a plain value, an overwrite (multi-version group), a delete (tombstone folds to
+// absent), a merge (folds operands over the base), and a missing key. The f2 core has no
+// zero-copy reader, so these calls exercise the copying fallback and must still agree with Get.
+func TestGetZeroCopyMatchesGet(t *testing.T) {
+	fs := vfs.NewMem()
+	d, err := Open(fs, "test.kv", Options{PageSize: 4096, Merge: concatMerge})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer d.Close()
 
-			if _, err := d.Write(func(b *engine.WriteBatch) {
-				b.Set([]byte("plain"), []byte("v1"))
-				b.Set([]byte("over"), []byte("old"))
-				b.Set([]byte("gone"), []byte("doomed"))
-				b.Set([]byte("m"), []byte("base"))
-			}); err != nil {
-				t.Fatalf("write 1: %v", err)
-			}
-			if _, err := d.Write(func(b *engine.WriteBatch) {
-				b.Set([]byte("over"), []byte("new"))
-				b.Delete([]byte("gone"))
-				b.Merge([]byte("m"), []byte("+x"))
-			}); err != nil {
-				t.Fatalf("write 2: %v", err)
-			}
+	if _, err := d.Write(func(b *engine.WriteBatch) {
+		b.Set([]byte("plain"), []byte("v1"))
+		b.Set([]byte("over"), []byte("old"))
+		b.Set([]byte("gone"), []byte("doomed"))
+		b.Set([]byte("m"), []byte("base"))
+	}); err != nil {
+		t.Fatalf("write 1: %v", err)
+	}
+	if _, err := d.Write(func(b *engine.WriteBatch) {
+		b.Set([]byte("over"), []byte("new"))
+		b.Delete([]byte("gone"))
+		b.Merge([]byte("m"), []byte("+x"))
+	}); err != nil {
+		t.Fatalf("write 2: %v", err)
+	}
 
-			for _, key := range []string{"plain", "over", "gone", "m", "absent"} {
-				want, wantErr := d.Get([]byte(key))
-				got, gotErr := d.GetZeroCopy([]byte(key))
-				if (wantErr == nil) != (gotErr == nil) || (wantErr != nil && wantErr != gotErr) {
-					t.Fatalf("key %q: Get err %v, GetZeroCopy err %v", key, wantErr, gotErr)
-				}
-				if wantErr == nil && !bytes.Equal(want, got) {
-					t.Fatalf("key %q: Get %q != GetZeroCopy %q", key, want, got)
-				}
-			}
-		})
+	for _, key := range []string{"plain", "over", "gone", "m", "absent"} {
+		want, wantErr := d.Get([]byte(key))
+		got, gotErr := d.GetZeroCopy([]byte(key))
+		if (wantErr == nil) != (gotErr == nil) || (wantErr != nil && wantErr != gotErr) {
+			t.Fatalf("key %q: Get err %v, GetZeroCopy err %v", key, wantErr, gotErr)
+		}
+		if wantErr == nil && !bytes.Equal(want, got) {
+			t.Fatalf("key %q: Get %q != GetZeroCopy %q", key, want, got)
+		}
 	}
 }
 

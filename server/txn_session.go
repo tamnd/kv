@@ -307,17 +307,6 @@ func (s *Service) TxnDelete(id uint64, key []byte) error {
 	return s.txns.with(id, func(txn *kv.Txn) error { return txn.Delete(key) })
 }
 
-// TxnDeleteRange buffers a range delete inside an open transaction.
-func (s *Service) TxnDeleteRange(id uint64, lo, hi []byte) error {
-	if err := s.limits.checkKey(lo); err != nil {
-		return err
-	}
-	if err := s.limits.checkKey(hi); err != nil {
-		return err
-	}
-	return s.txns.with(id, func(txn *kv.Txn) error { return txn.DeleteRange(lo, hi) })
-}
-
 // TxnMerge buffers a merge inside an open transaction.
 func (s *Service) TxnMerge(id uint64, key, operand []byte) error {
 	if err := s.limits.checkKey(key); err != nil {

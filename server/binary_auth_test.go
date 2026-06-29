@@ -156,22 +156,6 @@ func TestBinaryAuthBatchAllOrNothing(t *testing.T) {
 	}
 }
 
-func TestBinaryAuthRangeDeleteEnforced(t *testing.T) {
-	addr := newAuthBinaryServer(t)
-	cl := dialClient(t, addr)
-	if _, err := cl.Authenticate("rw"); err != nil {
-		t.Fatalf("Authenticate: %v", err)
-	}
-	// A range delete inside the grant is allowed.
-	if _, err := cl.DeleteRange([]byte("t1-a"), []byte("t1-z")); err != nil {
-		t.Fatalf("rw DeleteRange in-prefix: %v", err)
-	}
-	// One that escapes the grant is forbidden.
-	if _, err := cl.DeleteRange([]byte("t1-a"), []byte("u")); !errors.Is(err, ErrForbidden) {
-		t.Fatalf("rw DeleteRange escaping prefix error = %v, want ErrForbidden", err)
-	}
-}
-
 func TestBinaryAuthWatchPrefixEnforced(t *testing.T) {
 	addr := newAuthBinaryServer(t)
 	cl := dialClient(t, addr)

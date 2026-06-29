@@ -9,6 +9,7 @@
 *.kv-wal
 *.kv-shm
 *.kv-journal
+*.kv-f2
 
 # Editor and OS noise
 .DS_Store

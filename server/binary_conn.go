@@ -251,21 +251,6 @@ func (srv *Server) dispatchBinary(body []byte, sess *binarySession) []byte {
 		}
 		return encodeVersionResponse(version)
 
-	case opDeleteRange:
-		lo := d.bytes()
-		hi := d.bytes()
-		if d.err != nil {
-			return decodeErrResponse()
-		}
-		if err := srv.authorizeBinary(sess, func(id *Identity) bool { return id.canWriteRange(lo, hi) }); err != nil {
-			return errResponse(err)
-		}
-		version, err := s.DeleteRange(lo, hi)
-		if err != nil {
-			return errResponse(err)
-		}
-		return encodeVersionResponse(version)
-
 	case opMerge:
 		key := d.bytes()
 		operand := d.bytes()
@@ -402,21 +387,6 @@ func (srv *Server) dispatchBinary(body []byte, sess *binarySession) []byte {
 		}
 		return []byte{byte(statusOK)}
 
-	case opTxnDeleteRange:
-		id := d.uint64()
-		lo := d.bytes()
-		hi := d.bytes()
-		if d.err != nil {
-			return decodeErrResponse()
-		}
-		if err := srv.authorizeBinary(sess, func(id *Identity) bool { return id.canWriteRange(lo, hi) }); err != nil {
-			return errResponse(err)
-		}
-		if err := s.TxnDeleteRange(id, lo, hi); err != nil {
-			return errResponse(err)
-		}
-		return []byte{byte(statusOK)}
-
 	case opTxnMerge:
 		id := d.uint64()
 		key := d.bytes()
@@ -508,13 +478,11 @@ func decodeOpList(d *decoder) ([]Op, bool) {
 		kind := d.byte()
 		key := d.bytes()
 		value := d.bytes()
-		lo := d.bytes()
-		hi := d.bytes()
 		ttl := time.Duration(d.uint64()) * time.Millisecond
 		if d.err != nil {
 			return nil, false
 		}
-		ops = append(ops, Op{Kind: opKindFromByte(kind), Key: key, Value: value, Lo: lo, Hi: hi, TTL: ttl})
+		ops = append(ops, Op{Kind: opKindFromByte(kind), Key: key, Value: value, TTL: ttl})
 	}
 	return ops, true
 }
@@ -594,8 +562,6 @@ func opKindFromByte(b byte) OpKind {
 		return OpSet
 	case 4:
 		return OpDelete
-	case 5:
-		return OpDeleteRange
 	case 6:
 		return OpMerge
 	default:
@@ -614,8 +580,6 @@ func opKindToByte(k OpKind) byte {
 		return 3
 	case OpDelete:
 		return 4
-	case OpDeleteRange:
-		return 5
 	case OpMerge:
 		return 6
 	default:

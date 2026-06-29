@@ -2,7 +2,6 @@ package db
 
 import (
 	"fmt"
-	"strings"
 	"testing"
 
 	"github.com/tamnd/kv/engine"
@@ -103,18 +102,23 @@ func TestLoadFastPathDurableAcrossReopen(t *testing.T) {
 	}
 }
 
-// TestLoadFastPathRejectsUnsorted feeds out-of-order keys into a fresh database and checks
-// the fast path reports the violation rather than building a mis-ordered tree.
-func TestLoadFastPathRejectsUnsorted(t *testing.T) {
+// TestLoadAcceptsUnsorted feeds out-of-order keys into a fresh database. f2 has no key
+// order, so its bulk load carries no ascending-order precondition: unsorted input loads
+// cleanly and every pair reads back.
+func TestLoadAcceptsUnsorted(t *testing.T) {
 	d, err := Open(vfs.NewMem(), "test.kv", Options{})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
 	t.Cleanup(func() { d.Close() })
 
-	_, err = d.Load(pairFeed([][2]string{{"b", "1"}, {"a", "2"}}))
-	if err == nil || !strings.Contains(err.Error(), "ascending") {
-		t.Fatalf("unsorted load err = %v, want an ascending-order error", err)
+	if _, err := d.Load(pairFeed([][2]string{{"b", "1"}, {"a", "2"}})); err != nil {
+		t.Fatalf("unsorted load: %v", err)
+	}
+	for k, want := range map[string]string{"a": "2", "b": "1"} {
+		if got, ok := txnGet(t, d, k); !ok || got != want {
+			t.Fatalf("get %q = %q,%v, want %q", k, got, ok, want)
+		}
 	}
 }
 

@@ -168,8 +168,6 @@ func (sh *shell) bare(toks []string) error {
 		return sh.cmdSet(args)
 	case "del":
 		return sh.cmdDel(args)
-	case "del-range":
-		return sh.cmdDelRange(args)
 	case "exists":
 		return sh.cmdExists(args)
 	case "merge":
@@ -255,27 +253,6 @@ func (sh *shell) cmdDel(args []string) error {
 		return fmt.Errorf("bad key: %w", err)
 	}
 	return sh.write(func(txn *kv.Txn) error { return txn.Delete(key) })
-}
-
-func (sh *shell) cmdDelRange(args []string) error {
-	fs := flag.NewFlagSet("del-range", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	e := sh.shellEnc(fs)
-	if err := parseArgs(fs, args); err != nil {
-		return err
-	}
-	if fs.NArg() != 2 {
-		return fmt.Errorf("usage: del-range <lo> <hi>")
-	}
-	lo, err := e.decode(fs.Arg(0))
-	if err != nil {
-		return fmt.Errorf("bad lo: %w", err)
-	}
-	hi, err := e.decode(fs.Arg(1))
-	if err != nil {
-		return fmt.Errorf("bad hi: %w", err)
-	}
-	return sh.write(func(txn *kv.Txn) error { return txn.DeleteRange(lo, hi) })
 }
 
 func (sh *shell) cmdExists(args []string) error {
@@ -515,7 +492,6 @@ func (sh *shell) help() {
   get <key>                 print the value for a key
   set <key> <value>         upsert a key to a value
   del <key>                 delete a key
-  del-range <lo> <hi>       range-delete [lo, hi)
   exists <key>              print true or false
   merge <key> <operand>     record a merge operand
   (all accept --hex or --base64 for binary keys and values)
