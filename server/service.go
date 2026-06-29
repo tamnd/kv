@@ -347,10 +347,6 @@ func (s *Service) Stats() kv.Stats { return s.db.Stats() }
 // Checkpoint folds the WAL into the main file, the ops-surface checkpoint (spec 17 §3).
 func (s *Service) Checkpoint() error { return s.db.Checkpoint() }
 
-// Compact runs one bounded maintenance round and returns the pages reclaimed; a budget of
-// zero means no page cap.
-func (s *Service) Compact(budget int) (int, error) { return s.db.Vacuum(budget) }
-
 // errInvalidOp reports an unknown op kind in a request, mapped to 400 by the HTTP adapter.
 func errInvalidOp(k OpKind) error {
 	return errors.New("kv: invalid operation kind " + string(k))

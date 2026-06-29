@@ -123,9 +123,6 @@ func TestBinaryAuthOpsEndpointsAdminOnly(t *testing.T) {
 	if err := rw.Checkpoint(); !errors.Is(err, ErrForbidden) {
 		t.Fatalf("rw Checkpoint error = %v, want ErrForbidden", err)
 	}
-	if _, err := rw.Compact(1); !errors.Is(err, ErrForbidden) {
-		t.Fatalf("rw Compact error = %v, want ErrForbidden", err)
-	}
 	// The admin token reaches them.
 	admin := dialClient(t, addr)
 	if _, err := admin.Authenticate("admin"); err != nil {
@@ -136,9 +133,6 @@ func TestBinaryAuthOpsEndpointsAdminOnly(t *testing.T) {
 	}
 	if err := admin.Checkpoint(); err != nil {
 		t.Fatalf("admin Checkpoint: %v", err)
-	}
-	if _, err := admin.Compact(1); err != nil {
-		t.Fatalf("admin Compact: %v", err)
 	}
 }
 
@@ -175,31 +169,6 @@ func TestBinaryAuthRangeDeleteEnforced(t *testing.T) {
 	// One that escapes the grant is forbidden.
 	if _, err := cl.DeleteRange([]byte("t1-a"), []byte("u")); !errors.Is(err, ErrForbidden) {
 		t.Fatalf("rw DeleteRange escaping prefix error = %v, want ErrForbidden", err)
-	}
-}
-
-func TestBinaryAuthScanPrefixEnforced(t *testing.T) {
-	addr := newAuthBinaryServer(t)
-	cl := dialClient(t, addr)
-	if _, err := cl.Authenticate("ro"); err != nil {
-		t.Fatalf("Authenticate: %v", err)
-	}
-	// A scan confined to the granted prefix is allowed.
-	if err := cl.Scan(ScanOptions{Prefix: []byte("t1-")}, func(_, _ []byte) error { return nil }); err != nil {
-		t.Fatalf("ro scan in-prefix: %v", err)
-	}
-	// A scan of another prefix is forbidden. The deny rides an error frame, so the Scan call
-	// returns the forbidden error; the connection is spent after, so a fresh client follows.
-	if err := cl.Scan(ScanOptions{Prefix: []byte("t2-")}, func(_, _ []byte) error { return nil }); !errors.Is(err, ErrForbidden) {
-		t.Fatalf("ro scan out-of-prefix error = %v, want ErrForbidden", err)
-	}
-	// A whole-keyspace scan is forbidden for a prefix-scoped token.
-	cl2 := dialClient(t, addr)
-	if _, err := cl2.Authenticate("ro"); err != nil {
-		t.Fatalf("Authenticate: %v", err)
-	}
-	if err := cl2.Scan(ScanOptions{}, func(_, _ []byte) error { return nil }); !errors.Is(err, ErrForbidden) {
-		t.Fatalf("ro whole-keyspace scan error = %v, want ErrForbidden", err)
 	}
 }
 

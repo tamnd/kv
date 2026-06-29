@@ -181,18 +181,3 @@ func TestStaticTokenAuthenticatorCopiesTable(t *testing.T) {
 		t.Fatalf("authenticator table changed when caller's map was mutated")
 	}
 }
-
-func TestScanAuthPrefix(t *testing.T) {
-	// An explicit prefix is used directly.
-	if got := scanAuthPrefix([]byte("p/"), []byte("x"), []byte("y")); string(got) != "p/" {
-		t.Fatalf("explicit prefix = %q, want p/", got)
-	}
-	// With no prefix, the shared prefix of from/to is the bound.
-	if got := scanAuthPrefix(nil, []byte("app"), []byte("apq")); string(got) != "ap" {
-		t.Fatalf("derived prefix = %q, want ap", got)
-	}
-	// Disjoint bounds share nothing, so the whole keyspace is the bound.
-	if got := scanAuthPrefix(nil, []byte("a"), []byte("z")); len(got) != 0 {
-		t.Fatalf("disjoint bounds prefix = %q, want empty", got)
-	}
-}

@@ -22,8 +22,8 @@ import (
 // body is a one-byte opcode then the operation's fields; a response body is a one-byte status
 // then, on success, the result fields, or on failure a length-prefixed error message. Framing
 // every message with its length is what lets the reader own exactly one allocation per message
-// and what makes the streaming opcodes (scan, watch, in a later slice) able to interleave many
-// result frames between two request frames on the same connection.
+// and what makes the watch opcode able to interleave many result frames between two request
+// frames on the same connection.
 
 // opcode names a request operation on the binary wire. The values are explicit and frozen:
 // the wire is a compatibility surface, so an opcode's number never changes.
@@ -40,8 +40,6 @@ const (
 	opBatch       opcode = 8
 	opStats       opcode = 9
 	opCheckpoint  opcode = 10
-	opCompact     opcode = 11
-	opScan        opcode = 12
 	opWatch       opcode = 13
 
 	opBeginTxn       opcode = 14

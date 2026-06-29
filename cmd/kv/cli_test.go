@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -9,7 +8,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -116,46 +114,14 @@ func TestCLIDelAndDelRange(t *testing.T) {
 	if code := run([]string{"del-range", p, "b", "d"}); code != exitOK {
 		t.Fatalf("del-range: exit %d", code)
 	}
-	out := capture(t, func() { run([]string{"count", p}) })
-	if strings.TrimSpace(out) != "1" {
-		t.Fatalf("count after deletes = %q, want 1", out)
-	}
-}
-
-func TestCLIScanPrefixJSONL(t *testing.T) {
-	p := dbPath(t)
-	run([]string{"set", p, "user:1", "alice"})
-	run([]string{"set", p, "user:2", "bob"})
-	run([]string{"set", p, "other", "x"})
-	out := capture(t, func() {
-		run([]string{"scan", p, "--prefix", "user:", "-f", "jsonl"})
-	})
-	var keys []string
-	sc := bufio.NewScanner(strings.NewReader(out))
-	for sc.Scan() {
-		var r record
-		if err := json.Unmarshal(sc.Bytes(), &r); err != nil {
-			t.Fatalf("bad jsonl line %q: %v", sc.Text(), err)
-		}
-		keys = append(keys, r.Key)
-	}
-	if len(keys) != 2 || keys[0] != "user:1" || keys[1] != "user:2" {
-		t.Fatalf("scanned keys = %v, want [user:1 user:2]", keys)
-	}
-}
-
-func TestCLIScanReverseKeysOnly(t *testing.T) {
-	p := dbPath(t)
+	// a, b, c are gone; only d survives.
 	for _, k := range []string{"a", "b", "c"} {
-		run([]string{"set", p, k, k})
+		if code := run([]string{"get", p, k}); code != exitNotFound {
+			t.Fatalf("get %q after deletes = exit %d, want %d", k, code, exitNotFound)
+		}
 	}
-	out := capture(t, func() {
-		run([]string{"scan", p, "--reverse", "--keys-only", "-f", "raw"})
-	})
-	got := strings.Fields(out)
-	want := []string{"c", "b", "a"}
-	if strings.Join(got, ",") != strings.Join(want, ",") {
-		t.Fatalf("reverse keys = %v, want %v", got, want)
+	if code := run([]string{"exists", p, "d"}); code != exitOK {
+		t.Fatalf("exists d after deletes = exit %d, want %d", code, exitOK)
 	}
 }
 
@@ -178,17 +144,15 @@ func TestCLIBackupRestoreRoundTrip(t *testing.T) {
 		t.Fatal("restore over existing file should not exit 0")
 	}
 
-	out := capture(t, func() { run([]string{"scan", dst, "-f", "jsonl"}) })
-	var got []string
-	sc := bufio.NewScanner(strings.NewReader(out))
-	for sc.Scan() {
-		var r record
-		json.Unmarshal(sc.Bytes(), &r)
-		got = append(got, r.Key+"="+r.Value)
-	}
-	sort.Strings(got)
-	if strings.Join(got, ",") != "k1=v1,k2=v2" {
-		t.Fatalf("restored = %v, want [k1=v1 k2=v2]", got)
+	for _, want := range [][2]string{{"k1", "v1"}, {"k2", "v2"}} {
+		got := strings.TrimSpace(capture(t, func() {
+			if code := run([]string{"get", dst, want[0]}); code != exitOK {
+				t.Fatalf("get %q: exit %d", want[0], code)
+			}
+		}))
+		if got != want[1] {
+			t.Fatalf("restored %q = %q, want %q", want[0], got, want[1])
+		}
 	}
 }
 
@@ -218,17 +182,15 @@ func TestCLIShipReplayRoundTrip(t *testing.T) {
 		t.Fatalf("replay: exit %d", code)
 	}
 
-	out := capture(t, func() { run([]string{"scan", follower, "-f", "jsonl"}) })
-	var got []string
-	sc := bufio.NewScanner(strings.NewReader(out))
-	for sc.Scan() {
-		var r record
-		json.Unmarshal(sc.Bytes(), &r)
-		got = append(got, r.Key+"="+r.Value)
-	}
-	sort.Strings(got)
-	if strings.Join(got, ",") != "k1=v1,k2=v2,k3=v3" {
-		t.Fatalf("follower = %v, want [k1=v1 k2=v2 k3=v3]", got)
+	for _, want := range [][2]string{{"k1", "v1"}, {"k2", "v2"}, {"k3", "v3"}} {
+		got := strings.TrimSpace(capture(t, func() {
+			if code := run([]string{"get", follower, want[0]}); code != exitOK {
+				t.Fatalf("get %q: exit %d", want[0], code)
+			}
+		}))
+		if got != want[1] {
+			t.Fatalf("follower %q = %q, want %q", want[0], got, want[1])
+		}
 	}
 }
 
@@ -271,47 +233,49 @@ func TestCLIPITRRollForward(t *testing.T) {
 		t.Fatalf("replay g4: exit %d", code)
 	}
 
-	out := capture(t, func() { run([]string{"scan", follower, "-f", "jsonl"}) })
-	var got []string
-	sc := bufio.NewScanner(strings.NewReader(out))
-	for sc.Scan() {
-		var r record
-		json.Unmarshal(sc.Bytes(), &r)
-		got = append(got, r.Key+"="+r.Value)
+	for _, want := range [][2]string{{"k1", "v1"}, {"k2", "v2"}, {"k3", "v3"}} {
+		got := strings.TrimSpace(capture(t, func() {
+			if code := run([]string{"get", follower, want[0]}); code != exitOK {
+				t.Fatalf("get %q: exit %d", want[0], code)
+			}
+		}))
+		if got != want[1] {
+			t.Fatalf("recovered %q = %q, want %q", want[0], got, want[1])
+		}
 	}
-	sort.Strings(got)
-	if strings.Join(got, ",") != "k1=v1,k2=v2,k3=v3" {
-		t.Fatalf("recovered = %v, want [k1=v1 k2=v2 k3=v3]", got)
+	// k4 is past the recovery point and must not be present.
+	if code := run([]string{"get", follower, "k4"}); code != exitNotFound {
+		t.Fatalf("get k4 after recovery = exit %d, want %d", code, exitNotFound)
 	}
 }
 
-func TestCLIDumpLoadRoundTrip(t *testing.T) {
-	src := dbPath(t)
-	run([]string{"set", src, "k1", "v1"})
-	run([]string{"set", src, "k2", "v2"})
-	dump := capture(t, func() { run([]string{"dump", src}) })
-
+// TestCLILoad confirms the bulk load command reads a JSONL file of key/value records and
+// inserts every pair, readable afterward through get. The fast path wants ascending keys,
+// so the input file is written in sorted order.
+func TestCLILoad(t *testing.T) {
 	dst := filepath.Join(t.TempDir(), "dst.kv")
 	if code := run([]string{"create", dst}); code != exitOK {
 		t.Fatalf("create dst: exit %d", code)
 	}
-	// Feed the dump back through load via a redirected stdin.
-	withStdin(t, dump, func() {
-		if code := run([]string{"load", dst}); code != exitOK {
-			t.Fatalf("load: exit %d", code)
-		}
-	})
-	out := capture(t, func() { run([]string{"scan", dst, "-f", "jsonl"}) })
-	var got []string
-	sc := bufio.NewScanner(strings.NewReader(out))
-	for sc.Scan() {
-		var r record
-		json.Unmarshal(sc.Bytes(), &r)
-		got = append(got, r.Key+"="+r.Value)
+
+	input := filepath.Join(t.TempDir(), "load.jsonl")
+	jsonl := `{"key":"k1","value":"v1"}` + "\n" + `{"key":"k2","value":"v2"}` + "\n"
+	if err := os.WriteFile(input, []byte(jsonl), 0o644); err != nil {
+		t.Fatalf("write input: %v", err)
 	}
-	sort.Strings(got)
-	if strings.Join(got, ",") != "k1=v1,k2=v2" {
-		t.Fatalf("loaded = %v, want [k1=v1 k2=v2]", got)
+	if code := run([]string{"load", dst, "--input", input}); code != exitOK {
+		t.Fatalf("load: exit %d", code)
+	}
+
+	for _, want := range [][2]string{{"k1", "v1"}, {"k2", "v2"}} {
+		got := strings.TrimSpace(capture(t, func() {
+			if code := run([]string{"get", dst, want[0]}); code != exitOK {
+				t.Fatalf("get %q: exit %d", want[0], code)
+			}
+		}))
+		if got != want[1] {
+			t.Fatalf("loaded %q = %q, want %q", want[0], got, want[1])
+		}
 	}
 }
 
@@ -584,48 +548,6 @@ func TestCLIVacuum(t *testing.T) {
 	}
 }
 
-// TestCLIVacuumFull confirms the full-vacuum command rebuilds a churned file, prints a
-// before/after page summary, and leaves every live key readable through the swapped-in file
-// while the deleted keys stay gone (spec 09 §3.2, spec 16).
-func TestCLIVacuumFull(t *testing.T) {
-	p := dbPath(t)
-	for i := 0; i < 200; i++ {
-		k := fmt.Sprintf("k%04d", i)
-		if code := run([]string{"set", p, k, "v" + k}); code != exitOK {
-			t.Fatalf("set %s: exit %d", k, code)
-		}
-	}
-	for i := 0; i < 100; i++ {
-		if code := run([]string{"del", p, fmt.Sprintf("k%04d", i)}); code != exitOK {
-			t.Fatalf("del: exit %d", code)
-		}
-	}
-
-	out := capture(t, func() {
-		if code := run([]string{"vacuum", p, "--full"}); code != exitOK {
-			t.Fatalf("vacuum --full: exit %d, want 0", code)
-		}
-	})
-	if !strings.Contains(out, "compacted") {
-		t.Fatalf("vacuum --full output = %q, want a compacted summary", out)
-	}
-
-	if code := run([]string{"check", p}); code != exitOK {
-		t.Fatalf("check after full vacuum: exit %d, want 0", code)
-	}
-	if code := run([]string{"get", p, "k0000"}); code != exitNotFound {
-		t.Fatalf("deleted key after full vacuum = exit %d, want %d", code, exitNotFound)
-	}
-	got := capture(t, func() {
-		if code := run([]string{"get", p, "k0150"}); code != exitOK {
-			t.Fatalf("get survivor: exit %d", code)
-		}
-	})
-	if !strings.Contains(got, "vk0150") {
-		t.Fatalf("survivor value = %q, want vk0150", got)
-	}
-}
-
 // withStdin runs fn with os.Stdin replaced by a pipe carrying the given input.
 func withStdin(t *testing.T, input string, fn func()) {
 	t.Helper()
@@ -680,23 +602,6 @@ func TestShellQuotedValue(t *testing.T) {
 	out := shellSession(t, "set doc '{\"name\": \"a b\"}'\nget doc\n.exit\n")
 	if got := strings.TrimSpace(out); got != `{"name": "a b"}` {
 		t.Fatalf("get doc = %q, want the quoted JSON intact", got)
-	}
-}
-
-// TestShellScanAndCount checks a prefix scan and a count run against the open file, with
-// the format dot-command selecting the rendering.
-func TestShellScanAndCount(t *testing.T) {
-	out := shellSession(t, ".format raw\nset user:1 a\nset user:2 b\nset other x\nscan --prefix user: --keys-only\ncount --prefix user:\n.exit\n")
-	lines := strings.Split(strings.TrimSpace(out), "\n")
-	// raw key-only scan prints the two user keys, then count prints 2.
-	want := []string{"user:1", "user:2", "2"}
-	if len(lines) != len(want) {
-		t.Fatalf("got %q, want %q", lines, want)
-	}
-	for i := range want {
-		if lines[i] != want[i] {
-			t.Fatalf("line %d = %q, want %q", i, lines[i], want[i])
-		}
 	}
 }
 

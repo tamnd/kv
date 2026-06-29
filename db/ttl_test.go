@@ -129,45 +129,6 @@ func TestTTLReadYourWrites(t *testing.T) {
 	}
 }
 
-// TestTTLScanExcludesExpired checks an iterator skips a key whose TTL has lapsed while
-// still returning its live neighbors.
-func TestTTLScanExcludesExpired(t *testing.T) {
-	clk := &testClock{}
-	clk.set(10)
-	d := openMemClock(t, clk, Options{})
-
-	setTTL(t, d, "a", "1", 0)   // never expires
-	setTTL(t, d, "b", "2", 100) // expires at 100
-	setTTL(t, d, "c", "3", 0)   // never expires
-
-	clk.set(200)
-	got := map[string]string{}
-	err := d.View(func(txn *Txn) error {
-		it, err := txn.NewIterator(engine.IterOptions{})
-		if err != nil {
-			return err
-		}
-		defer it.Close()
-		for it.First(); it.Valid(); it.Next() {
-			v, err := it.Value()
-			if err != nil {
-				return err
-			}
-			got[string(it.Key())] = string(v)
-		}
-		return it.Error()
-	})
-	if err != nil {
-		t.Fatalf("scan: %v", err)
-	}
-	if len(got) != 2 || got["a"] != "1" || got["c"] != "3" {
-		t.Fatalf("scan after expiry = %v, want a=1 c=3 only", got)
-	}
-	if _, ok := got["b"]; ok {
-		t.Fatalf("expired key b present in scan")
-	}
-}
-
 // TestTTLSweepReclaims checks the db-level maintenance sweep reclaims an expired TTL
 // key's value through the database clock: after the clock advances past the deadline, a
 // Maintain pass reports the key swept and bytes reclaimed, the key stays absent, and a

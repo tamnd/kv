@@ -15,7 +15,7 @@ import (
 // tightLimits is a small limit set the size tests drive against, so a modest payload trips each
 // bound without allocating anything large.
 func tightLimits() Limits {
-	return Limits{MaxKeySize: 8, MaxValueSize: 8, MaxBatchOps: 3, MaxScanLimit: 2}
+	return Limits{MaxKeySize: 8, MaxValueSize: 8, MaxBatchOps: 3}
 }
 
 // newBinaryServerWithLimits serves the binary protocol with the given limits and returns a
@@ -126,44 +126,6 @@ func TestLimitsServiceTxnAssertAndOpsBounded(t *testing.T) {
 	}
 	if _, err := svc.Txn(TxnRequest{Ops: []Op{{Kind: OpSet, Key: big, Value: []byte("v")}}}); !errors.Is(err, ErrLimitExceeded) {
 		t.Fatalf("txn big op key err = %v, want ErrLimitExceeded", err)
-	}
-}
-
-func TestLimitsServiceClampsScan(t *testing.T) {
-	db := newTestDB(t)
-	svc := NewService(db)
-	defer svc.Close()
-	svc.SetLimits(tightLimits()) // MaxScanLimit 2
-
-	for _, k := range []string{"a", "b", "c", "d", "e"} {
-		if _, err := svc.Set([]byte(k), []byte("v"), 0); err != nil {
-			t.Fatalf("seed %s: %v", k, err)
-		}
-	}
-
-	// An unbounded scan is clamped to the ceiling, and a request above the ceiling is too.
-	for _, req := range []int{0, 100} {
-		n := 0
-		err := svc.Scan(ScanOptions{Limit: req}, func(_, _ []byte) error {
-			n++
-			return nil
-		})
-		if err != nil {
-			t.Fatalf("scan limit %d: %v", req, err)
-		}
-		if n != 2 {
-			t.Fatalf("scan limit %d returned %d pairs, want 2 (clamped)", req, n)
-		}
-	}
-
-	// A request below the ceiling is honored unchanged.
-	n := 0
-	svc.Scan(ScanOptions{Limit: 1}, func(_, _ []byte) error {
-		n++
-		return nil
-	})
-	if n != 1 {
-		t.Fatalf("scan limit 1 returned %d pairs, want 1", n)
 	}
 }
 

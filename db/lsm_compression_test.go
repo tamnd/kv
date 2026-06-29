@@ -87,53 +87,24 @@ func TestLSMCompressionTransparent(t *testing.T) {
 		}
 	}
 
-	// Full scans must agree key for key and value for value, so compression is invisible to
-	// the range path as well as the point path.
-	scan := func(d *DB) ([]string, []string) {
-		var keys, vals []string
-		if err := d.View(func(txn *Txn) error {
-			it, err := txn.NewIterator(engine.IterOptions{})
-			if err != nil {
-				return err
-			}
-			defer it.Close()
-			keys, vals = collect(t, it)
-			return nil
-		}); err != nil {
-			t.Fatalf("scan: %v", err)
-		}
-		return keys, vals
-	}
-	pKeys, pVals := scan(plain)
-	cKeys, cVals := scan(comp)
-	if !eq(pKeys, cKeys...) {
-		t.Fatalf("scan keys differ under compression: plain %d keys, compressed %d", len(pKeys), len(cKeys))
-	}
-	if !eq(pVals, cVals...) {
-		t.Fatalf("scan values differ under compression")
-	}
-
-	// Spot-check the compressed result against the truth so a bug shared by both paths cannot
-	// pass: a deleted key gone, an overwritten key carrying its new value, an untouched key
-	// its original.
-	got := make(map[string]string, len(cKeys))
-	for i, k := range cKeys {
-		got[k] = cVals[i]
-	}
+	// Spot-check the compressed result against the truth with point reads so a bug shared by
+	// both paths cannot pass: a deleted key gone, an overwritten key carrying its new value,
+	// an untouched key its original.
 	for i := 0; i < n; i++ {
 		k := fmt.Sprintf("key%06d", i)
+		got, ok := txnGet(t, comp, k)
 		switch {
 		case i%5 == 0:
-			if _, ok := got[k]; ok {
+			if ok {
 				t.Fatalf("deleted key %s still present under compression", k)
 			}
 		case i%3 == 0:
-			if got[k] != fmt.Sprintf("payload-field-rewrite-%06d", i) {
-				t.Fatalf("overwritten key %s = %q, want rewrite", k, got[k])
+			if !ok || got != fmt.Sprintf("payload-field-rewrite-%06d", i) {
+				t.Fatalf("overwritten key %s = %q,%v, want rewrite", k, got, ok)
 			}
 		default:
-			if got[k] != fmt.Sprintf("payload-field-value-shared-prefix-%06d", i) {
-				t.Fatalf("key %s = %q, want original", k, got[k])
+			if !ok || got != fmt.Sprintf("payload-field-value-shared-prefix-%06d", i) {
+				t.Fatalf("key %s = %q,%v, want original", k, got, ok)
 			}
 		}
 	}

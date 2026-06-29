@@ -117,11 +117,6 @@ type Tracer = db.Tracer
 // Span is one started trace span; End closes it, called exactly once.
 type Span = db.Span
 
-// IterOptions controls a range scan: bounds, prefix, reverse, key-only (spec 11 §1).
-// It is the same shape the iterator layer consumes, exposed here so callers construct
-// it as kv.IterOptions.
-type IterOptions = engine.IterOptions
-
 // LevelStats is one LSM level's segment count and on-disk footprint, the per-level shape
 // reported in Stats for the compaction-backlog view (spec 19 §1.5).
 type LevelStats = engine.LevelStats
@@ -372,34 +367,6 @@ func Open(path string, opts ...Option) (*DB, error) {
 		return nil, wrap(err)
 	}
 	return &DB{d: d}, nil
-}
-
-// Compact runs a full vacuum on the database at path (spec 09 §3.2): it rebuilds the file
-// from scratch into a fresh, maximally compact copy holding only the live data and swaps it
-// in atomically, reclaiming all the space that obsolete versions, tombstones, and freelist
-// holes were holding. It is an offline operation: path must not be open elsewhere while it
-// runs, and it needs room on disk for a second copy of the live data. Open the database
-// again afterward to use it.
-func Compact(path string, opts ...Option) error {
-	c := &config{}
-	for _, o := range opts {
-		o(c)
-	}
-	c.resolveCache()
-	return wrap(db.Compact(vfs.NewOS(), path, c.opts))
-}
-
-// Migrate upgrades the generation-1 (v0.2.0) database at srcPath into a generation-2
-// Bε-tree database at dstPath, the one-way conversion off the old on-disk format the
-// 2059 redesign replaced the two-engine split with. It builds the new file beside the
-// destination, verifies it holds the source's live key space key-for-key, and only then
-// renames it into place, so the original is preserved until the rewrite is durable and
-// verified. Passing the same path for srcPath and dstPath upgrades a file in place. It is
-// offline: neither path may be open elsewhere while it runs, and it needs room on disk for
-// the rewritten copy. It refuses a source that is already generation 2, which has nothing
-// to upgrade. There is no downgrade; restore from a backup to go back.
-func Migrate(srcPath, dstPath string) error {
-	return wrap(db.Migrate(vfs.NewOS(), srcPath, dstPath))
 }
 
 // RestoreBackup reconstructs a database at path from a stream produced by DB.Backup, writing
@@ -894,10 +861,10 @@ func (kdb *DB) Check() (*CheckReport, error) {
 // key derived from the same master key, while the pages already on disk keep the epoch they
 // were sealed under and stay readable: a lazy, incremental rotation that does not re-encrypt
 // the whole file and does not change the master key supplied through WithEncryptionKey. It
-// folds the WAL and persists the new key epoch durably before returning. To force a full
-// re-encryption that leaves no page under the old epoch, run Compact, which rebuilds the file
-// and reseals every page. It returns ErrNotEncrypted if the database was not created with an
-// encryption key.
+// folds the WAL and persists the new key epoch durably before returning. Pages already on
+// disk under an older epoch are resealed lazily as later writes rewrite them, so over time
+// the old epoch fades out without a whole-file pass. It returns ErrNotEncrypted if the
+// database was not created with an encryption key.
 func (kdb *DB) RotateEncryptionKey() error {
 	return wrap(kdb.d.RotateEncryptionKey())
 }

@@ -122,7 +122,6 @@ func TestHTTPAuthOpsEndpointsAdminOnly(t *testing.T) {
 		{http.MethodGet, "/v1/stats"},
 		{http.MethodGet, "/v1/info"},
 		{http.MethodPost, "/v1/checkpoint"},
-		{http.MethodPost, "/v1/compact"},
 	} {
 		if status, _ := doAuth(t, "rw", route.method, ts+route.path, nil); status != http.StatusForbidden {
 			t.Fatalf("rw %s %s status = %d, want 403", route.method, route.path, status)
@@ -130,26 +129,6 @@ func TestHTTPAuthOpsEndpointsAdminOnly(t *testing.T) {
 		if status, _ := doAuth(t, "admin", route.method, ts+route.path, nil); status != http.StatusOK {
 			t.Fatalf("admin %s %s status = %d, want 200", route.method, route.path, status)
 		}
-	}
-}
-
-func TestHTTPAuthScanPrefixEnforced(t *testing.T) {
-	ts := newAuthHTTPServer(t)
-	// A scan confined to the granted prefix is allowed.
-	if status, _ := doAuth(t, "ro", http.MethodGet, ts+"/v1/scan?prefix=t1-", nil); status != http.StatusOK {
-		t.Fatalf("ro scan in-prefix status = %d, want 200", status)
-	}
-	// A scan of another prefix is forbidden.
-	if status, _ := doAuth(t, "ro", http.MethodGet, ts+"/v1/scan?prefix=t2-", nil); status != http.StatusForbidden {
-		t.Fatalf("ro scan out-of-prefix status = %d, want 403", status)
-	}
-	// A whole-keyspace scan (no prefix) is forbidden for a prefix-scoped token.
-	if status, _ := doAuth(t, "ro", http.MethodGet, ts+"/v1/scan", nil); status != http.StatusForbidden {
-		t.Fatalf("ro whole-keyspace scan status = %d, want 403", status)
-	}
-	// The admin scans anything.
-	if status, _ := doAuth(t, "admin", http.MethodGet, ts+"/v1/scan", nil); status != http.StatusOK {
-		t.Fatalf("admin whole-keyspace scan status = %d, want 200", status)
 	}
 }
 

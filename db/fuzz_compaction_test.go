@@ -111,21 +111,14 @@ func FuzzCompaction(f *testing.F) {
 							return nil
 						}
 						checkGet(t, txn, work, fuzzKey(kb))
-					case 5: // scan: lo, hi, flag
-						a, ok1 := cur.next()
-						b, ok2 := cur.next()
-						fl, ok3 := cur.next()
+					case 5: // formerly scan: consume the three operand bytes so the program decoding
+						// stays aligned with the operation fuzzer. The range surface is gone.
+						_, ok1 := cur.next()
+						_, ok2 := cur.next()
+						_, ok3 := cur.next()
 						if !ok1 || !ok2 || !ok3 {
 							return nil
 						}
-						lo, hi := orderedRange(a, b)
-						if fl&0x4 != 0 {
-							lo = nil
-						}
-						if fl&0x8 != 0 {
-							hi = nil
-						}
-						checkScan(t, txn, work, lo, hi, fl&0x1 != 0)
 					case 6: // commit boundary: read the structural action
 						p, ok := cur.next()
 						if ok {
@@ -143,12 +136,12 @@ func FuzzCompaction(f *testing.F) {
 			switch post {
 			case 0: // maintain: drain the compaction backlog, then assert the merged result still matches
 				drainCompaction(t, d)
-				assertFullScan(t, d, committed)
+				assertModel(t, d, committed)
 			case 1: // checkpoint: fold the WAL and the flushed segments into the main file
 				if err := d.Checkpoint(); err != nil {
 					t.Fatalf("checkpoint: %v", err)
 				}
-				assertFullScan(t, d, committed)
+				assertModel(t, d, committed)
 			case 2: // reopen: close and recover, asserting the segments and the WAL tail rebuild the state
 				if err := d.Close(); err != nil {
 					t.Fatalf("close: %v", err)
@@ -157,14 +150,14 @@ func FuzzCompaction(f *testing.F) {
 				if err != nil {
 					t.Fatalf("reopen: %v", err)
 				}
-				assertFullScan(t, d, committed)
+				assertModel(t, d, committed)
 			}
 		}
 
 		// Run compaction once more at the end so the final assertion is made against a fully merged tree,
 		// then check the whole keyspace equals the model.
 		drainCompaction(t, d)
-		assertFullScan(t, d, committed)
+		assertModel(t, d, committed)
 	})
 }
 

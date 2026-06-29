@@ -67,28 +67,6 @@ func (t *Txn) DeleteRange(lo, hi []byte) error { return wrap(t.t.DeleteRange(lo,
 // appends the engine collapses.
 func (t *Txn) Merge(key, operand []byte) error { return wrap(t.t.Merge(key, operand)) }
 
-// NewIterator returns a snapshot-consistent iterator over the transaction's snapshot,
-// overlaid with its own buffered writes (spec 11). The caller must Close it.
-func (t *Txn) NewIterator(opts IterOptions) (*Iterator, error) {
-	it, err := t.t.NewIterator(opts)
-	if err != nil {
-		return nil, wrap(err)
-	}
-	return &Iterator{it: it}, nil
-}
-
-// NewScanCursor returns a forward-only zero-copy range scan over the transaction's
-// snapshot (spec 11). When the transaction has no buffered writes and the scan is
-// forward, it takes the zero-copy batch path; otherwise it falls back to an Iterator so
-// read-your-writes and reverse iteration still hold. The caller must Close it.
-func (t *Txn) NewScanCursor(opts IterOptions) (*ScanCursor, error) {
-	sc, err := t.t.NewScanCursor(opts)
-	if err != nil {
-		return nil, wrap(err)
-	}
-	return &ScanCursor{sc: sc}, nil
-}
-
 // Commit durably applies a writable transaction's buffered writes, or returns
 // ErrConflict if it lost a write-write or SSI race (spec 15 §2.2).
 func (t *Txn) Commit() error { return wrap(t.t.Commit()) }

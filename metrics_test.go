@@ -196,9 +196,9 @@ func TestDBWriteMetricsIsWellFormed(t *testing.T) {
 	}
 }
 
-// TestDBMetricsCountOperations drives a known mix of reads, writes, and a scan, then checks
-// the per-op counters and the commit-latency pair reflect the work: 50 sets across 50
-// commits, one get, one scan, and a positive total commit latency.
+// TestDBMetricsCountOperations drives a known mix of reads and writes, then checks the
+// per-op counters and the commit-latency pair reflect the work: 50 sets across 50 commits,
+// one get, and a positive total commit latency.
 func TestDBMetricsCountOperations(t *testing.T) {
 	d := open(t)
 	for i := range 50 {
@@ -211,11 +211,6 @@ func TestDBMetricsCountOperations(t *testing.T) {
 		if _, err := txn.Get([]byte{1}); err != nil {
 			return err
 		}
-		it, err := txn.NewIterator(kv.IterOptions{})
-		if err != nil {
-			return err
-		}
-		defer it.Close()
 		return nil
 	}); err != nil {
 		t.Fatalf("read txn: %v", err)
@@ -227,9 +222,6 @@ func TestDBMetricsCountOperations(t *testing.T) {
 	}
 	if s.Gets != 1 {
 		t.Errorf("Gets = %d, want 1", s.Gets)
-	}
-	if s.Scans != 1 {
-		t.Errorf("Scans = %d, want 1", s.Scans)
 	}
 	if s.Commits != 50 {
 		t.Errorf("Commits = %d, want 50", s.Commits)

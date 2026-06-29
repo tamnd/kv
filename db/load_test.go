@@ -33,7 +33,7 @@ func ascendingPairs(n int) [][2]string {
 }
 
 // TestLoadFastPathPopulatesEmpty bulk-loads ascending pairs into a fresh database, then
-// checks every key reads back at the returned version and a scan returns them in order.
+// checks every key reads back at the returned version.
 func TestLoadFastPathPopulatesEmpty(t *testing.T) {
 	d, err := Open(vfs.NewMem(), "test.kv", Options{})
 	if err != nil {
@@ -56,28 +56,6 @@ func TestLoadFastPathPopulatesEmpty(t *testing.T) {
 		if !ok || got != fmt.Sprintf("v%06d", i) {
 			t.Fatalf("get %q = %q,%v", k, got, ok)
 		}
-	}
-
-	count := 0
-	err = d.View(func(txn *Txn) error {
-		it, err := txn.NewIterator(engine.IterOptions{})
-		if err != nil {
-			return err
-		}
-		defer it.Close()
-		for it.First(); it.Valid(); it.Next() {
-			if want := fmt.Sprintf("k%06d", count); string(it.Key()) != want {
-				t.Fatalf("scan %d = %q, want %q", count, it.Key(), want)
-			}
-			count++
-		}
-		return it.Error()
-	})
-	if err != nil {
-		t.Fatalf("scan: %v", err)
-	}
-	if count != n {
-		t.Fatalf("scan visited %d, want %d", count, n)
 	}
 }
 

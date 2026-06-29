@@ -232,16 +232,12 @@ func TestStatsAndHealth(t *testing.T) {
 	}
 }
 
-func TestCheckpointAndCompact(t *testing.T) {
+func TestCheckpoint(t *testing.T) {
 	hs, _ := newTestServer(t)
 	do(t, http.MethodPut, hs.URL+"/v1/kv/k", strings.NewReader("v"))
 	code, _ := do(t, http.MethodPost, hs.URL+"/v1/checkpoint", nil)
 	if code != http.StatusOK {
 		t.Fatalf("checkpoint status = %d", code)
-	}
-	code, body := do(t, http.MethodPost, hs.URL+"/v1/compact", nil)
-	if code != http.StatusOK {
-		t.Fatalf("compact status = %d, body %s", code, body)
 	}
 }
 

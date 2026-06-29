@@ -10,20 +10,11 @@ import (
 	"github.com/tamnd/kv"
 )
 
-// This file holds the two streaming HTTP handlers. A scan writes its result as NDJSON, one
-// JSON object per line, flushed as each pair is produced, so a client reads rows as the
-// server finds them and the server never buffers the whole range. A watch writes its result
-// as Server-Sent Events, one event per committed batch, held open until the client
-// disconnects or the database closes. Both rely on the http.ResponseWriter implementing
-// http.Flusher, which the standard library's server always does, so a row or an event reaches
-// the client at the moment it is produced rather than when a buffer happens to fill.
-
-// jsonScanRow is one NDJSON line of a scan: a key and, unless the scan is keys-only, a value,
-// both base64-encoded since the bytes are arbitrary.
-type jsonScanRow struct {
-	Key   string `json:"key"`
-	Value string `json:"value,omitempty"`
-}
+// This file holds the streaming HTTP watch handler. A watch writes its result as Server-Sent
+// Events, one event per committed batch, held open until the client disconnects or the
+// database closes. It relies on the http.ResponseWriter implementing http.Flusher, which the
+// standard library's server always does, so an event reaches the client at the moment it is
+// produced rather than when a buffer happens to fill.
 
 // jsonChange is one SSE event of a watch: a committed mutation. Kind is the string form of
 // the change kind; Key and Value are base64; Version is the commit version the batch shares.
@@ -32,94 +23,6 @@ type jsonChange struct {
 	Key     string `json:"key"`
 	Value   string `json:"value,omitempty"`
 	Version uint64 `json:"version"`
-}
-
-// handleScan streams a range or prefix scan as NDJSON (spec 17 §2.2). The query selects the
-// range: prefix, from (inclusive lower), to (exclusive upper), reverse, limit, and keys_only,
-// with from/to/prefix decoded under the shared ?encoding selector. Each produced pair is
-// written as one JSON line and flushed, so the response is a live stream, not a materialized
-// array. An error mid-stream cannot change the already-sent status, so it ends the stream and
-// is recorded in a trailing error line, the NDJSON convention for a stream that failed after
-// it began.
-func (srv *Server) handleScan(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	enc := q.Get("encoding")
-	prefix, err := decodeBytes(q.Get("prefix"), enc)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, err)
-		return
-	}
-	lower, err := decodeBytes(q.Get("from"), enc)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, err)
-		return
-	}
-	upper, err := decodeBytes(q.Get("to"), enc)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, err)
-		return
-	}
-	limit := 0
-	if l := q.Get("limit"); l != "" {
-		n, e := strconv.Atoi(l)
-		if e != nil || n < 0 {
-			writeErr(w, http.StatusBadRequest, errInvalidQuery("limit"))
-			return
-		}
-		limit = n
-	}
-	// A scan may return any key in its selected region, so it needs a read grant covering that
-	// region: the explicit prefix, or the bound the from/to range shares. Authorizing before the
-	// header is written lets a denial be a clean 403 rather than a torn stream.
-	if err := srv.authorize(r, func(id *Identity) bool {
-		return id.canReadScan(scanAuthPrefix(prefix, lower, upper))
-	}); err != nil {
-		writeServiceErr(w, err)
-		return
-	}
-
-	opts := ScanOptions{
-		Lower:    nilIfEmpty(lower),
-		Upper:    nilIfEmpty(upper),
-		Prefix:   nilIfEmpty(prefix),
-		Reverse:  q.Get("reverse") == "true",
-		KeysOnly: q.Get("keys_only") == "true",
-		Limit:    limit,
-	}
-
-	w.Header().Set("Content-Type", "application/x-ndjson")
-	w.WriteHeader(http.StatusOK)
-	enc2 := json.NewEncoder(w)
-	flusher, _ := w.(http.Flusher)
-
-	scanErr := srv.svc.Scan(opts, func(key, value []byte) error {
-		// A client that hung up aborts the scan early so the server stops iterating for a
-		// reader that will never read.
-		select {
-		case <-r.Context().Done():
-			return r.Context().Err()
-		default:
-		}
-		row := jsonScanRow{Key: base64.StdEncoding.EncodeToString(key)}
-		if !opts.KeysOnly {
-			row.Value = base64.StdEncoding.EncodeToString(value)
-		}
-		if e := enc2.Encode(row); e != nil {
-			return e
-		}
-		if flusher != nil {
-			flusher.Flush()
-		}
-		return nil
-	})
-	if scanErr != nil && r.Context().Err() == nil {
-		// The header is already sent, so the failure rides a trailing JSON line the client
-		// can distinguish from a row by its single error field.
-		enc2.Encode(map[string]string{"error": scanErr.Error()})
-		if flusher != nil {
-			flusher.Flush()
-		}
-	}
 }
 
 // handleWatch streams the change feed as Server-Sent Events (spec 17 §2.2). The query selects
@@ -228,8 +131,8 @@ func changeKindString(k kv.ChangeKind) string {
 	}
 }
 
-// nilIfEmpty turns an empty byte slice into nil so an absent bound or prefix reaches the
-// library as unbounded rather than as an empty-string bound, which would match nothing useful.
+// nilIfEmpty turns an empty byte slice into nil so an absent prefix reaches the library as
+// unbounded rather than as an empty-string prefix, which would match nothing useful.
 func nilIfEmpty(b []byte) []byte {
 	if len(b) == 0 {
 		return nil

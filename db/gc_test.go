@@ -19,6 +19,19 @@ func putN(t *testing.T, d *DB, key, v string) uint64 {
 	return d.Version()
 }
 
+// seedRange writes keys k00..k{n-1} with values v00..v{n-1} in a single transaction.
+func seedRange(t *testing.T, d *DB, n int) {
+	t.Helper()
+	if err := d.Update(func(txn *Txn) error {
+		for i := 0; i < n; i++ {
+			txn.Set([]byte(fmt.Sprintf("k%02d", i)), []byte(fmt.Sprintf("v%02d", i)))
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+}
+
 // TestGCCollapsesOldVersions writes several versions of one key with no live reader,
 // runs GC, and checks the live value survives while the dead history is reclaimed and
 // a second GC has nothing left to do.
