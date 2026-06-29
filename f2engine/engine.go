@@ -22,6 +22,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/tamnd/kv/crypto"
 	"github.com/tamnd/kv/engine"
 	"github.com/tamnd/kv/f2"
 	"github.com/tamnd/kv/format"
@@ -42,6 +43,11 @@ type Config struct {
 	ResidentPagesPerShard int
 	Durability            f2.Durability
 	CheckpointBytes       int64
+	// Crypto, when set, seals the records region of every data, snapshot, and superblock
+	// page f2 writes with the database key, and opens it on read. A nil Crypto leaves the
+	// file in plaintext and keeps f2's record-granular fast paths. The host passes the same
+	// scheme it derived for the main pager so f2 needs no second key descriptor.
+	Crypto *crypto.Scheme
 }
 
 // Engine adapts an f2.Store to engine.Engine.
@@ -85,6 +91,7 @@ func New(cfg Config) (*Engine, error) {
 		Path:                  cfg.Path,
 		Durability:            cfg.Durability,
 		CheckpointBytes:       cfg.CheckpointBytes,
+		Crypto:                cfg.Crypto,
 	})
 	if err != nil {
 		return nil, err

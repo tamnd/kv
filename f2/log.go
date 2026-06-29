@@ -50,6 +50,7 @@ var errLogFull = errors.New("f2: shard log address space exhausted, compact the 
 type log struct {
 	pageSize int64
 	hdr      int64 // per-page header bytes reserved at the front, single-file only
+	reserve  int64 // bytes reserved at the page tail for the AEAD envelope, 0 unless encrypted
 	dir      atomic.Pointer[pageDir]
 	tail     int64 // next free logical offset, write side only
 
@@ -97,14 +98,18 @@ func newLog(pageSize int, df *durableFile, shardID, budget int) *log {
 	if df != nil {
 		l.hdr = blockHeaderSize
 		l.tail = l.hdr // page 0 reserves its header
+		if df.enc != nil {
+			l.reserve = cryptoOverhead // the sealed envelope sits in the page tail
+		}
 	}
 	d := &pageDir{refs: make([]atomic.Pointer[pageRef], 0, 8)}
 	l.dir.Store(d)
 	return l
 }
 
-// maxRecord is the largest record this log can store, the page minus any header.
-func (l *log) maxRecord() int { return int(l.pageSize - l.hdr) }
+// maxRecord is the largest record this log can store, the page minus any header and
+// the AEAD envelope reserved at the tail when the file is encrypted.
+func (l *log) maxRecord() int { return int(l.pageSize - l.hdr - l.reserve) }
 
 // append writes one record and returns its logical address and byte length. A
 // record never straddles a page: if it would not fit in what is left of the
@@ -119,7 +124,7 @@ func (l *log) append(key, value []byte, tombstone bool) (int64, int, error) {
 	}
 	off := l.tail
 	within := off % l.pageSize
-	if within+int64(n) > l.pageSize {
+	if within+int64(n) > l.pageSize-l.reserve {
 		off += l.pageSize - within // to the next page boundary
 		off += l.hdr               // past its header
 	}
@@ -184,7 +189,15 @@ func (l *log) addPage() error {
 		if l.df.dial == DurabilityFull {
 			// The header must reach disk before any record acknowledged from this
 			// page, so a Full crash never leaves a record in an unheadered block.
-			if _, err := l.df.f.WriteAt(buf[:blockHeaderSize], l.df.blockOffset(block)); err != nil {
+			if l.df.enc != nil {
+				// Under encryption every write is a whole sealed page, so seal and write
+				// the empty page now rather than a bare header. This also overwrites any
+				// stale ciphertext a reused block carries, which would otherwise open
+				// under this block's page number and resurrect dead records.
+				if err := l.df.writeData(block, buf); err != nil {
+					return err
+				}
+			} else if _, err := l.df.f.WriteAt(buf[:blockHeaderSize], l.df.blockOffset(block)); err != nil {
 				return err
 			}
 			if err := l.df.sync(); err != nil {
@@ -228,6 +241,14 @@ func (l *log) writeThrough(pi int, page []byte, w, n int) error {
 	if l.df.dial != DurabilityFull {
 		return nil
 	}
+	if l.df.enc != nil {
+		// Encryption seals the whole records region as one envelope, so a single
+		// record cannot be written in place: write and seal the whole page instead.
+		if err := l.df.writeData(l.pageBlock[pi], page); err != nil {
+			return err
+		}
+		return l.df.sync()
+	}
 	off := l.df.blockOffset(l.pageBlock[pi]) + int64(w)
 	if _, err := l.df.f.WriteAt(page[w:w+n], off); err != nil {
 		return err
@@ -247,7 +268,7 @@ func (l *log) sealPage(pi int) error {
 	if ref.mem == nil {
 		return nil // already evicted, hence already on disk
 	}
-	if _, err := l.df.f.WriteAt(ref.mem, l.df.blockOffset(l.pageBlock[pi])); err != nil {
+	if err := l.df.writeData(l.pageBlock[pi], ref.mem); err != nil {
 		return err
 	}
 	if l.df.dial == DurabilityNormal {
@@ -269,8 +290,7 @@ func (l *log) flushTail() error {
 	if ref.mem == nil {
 		return nil
 	}
-	_, err := l.df.f.WriteAt(ref.mem, l.df.blockOffset(l.pageBlock[pi]))
-	return err
+	return l.df.writeData(l.pageBlock[pi], ref.mem)
 }
 
 // evictFront drops the front resident page from RAM. The page is already on disk
@@ -324,7 +344,7 @@ func (l *log) packResident(key, value []byte) int64 {
 	n := durableRecordLen(key, value)
 	off := l.tail
 	within := off % l.pageSize
-	if within+int64(n) > l.pageSize {
+	if within+int64(n) > l.pageSize-l.reserve {
 		off += l.pageSize - within // to the next page boundary
 		off += l.hdr               // past its header
 	}
@@ -366,7 +386,7 @@ func (l *log) commitGeneration() error {
 	d := l.dir.Load()
 	for pi := 1; pi < l.npages; pi++ {
 		buf := d.refs[pi].Load().mem
-		if _, err := l.df.f.WriteAt(buf, l.df.blockOffset(l.pageBlock[pi])); err != nil {
+		if err := l.df.writeData(l.pageBlock[pi], buf); err != nil {
 			return err
 		}
 	}
@@ -376,7 +396,7 @@ func (l *log) commitGeneration() error {
 		}
 	}
 	buf0 := d.refs[0].Load().mem
-	if _, err := l.df.f.WriteAt(buf0, l.df.blockOffset(l.pageBlock[0])); err != nil {
+	if err := l.df.writeData(l.pageBlock[0], buf0); err != nil {
 		return err
 	}
 	if l.df.dial != DurabilityNone {
@@ -441,6 +461,11 @@ const evictProbe = 512
 var probePool = sync.Pool{New: func() any { b := make([]byte, evictProbe); return &b }}
 
 func (l *log) readEvicted(at int64) (key, value []byte) {
+	if l.df.enc != nil {
+		// Encryption seals the whole records region, so a record cannot be read in
+		// isolation: read and open the whole page, then decode the record at its offset.
+		return l.readEvictedSealed(at)
+	}
 	bp := probePool.Get().(*[]byte)
 	buf := (*bp)[:evictProbe]
 	n, _ := l.df.f.ReadAt(buf, at)
@@ -475,6 +500,28 @@ func (l *log) readEvicted(at int64) (key, value []byte) {
 	key, value = out[:len(k):len(k)], out[len(k):]
 	probePool.Put(bp)
 	return key, value
+}
+
+// readEvictedSealed reads the whole page that holds the record at file offset at,
+// decrypts its records region, and decodes the record at its within-page offset. It is
+// the encrypted counterpart of readEvicted's probe path: a sealed record cannot be read
+// in isolation, so the unit is the page. The page number is the file block index, derived
+// from at the same way the eviction ref stored it (blockOffset + within).
+func (l *log) readEvictedSealed(at int64) (key, value []byte) {
+	block := (at - dataStart) / l.pageSize
+	within := (at - dataStart) % l.pageSize
+	buf := make([]byte, l.pageSize)
+	if _, err := l.df.readData(block, buf); err != nil {
+		return nil, nil // short read or failed open: report nothing, never ciphertext
+	}
+	k, v := l.decodeAt(buf[within:])
+	if k == nil {
+		return nil, nil
+	}
+	out := make([]byte, len(k)+len(v))
+	copy(out, k)
+	copy(out[len(k):], v)
+	return out[:len(k):len(k)], out[len(k):]
 }
 
 // durableRecordSpan returns the total on-log byte length of the durable record at

@@ -481,7 +481,7 @@ func create(fs vfs.FS, path string, opts Options) (*DB, error) {
 		pgr.Close()
 		return nil, err
 	}
-	eng, err := newEngine(opts.engineKind(), pgr, path, opts.sync())
+	eng, err := newEngine(opts.engineKind(), pgr, path, opts.sync(), enc)
 	if err != nil {
 		w.Close()
 		pgr.Close()
@@ -517,7 +517,7 @@ func openExisting(fs vfs.FS, path string, opts Options) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	eng, err := newEngine(pgr.Header().Engine, pgr, path, opts.sync())
+	eng, err := newEngine(pgr.Header().Engine, pgr, path, opts.sync(), enc)
 	if err != nil {
 		pgr.Close()
 		return nil, err
@@ -681,7 +681,7 @@ func (d *DB) redo(rec wal.RecoverResult) (uint64, error) {
 // pager's pages; the f2 core is self-durable and persists into its own sidecar file next
 // to the main file, so it takes the database path and the durability level rather than the
 // pager.
-func newEngine(kind format.EngineKind, pgr *pager.Pager, path string, sync wal.Sync) (engine.Engine, error) {
+func newEngine(kind format.EngineKind, pgr *pager.Pager, path string, sync wal.Sync, enc *crypto.Scheme) (engine.Engine, error) {
 	switch kind {
 	case format.EngineBTree:
 		return btree.New(pgr), nil
@@ -693,6 +693,7 @@ func newEngine(kind format.EngineKind, pgr *pager.Pager, path string, sync wal.S
 		return f2engine.New(f2engine.Config{
 			Path:       path + f2Suffix,
 			Durability: f2Durability(sync),
+			Crypto:     enc,
 		})
 	default:
 		return nil, fmt.Errorf("kv: unknown engine kind %d", kind)

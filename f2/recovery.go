@@ -173,9 +173,15 @@ func (s *Store) recover(ctx context.Context) error {
 				// Evicted: just a pointer at the block, reread on demand.
 				d.refs[pi].Store(&pageRef{fileOff: df.blockOffset(block)})
 			} else {
-				// Resident: load the page into RAM.
+				// Resident: load the page into RAM, decrypting its records region when the
+				// file is encrypted. A header-only or torn encrypted page fails the open, so
+				// its records region is cleared and the page reads as empty.
 				buf := make([]byte, l.pageSize)
-				_, _ = df.f.ReadAt(buf, df.blockOffset(block))
+				if _, err := df.readData(block, buf); err != nil && df.enc != nil {
+					for j := blockHeaderSize; j < len(buf); j++ {
+						buf[j] = 0
+					}
+				}
 				d.refs[pi].Store(&pageRef{mem: buf})
 			}
 		}
@@ -226,7 +232,11 @@ func (s *Store) recover(ctx context.Context) error {
 			buf := ref.mem
 			if buf == nil {
 				buf = make([]byte, l.pageSize)
-				_, _ = df.f.ReadAt(buf, ref.fileOff)
+				if _, err := df.readData(blocks[pi].block, buf); err != nil && df.enc != nil {
+					for j := blockHeaderSize; j < len(buf); j++ {
+						buf[j] = 0
+					}
+				}
 			}
 			within := int64(blocks[pi].hdrLen)
 			if pi == replayPage {
