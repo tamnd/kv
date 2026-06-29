@@ -480,7 +480,18 @@ func (sh *shard) rebuild(d *durableFile, pageSize int64, chain []extentRef, sec 
 		}
 	}
 
-	sh.pages.Store(&pageSet{pages: pages, diskOff: diskOff})
+	// Publish the page directory: a resident page gets a ref carrying its buffer, every
+	// other page id a spilled ref carrying its disk offset (-1 for a hole). One ref per
+	// page id, the same per-slot directory the live store maintains (audit L6).
+	dir := &pageDir{refs: make([]atomic.Pointer[pageRef], npages)}
+	for pid := int64(0); pid < npages; pid++ {
+		if pages[pid] != nil {
+			dir.refs[pid].Store(&pageRef{mem: pages[pid]})
+		} else {
+			dir.refs[pid].Store(&pageRef{diskOff: diskOff[pid]})
+		}
+	}
+	sh.pages.Store(dir)
 	sh.pageExtent = pageExtent
 	sh.pageFill = pageFill
 	sh.pageFlushed = pageFlushed
@@ -531,7 +542,7 @@ func (sh *shard) rebuild(d *durableFile, pageSize int64, chain []extentRef, sec 
 // so it loads the directory without the lock. A descriptor it cannot read or decode
 // contributes nothing rather than failing recovery, matching the fail-closed read path.
 func (sh *shard) collectLiveOversize(npages int64) ([]int64, int64, error) {
-	ps := sh.pages.Load()
+	d := sh.pages.Load()
 	var ids []int64
 	var count int64
 	t := sh.index.Load()
@@ -545,7 +556,7 @@ func (sh *shard) collectLiveOversize(npages int64) ([]int64, int64, error) {
 		if !loc.isOversize() {
 			continue
 		}
-		if err := sh.readAtLogicalLocked(ps, loc.addr, descBytes); err != nil {
+		if err := sh.readAtLogicalLocked(d, loc.addr, descBytes); err != nil {
 			continue
 		}
 		desc, derr := decodeOversizeDescriptor(descBytes)
@@ -580,7 +591,7 @@ func (sh *shard) recomputeDeadBytes(d *durableFile, pageSize int64, npages int64
 			continue
 		}
 		var src []byte
-		if p := sh.pages.Load().pages[pid]; p != nil {
+		if p := sh.pages.Load().refs[pid].Load().mem; p != nil {
 			src = p[:fill]
 		} else {
 			if _, err := d.f.ReadAt(body[:fill], d.logBodyOffset(sh.pageExtent[pid])); err != nil {

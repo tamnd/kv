@@ -425,6 +425,39 @@ func benchCrash(s *Store) {
 	_ = s.df.f.Close()
 }
 
+// BenchmarkPageRollGrowth builds a single memory-only shard up to a few thousand pages and
+// measures the cost of the page-directory growth that rolling drives. The index is pinned at
+// a handful of keys (every Set appends and rolls, but repoints the same slots), so the only
+// structure that grows with the page count is the directory, which isolates audit L6. The
+// old directory copied the whole pages and diskOff slices on every roll, O(pages) per roll
+// and O(pages^2) over the build; the per-slot directory doubles capacity and stores one ref
+// per roll, so the build's allocation volume stays near-linear. ReportAllocs is the signal:
+// a roll that copied a growing slice each time shows far more bytes/op than one slot store.
+func BenchmarkPageRollGrowth(b *testing.B) {
+	const targetPages = 4000
+	v := benchValue(64)
+	// A small fixed key set keeps the index tiny; the keys cycle so each Set appends a fresh
+	// record and rolls pages without adding index entries.
+	keys := [][]byte{benchKey(0), benchKey(1), benchKey(2), benchKey(3)}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		s, err := New(Tunables{Shards: 1, PageSize: 256, ResidentPagesPerShard: 0})
+		if err != nil {
+			b.Fatal(err)
+		}
+		sh := s.shards[0]
+		j := 0
+		for sh.tailPage < targetPages {
+			if err := s.Set(keys[j&3], v); err != nil {
+				b.Fatal(err)
+			}
+			j++
+		}
+		s.Close()
+	}
+}
+
 // prepareRecoveryFile writes a high-overwrite store to disk and crashes it, leaving a file a
 // later New must recover. With checkpoint set, a final snapshot is committed after the
 // writes, so recovery installs each shard's index from the cut and replays only the empty

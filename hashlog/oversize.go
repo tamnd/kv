@@ -154,8 +154,7 @@ func (sh *shard) setOversizeLocked(key, value []byte) error {
 		// oversize-home-too-big path above). Report the error rather than acknowledging.
 		return err
 	}
-	ps := sh.pages.Load()
-	page := ps.pages[sh.tailPage]
+	page := sh.pages.Load().refs[sh.tailPage].Load().mem
 	recStart := sh.tailPage*int64(sh.pageSize) + int64(sh.tailPos)
 	if err := addrInRange(recStart, rl); err != nil {
 		// The cont chain is already written; with no home record naming it, recovery's
@@ -283,9 +282,9 @@ func (sh *shard) freeOversizeContLocked(loc valLoc) {
 // returning it. The returned slice is a fresh copy (a spanning value is not contiguous in
 // any one page), so the caller owns it. It runs under the shard read lock, the same lock
 // the inline getLocked read holds, so the home page and the file are stable for the read.
-func (sh *shard) readOversizeLocked(ps *pageSet, loc valLoc) ([]byte, bool, error) {
+func (sh *shard) readOversizeLocked(d *pageDir, loc valLoc) ([]byte, bool, error) {
 	descBytes := make([]byte, oversizeDescriptorLen)
-	if err := sh.readAtLogicalLocked(ps, loc.addr, descBytes); err != nil {
+	if err := sh.readAtLogicalLocked(d, loc.addr, descBytes); err != nil {
 		return nil, false, err
 	}
 	desc, err := decodeOversizeDescriptor(descBytes)
@@ -346,21 +345,24 @@ func (sh *shard) readOversizeChain(desc oversizeDescriptor) ([]byte, error) {
 // address against the directory and the page before indexing, so a stale or corrupt address
 // returns errBadOversize rather than panicking. It runs under the shard read or write lock,
 // so the page directory it loads is stable.
-func (sh *shard) readAtLogicalLocked(ps *pageSet, addr int64, dst []byte) error {
+func (sh *shard) readAtLogicalLocked(d *pageDir, addr int64, dst []byte) error {
 	pageBytes := int64(sh.pageSize)
 	pid := addr / pageBytes
 	off := int(addr % pageBytes)
-	if pid < 0 || pid >= int64(len(ps.pages)) {
+	// Bound against the live page count, not the directory capacity, which may hold spare
+	// slots past the last page (audit L6). Under the shard lock len(pageFill) is stable.
+	if pid < 0 || pid >= int64(len(sh.pageFill)) {
 		return errBadOversize
 	}
-	if page := ps.pages[pid]; page != nil {
-		if off < 0 || off+len(dst) > len(page) {
+	ref := d.refs[pid].Load()
+	if ref.mem != nil {
+		if off < 0 || off+len(dst) > len(ref.mem) {
 			return errBadOversize
 		}
-		copy(dst, page[off:off+len(dst)])
+		copy(dst, ref.mem[off:off+len(dst)])
 		return nil
 	}
-	dOff := ps.diskOff[pid]
+	dOff := ref.diskOff
 	if dOff < 0 {
 		return errBadOversize
 	}
