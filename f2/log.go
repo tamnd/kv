@@ -32,12 +32,21 @@ var errLogFull = errors.New("f2: shard log address space exhausted, compact the 
 //     A page that is evicted from RAM is simply a page already written to the
 //     file, so eviction is free of any extra copy.
 //
-// In both profiles the read path takes no shard lock: it loads the page directory
-// atomically and indexes into immutable page refs. Each directory slot is an
-// atomic pointer to an immutable pageRef, so eviction (swapping a resident ref
-// for an evicted one) never tears a concurrent read, and a reader holding a slice
-// into an evicted page stays correct because the garbage collector keeps the
+// The memory-only and unbudgeted profiles read with no shard lock: they load the
+// page directory atomically and index into immutable page refs. Each directory slot
+// is an atomic pointer to an immutable pageRef, so a concurrent grow of the
+// directory never tears a read, and because neither profile evicts, a reader's slice
+// into a page stays valid for the page's life with the garbage collector keeping the
 // backing array alive.
+//
+// The budgeted profile evicts, and to keep eviction allocation-free it recycles
+// evicted page buffers (audit L5) rather than dropping them to the collector. A
+// recycled buffer is reused for a later page, so a read must not alias one a writer
+// could recycle. The budgeted read therefore takes the shard read lock and copies
+// its value out under it (shard.getLocked), which excludes the evictor (it holds the
+// write lock), so a buffer is recycled only while no reader can be touching it and
+// recycling needs no epoch deferral. This mirrors the sibling hashlog engine's
+// durable evicting profile.
 type log struct {
 	pageSize int64
 	hdr      int64 // per-page header bytes reserved at the front, single-file only
@@ -51,6 +60,14 @@ type log struct {
 	budget    int     // resident page budget, 0 means unbounded
 	evict     int     // index of the next page to evict, the front of the window
 	npages    int     // pages allocated so far
+
+	// freeBufs is the page-buffer recycle pool (audit L5), filled by eviction and
+	// drawn from when a new page rolls. It is touched only under the shard write lock,
+	// which is also where eviction runs, so an evicted buffer goes straight into the
+	// pool: no budgeted reader can be aliasing it (a budgeted read holds the read lock,
+	// excluded by the write lock). It stays empty on the memory-only and unbudgeted
+	// profiles, which never evict.
+	freeBufs [][]byte
 }
 
 // pageRef is one page's location. It is immutable once published: a resident page
@@ -158,7 +175,7 @@ func (l *log) addPage() error {
 		}
 	}
 	d := l.ensureCap(l.npages + 1)
-	buf := make([]byte, l.pageSize)
+	buf := l.newPageBuf()
 	pi := l.npages
 	if l.df != nil {
 		block := l.df.allocBlock()
@@ -182,6 +199,25 @@ func (l *log) addPage() error {
 		l.evictFront()
 	}
 	return nil
+}
+
+// newPageBuf returns a zeroed page buffer, drawing from the recycle pool a budgeted
+// log fills on eviction before falling back to a fresh allocation. A recycled buffer
+// is wiped so a stale record left from its previous page never decodes back as live:
+// recovery walks a page until a record fails to decode, and an old record carries a
+// valid CRC, so unzeroed trailing bytes would resurrect dead data. The caller holds
+// the shard write lock.
+func (l *log) newPageBuf() []byte {
+	if n := len(l.freeBufs); n > 0 {
+		buf := l.freeBufs[n-1]
+		l.freeBufs[n-1] = nil
+		l.freeBufs = l.freeBufs[:n-1]
+		for i := range buf {
+			buf[i] = 0
+		}
+		return buf
+	}
+	return make([]byte, l.pageSize)
 }
 
 // writeThrough flushes a single record to disk and, under Full, fsyncs it, so an
@@ -240,11 +276,19 @@ func (l *log) flushTail() error {
 // evictFront drops the front resident page from RAM. The page is already on disk
 // in its block, so eviction only repoints the ref to the block offset; a later
 // read of that page preads it back. The atomic store is what makes this safe for
-// a concurrent reader. The caller holds the shard write lock.
+// a concurrent reader. The evicted buffer goes straight into the recycle pool
+// (audit L5): eviction runs under the shard write lock, and a budgeted read holds
+// the read lock, so no reader can be aliasing the buffer here, and a fresh page
+// roll can wipe and reuse it instead of allocating. The caller holds the shard
+// write lock.
 func (l *log) evictFront() {
 	d := l.dir.Load()
+	ref := d.refs[l.evict].Load()
 	fileOff := l.df.blockOffset(l.pageBlock[l.evict])
 	d.refs[l.evict].Store(&pageRef{fileOff: fileOff})
+	if ref.mem != nil {
+		l.freeBufs = append(l.freeBufs, ref.mem)
+	}
 	l.evict++
 }
 
@@ -303,7 +347,7 @@ func (l *log) packResident(key, value []byte) int64 {
 // shard write lock.
 func (l *log) addPageResident() {
 	d := l.ensureCap(l.npages + 1)
-	buf := make([]byte, l.pageSize)
+	buf := l.newPageBuf()
 	pi := l.npages
 	block := l.df.allocBlock()
 	l.pageBlock = append(l.pageBlock, block)
@@ -349,11 +393,8 @@ func (l *log) evictToBudget() {
 	if l.budget <= 0 {
 		return
 	}
-	d := l.dir.Load()
 	for l.npages-l.evict > l.budget {
-		fileOff := l.df.blockOffset(l.pageBlock[l.evict])
-		d.refs[l.evict].Store(&pageRef{fileOff: fileOff})
-		l.evict++
+		l.evictFront()
 	}
 }
 
