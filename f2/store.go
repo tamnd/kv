@@ -170,9 +170,38 @@ type Stats struct {
 	IndexBytes  int64 // resident index cost: IndexSlots * 8
 	LogBytes    int64 // bytes appended to the logs (live plus stranded)
 	DeadBytes   int64 // bytes stranded by overwrites and deletes
+	LiveBytes   int64 // LogBytes - DeadBytes, the bytes the index still references
 	ResidentLog int64 // log bytes held in RAM (all of LogBytes in memory-only mode)
 	EvictedLog  int64 // log bytes dropped from RAM, present only in the file
 	ResidentMem int64 // total resident footprint estimate: IndexBytes + ResidentLog
+
+	// SpaceAmplification is LogBytes over LiveBytes: 1.0 with no garbage, rising as dead
+	// bytes accumulate between compactions, back toward 1.0 after a compaction. It is 1.0
+	// when there is no live data to amplify.
+	SpaceAmplification float64
+
+	// FsyncCount is device barriers issued since open; FsyncAvgLatency is the mean wall
+	// time per barrier, the signal that the Full dial is disk-bound. Both are 0 in
+	// memory-only mode and under DurabilityNone.
+	FsyncCount      int64
+	FsyncAvgLatency time.Duration
+
+	// MinShardKeys and MaxShardKeys bound the per-shard live key counts. A wide gap means
+	// a skewed hash or too few shards for the key space, which concentrates lock
+	// contention and compaction work on one shard.
+	MinShardKeys int64
+	MaxShardKeys int64
+
+	// CompactionBacklog is blocks compaction has retired but the epoch guard has not yet
+	// released for reuse, the disk space that frees once the readers that could still see
+	// them drain.
+	CompactionBacklog int
+
+	// RecoveryDuration and RecoveryRecords report what the open-time recovery did: the
+	// wall time it took and how many records it replayed. Both are 0 for a memory-only
+	// store and a freshly created file that replayed nothing.
+	RecoveryDuration time.Duration
+	RecoveryRecords  int64
 }
 
 // BytesPerKey is the resident index cost per live key, the headline scalability
@@ -198,6 +227,11 @@ type Store struct {
 	ckptBytes int64        // checkpoint interval, 0 disables auto-checkpoint
 	sinceCkpt atomic.Int64 // durable bytes appended since the last checkpoint
 	closed    atomic.Bool  // set once by Close, makes later calls return errClosed
+
+	// recoverNanos and recoverRecords record what the open-time recovery did, so Stats
+	// can report the replay cost. Both are 0 for a memory-only store and a fresh file.
+	recoverNanos   atomic.Int64
+	recoverRecords atomic.Int64
 
 	bgStop chan struct{}  // closed by Close to stop the background compactor
 	bgWG   sync.WaitGroup // waits for the background compactor to exit
@@ -449,7 +483,7 @@ func (s *Store) Checkpoint() error {
 		}
 	}
 	if s.df.dial != DurabilityNone {
-		if err := platformSyncData(s.df.f); err != nil {
+		if err := s.df.sync(); err != nil {
 			return err
 		}
 	}
@@ -481,7 +515,7 @@ func (s *Store) Close() error {
 				return ferr
 			}
 		}
-		if err := platformSyncData(s.df.f); err != nil {
+		if err := s.df.sync(); err != nil {
 			return err
 		}
 		if err := s.df.writeSuperblock(); err != nil {
@@ -496,14 +530,16 @@ func (s *Store) Close() error {
 // Stats sums the per-shard accounting into one snapshot. It takes each shard's
 // read lock briefly, so it is consistent per shard but not a global instant.
 func (s *Store) Stats() Stats {
-	var st Stats
+	st := Stats{MinShardKeys: -1}
 	for _, sh := range s.shards {
 		sh.mu.RLock()
 		t := sh.index.Load()
-		st.Keys += int64(t.live)
+		keys := int64(t.live)
+		st.Keys += keys
 		st.IndexSlots += int64(len(t.slots))
 		st.LogBytes += int64(sh.logBytes)
 		st.DeadBytes += int64(sh.deadBytes)
+		st.CompactionBacklog += len(sh.deferred)
 		evicted := int64(sh.log.evict) * sh.log.pageSize
 		resident := int64(sh.logBytes) - evicted
 		if resident < 0 {
@@ -511,9 +547,31 @@ func (s *Store) Stats() Stats {
 		}
 		st.EvictedLog += evicted
 		st.ResidentLog += resident
+		if st.MinShardKeys < 0 || keys < st.MinShardKeys {
+			st.MinShardKeys = keys
+		}
+		if keys > st.MaxShardKeys {
+			st.MaxShardKeys = keys
+		}
 		sh.mu.RUnlock()
+	}
+	if st.MinShardKeys < 0 {
+		st.MinShardKeys = 0
 	}
 	st.IndexBytes = st.IndexSlots * 8
 	st.ResidentMem = st.IndexBytes + st.ResidentLog
+	st.LiveBytes = st.LogBytes - st.DeadBytes
+	st.SpaceAmplification = 1.0
+	if st.LiveBytes > 0 {
+		st.SpaceAmplification = float64(st.LogBytes) / float64(st.LiveBytes)
+	}
+	if s.df != nil {
+		st.FsyncCount = s.df.syncCount.Load()
+		if st.FsyncCount > 0 {
+			st.FsyncAvgLatency = time.Duration(s.df.syncNanos.Load() / st.FsyncCount)
+		}
+	}
+	st.RecoveryDuration = time.Duration(s.recoverNanos.Load())
+	st.RecoveryRecords = s.recoverRecords.Load()
 	return st
 }

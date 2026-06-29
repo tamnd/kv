@@ -330,6 +330,23 @@ func BenchmarkScaleExtrapolate(b *testing.B) {
 	}
 }
 
+// BenchmarkF2Stats measures the operability snapshot so its cost stays low enough to poll
+// on a metrics cadence (audit A6, A7). The walk takes every shard's read lock and reads its
+// index and byte counters, work that scales with the shard count, not the key count, so it
+// stays microsecond-class on a large store.
+func BenchmarkF2Stats(b *testing.B) {
+	s := fillF2(b, benchKeys)
+	defer s.Close()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		st := s.Stats()
+		if st.Keys != benchKeys {
+			b.Fatalf("Keys = %d, want %d", st.Keys, benchKeys)
+		}
+	}
+}
+
 func humanCount(n int64) string {
 	switch {
 	case n >= 1_000_000_000:

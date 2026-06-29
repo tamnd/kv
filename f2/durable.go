@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 // The single durable file is the only on-disk design. It does two jobs at once.
@@ -61,6 +63,30 @@ type durableFile struct {
 	allocHigh int64   // next never-used data block
 	free      []int64 // blocks a compaction retired, available for reuse
 	seq       uint64
+
+	// syncCount counts device barriers issued and syncNanos accumulates their wall
+	// time, so Stats can report whether the Full dial is disk-bound. Both are read
+	// without the lock, so they are atomics. syncHook, when set, replaces the platform
+	// barrier in a test so a benchmark or a counter assertion does not pay F_FULLFSYNC.
+	syncCount atomic.Int64
+	syncNanos atomic.Int64
+	syncHook  func(*os.File) error
+}
+
+// sync issues a device barrier and records its count and wall time. Every barrier in
+// the durable path routes through here so the fsync accounting is complete. It takes
+// no lock, so writeSuperblock (which holds d.mu) can call it without deadlocking.
+func (d *durableFile) sync() error {
+	d.syncCount.Add(1)
+	start := time.Now()
+	var err error
+	if d.syncHook != nil {
+		err = d.syncHook(d.f)
+	} else {
+		err = platformSyncData(d.f)
+	}
+	d.syncNanos.Add(int64(time.Since(start)))
+	return err
 }
 
 // blockOffset is the byte offset of data block b in the file.
@@ -152,7 +178,7 @@ func (d *durableFile) writeSuperblock() error {
 		return err
 	}
 	if d.dial != DurabilityNone {
-		return platformSyncData(d.f)
+		return d.sync()
 	}
 	return nil
 }
