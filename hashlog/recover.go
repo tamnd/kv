@@ -2,6 +2,7 @@ package hashlog
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"sort"
@@ -63,7 +64,10 @@ type extentRef struct {
 // into memory: it reconstructs the index (keys and locations) and leaves the values on
 // disk where the locations point, the larger-than-memory property carried into recovery
 // (doc 05 section 9).
-func (s *Store) recover() error {
+func (s *Store) recover(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	start := time.Now()
 	defer func() { s.rec.duration = time.Since(start) }()
 	d := s.df
@@ -143,11 +147,18 @@ func (s *Store) recover() error {
 		wg.Add(1)
 		go func(i int, sh *shard) {
 			defer wg.Done()
+			// Observe cancellation before this shard's replay: a cancel during recovery
+			// stops the shards that have not started, so a deadline bounds the open rather
+			// than letting a large log tail run to completion regardless.
+			if err := ctx.Err(); err != nil {
+				errs[i] = err
+				return
+			}
 			var sec *snapSection
 			if snap != nil {
 				sec = &snap.sections[i]
 			}
-			r, err := sh.rebuild(d, pageSize, chains[i], sec, d.sb.frontiers[i])
+			r, err := sh.rebuild(ctx, d, pageSize, chains[i], sec, d.sb.frontiers[i])
 			if err != nil {
 				errs[i] = err
 				return
@@ -286,7 +297,7 @@ type shardRebuildResult struct {
 // from the recorded frontier forward with a CRC-stop at the torn tail. It runs with the
 // shard owned exclusively by recovery (no concurrent reader or writer), so it mutates
 // the shard's fields directly without the lock.
-func (sh *shard) rebuild(d *durableFile, pageSize int64, chain []extentRef, sec *snapSection, fr shardFrontier) (shardRebuildResult, error) {
+func (sh *shard) rebuild(ctx context.Context, d *durableFile, pageSize int64, chain []extentRef, sec *snapSection, fr shardFrontier) (shardRebuildResult, error) {
 	res := shardRebuildResult{tornAt: -1}
 
 	// Order the shard's extents by logical base address: that is the page order, since
@@ -379,6 +390,12 @@ func (sh *shard) rebuild(d *durableFile, pageSize int64, chain []extentRef, sec 
 	body := make([]byte, pageSize)
 	lastPage := maxPid
 	for pid := startPage; pid <= maxPid && pid < npages; pid++ {
+		// Observe cancellation at each page so a long replay over a large log tail honours a
+		// deadline. One check per page is off the per-record path, so it costs nothing on a
+		// normal recovery.
+		if err := ctx.Err(); err != nil {
+			return res, err
+		}
 		if pageExtent[pid] < 0 {
 			continue // a compaction hole: no extent, no records, skip to the next page
 		}

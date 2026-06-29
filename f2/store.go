@@ -53,6 +53,7 @@
 package f2
 
 import (
+	"context"
 	"errors"
 	"math/bits"
 	"os"
@@ -250,8 +251,18 @@ type Store struct {
 // file that is both the larger-than-memory backing (bounded by
 // ResidentPagesPerShard) and, under a Normal or Full dial, the crash-recoverable
 // store. Opening an existing file replays it: the compact index is rebuilt from
-// the file's records, so the store comes back with every key it acknowledged.
+// the file's records, so the store comes back with every key it acknowledged. It
+// is NewContext with a background context, so a large replay cannot be cancelled.
 func New(t Tunables) (*Store, error) {
+	return NewContext(context.Background(), t)
+}
+
+// NewContext opens a Store like New, threading ctx through the replay so opening an
+// existing file with a large log tail can be cancelled or bounded by a deadline. The
+// context covers recovery only; the open store does not retain it. Cancellation is
+// observed at shard and page boundaries during replay, so it bounds the work rather than
+// aborting mid-record. A memory-only store has nothing to replay and ignores ctx.
+func NewContext(ctx context.Context, t Tunables) (*Store, error) {
 	if t.Shards <= 0 || t.Shards&(t.Shards-1) != 0 {
 		return nil, errBadShards
 	}
@@ -271,7 +282,7 @@ func New(t Tunables) (*Store, error) {
 	if t.ResidentPagesPerShard < 0 {
 		return nil, errBadBudget
 	}
-	return newDurable(t)
+	return newDurable(ctx, t)
 }
 
 // newMemory builds the memory-only store: no file, every page resident.
@@ -291,7 +302,7 @@ func newMemory(t Tunables) *Store {
 // newDurable opens or creates the single file, builds the shards over it, and
 // replays an existing file into the index. A fresh file gets an initial
 // superblock so a later open always finds one.
-func newDurable(t Tunables) (*Store, error) {
+func newDurable(ctx context.Context, t Tunables) (*Store, error) {
 	f, err := os.OpenFile(t.Path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, err
@@ -328,7 +339,7 @@ func newDurable(t Tunables) (*Store, error) {
 		s.shards[i] = newShard(t.PageSize, df, i, t.ResidentPagesPerShard, s.ep)
 	}
 	if sb.valid {
-		if err := s.recover(); err != nil {
+		if err := s.recover(ctx); err != nil {
 			_ = f.Close()
 			return nil, err
 		}
@@ -373,7 +384,7 @@ func (s *Store) checkpointLoop() {
 			if s.closed.Load() {
 				return
 			}
-			_ = s.checkpoint()
+			_ = s.checkpoint(context.Background())
 		}
 	}
 }
@@ -514,16 +525,24 @@ func (s *Store) Delete(key []byte) error {
 // operation history since the last compaction. Under a non-None dial the tail flush, the
 // snapshot chain, and the superblock are each fsynced.
 func (s *Store) Checkpoint() error {
+	return s.CheckpointContext(context.Background())
+}
+
+// CheckpointContext runs a checkpoint like Checkpoint, threading ctx so a checkpoint over
+// a store with many shards can be cancelled or bounded by a deadline. Cancellation is
+// observed between shard captures, before the snapshot is written or the superblock
+// advanced, so a cancelled checkpoint commits nothing and leaves the store unchanged.
+func (s *Store) CheckpointContext(ctx context.Context) error {
 	if s.closed.Load() {
 		return errClosed
 	}
-	return s.checkpoint()
+	return s.checkpoint(ctx)
 }
 
 // checkpoint is the checkpoint body without the closed guard, shared by the public
 // Checkpoint, the background loop, and Close. ckptMu makes it single-flight: at most one
 // commit runs at a time, so two triggers never race the snapshot chain's allocate-and-free.
-func (s *Store) checkpoint() error {
+func (s *Store) checkpoint(ctx context.Context) error {
 	if s.df == nil {
 		return nil
 	}
@@ -535,6 +554,11 @@ func (s *Store) checkpoint() error {
 	// always taken, because recovery rebuilds each shard on its own.
 	snaps := make([]shardSnap, len(s.shards))
 	for i, sh := range s.shards {
+		// Observe cancellation before each capture, while nothing is committed: a cancel
+		// here returns without writing a snapshot, so the store is unchanged.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		sh.mu.Lock()
 		err := sh.log.flushTail()
 		if err == nil {
@@ -574,7 +598,7 @@ func (s *Store) Close() error {
 		// under None, so a clean close is always fully recoverable and the reopen is
 		// delta-bound rather than replaying the whole generation; only a crash exposes
 		// the dial's loss window.
-		if err := s.checkpoint(); err != nil {
+		if err := s.checkpoint(context.Background()); err != nil {
 			return err
 		}
 		unlockFile(s.df.f)
