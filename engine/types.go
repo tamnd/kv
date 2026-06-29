@@ -63,52 +63,6 @@ func (c *TTLClock) For(kind format.Kind) uint64 {
 	return c.now
 }
 
-// IterOptions controls a range scan (spec 11). All keys are user keys.
-type IterOptions struct {
-	// Lower is the inclusive lower bound; nil means unbounded below.
-	Lower []byte
-	// Upper is the exclusive upper bound; nil means unbounded above.
-	Upper []byte
-	// Prefix restricts iteration to keys with this prefix; it is a convenience
-	// that the iterator layer translates into Lower/Upper bounds.
-	Prefix []byte
-	// Reverse iterates from high to low keys.
-	Reverse bool
-	// KeysOnly skips value materialization, so separated values are never
-	// fetched.
-	KeysOnly bool
-}
-
-// LazyValue defers fetching a separated value (vLog/overflow) until the caller
-// actually reads it. For inline values the bytes are already present; for
-// separated values fetch resolves the pointer on demand.
-type LazyValue struct {
-	inline []byte
-	length int
-	fetch  func() ([]byte, error)
-}
-
-// InlineValue wraps already-materialized bytes.
-func InlineValue(b []byte) LazyValue {
-	return LazyValue{inline: b, length: len(b)}
-}
-
-// SeparatedValue wraps a deferred fetch of a value of known length.
-func SeparatedValue(length int, fetch func() ([]byte, error)) LazyValue {
-	return LazyValue{length: length, fetch: fetch}
-}
-
-// Len reports the value length without materializing a separated value.
-func (lv LazyValue) Len() int { return lv.length }
-
-// Value materializes the value, resolving a separated pointer if needed.
-func (lv LazyValue) Value() ([]byte, error) {
-	if lv.fetch != nil {
-		return lv.fetch()
-	}
-	return lv.inline, nil
-}
-
 // MaintBudget bounds a single Maintain call so background work never starves the
 // foreground (spec 09). A zero budget means "do nothing this call".
 type MaintBudget struct {

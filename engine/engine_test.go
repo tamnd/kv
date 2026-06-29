@@ -83,52 +83,6 @@ func TestModelMergeFold(t *testing.T) {
 	rd.Close()
 }
 
-func TestModelReverseScan(t *testing.T) {
-	m := NewModel()
-	m.Open(&Env{})
-	b := NewWriteBatch(1)
-	for _, k := range []string{"a", "b", "c", "d"} {
-		b.Set([]byte(k), []byte(k))
-	}
-	m.Apply(b, 1)
-
-	rd, _ := m.NewReader(Snapshot{Version: 1})
-	cur, _ := rd.NewIter(IterOptions{Reverse: true})
-	var got []string
-	for ok := cur.First(); ok; ok = cur.Next() {
-		got = append(got, string(cur.Key()))
-	}
-	cur.Close()
-	rd.Close()
-	want := []string{"d", "c", "b", "a"}
-	if fmt.Sprint(got) != fmt.Sprint(want) {
-		t.Fatalf("reverse scan = %v, want %v", got, want)
-	}
-}
-
-func TestModelPrefixScan(t *testing.T) {
-	m := NewModel()
-	m.Open(&Env{})
-	b := NewWriteBatch(1)
-	for _, k := range []string{"app", "apple", "apply", "banana", "az"} {
-		b.Set([]byte(k), []byte(k))
-	}
-	m.Apply(b, 1)
-
-	rd, _ := m.NewReader(Snapshot{Version: 1})
-	cur, _ := rd.NewIter(IterOptions{Prefix: []byte("app")})
-	var got []string
-	for ok := cur.First(); ok; ok = cur.Next() {
-		got = append(got, string(cur.Key()))
-	}
-	cur.Close()
-	rd.Close()
-	want := []string{"app", "apple", "apply"}
-	if fmt.Sprint(got) != fmt.Sprint(want) {
-		t.Fatalf("prefix scan = %v, want %v", got, want)
-	}
-}
-
 // TestModelConformanceRandom drives the model engine through many randomized
 // commit sequences and checks it against the oracle at every snapshot. This is
 // the M0 backbone: the same CheckEngine harness will later run the real cores.

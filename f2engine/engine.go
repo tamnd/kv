@@ -7,9 +7,9 @@
 // one resolver the other cores and the conformance oracle share, so f2 resolves get, set,
 // delete, TTL, and merge at any snapshot exactly as a B-tree or LSM core would.
 //
-// What f2 cannot do is anything that needs key order. A hash index has no ordering, so a
-// range scan (NewIter) and a range delete return ErrUnsupported rather than a wrong or
-// O(n)-per-call answer. The host treats those as unsupported on this engine.
+// What f2 cannot do is anything that needs key order. A hash index has no ordering, so the
+// engine serves only point operations: there is no range scan, and a range delete returns
+// ErrUnsupported from Apply rather than a wrong or O(n)-per-call answer.
 //
 // Durability is f2's own. The store recovers itself from its log and index snapshot on
 // open, and the host drives a checkpoint by calling Checkpoint, so the engine owns its
@@ -29,9 +29,9 @@ import (
 	"github.com/tamnd/kv/vfs"
 )
 
-// ErrUnsupported is returned for the range operations an unordered hash index cannot
-// serve: a range scan (NewIter) and a range delete. f2 has no key order, so these have no
-// meaning on it. Point reads and writes are fully supported.
+// ErrUnsupported is returned for the range operation an unordered hash index cannot serve:
+// a range delete, which Apply rejects. f2 has no key order, so it has no meaning on it.
+// Point reads and writes are fully supported.
 var ErrUnsupported = fmt.Errorf("kv: operation not supported by the f2 engine (no key order)")
 
 // Config configures the f2 engine. An empty Path is the memory-only mode the tests use;
@@ -335,11 +335,6 @@ type reader struct {
 
 // Get implements engine.Reader.
 func (r *reader) Get(userKey []byte) ([]byte, error) { return r.e.resolve(r.snap, userKey) }
-
-// NewIter implements engine.Reader by reporting that f2 cannot serve an ordered scan.
-func (r *reader) NewIter(opts engine.IterOptions) (engine.Cursor, error) {
-	return nil, ErrUnsupported
-}
 
 // Close implements engine.Reader.
 func (r *reader) Close() error { return nil }

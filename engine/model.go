@@ -15,8 +15,8 @@ import (
 // resolves MVCC visibility with the same internal-key ordering the cores use, so
 // any divergence between a core and the Model is a bug in the core.
 //
-// The Model is also what the host layers above the seam (transactions, iterators,
-// cache) are tested against in isolation, without either real core.
+// The Model is also what the host layers above the seam (transactions, cache)
+// are tested against in isolation, without the real core.
 type Model struct {
 	mu sync.RWMutex
 	// store maps string(internalKey) -> value. Re-applying the same internal key
@@ -169,118 +169,4 @@ func (r *modelReader) Get(userKey []byte) ([]byte, error) {
 	return nil, ErrNotFound
 }
 
-func (r *modelReader) NewIter(opts IterOptions) (Cursor, error) {
-	view := r.m.snapshot(r.snap)
-	lower, upper := opts.Lower, opts.Upper
-	if len(opts.Prefix) > 0 {
-		lower = opts.Prefix
-		upper = format.PrefixSuccessor(opts.Prefix)
-	}
-	var filtered []resolved
-	for _, e := range view {
-		if lower != nil && bytes.Compare(e.uk, lower) < 0 {
-			continue
-		}
-		if upper != nil && bytes.Compare(e.uk, upper) >= 0 {
-			continue
-		}
-		filtered = append(filtered, e)
-	}
-	return &modelCursor{view: filtered, pos: -1, reverse: opts.Reverse}, nil
-}
-
 func (r *modelReader) Close() error { return nil }
-
-// modelCursor walks a pre-resolved snapshot view. Bounds and prefix have already
-// been applied; reverse flips the direction of First/Last/Next/Prev.
-type modelCursor struct {
-	view    []resolved
-	pos     int
-	reverse bool
-}
-
-func (c *modelCursor) First() bool {
-	if c.reverse {
-		c.pos = len(c.view) - 1
-	} else {
-		c.pos = 0
-	}
-	return c.Valid()
-}
-
-func (c *modelCursor) Last() bool {
-	if c.reverse {
-		c.pos = 0
-	} else {
-		c.pos = len(c.view) - 1
-	}
-	return c.Valid()
-}
-
-func (c *modelCursor) Next() bool {
-	if c.reverse {
-		c.pos--
-	} else {
-		c.pos++
-	}
-	return c.Valid()
-}
-
-func (c *modelCursor) Prev() bool {
-	if c.reverse {
-		c.pos++
-	} else {
-		c.pos--
-	}
-	return c.Valid()
-}
-
-func (c *modelCursor) SeekGE(userKey []byte) bool {
-	idx := sort.Search(len(c.view), func(i int) bool {
-		return bytes.Compare(c.view[i].uk, userKey) >= 0
-	})
-	if c.reverse {
-		// In reverse, "seek >= key" lands on the first key >= userKey but iteration
-		// proceeds downward; callers rarely mix these, so position at idx.
-		c.pos = idx
-	} else {
-		c.pos = idx
-	}
-	return c.Valid()
-}
-
-func (c *modelCursor) SeekLT(userKey []byte) bool {
-	idx := sort.Search(len(c.view), func(i int) bool {
-		return bytes.Compare(c.view[i].uk, userKey) >= 0
-	})
-	c.pos = idx - 1
-	return c.Valid()
-}
-
-func (c *modelCursor) Valid() bool { return c.pos >= 0 && c.pos < len(c.view) }
-
-func (c *modelCursor) Key() []byte {
-	if !c.Valid() {
-		return nil
-	}
-	return c.view[c.pos].uk
-}
-
-func (c *modelCursor) InternalKey() []byte {
-	if !c.Valid() {
-		return nil
-	}
-	// The resolved view does not carry a version; synthesize a max-version
-	// internal key so the merge layer's comparisons remain well-defined.
-	return format.EncodeInternalKey(c.view[c.pos].uk, format.MaxVersion, format.KindSet)
-}
-
-func (c *modelCursor) Value() (LazyValue, error) {
-	if !c.Valid() {
-		return LazyValue{}, nil
-	}
-	return InlineValue(c.view[c.pos].val), nil
-}
-
-func (c *modelCursor) Error() error { return nil }
-func (c *modelCursor) Close() error { return nil }

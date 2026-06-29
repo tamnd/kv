@@ -187,23 +187,14 @@ func TestReopenRecoversReads(t *testing.T) {
 	}
 }
 
-// TestRangeOpsUnsupported asserts that the two ordered operations a hash index cannot serve
-// fail cleanly: a scan reports ErrUnsupported and a range delete is rejected by Apply.
-func TestRangeOpsUnsupported(t *testing.T) {
+// TestRangeDeleteUnsupported asserts that the one ordered operation a hash index cannot serve
+// fails cleanly: a range delete is rejected by Apply with ErrUnsupported.
+func TestRangeDeleteUnsupported(t *testing.T) {
 	e, err := New(Config{Shards: 4, PageSize: 64 << 10})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer e.Close()
-
-	rd, err := e.NewReader(engine.Snapshot{Version: 1})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer rd.Close()
-	if _, err := rd.NewIter(engine.IterOptions{}); !errors.Is(err, ErrUnsupported) {
-		t.Fatalf("NewIter err = %v, want ErrUnsupported", err)
-	}
 
 	b := engine.NewWriteBatch(1)
 	b.DeleteRange([]byte("a"), []byte("z"))
