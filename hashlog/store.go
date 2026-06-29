@@ -61,6 +61,7 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // Durability is the per-store durability dial (spec 2070 doc 04 section 5, D6). It is
@@ -448,6 +449,10 @@ type RecoveryStats struct {
 	ReplayedRecords int64
 	BytesReplayed   []int64
 	TornTailOffset  []int64
+	// Duration is the wall time the open-time recovery took, from the first header scan
+	// to the last shard's index rebuild. It is zero for a memory-only store and for a
+	// freshly created durable file that had nothing to replay.
+	Duration time.Duration
 }
 
 // RecoveryStats returns the counters recorded by the open-time recovery.
@@ -456,7 +461,114 @@ func (s *Store) RecoveryStats() RecoveryStats {
 		ReplayedRecords: s.rec.replayedRecords,
 		BytesReplayed:   s.rec.bytesReplayed,
 		TornTailOffset:  s.rec.tornTailOff,
+		Duration:        s.rec.duration,
 	}
+}
+
+// Stats is a one-call operability snapshot of the store (audit A6, A7). It folds the
+// space, page-residency, durability, and key-distribution numbers an operator needs to
+// reason about space amplification and tail latency into one struct, alongside the
+// per-area compaction, checkpoint, and recovery counters. Each shard contributes under
+// its read lock, so the result is a consistent point-in-time view that does not block
+// writers for long. The byte-accounting fields (DeadBytes, LiveBytes, LiveExtentBytes,
+// SpaceAmplification) are maintained by the durable compaction path and read zero or one
+// in a memory-only store, which never spills or compacts.
+type Stats struct {
+	// LiveKeys is the live key count across all shards (the same number Len reports).
+	LiveKeys int
+	// LiveExtentBytes is the record bytes currently held in live extents, the denominator
+	// of space accounting. DeadBytes is the slice of that superseded by an overwrite or a
+	// delete and not yet reclaimed by compaction. LiveBytes is LiveExtentBytes minus
+	// DeadBytes, the bytes still referenced by the index.
+	LiveExtentBytes int64
+	DeadBytes       int64
+	LiveBytes       int64
+	// SpaceAmplification is LiveExtentBytes over LiveBytes: 1.0 with no garbage, rising as
+	// dead bytes accumulate between compactions, back to 1.0 after a full compaction. It is
+	// 1.0 when there is no live data to amplify.
+	SpaceAmplification float64
+	// ResidentPages is pages held in RAM; SpilledPages is pages evicted to the spill file.
+	// Their sum is the live (non-retired) page count; the ratio is how much of the working
+	// set fits the resident budget. SpilledPages is zero until a Set pushes a shard past
+	// its budget.
+	ResidentPages int
+	SpilledPages  int
+	// FsyncCount is device barriers issued since open; FsyncAvgLatency is the mean wall
+	// time per barrier, the signal that the Full durability dial is disk-bound. Both are
+	// zero in memory-only mode and under DurabilityNone.
+	FsyncCount      int64
+	FsyncAvgLatency time.Duration
+	// MinShardKeys and MaxShardKeys bound the per-shard live key counts. A wide gap means a
+	// skewed hash or too few shards for the key space, which concentrates lock contention
+	// and compaction work on one shard.
+	MinShardKeys int
+	MaxShardKeys int
+	// CompactionBacklog is extents compaction has retired but a checkpoint has not yet
+	// durably freed back to the allocator, the disk space a checkpoint will reclaim.
+	CompactionBacklog int
+	// Compaction, Checkpoint, and Recovery are the existing per-area counters, folded in so
+	// one call gives the whole operational picture. RecoveryDuration lifts the recovery
+	// wall time out for convenience.
+	RecoveryDuration time.Duration
+	Compaction       CompactionStats
+	Checkpoint       CheckpointStats
+	Recovery         RecoveryStats
+}
+
+// Stats returns a consistent operability snapshot of the store (audit A6, A7). It walks
+// every shard under a read lock, summing the live keys, live and dead bytes, resident and
+// spilled pages, and compaction backlog, and tracking the per-shard key skew, then reads
+// the durability counters and the folded compaction, checkpoint, and recovery stats. It
+// is safe to call concurrently with writers and cheap enough to poll on a metrics cadence.
+func (s *Store) Stats() Stats {
+	st := Stats{
+		MinShardKeys: -1,
+		Compaction:   s.CompactionStats(),
+		Checkpoint:   s.CheckpointStats(),
+		Recovery:     s.RecoveryStats(),
+	}
+	for _, sh := range s.shards {
+		sh.mu.RLock()
+		st.LiveKeys += sh.idxLive
+		st.SpilledPages += sh.spilledPages
+		st.CompactionBacklog += len(sh.pendingFree)
+		for _, db := range sh.deadBytes {
+			st.DeadBytes += db
+		}
+		for _, pf := range sh.pageFill {
+			st.LiveExtentBytes += int64(pf)
+		}
+		if ps := sh.pages.Load(); ps != nil {
+			for _, p := range ps.pages {
+				if p != nil {
+					st.ResidentPages++
+				}
+			}
+		}
+		if st.MinShardKeys < 0 || sh.idxLive < st.MinShardKeys {
+			st.MinShardKeys = sh.idxLive
+		}
+		if sh.idxLive > st.MaxShardKeys {
+			st.MaxShardKeys = sh.idxLive
+		}
+		sh.mu.RUnlock()
+	}
+	if st.MinShardKeys < 0 {
+		st.MinShardKeys = 0
+	}
+	st.LiveBytes = st.LiveExtentBytes - st.DeadBytes
+	st.SpaceAmplification = 1.0
+	if st.LiveBytes > 0 {
+		st.SpaceAmplification = float64(st.LiveExtentBytes) / float64(st.LiveBytes)
+	}
+	if s.df != nil {
+		st.FsyncCount = s.df.syncCount.Load()
+		if st.FsyncCount > 0 {
+			st.FsyncAvgLatency = time.Duration(s.df.syncNanos.Load() / st.FsyncCount)
+		}
+	}
+	st.RecoveryDuration = st.Recovery.Duration
+	return st
 }
 
 // Checkpoint writes a durable index snapshot and commits it through the superblock
