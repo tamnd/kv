@@ -1,9 +1,10 @@
 package f2
 
 import (
-	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/tamnd/kv/vfs"
 )
 
 // TestStatsAuditFieldsMemoryOnly checks the snapshot a memory-only store reports: every
@@ -89,7 +90,7 @@ func TestStatsAuditAmplification(t *testing.T) {
 // measures the accounting, not the platform's F_FULLFSYNC latency.
 func TestStatsAuditFsync(t *testing.T) {
 	s := mustOpenT(t, durableTunables(t, DurabilityFull))
-	s.df.syncHook = func(*os.File) error { return nil }
+	s.df.syncHook = func(vfs.File) error { return nil }
 
 	const writes = 300
 	for i := 0; i < writes; i++ {

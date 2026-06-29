@@ -1,10 +1,11 @@
 package f2
 
 import (
-	"os"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/tamnd/kv/vfs"
 )
 
 // TestGroupCommitCoalesces proves the L4 mechanism: when many writers reach the
@@ -43,7 +44,7 @@ func TestGroupCommitCoalesces(t *testing.T) {
 	// Prime the keys with a no-op barrier so page 0 and every key already exist; the
 	// measured phase then overwrites them, which appends one record per write and
 	// rarely rolls a page, so almost every barrier in that phase is a record flush.
-	s.df.syncHook = func(*os.File) error { return nil }
+	s.df.syncHook = func(vfs.File) error { return nil }
 	for i, k := range keys {
 		if err := s.Set(k, tval(i)); err != nil {
 			t.Fatalf("prime Set: %v", err)
@@ -56,7 +57,7 @@ func TestGroupCommitCoalesces(t *testing.T) {
 	entry := make(chan struct{})
 	release := make(chan struct{})
 	var once sync.Once
-	s.df.syncHook = func(*os.File) error {
+	s.df.syncHook = func(vfs.File) error {
 		once.Do(func() { close(entry) })
 		<-release
 		return nil
@@ -93,7 +94,7 @@ func TestGroupCommitCoalesces(t *testing.T) {
 
 	// Every overwrite must be durable and correct: coalescing changes how many
 	// barriers run, never which writes they cover.
-	s.df.syncHook = func(*os.File) error { return nil }
+	s.df.syncHook = func(vfs.File) error { return nil }
 	for i, k := range keys {
 		got, found := get(t, s, k)
 		if !found || string(got) != string(tval(i+1_000_000)) {
@@ -108,7 +109,7 @@ func TestGroupCommitCoalesces(t *testing.T) {
 // that group commit does not weaken the durability a lone writer is promised.
 func TestGroupCommitSequentialUnchanged(t *testing.T) {
 	s := mustOpenT(t, durableTunables(t, DurabilityFull))
-	s.df.syncHook = func(*os.File) error { return nil }
+	s.df.syncHook = func(vfs.File) error { return nil }
 
 	const writes = 200
 	before := s.df.syncCount.Load()
@@ -139,7 +140,7 @@ func BenchmarkF2SetFullParallel(b *testing.B) {
 	})
 	// A fixed barrier latency stands in for a device flush, so the benchmark measures
 	// the coalescing win rather than the host disk's F_FULLFSYNC time.
-	s.df.syncHook = func(*os.File) error { time.Sleep(50 * time.Microsecond); return nil }
+	s.df.syncHook = func(vfs.File) error { time.Sleep(50 * time.Microsecond); return nil }
 
 	const span = 1 << 16
 	before := s.df.syncCount.Load()

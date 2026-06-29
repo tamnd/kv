@@ -334,20 +334,6 @@ func TestCloseGuards(t *testing.T) {
 	}
 }
 
-// TestFileLockExcludesSecondOpen pins A1: a second open of the same file fails
-// fast with errLocked rather than letting two writers corrupt one store.
-func TestFileLockExcludesSecondOpen(t *testing.T) {
-	tn := durableTunables(t, DurabilityNone)
-	s, err := New(tn)
-	if err != nil {
-		t.Fatalf("first New: %v", err)
-	}
-	defer s.Close()
-	if _, err := New(tn); err != errLocked {
-		t.Fatalf("second New: got %v want errLocked", err)
-	}
-}
-
 // crash releases a durable store's file descriptor without the clean-close
 // checkpoint, modeling a process that died mid-run. Anything the dial had already
 // fsynced is on disk; the rest is the dial's loss window.

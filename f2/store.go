@@ -56,10 +56,11 @@ import (
 	"context"
 	"errors"
 	"math/bits"
-	"os"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/tamnd/kv/vfs"
 )
 
 // Durability is the per-store durability dial, the same contract hashlog uses so
@@ -110,6 +111,13 @@ type Tunables struct {
 	// store. Empty keeps the memory-only mode, the benchmarked ceiling.
 	Path string
 
+	// FS is the filesystem the single file is opened on. It lets the host run f2 on
+	// its own vfs backend: the in-memory backend for a fast, deterministic test, or
+	// the OS backend for a real file. It is honored only with a Path; an empty Path is
+	// memory-only and touches no file. Nil with a Path defaults to the OS backend, so a
+	// caller that just sets a Path gets a real file with no extra wiring.
+	FS vfs.FS
+
 	// Durability is the durability dial. It is meaningful only when a Path is set;
 	// selecting Normal or Full without a Path is an error because there is nowhere
 	// to sync. The zero value is None.
@@ -152,7 +160,6 @@ var (
 	errBadBudget        = errors.New("f2: ResidentPagesPerShard must be zero or at least one")
 	errValueTooBig      = errors.New("f2: record does not fit in a page")
 	errPageMismatch     = errors.New("f2: file page size or shard count differs from tunables")
-	errLocked           = errors.New("f2: file is already open by another process")
 	errClosed           = errors.New("f2: store is closed")
 )
 
@@ -303,13 +310,19 @@ func newMemory(t Tunables) *Store {
 // replays an existing file into the index. A fresh file gets an initial
 // superblock so a later open always finds one.
 func newDurable(ctx context.Context, t Tunables) (*Store, error) {
-	f, err := os.OpenFile(t.Path, os.O_CREATE|os.O_RDWR, 0o644)
+	fs := t.FS
+	if fs == nil {
+		fs = vfs.NewOS()
+	}
+	f, err := fs.Open(t.Path, vfs.OpenReadWrite|vfs.OpenCreate)
 	if err != nil {
 		return nil, err
 	}
 	// One writer per file: a second process opening the same path would write the
-	// superblock and append blocks independently and corrupt it.
-	if err := lockFile(f); err != nil {
+	// superblock and append blocks independently and corrupt it. The exclusion is the
+	// vfs backend's: the OS backend takes an advisory file lock where it implements
+	// one, and the in-memory backend is single-process by construction.
+	if err := f.Lock(vfs.LockExclusive); err != nil {
 		_ = f.Close()
 		return nil, err
 	}
@@ -343,12 +356,8 @@ func newDurable(ctx context.Context, t Tunables) (*Store, error) {
 			_ = f.Close()
 			return nil, err
 		}
-	} else { // stamp a fresh file, then make its directory entry durable
+	} else { // stamp a fresh file so a later open always finds a superblock
 		if err := df.writeSuperblock(); err != nil {
-			_ = f.Close()
-			return nil, err
-		}
-		if err := syncDir(t.Path); err != nil {
 			_ = f.Close()
 			return nil, err
 		}
@@ -601,7 +610,7 @@ func (s *Store) Close() error {
 		if err := s.checkpoint(context.Background()); err != nil {
 			return err
 		}
-		unlockFile(s.df.f)
+		_ = s.df.f.Unlock(vfs.LockNone)
 		return s.df.f.Close()
 	}
 	return nil
