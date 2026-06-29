@@ -7,8 +7,15 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/tamnd/kv/crypto"
 	"github.com/tamnd/kv/vfs"
 )
+
+// cryptoOverhead is the per-page envelope cost the AEAD seal adds: tag, stored nonce,
+// and cleartext epoch. Under encryption a data or snapshot block reserves this many
+// bytes at its tail so the sealed records region fits the same fixed page stride. It is
+// the package-wide name for crypto.Overhead so log.go and store.go need not import crypto.
+const cryptoOverhead = crypto.Overhead
 
 // The single durable file is the only on-disk design. It does two jobs at once.
 // It is the larger-than-memory backing: a shard keeps a budget of pages in RAM
@@ -47,7 +54,7 @@ const (
 
 	sbMagic    uint32 = 0x32424446 // "FDB2"
 	bhMagic    uint32 = 0x32485046 // "FPH2"
-	durVersion uint32 = 3          // 3 added the index snapshot pointer; 2 and 1 files still open
+	durVersion uint32 = 4          // 3 added the snapshot pointer, 4 the encryption flag; older files still open
 
 	// sbSnapOffset is where the index snapshot fields begin, after the version-2
 	// core and its CRC. They carry their own CRC over [sbSnapOffset, sbSnapCRC), so a
@@ -55,6 +62,17 @@ const (
 	// pointer reads as no snapshot. Layout: snapRoot(8) snapSeq(8) snapShards(4) crc(4).
 	sbSnapOffset = 36
 	sbSnapCRC    = 56
+
+	// sbFlagsOffset is the encryption-flag extension, past the snapshot pointer and its
+	// CRC, with its own CRC so a version-3 reader ignores it and a torn flag reads as
+	// unset. Layout: flags(4) crc(4).
+	sbFlagsOffset = 60
+	sbFlagsCRC    = 64
+
+	// flagEncrypted marks a file whose data and snapshot blocks have their records
+	// region sealed with the database encryption key. An opener whose key state
+	// disagrees with this bit is rejected rather than left to decode ciphertext.
+	flagEncrypted uint32 = 1
 )
 
 // durableFile owns the one file and hands out blocks. The mutex guards the block
@@ -65,6 +83,13 @@ type durableFile struct {
 	pageSize int64
 	shards   int
 	dial     Durability
+
+	// enc, when set, seals each data and snapshot block's records region with the
+	// database's AEAD page envelope (D17). It is nil for an unencrypted file, which
+	// keeps the record-granular fast paths and pays nothing. The block header stays
+	// plaintext; only the region past it is sealed, reserving cryptoOverhead at the
+	// page tail so a sealed page keeps the same fixed stride.
+	enc *crypto.Scheme
 
 	mu        sync.Mutex
 	allocHigh int64   // next never-used data block
@@ -258,6 +283,15 @@ func (d *durableFile) writeSuperblock() error {
 	binary.LittleEndian.PutUint64(buf[sbSnapOffset+8:], d.snapSeq)
 	binary.LittleEndian.PutUint32(buf[sbSnapOffset+16:], uint32(d.snapShards))
 	binary.LittleEndian.PutUint32(buf[sbSnapCRC:], crc32.Checksum(buf[sbSnapOffset:sbSnapCRC], crcTable))
+	// The encryption flag lives past the snapshot CRC with its own CRC, so a version-3
+	// reader ignores it. It records whether this file's blocks are sealed, so a reopen
+	// can refuse a key/no-key mismatch instead of decoding ciphertext as records.
+	var flags uint32
+	if d.enc != nil {
+		flags = flagEncrypted
+	}
+	binary.LittleEndian.PutUint32(buf[sbFlagsOffset:], flags)
+	binary.LittleEndian.PutUint32(buf[sbFlagsCRC:], crc32.Checksum(buf[sbFlagsOffset:sbFlagsCRC], crcTable))
 	slot := int64(d.seq % numSuperblocks)
 	if _, err := d.f.WriteAt(buf, slot*sbSize); err != nil {
 		return err
@@ -284,6 +318,11 @@ type superblock struct {
 	snapSeq    uint64
 	snapShards int
 	snapValid  bool
+
+	// encrypted records that the file's blocks are sealed, read from the version-4 flag
+	// extension. It is false for an older file or a torn flag, so an unencrypted file
+	// reads as unencrypted.
+	encrypted bool
 }
 
 // readSuperblock returns the newest valid superblock across the two slots, or an
@@ -318,9 +357,95 @@ func readSuperblock(f vfs.File) superblock {
 				best.snapShards = int(binary.LittleEndian.Uint32(buf[sbSnapOffset+16:]))
 				best.snapValid = best.snapRoot >= 0
 			}
+			// The encryption flag is present only on a version-4 slot and only when its
+			// own CRC checks; otherwise the file reads as unencrypted.
+			if n >= sbFlagsCRC+4 &&
+				binary.LittleEndian.Uint32(buf[sbFlagsCRC:]) == crc32.Checksum(buf[sbFlagsOffset:sbFlagsCRC], crcTable) {
+				best.encrypted = binary.LittleEndian.Uint32(buf[sbFlagsOffset:])&flagEncrypted != 0
+			}
 		}
 	}
 	return best
+}
+
+// plainLen is the plaintext capacity of a block's records region under encryption:
+// the page minus its plaintext header and the AEAD envelope reserved at the tail.
+// Sealing exactly this many bytes produces an envelope of plainLen+cryptoOverhead =
+// pageSize-hdrLen bytes, so the sealed region fills [hdrLen, pageSize) and the page
+// keeps its fixed stride.
+func (d *durableFile) plainLen(hdrLen int) int64 {
+	return d.pageSize - int64(hdrLen) - cryptoOverhead
+}
+
+// sealScratchPool recycles the per-write scratch buffers the seal path needs: a page is
+// sealed into a separate buffer so the live resident page (which lock-free readers may
+// alias) is never mutated into ciphertext. The pool grows to the largest page seen, so a
+// mixed-size process self-heals to one slab per goroutine on the write path.
+var sealScratchPool = sync.Pool{New: func() any { b := make([]byte, 0); return &b }}
+
+func getSealScratch(n int64) *[]byte {
+	p := sealScratchPool.Get().(*[]byte)
+	if int64(cap(*p)) < n {
+		*p = make([]byte, n)
+	}
+	*p = (*p)[:n]
+	return p
+}
+
+func putSealScratch(p *[]byte) { sealScratchPool.Put(p) }
+
+// writeData writes a full data page buffer to its block, sealing the records region
+// [blockHeaderSize, pageSize) when encryption is on and writing it verbatim otherwise.
+// The page buffer is never mutated: the seal goes into a scratch buffer.
+func (d *durableFile) writeData(block int64, page []byte) error {
+	return d.writeSealed(d.blockOffset(block), page, blockHeaderSize, uint32(block))
+}
+
+// writeSealed writes page to off. With no scheme it is one WriteAt. With a scheme it
+// copies the plaintext header, seals page[hdrLen:pageSize-overhead] into a scratch, and
+// writes [header || envelope] so the header stays readable for recovery before any
+// decrypt. pageNo binds the ciphertext to its block as AEAD associated data.
+func (d *durableFile) writeSealed(off int64, page []byte, hdrLen int, pageNo uint32) error {
+	if d.enc == nil {
+		_, err := d.f.WriteAt(page, off)
+		return err
+	}
+	sp := getSealScratch(d.pageSize)
+	defer putSealScratch(sp)
+	sb := *sp
+	copy(sb[:hdrLen], page[:hdrLen])
+	plain := page[hdrLen : int64(hdrLen)+d.plainLen(hdrLen)]
+	if _, err := d.enc.SealPage(sb[hdrLen:hdrLen], plain, pageNo); err != nil {
+		return err
+	}
+	_, err := d.f.WriteAt(sb, off)
+	return err
+}
+
+// readData reads a full data page into dst, decrypting the records region in place when
+// encryption is on. dst must be a fresh or owned pageSize buffer, never a published
+// resident page, because the open overwrites its records region with plaintext.
+func (d *durableFile) readData(block int64, dst []byte) (int, error) {
+	return d.readSealed(d.blockOffset(block), dst, blockHeaderSize, uint32(block))
+}
+
+// readSealed reads a full page into dst. With no scheme it is one ReadAt. With a scheme
+// it opens the envelope at [hdrLen, pageSize) in place, leaving the plaintext records at
+// [hdrLen, pageSize-overhead). A short read or a failed open (a header-only tail page or a
+// tampered block) returns the error so the caller can treat the page as carrying no
+// records rather than trusting ciphertext.
+func (d *durableFile) readSealed(off int64, dst []byte, hdrLen int, pageNo uint32) (int, error) {
+	n, err := d.f.ReadAt(dst, off)
+	if d.enc == nil || err != nil {
+		return n, err
+	}
+	if int64(n) < d.pageSize {
+		return n, crypto.ErrWrongKey // not a full sealed page: no records to open
+	}
+	if _, oerr := d.enc.OpenPage(dst[hdrLen:hdrLen], dst[hdrLen:d.pageSize], pageNo); oerr != nil {
+		return n, oerr
+	}
+	return n, nil
 }
 
 // fileBlocks reports how many data blocks the file currently spans, used by

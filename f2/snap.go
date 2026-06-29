@@ -176,6 +176,9 @@ func installSnapshotIndex(sh *shard, sec shardSnap, l *log) bool {
 // superblock flip is the only thing that makes the new chain authoritative.
 func (d *durableFile) writeSnapshot(stream []byte, seq uint64) (root int64, blocks []int64, err error) {
 	payloadPer := int(d.pageSize) - snapBlockHdr
+	if d.enc != nil {
+		payloadPer -= cryptoOverhead // the sealed envelope takes the page tail
+	}
 	if payloadPer <= 0 {
 		return -1, nil, errors.New("f2: page too small for a snapshot block")
 	}
@@ -210,7 +213,10 @@ func (d *durableFile) writeSnapshot(stream []byte, seq uint64) (root int64, bloc
 		}
 		crc := crc32.Update(crc32.Checksum(buf[0:28], crcTable), crcTable, chunk)
 		binary.LittleEndian.PutUint32(buf[28:], crc)
-		if _, err := d.f.WriteAt(buf, d.blockOffset(blocks[i])); err != nil {
+		// The header (through the CRC) stays plaintext; writeSealed seals only the
+		// payload region when encryption is on, so the CRC over the plaintext chunk is
+		// computed before the seal and checked after the open on read.
+		if err := d.writeSealed(d.blockOffset(blocks[i]), buf, snapBlockHdr, uint32(blocks[i])); err != nil {
 			return -1, blocks, err
 		}
 	}
@@ -233,7 +239,10 @@ func (d *durableFile) readSnapshot(root int64, seq uint64, maxBlocks int64) (str
 			return nil, nil, errSnapTorn
 		}
 		buf := make([]byte, d.pageSize)
-		if _, err := d.f.ReadAt(buf, d.blockOffset(b)); err != nil {
+		if _, err := d.readSealed(d.blockOffset(b), buf, snapBlockHdr, uint32(b)); err != nil {
+			if d.enc != nil {
+				return nil, nil, errSnapTorn // a failed open reads as a torn chain, full replay
+			}
 			return nil, nil, err
 		}
 		if binary.LittleEndian.Uint32(buf[0:]) != snapMagic {

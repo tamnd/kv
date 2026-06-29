@@ -60,6 +60,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/tamnd/kv/crypto"
 	"github.com/tamnd/kv/vfs"
 )
 
@@ -123,6 +124,13 @@ type Tunables struct {
 	// to sync. The zero value is None.
 	Durability Durability
 
+	// Crypto, when set, seals each data and snapshot block's records region at rest
+	// with the database's AEAD page envelope (D17). It is honored only with a Path; a
+	// memory-only store holds nothing on disk to encrypt. The host passes the same
+	// scheme the main file uses, so the f2 sidecar is encrypted under the same key. Nil
+	// keeps the file plaintext and the record-granular fast paths.
+	Crypto *crypto.Scheme
+
 	// CheckpointBytes bounds the durable record bytes appended before a checkpoint
 	// is due, capping recovery replay. Zero defaults to 256 MiB in durable mode.
 	CheckpointBytes int64
@@ -160,6 +168,7 @@ var (
 	errBadBudget        = errors.New("f2: ResidentPagesPerShard must be zero or at least one")
 	errValueTooBig      = errors.New("f2: record does not fit in a page")
 	errPageMismatch     = errors.New("f2: file page size or shard count differs from tunables")
+	errEncryptMismatch  = errors.New("f2: file encryption state differs from the supplied key")
 	errClosed           = errors.New("f2: store is closed")
 )
 
@@ -337,7 +346,7 @@ func newDurable(ctx context.Context, t Tunables) (*Store, error) {
 		t:          t,
 		ckptBytes:  ckpt,
 	}
-	df := &durableFile{f: f, pageSize: int64(t.PageSize), shards: t.Shards, dial: t.Durability, snapRoot: -1}
+	df := &durableFile{f: f, pageSize: int64(t.PageSize), shards: t.Shards, dial: t.Durability, snapRoot: -1, enc: t.Crypto}
 	df.gcCond = sync.NewCond(&df.smu)
 	s.df = df
 	s.ep = newEpochs()
@@ -346,6 +355,13 @@ func newDurable(ctx context.Context, t Tunables) (*Store, error) {
 	if sb.valid && (sb.pageSize != df.pageSize || sb.shards != df.shards) {
 		_ = f.Close()
 		return nil, errPageMismatch
+	}
+	// Refuse a key/file mismatch: a key supplied for a plaintext file, or no key for an
+	// encrypted one, would otherwise seal or decode against the wrong expectation. The
+	// pager guards the main file the same way; this guards the standalone f2 path.
+	if sb.valid && sb.encrypted != (df.enc != nil) {
+		_ = f.Close()
+		return nil, errEncryptMismatch
 	}
 	df.seq = sb.seq
 	for i := range s.shards {
@@ -490,7 +506,11 @@ func (s *Store) Set(key, value []byte) error {
 	var n int
 	if s.df != nil {
 		n = durableRecordLen(key, value)
-		if n > s.t.PageSize-blockHeaderSize {
+		limit := s.t.PageSize - blockHeaderSize
+		if s.df.enc != nil {
+			limit -= cryptoOverhead // the sealed envelope reserves the page tail
+		}
+		if n > limit {
 			return errValueTooBig
 		}
 	} else {
