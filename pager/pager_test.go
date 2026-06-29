@@ -20,7 +20,7 @@ func newTestPager(t *testing.T, opts Options) (*vfs.Mem, *Pager) {
 }
 
 func TestCreateThenOpenRoundTrip(t *testing.T) {
-	fs, p := newTestPager(t, Options{PageSize: 4096, Engine: format.EngineBTree})
+	fs, p := newTestPager(t, Options{PageSize: 4096, Engine: format.EngineF2})
 	if p.PageSize() != 4096 {
 		t.Fatalf("page size = %d, want 4096", p.PageSize())
 	}
@@ -41,7 +41,7 @@ func TestCreateThenOpenRoundTrip(t *testing.T) {
 	if p2.PageSize() != 4096 {
 		t.Fatalf("reopened page size = %d, want 4096", p2.PageSize())
 	}
-	if p2.Header().Engine != format.EngineBTree {
+	if p2.Header().Engine != format.EngineF2 {
 		t.Fatalf("reopened engine = %v", p2.Header().Engine)
 	}
 }

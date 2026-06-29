@@ -8,7 +8,18 @@ The authoritative, full changelog lives in [CHANGELOG.md](https://github.com/tam
 
 ## Versioning
 
-kv follows semantic versioning. While the project is in its 0.x series, the API stays broadly stable as the surface settles toward a 1.0 commitment, and any breaking change is called out in the release notes. The on-disk format written by 0.1.0 is fixed and forward-compatible, so a database created now opens in later releases.
+kv follows semantic versioning. While the project is in its 0.x series, the API and on-disk format are still settling toward a 1.0 commitment, and any breaking change is called out in the release notes. 0.3.0 consolidated the storage engine and is a clean break: a database created by 0.1.0 or 0.2.0 does not open in 0.3.0 or later. From 0.3.0 on, the f2 on-disk format is the one the project carries forward.
+
+## 0.3.0
+
+A consolidation release, and a deliberate breaking change. kv had shipped two storage cores and let you pick one per database; benchmarking settled the question, so the project now has a single engine, f2, a sharded hash index over a self-durable log, and the rest was removed to keep the surface small and the code honest.
+
+- **One engine.** The B-tree and LSM cores are gone, and so is the engine selector. Every database uses f2. `WithEngine`, `kv.BTree`, and `kv.LSM` are removed, along with the per-core tuning options (`WithMemtableSize`, `WithLevelRatio`, `WithFilter`, `WithRangeIndex`, `WithValueSeparation`, `WithCompression`, `WithColdCompression`, `WithFillFactor`, `WithMaxInlineValue`, `WithBtreeBuffers`).
+- **Point lookups only.** f2 does not keep keys in order, so range scan and ordered iteration are gone: `Txn.NewIterator`, `IterOptions`, the `Iterator` type, and `Txn.DeleteRange` are removed, and the CLI loses `scan`, `count`, `dump`, and `export`. The operations are the point ones: get, set, exists, delete, and merge. A get is a hash and a read, and read latency stays flat as the database grows.
+- **Same everything else.** Transactions with snapshot and serializable isolation, the tunable write-ahead log and crash recovery, encryption at rest, backup and replication, the server, and the observability surface all carry forward unchanged.
+- **A new on-disk file.** f2 keeps its durable state in an `app.kv-f2` sidecar next to the main file and the WAL. A database created before 0.3.0 cannot be opened; move data across with the source you loaded from.
+
+If you were running the default B-tree and using only point operations, the upgrade is recreating the database on 0.3.0 and reloading it. If you relied on scans or the LSM core, 0.2.0 remains available, and the pre-consolidation code is preserved in the `tamnd/kv-v1` repository.
 
 ## 0.2.0
 

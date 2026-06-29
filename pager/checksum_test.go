@@ -57,7 +57,7 @@ func corruptOnDisk(t *testing.T, fs vfs.FS, path string, pgno uint32, pageSize i
 // rather than handing back the torn bytes (spec 02 §3.2).
 func TestGetVerifiesChecksum(t *testing.T) {
 	fs := vfs.NewMem()
-	p, err := Create(fs, "test.kv", Options{PageSize: 4096, Engine: format.EngineBTree, Checksum: format.ChecksumCRC32C})
+	p, err := Create(fs, "test.kv", Options{PageSize: 4096, Engine: format.EngineF2, Checksum: format.ChecksumCRC32C})
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -82,7 +82,7 @@ func TestGetVerifiesChecksum(t *testing.T) {
 // corrupted reads back without error, so verification adds no false positives.
 func TestGetAcceptsCleanChecksum(t *testing.T) {
 	fs := vfs.NewMem()
-	p, err := Create(fs, "test.kv", Options{PageSize: 4096, Engine: format.EngineBTree, Checksum: format.ChecksumCRC32C})
+	p, err := Create(fs, "test.kv", Options{PageSize: 4096, Engine: format.EngineF2, Checksum: format.ChecksumCRC32C})
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -107,7 +107,7 @@ func TestGetAcceptsCleanChecksum(t *testing.T) {
 // with ErrCorrupt: a torn header must be caught at open, not silently trusted.
 func TestOpenRejectsCorruptHeaderPage(t *testing.T) {
 	fs := vfs.NewMem()
-	p, err := Create(fs, "test.kv", Options{PageSize: 4096, Engine: format.EngineBTree, Checksum: format.ChecksumCRC32C})
+	p, err := Create(fs, "test.kv", Options{PageSize: 4096, Engine: format.EngineF2, Checksum: format.ChecksumCRC32C})
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}

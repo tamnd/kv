@@ -49,11 +49,9 @@ Inside the closure, `txn` is the handle for all data access:
 | `Set(key, value)` | Upsert. |
 | `SetWithTTL(key, value, ttl)` | Upsert that expires after `ttl`. |
 | `Delete(key)` | Remove one key. |
-| `DeleteRange(lo, hi)` | Remove every key in `[lo, hi)` in one operation. |
 | `Merge(key, operand)` | Fold an operand into a key through the registered merge operator. |
-| `NewIterator(opts)` | A snapshot-consistent iterator over a range or prefix. |
 
-`Get` returns bytes that point into the database's buffers and stay valid only until the transaction ends. If you need to keep a value after the closure returns, use `GetCopy`, or copy it yourself.
+Every method addresses one key: kv is a point-lookup store, with no range delete and no iterator. `Get` returns bytes that point into the database's buffers and stay valid only until the transaction ends. If you need to keep a value after the closure returns, use `GetCopy`, or copy it yourself.
 
 ## Snapshot isolation, the default
 
@@ -125,5 +123,5 @@ A pinned snapshot, like an open transaction, holds back the versions it can see,
 
 ## Next
 
-- [Choosing an engine](/guides/engines/) covers how the B-tree and LSM cores differ under your transaction load.
+- [The storage engine](/guides/engines/) covers the hash-indexed core your transactions commit into.
 - [Durability](/guides/durability/) covers what "committed" means when the power goes out.

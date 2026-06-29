@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"github.com/tamnd/kv/engine"
-	"github.com/tamnd/kv/format"
 	"github.com/tamnd/kv/vfs"
 	"github.com/tamnd/kv/wal"
 )
@@ -57,107 +56,6 @@ func BenchmarkConcurrentGet(b *testing.B) {
 			}
 			wg.Wait()
 		})
-	}
-}
-
-// BenchmarkPointReadLSM measures a point read whose newest version sits in a shallow
-// source while older versions of the same key litter the deep levels. A large keyspace is
-// settled into a multi-level tree, then a small working set is overwritten several times so
-// each working key has a fresh version in the memtable or a recent L0 segment and stale
-// versions in every level below. Every level's Bloom filter answers a hit for these keys, so
-// before the short-circuit the read pulled a block index and a cell out of every level; after
-// it, the read stops at the shallowest level that supplies a base. The cost gap is the deep
-// levels the read no longer touches (spec 03 R2).
-func BenchmarkPointReadLSM(b *testing.B) {
-	const keys = 20000
-	const working = 256
-	fs := vfs.NewMem()
-	d, err := Open(fs, "bench.kv", Options{PageSize: 4096, Engine: format.EngineLSM, MemtableSize: 64 << 10, Sync: wal.SyncOff})
-	if err != nil {
-		b.Fatalf("open: %v", err)
-	}
-	defer d.Close()
-	for i := range keys {
-		key := fmt.Sprintf("k%08d", i)
-		if _, err := d.Write(func(wb *engine.WriteBatch) {
-			wb.Set([]byte(key), []byte("v00000000"))
-		}); err != nil {
-			b.Fatalf("seed: %v", err)
-		}
-	}
-	// Settle the seeded keyspace into the leveled tree so the stale versions sit deep.
-	for {
-		rep, err := d.Maintain(0)
-		if err != nil {
-			b.Fatalf("maintain: %v", err)
-		}
-		if rep.PagesCompacted == 0 {
-			break
-		}
-	}
-	// Overwrite the working set repeatedly. The newest version of each key lands in the
-	// memtable or a recent L0 segment; the old versions stay in the levels below.
-	for round := range 8 {
-		for j := range working {
-			key := fmt.Sprintf("k%08d", j)
-			if _, err := d.Write(func(wb *engine.WriteBatch) {
-				wb.Set([]byte(key), []byte(fmt.Sprintf("v%08d", round+1)))
-			}); err != nil {
-				b.Fatalf("overwrite: %v", err)
-			}
-		}
-	}
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := range b.N {
-		key := fmt.Sprintf("k%08d", i%working)
-		if _, err := d.Get([]byte(key)); err != nil {
-			b.Fatalf("get: %v", err)
-		}
-	}
-}
-
-// BenchmarkPointReadLSMOneVersion measures the dominant point-read shape: a key written once
-// and settled into the leveled tree, so a read gathers exactly one version off a single
-// on-disk segment. This is the shape the readrandom workload has (a keyspace loaded once and
-// read back), as opposed to the multi-version stack BenchmarkPointReadLSM builds. With one
-// gathered op that is a visible set under no covering range delete, the GetAt fast path returns
-// materializeOp's already-owned value directly instead of folding and copying it a second time,
-// so this benchmark isolates that redundant segment-read copy (perf/13).
-func BenchmarkPointReadLSMOneVersion(b *testing.B) {
-	const keys = 20000
-	fs := vfs.NewMem()
-	d, err := Open(fs, "bench.kv", Options{PageSize: 4096, Engine: format.EngineLSM, MemtableSize: 64 << 10, Sync: wal.SyncOff})
-	if err != nil {
-		b.Fatalf("open: %v", err)
-	}
-	defer d.Close()
-	for i := range keys {
-		key := fmt.Sprintf("k%08d", i)
-		if _, err := d.Write(func(wb *engine.WriteBatch) {
-			wb.Set([]byte(key), []byte("v00000000"))
-		}); err != nil {
-			b.Fatalf("seed: %v", err)
-		}
-	}
-	// Settle every key into the leveled tree so each lives in exactly one segment, with no
-	// shallower version above it: a read gathers a single op and the fast path fires.
-	for {
-		rep, err := d.Maintain(0)
-		if err != nil {
-			b.Fatalf("maintain: %v", err)
-		}
-		if rep.PagesCompacted == 0 {
-			break
-		}
-	}
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := range b.N {
-		key := fmt.Sprintf("k%08d", i%keys)
-		if _, err := d.Get([]byte(key)); err != nil {
-			b.Fatalf("get: %v", err)
-		}
 	}
 }
 

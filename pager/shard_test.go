@@ -65,7 +65,7 @@ func TestShardFramePartition(t *testing.T) {
 // A pre-sharding global-lock bug or a shard-routing mistake would surface here as a race
 // report or a content mismatch.
 func TestConcurrentShardedReads(t *testing.T) {
-	_, p := newTestPager(t, Options{PageSize: 4096, CacheFrames: 256, Engine: format.EngineBTree})
+	_, p := newTestPager(t, Options{PageSize: 4096, CacheFrames: 256, Engine: format.EngineF2})
 	const npages = 2000
 
 	// Lay down npages distinct pages, each stamped with its own pattern.
