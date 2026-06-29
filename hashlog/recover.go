@@ -534,10 +534,14 @@ func (sh *shard) collectLiveOversize(npages int64) ([]int64, int64, error) {
 	descBytes := make([]byte, oversizeDescriptorLen)
 	for i := range t.slots {
 		e := t.slots[i].Load()
-		if e == nil || e == tombstone || !e.loc.isOversize() {
+		if e == nil || e == tombstone {
 			continue
 		}
-		if err := sh.readAtLogicalLocked(ps, e.loc.addr, descBytes); err != nil {
+		loc := e.loadLoc()
+		if !loc.isOversize() {
+			continue
+		}
+		if err := sh.readAtLogicalLocked(ps, loc.addr, descBytes); err != nil {
 			continue
 		}
 		desc, derr := decodeOversizeDescriptor(descBytes)
@@ -589,7 +593,7 @@ func (sh *shard) recomputeDeadBytes(d *durableFile, pageSize int64, npages int64
 			}
 			if flags&flagTombstone == 0 {
 				valueAddr := pid*pageSize + int64(pos) + int64(durableValOff(key, value))
-				if e := sh.index.Load().lookupEntry(tableHash(key), key); e == nil || e.loc.addr != valueAddr {
+				if e := sh.index.Load().lookupEntry(tableHash(key), key); e == nil || e.loadLoc().addr != valueAddr {
 					dead += int64(durableRecordLenFor(len(key), len(value)))
 				}
 			}
@@ -610,7 +614,7 @@ func recoverInsert(t *idxTable, key []byte, loc valLoc, live, occ *int) {
 	for t.slots[i].Load() != nil {
 		i = (i + 1) & t.mask
 	}
-	t.slots[i].Store(&entry{thash: thash, key: append([]byte(nil), key...), loc: loc})
+	t.slots[i].Store(newEntry(thash, append([]byte(nil), key...), loc))
 	*live++
 	*occ++
 }
@@ -630,13 +634,13 @@ func recoverInsertGrow(t **idxTable, key []byte, loc valLoc, live, occ *int) {
 	for {
 		e := tb.slots[i].Load()
 		if e == nil {
-			tb.slots[i].Store(&entry{thash: thash, key: append([]byte(nil), key...), loc: loc})
+			tb.slots[i].Store(newEntry(thash, append([]byte(nil), key...), loc))
 			*live++
 			*occ++
 			return
 		}
 		if e != tombstone && e.thash == thash && bytes.Equal(e.key, key) {
-			tb.slots[i].Store(&entry{thash: thash, key: e.key, loc: loc})
+			e.loc.Store(packLoc(loc))
 			return
 		}
 		i = (i + 1) & tb.mask

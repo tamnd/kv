@@ -158,6 +158,36 @@ func BenchmarkFullSetFlushSuffix(b *testing.B) {
 	}
 }
 
+// BenchmarkOverwrite isolates L2: an overwrite of an existing key repoints its index slot.
+// Before the packed slot that allocated a fresh *entry per Set; now it is one atomic store
+// with no allocation. A memory-only full-resident store never takes the same-size in-place
+// tail path (that is the durable eviction profile), so every Set here is the slot-repoint
+// path the audit flagged. The keys are pre-inserted and cycled, the value is small and the
+// page large so page rolls are rare next to the per-op work, and ReportAllocs surfaces the
+// allocation the fix removes. Numbers stay local until the M10 hardware gate.
+func BenchmarkOverwrite(b *testing.B) {
+	s, err := New(Tunables{Shards: 1, PageSize: 1 << 20, ResidentPagesPerShard: 0})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer s.Close()
+
+	const keys = 1024
+	v := benchValue(16)
+	for i := 0; i < keys; i++ {
+		if err := s.Set(benchKey(i), v); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := s.Set(benchKey(i%keys), v); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // BenchmarkCheckpoint measures one checkpoint over a populated store: capture every
 // shard's cut, encode the snapshot, write and barrier its extents, and flip the
 // superblock. It is the cost of the periodic durability artifact, amortized over the

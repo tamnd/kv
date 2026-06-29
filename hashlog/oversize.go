@@ -157,6 +157,11 @@ func (sh *shard) setOversizeLocked(key, value []byte) error {
 	ps := sh.pages.Load()
 	page := ps.pages[sh.tailPage]
 	recStart := sh.tailPage*int64(sh.pageSize) + int64(sh.tailPos)
+	if err := addrInRange(recStart, rl); err != nil {
+		// The cont chain is already written; with no home record naming it, recovery's
+		// physical scan reconciles it free, as in the failed-seal path above.
+		return err
+	}
 	lsn := sh.df.nextLSN()
 	n := encodeDurableRecord(page[sh.tailPos:], lsn, key, desc, flagOversize)
 	sh.tailPos += n
@@ -245,8 +250,8 @@ func (sh *shard) writeOversizeChain(value []byte) (head, cnt int64, err error) {
 // It runs under the shard write lock.
 func (sh *shard) supersedeOldLocked(old *entry) {
 	sh.creditDeadLocked(old)
-	if old.loc.isOversize() {
-		sh.freeOversizeContLocked(old.loc)
+	if loc := old.loadLoc(); loc.isOversize() {
+		sh.freeOversizeContLocked(loc)
 	}
 }
 
