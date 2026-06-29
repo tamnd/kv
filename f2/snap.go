@@ -141,6 +141,32 @@ func decodeSnapStream(buf []byte) ([]shardSnap, error) {
 	return snaps, nil
 }
 
+// installSnapshotIndex rebuilds a shard's index from a snapshot section's live slot
+// words and publishes it. It is the grow path run from disk: each word's home is
+// fingerprint & mask, so no key or value is read, the slots drop straight into place. It
+// sizes the table for the live count at the load factor so the delta replay that follows
+// does not immediately grow it. It returns false without publishing when that table would
+// be wider than the fingerprint can address, the documented per-shard ceiling, where the
+// home arithmetic no longer holds and the caller must full-replay the generation instead.
+func installSnapshotIndex(sh *shard, sec shardSnap, l *log) bool {
+	ni := newIndex(len(sec.slots)*loadDen/loadNum + 1)
+	if ni.mask > slotFPValueMask {
+		return false
+	}
+	ni.log = l
+	for _, w := range sec.slots {
+		j := slotFP(w) & ni.mask
+		for ni.slots[j].Load() != 0 {
+			j = (j + 1) & ni.mask
+		}
+		ni.slots[j].Store(w)
+		ni.live++
+		ni.used++
+	}
+	sh.index.Store(ni)
+	return true
+}
+
 // writeSnapshot writes a byte stream across a freshly allocated chain of blocks and
 // returns the chain root and the blocks it used. Each block carries the next block id, so
 // the chain is self-describing on disk and recovery follows it without an index. The

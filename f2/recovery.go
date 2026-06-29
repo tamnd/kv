@@ -52,6 +52,26 @@ func (s *Store) recover() error {
 		return err
 	}
 
+	// Read the committed index snapshot, if the superblock points at one. A torn or
+	// truncated chain, or one that does not cover this shard count, reads as no snapshot
+	// and every shard full-replays, never a wrong index. The chain blocks are remembered
+	// so the scan below conserves them (a committed snapshot is neither live data nor
+	// free) and a later checkpoint can free them after writing the next chain.
+	var snaps []shardSnap
+	var snapBlocks []int64
+	sb := readSuperblock(df.f)
+	if sb.snapValid {
+		if stream, chain, rerr := df.readSnapshot(sb.snapRoot, sb.snapSeq, nblocks); rerr == nil {
+			if decoded, derr := decodeSnapStream(stream); derr == nil && len(decoded) == len(s.shards) {
+				snaps = decoded
+				snapBlocks = chain
+				df.mu.Lock()
+				df.snapRoot, df.snapSeq, df.snapShards, df.snapBlocks = sb.snapRoot, sb.snapSeq, sb.snapShards, chain
+				df.mu.Unlock()
+			}
+		}
+	}
+
 	// Pass 1: header-only scan, group blocks by shard tagged with generation, and
 	// track the highest generation that has a page 0 (the committed generation).
 	type blk struct {
@@ -65,7 +85,12 @@ func (s *Store) recover() error {
 	for i := range activeGen {
 		activeGen[i] = -1
 	}
-	survivor := make([]bool, nblocks) // block id to whether a surviving page claims it
+	survivor := make([]bool, nblocks) // block id to whether a surviving page or the snapshot claims it
+	for _, b := range snapBlocks {
+		if b >= 0 && b < nblocks {
+			survivor[b] = true // the committed snapshot chain is occupied, not free
+		}
+	}
 	hdr := make([]byte, blockHeaderSize)
 	for b := int64(0); b < nblocks; b++ {
 		n, _ := df.f.ReadAt(hdr, df.blockOffset(b))
@@ -149,11 +174,38 @@ func (s *Store) recover() error {
 		// so a later append never reuses a generation a compaction already retired.
 		l.gen = gen
 
-		// Replay records in page order to rebuild the index. The tail offset falls
-		// out of where the last page's records end. Each page's records start past
-		// its own header, whose length depends on the generation that wrote it.
+		// Choose the replay range. With a committed snapshot for this shard whose
+		// generation still matches (a compaction after the checkpoint would have bumped
+		// it and stranded the snapshot's addresses), install the index from the snapshot
+		// and replay only the records past the frontier, the post-checkpoint delta. The
+		// pre-frontier pages are not even decoded: the snapshot already holds their live
+		// state, so the replay cost falls from the whole history to the delta. Otherwise
+		// replay the whole generation from page 0, the original path, with an empty index.
+		replayPage := 0
+		replayWithin := int64(blocks[0].hdrLen)
+		snapTail := int64(-1) // >= 0 once a snapshot frontier sits at or past the last page
+		if snaps != nil && snaps[sid].gen == gen && installSnapshotIndex(sh, snaps[sid], l) {
+			sec := snaps[sid]
+			sh.logBytes = sec.logBytes
+			sh.deadBytes = sec.deadBytes
+			fp := int(sec.frontier / l.pageSize)
+			if fp < n {
+				replayPage = fp
+				replayWithin = sec.frontier % l.pageSize
+			} else {
+				// The frontier names a page boundary no page was created past, so there
+				// is no delta and the tail is exactly the frontier the checkpoint cut.
+				replayPage = n
+				snapTail = sec.frontier
+			}
+		}
+
+		// Replay records in page order to rebuild (or extend) the index. The tail offset
+		// falls out of where the last page's records end. Each page's records start past
+		// its own header, whose length depends on the generation that wrote it; the
+		// frontier page instead starts at the frontier, a record boundary inside it.
 		lastWithin := int64(blocks[n-1].hdrLen)
-		for pi := 0; pi < n; pi++ {
+		for pi := replayPage; pi < n; pi++ {
 			ref := d.refs[pi].Load()
 			buf := ref.mem
 			if buf == nil {
@@ -161,6 +213,9 @@ func (s *Store) recover() error {
 				_, _ = df.f.ReadAt(buf, ref.fileOff)
 			}
 			within := int64(blocks[pi].hdrLen)
+			if pi == replayPage {
+				within = replayWithin
+			}
 			base := int64(pi) * l.pageSize
 			for {
 				key, _, tomb, rn, ok := decodeDurable(buf[within:])
@@ -181,7 +236,11 @@ func (s *Store) recover() error {
 				lastWithin = within
 			}
 		}
-		l.tail = int64(n-1)*l.pageSize + lastWithin
+		if snapTail >= 0 {
+			l.tail = snapTail
+		} else {
+			l.tail = int64(n-1)*l.pageSize + lastWithin
+		}
 	}
 
 	// Resume allocation past every block the file physically spans, so a new page

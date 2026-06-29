@@ -1,9 +1,28 @@
 package f2
 
 import (
+	"fmt"
 	"sort"
 	"testing"
 )
+
+func altVal(i int) []byte { return []byte(fmt.Sprintf("alt-%08d-payload", i)) }
+
+// flushTails pushes every shard's tail page to the file without writing a snapshot or
+// touching the superblock, so a following crash leaves the post-checkpoint records on
+// disk under the still-committed earlier snapshot. It models the steady state recovery
+// must handle: a snapshot plus a delta of records appended after it.
+func flushTails(t *testing.T, s *Store) {
+	t.Helper()
+	for _, sh := range s.shards {
+		sh.mu.Lock()
+		err := sh.log.flushTail()
+		sh.mu.Unlock()
+		if err != nil {
+			t.Fatalf("flushTail: %v", err)
+		}
+	}
+}
 
 // liveWords returns a shard's live slot words, the multiset the snapshot must store, read
 // the same way captureSnap reads them.
@@ -218,6 +237,151 @@ func assertConserved(t *testing.T, s *Store) {
 		_, isLive := live[b]
 		if !isLive && !freeSet[b] && !chainSet[b] {
 			t.Fatalf("block %d accounted by none of live/free/chain", b)
+		}
+	}
+}
+
+// TestSnapDeltaRecovery checks the S6-2 core: a reopen installs the committed snapshot and
+// replays only the records appended after the frontier, reconstructing the same logical
+// state a full replay would, while touching far fewer records. After a checkpoint over set
+// A, the delta adds new keys, overwrites part of A, and deletes part of A; a crash (no
+// clean-close snapshot) then reopens against the checkpoint's snapshot plus that delta.
+func TestSnapDeltaRecovery(t *testing.T) {
+	tn := durableTunables(t, DurabilityNone)
+	s, err := New(tn)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	const a = 4000
+	for i := 0; i < a; i++ {
+		if err := s.Set(tkey(i), tval(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+
+	// Delta after the cut: 1000 new keys, 500 overwrites, 300 deletes.
+	for i := a; i < a+1000; i++ {
+		if err := s.Set(tkey(i), tval(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 500; i++ {
+		if err := s.Set(tkey(i), altVal(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 500; i < 800; i++ {
+		if err := s.Delete(tkey(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	flushTails(t, s)
+	crash(t, s)
+
+	r := mustOpenT(t, tn)
+	st := r.Stats()
+	// Delta-bound, not history-bound: only the post-checkpoint records are replayed,
+	// the snapshot supplies the rest as slot words, never decoded.
+	if st.RecoveryRecords >= a {
+		t.Fatalf("RecoveryRecords = %d, want < %d (delta-bound replay)", st.RecoveryRecords, a)
+	}
+	if st.RecoveryRecords == 0 {
+		t.Fatal("RecoveryRecords = 0, want the delta replayed")
+	}
+
+	for i := 0; i < 500; i++ { // overwritten
+		got, ok, err := r.Get(tkey(i))
+		if err != nil || !ok || string(got) != string(altVal(i)) {
+			t.Fatalf("key %d = (%q, %v, %v), want overwritten value", i, got, ok, err)
+		}
+	}
+	for i := 500; i < 800; i++ { // deleted
+		if _, ok, _ := r.Get(tkey(i)); ok {
+			t.Fatalf("key %d present, want deleted", i)
+		}
+	}
+	for i := 800; i < a+1000; i++ { // untouched A tail and the new keys
+		got, ok, err := r.Get(tkey(i))
+		if err != nil || !ok || string(got) != string(tval(i)) {
+			t.Fatalf("key %d = (%q, %v, %v), want %q", i, got, ok, err, tval(i))
+		}
+	}
+}
+
+// TestSnapGenerationMismatchFallback checks that a compaction after a checkpoint, which
+// bumps the generation and strands the snapshot's generation-relative addresses, makes
+// recovery ignore the snapshot and full-replay the compacted generation, still correct.
+func TestSnapGenerationMismatchFallback(t *testing.T) {
+	tn := durableTunables(t, DurabilityNone)
+	s, err := New(tn)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	const keys = 3000
+	for round := 0; round < 4; round++ { // overwrite so every shard clears the compaction threshold
+		for i := 0; i < keys; i++ {
+			if err := s.Set(tkey(i), tval(i)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := s.Checkpoint(); err != nil { // snapshot at the pre-compaction generation
+		t.Fatalf("Checkpoint: %v", err)
+	}
+	if err := s.Compact(); err != nil { // bumps the generation, stranding the snapshot's addresses
+		t.Fatalf("Compact: %v", err)
+	}
+	flushTails(t, s)
+	crash(t, s)
+
+	r := mustOpenT(t, tn)
+	for i := 0; i < keys; i++ {
+		got, ok, err := r.Get(tkey(i))
+		if err != nil || !ok || string(got) != string(tval(i)) {
+			t.Fatalf("key %d = (%q, %v, %v) after gen-mismatch recovery, want %q", i, got, ok, err, tval(i))
+		}
+	}
+}
+
+// TestSnapTornSnapshotFallback corrupts the committed snapshot chain on disk and checks
+// that recovery rejects it whole and full-replays, losing no data. The chain's first
+// block is overwritten with garbage so its CRC fails.
+func TestSnapTornSnapshotFallback(t *testing.T) {
+	tn := durableTunables(t, DurabilityNone)
+	s, err := New(tn)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	const keys = 2000
+	for i := 0; i < keys; i++ {
+		if err := s.Set(tkey(i), tval(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+	root := s.df.snapRoot
+	off := s.df.blockOffset(root)
+	flushTails(t, s)
+	// Scribble over the snapshot root block so its CRC no longer checks.
+	garbage := make([]byte, 64)
+	for i := range garbage {
+		garbage[i] = 0xAB
+	}
+	if _, err := s.df.f.WriteAt(garbage, off); err != nil {
+		t.Fatalf("corrupt snapshot: %v", err)
+	}
+	crash(t, s)
+
+	r := mustOpenT(t, tn)
+	for i := 0; i < keys; i++ {
+		got, ok, err := r.Get(tkey(i))
+		if err != nil || !ok || string(got) != string(tval(i)) {
+			t.Fatalf("key %d = (%q, %v, %v) after torn-snapshot recovery, want %q", i, got, ok, err, tval(i))
 		}
 	}
 }
