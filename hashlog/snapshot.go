@@ -77,30 +77,38 @@ type decodedSnapshot struct {
 	sections   []snapSection
 }
 
-// encodeSnapSection serialises one shard's section: the entries back to back, then a
-// trailer of the entry count and a CRC32C over everything before the CRC. The same
-// CRC is mirrored into the directory so a reader can verify the section against the
-// directory before trusting its bytes.
-func encodeSnapSection(s snapSection) []byte {
+// snapSectionSize returns the encoded byte length of one shard's section: its entries
+// back to back plus the trailer. encodeSnapshot uses it to lay out the section offsets
+// before allocating the stream, so each section can be written straight into its final
+// place in the stream with no intermediate per-section buffer.
+func snapSectionSize(s snapSection) int {
 	n := 0
-	for _, t := range s.tuples {
-		n += snapEntryFixed + uvarintLen(uint64(len(t.key))) + len(t.key)
+	for i := range s.tuples {
+		n += snapEntryFixed + uvarintLen(uint64(len(s.tuples[i].key))) + len(s.tuples[i].key)
 	}
-	n += snapSectionTrailer
-	buf := make([]byte, n)
+	return n + snapSectionTrailer
+}
+
+// encodeSnapSectionInto serialises one shard's section directly into dst (which must be
+// exactly snapSectionSize(s) bytes): the entries back to back, then a trailer of the
+// entry count and a CRC32C over everything before the CRC. It returns the same CRC so
+// the caller can mirror it into the directory without rescanning the section, letting a
+// reader verify the section against the directory before trusting its bytes.
+func encodeSnapSectionInto(dst []byte, s snapSection) uint32 {
 	off := 0
-	for _, t := range s.tuples {
-		buf[off] = t.flags
-		binary.LittleEndian.PutUint64(buf[off+1:off+9], uint64(t.loc.addr))
-		binary.LittleEndian.PutUint32(buf[off+9:off+13], t.loc.vlen)
+	for i := range s.tuples {
+		t := &s.tuples[i]
+		dst[off] = t.flags
+		binary.LittleEndian.PutUint64(dst[off+1:off+9], uint64(t.loc.addr))
+		binary.LittleEndian.PutUint32(dst[off+9:off+13], t.loc.vlen)
 		off += snapEntryFixed
-		off += binary.PutUvarint(buf[off:], uint64(len(t.key)))
-		off += copy(buf[off:], t.key)
+		off += binary.PutUvarint(dst[off:], uint64(len(t.key)))
+		off += copy(dst[off:], t.key)
 	}
-	binary.LittleEndian.PutUint64(buf[off:off+8], uint64(len(s.tuples)))
-	crc := crc32c(buf[:off+8])
-	binary.LittleEndian.PutUint32(buf[off+8:off+12], crc)
-	return buf
+	binary.LittleEndian.PutUint64(dst[off:off+8], uint64(len(s.tuples)))
+	crc := crc32c(dst[:off+8])
+	binary.LittleEndian.PutUint32(dst[off+8:off+12], crc)
+	return crc
 }
 
 // encodeSnapshot serialises a whole snapshot stream: the header, then the shard
@@ -108,18 +116,23 @@ func encodeSnapSection(s snapSection) []byte {
 // region (the implementation writes it across a contiguous extent run, so recovery
 // reads it back as one region with no extent chain to walk, see the implementation
 // note). sections must have one entry per shard, indexed by shard id.
+//
+// Sections are sized in a first pass and then encoded straight into their final slice
+// of the one stream buffer, so a key is copied into the stream exactly once. There is no
+// intermediate per-section buffer, which matters at scale: a shard holding millions of
+// live keys would otherwise materialise its whole section a second time before the copy
+// into the stream (audit S7).
 func encodeSnapshot(shardCount int, generation uint64, sections []snapSection) []byte {
-	bodies := make([][]byte, shardCount)
-	for i := 0; i < shardCount; i++ {
-		bodies[i] = encodeSnapSection(sections[i])
-	}
 	dirOff := snapHeaderSize
 	sectionsOff := dirOff + shardCount*snapDirEntrySize
 	total := sectionsOff
 	offs := make([]int, shardCount)
+	sizes := make([]int, shardCount)
 	for i := 0; i < shardCount; i++ {
+		sz := snapSectionSize(sections[i])
 		offs[i] = total
-		total += len(bodies[i])
+		sizes[i] = sz
+		total += sz
 	}
 
 	buf := make([]byte, total)
@@ -133,12 +146,10 @@ func encodeSnapshot(shardCount int, generation uint64, sections []snapSection) [
 	binary.LittleEndian.PutUint32(buf[36:40], uint32(sectionsOff))
 
 	for i := 0; i < shardCount; i++ {
-		body := bodies[i]
-		copy(buf[offs[i]:], body)
-		crc := crc32c(body[:len(body)-crcSize])
+		crc := encodeSnapSectionInto(buf[offs[i]:offs[i]+sizes[i]], sections[i])
 		d := dirOff + i*snapDirEntrySize
 		binary.LittleEndian.PutUint64(buf[d:d+8], uint64(offs[i]))
-		binary.LittleEndian.PutUint64(buf[d+8:d+16], uint64(len(body)))
+		binary.LittleEndian.PutUint64(buf[d+8:d+16], uint64(sizes[i]))
 		binary.LittleEndian.PutUint64(buf[d+16:d+24], uint64(len(sections[i].tuples)))
 		binary.LittleEndian.PutUint64(buf[d+24:d+32], sections[i].frontierLSN)
 		binary.LittleEndian.PutUint32(buf[d+32:d+36], crc)

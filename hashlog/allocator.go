@@ -65,6 +65,26 @@ func (a *allocator) allocRun(n int64) (first int64, grew bool) {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
+	// Fast path: the run a checkpoint most often wants is the one the previous snapshot
+	// just freed. freeRun pushes a run's ids ascending onto the tail of the stack, so in
+	// the steady state (a periodic snapshot of roughly constant size) the last n stack
+	// entries are exactly a contiguous ascending run. Carve them straight off the tail in
+	// O(n), no sort and no scratch allocation. Any n consecutive ids form a valid
+	// contiguous run, so this is correct even when the tail is not the most-recently
+	// freed run; removing the tail slice preserves the LIFO order of what remains.
+	if m := int64(len(a.free)); m >= n {
+		if tail := a.free[m-n:]; isAscendingRun(tail) {
+			first = tail[0]
+			a.free = a.free[:m-n]
+			return first, false
+		}
+	}
+
+	// General path: the tail was not a ready run (a snapshot that changed size), so scan
+	// for any contiguous run of n free ids and carve it out rather than grow the file.
+	// This is off the steady-state path, so the sort is acceptable; the carved ids are a
+	// known contiguous range, so the rebuild filters by range with no scratch map.
 	if int64(len(a.free)) >= n {
 		sorted := append([]int64(nil), a.free...)
 		sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
@@ -75,13 +95,9 @@ func (a *allocator) allocRun(n int64) (first int64, grew bool) {
 			}
 			if int64(i-runStart) >= n {
 				first = sorted[runStart]
-				drop := make(map[int64]struct{}, n)
-				for k := int64(0); k < n; k++ {
-					drop[first+k] = struct{}{}
-				}
 				kept := make([]int64, 0, len(a.free)-int(n))
 				for _, id := range a.free {
-					if _, ok := drop[id]; !ok {
+					if id < first || id >= first+n {
 						kept = append(kept, id)
 					}
 				}
@@ -91,9 +107,22 @@ func (a *allocator) allocRun(n int64) (first int64, grew bool) {
 			runStart = i
 		}
 	}
+
 	first = a.count
 	a.count += n
 	return first, true
+}
+
+// isAscendingRun reports whether ids is a strictly +1 ascending sequence, that is a
+// contiguous extent run in id order. The free stack never holds a duplicate id (the
+// conservation invariant I7), so a +1 step is the only thing to check.
+func isAscendingRun(ids []int64) bool {
+	for i := 1; i < len(ids); i++ {
+		if ids[i] != ids[i-1]+1 {
+			return false
+		}
+	}
+	return true
 }
 
 // freeRun pushes a contiguous run of n extent ids back onto the free stack. The caller

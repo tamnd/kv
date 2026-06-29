@@ -64,6 +64,95 @@ func TestM4SnapshotRoundTrip(t *testing.T) {
 	}
 }
 
+// TestS7EncodeSnapshotAllocConstant pins the audit S7 win: encodeSnapshot writes every
+// section straight into the one stream buffer, so its allocation count is a small
+// constant (the stream plus the two offset/size scratch slices) and does not grow with
+// the shard count. The old encoder built one intermediate buffer per section, so its
+// allocations climbed with the shards; this test fails closed if that regresses.
+func TestS7EncodeSnapshotAllocConstant(t *testing.T) {
+	build := func(shardCount int) []snapSection {
+		secs := make([]snapSection, shardCount)
+		for s := 0; s < shardCount; s++ {
+			tuples := make([]snapTuple, 64)
+			for i := range tuples {
+				tuples[i] = snapTuple{
+					key: []byte(key(s*1000 + i)),
+					loc: valLoc{addr: int64(i*128 + s), vlen: uint32(i + 1)},
+				}
+			}
+			secs[s] = snapSection{shard: s, frontierLSN: uint64(s + 1), tuples: tuples}
+		}
+		return secs
+	}
+	small := build(8)
+	large := build(64)
+	allocsFor := func(secs []snapSection) float64 {
+		return testing.AllocsPerRun(20, func() {
+			_ = encodeSnapshot(len(secs), 1, secs)
+		})
+	}
+	a8 := allocsFor(small)
+	a64 := allocsFor(large)
+	// An eight-times-larger directory must not cost eight times the allocations. The
+	// encoder allocates the stream and two scratch slices regardless of shard count, so
+	// the two counts are the same small constant.
+	if a64 != a8 {
+		t.Fatalf("encodeSnapshot allocations scale with shard count: %v allocs at 8 shards, %v at 64", a8, a64)
+	}
+	if a64 > 6 {
+		t.Fatalf("encodeSnapshot allocated %v times for 64 shards, want a small constant independent of shards", a64)
+	}
+}
+
+// TestS7CaptureCutAliasesKeys pins that a captured cut aliases each entry's key rather
+// than copying it: the snapshot tuple's key header points at the same backing array the
+// live index entry holds. This is the under-lock allocation the audit removed, and it is
+// safe because an entry's key is immutable for its life.
+func TestS7CaptureCutAliasesKeys(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "alias.hlog")
+	s, err := New(ckptTunables(path, DurabilityNormal))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	for i := 0; i < 200; i++ {
+		if err := s.Set(key(i), value4(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sh := s.shards[0]
+	sec, _, _, err := sh.captureCut()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sec.tuples) == 0 {
+		t.Fatal("shard 0 captured no tuples")
+	}
+	// Find each captured key's live entry and assert the tuple aliases its bytes (same
+	// backing array, not a copy), which is what keeps the cut off the allocator.
+	tbl := sh.index.Load()
+	aliased := 0
+	for ti := range sec.tuples {
+		tk := sec.tuples[ti].key
+		for j := range tbl.slots {
+			e := tbl.slots[j].Load()
+			if e == nil || e == tombstone {
+				continue
+			}
+			if string(e.key) == string(tk) {
+				if len(e.key) > 0 && &e.key[0] != &tk[0] {
+					t.Fatalf("captured key %q was copied, want an alias of the entry's key", tk)
+				}
+				aliased++
+				break
+			}
+		}
+	}
+	if aliased != len(sec.tuples) {
+		t.Fatalf("matched %d of %d captured keys to live entries", aliased, len(sec.tuples))
+	}
+}
+
 // TestM4SnapshotEqualsLiveIndex is the round-trip-against-the-engine gate: after a
 // workload with overwrites and deletes, a checkpoint's snapshot read back off the file
 // holds exactly the store's live key set, each pointing at the same location.
@@ -366,4 +455,30 @@ func FuzzDecodeSnapshot(f *testing.F) {
 			}
 		}
 	})
+}
+
+// BenchmarkEncodeSnapshot measures serialising a large multi-shard snapshot: the
+// in-place encoder writes every section straight into the one stream, so the per-op
+// allocation count and bytes are the stream itself plus two small scratch slices, with
+// no intermediate per-section buffer. ReportAllocs makes the audit S7 win visible as a
+// flat alloc count as the section size grows.
+func BenchmarkEncodeSnapshot(b *testing.B) {
+	const shards = 64
+	const perShard = 4096
+	secs := make([]snapSection, shards)
+	for s := 0; s < shards; s++ {
+		tuples := make([]snapTuple, perShard)
+		for i := range tuples {
+			tuples[i] = snapTuple{
+				key: []byte(key(s*perShard + i)),
+				loc: valLoc{addr: int64(i*128 + s), vlen: uint32(i + 1)},
+			}
+		}
+		secs[s] = snapSection{shard: s, frontierLSN: uint64(s + 1), tuples: tuples}
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = encodeSnapshot(shards, 1, secs)
+	}
 }

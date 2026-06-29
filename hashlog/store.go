@@ -794,7 +794,16 @@ func (sh *shard) captureCut() (snapSection, shardFrontier, []int64, error) {
 		if e == nil || e == tombstone {
 			continue
 		}
-		tuples = append(tuples, snapTuple{key: append([]byte(nil), e.key...), loc: e.loadLoc()})
+		// Alias the entry's key rather than copy its bytes (audit S7). An entry's key is
+		// set once at construction and never rewritten (an overwrite stores a new loc, a
+		// grow moves the same entry pointer), so the bytes stay valid and unchanging for
+		// the entry's life. Reading loadLoc here pins the location as of the cut; the key
+		// bytes are then serialized after the lock is released, off the write path. This
+		// keeps the under-lock work to one slice of headers per live key instead of a copy
+		// of the whole live key set, so a large shard's checkpoint no longer stalls its
+		// writers for the length of that copy or spikes memory with a duplicate of every
+		// key.
+		tuples = append(tuples, snapTuple{key: e.key, loc: e.loadLoc()})
 	}
 	fr := shardFrontier{
 		frontierLSN: uint64(sh.frontier.Load()),
