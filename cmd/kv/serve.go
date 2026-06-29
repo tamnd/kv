@@ -12,9 +12,12 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
+	"github.com/tamnd/kv"
 	"github.com/tamnd/kv/server"
+	"github.com/tamnd/kv/server/resp"
 )
 
 // cmdServe opens a database and serves it over the network (spec 17): the CLI's job is to
@@ -65,11 +68,22 @@ func cmdServe(args []string) int {
 	tlsClientCA := fs.String("tls-client-ca", "", "path to a CA bundle (PEM) to verify client certificates (enables mTLS)")
 	mtlsIdentityFile := fs.String("mtls-identity-file", "", "path to a CN-to-identity table for mTLS (same format as -auth-file)")
 	insecure := fs.Bool("insecure", false, "allow serving a non-loopback address without TLS")
+	// Redis (RESP) face (spec 17, reusing the wire loop from tamnd/aki). kv can also
+	// speak the Redis protocol, so a redis client or a redis benchmark drives the same
+	// database as the HTTP and binary faces. -resp-addr binds it on TCP, -resp-unixsocket
+	// on a unix socket; both empty leaves the Redis face off. The three faces share one
+	// keyspace, since each is a front end over the same writer.
+	respAddr := fs.String("resp-addr", "", "listen address for the Redis (RESP) protocol (empty disables it)")
+	respUnixSocket := fs.String("resp-unixsocket", "", "unix socket path for the Redis (RESP) protocol (empty disables it)")
+	// -synchronous overrides the WAL durability for this run, so a benchmark can compare
+	// write paths with the per-commit fsync removed without rewriting the file. Empty keeps
+	// the database's own default, which is SyncFull.
+	synchronous := fs.String("synchronous", "", "WAL durability for this run: off, normal, full, or extra (empty keeps the default)")
 	if err := parseArgs(fs, args); err != nil {
 		return exitUsage
 	}
 	if fs.NArg() != 1 {
-		return usageErr("usage: kv serve <db> [-addr host:port] [-binary-addr host:port] [-auth-file path | -jwt-jwks-url url] [-tls-cert path -tls-key path] [limit flags]")
+		return usageErr("usage: kv serve <db> [-addr host:port] [-binary-addr host:port] [-resp-addr host:port] [-resp-unixsocket path] [-synchronous off|normal|full|extra] [-auth-file path | -jwt-jwks-url url] [-tls-cert path -tls-key path] [limit flags]")
 	}
 	limits := server.Limits{
 		MaxKeySize:   *maxKeySize,
@@ -111,29 +125,36 @@ func cmdServe(args []string) int {
 	// Refuse a non-loopback bind without TLS by default, so a port reachable off-host is encrypted.
 	// -insecure overrides for a trusted private network the operator vouches for.
 	if !*insecure {
-		if err := server.NonLoopbackRequiresTLS(*addr, tlsConfig != nil); err != nil {
-			return fail(err)
-		}
-		if err := server.NonLoopbackRequiresTLS(*binaryAddr, tlsConfig != nil); err != nil {
-			return fail(err)
+		for _, a := range []string{*addr, *binaryAddr, *respAddr} {
+			if a == "" {
+				continue
+			}
+			if err := server.NonLoopbackRequiresTLS(a, tlsConfig != nil); err != nil {
+				return fail(err)
+			}
 		}
 	}
 
-	d, code := openDB(fs.Arg(0))
-	if code != exitOK {
-		return code
-	}
-	defer d.Close()
-
-	// Bind the listener before announcing readiness so the printed address is the real one,
-	// including the OS-assigned port when -addr ends in :0, and so a bind failure is reported
-	// before any traffic is promised.
-	ln, err := net.Listen("tcp", *addr)
+	// serve creates the database if it does not exist yet, so a fresh data directory comes up
+	// as an empty server rather than an error: kv.Open creates the file with defaults when it is
+	// missing. -synchronous, when set, overrides the WAL durability for this process only.
+	var opts []kv.Option
+	sync, ok, err := parseSync(*synchronous)
 	if err != nil {
 		return fail(err)
 	}
+	if ok {
+		opts = append(opts, kv.WithSynchronous(sync))
+	}
+	d, err := kv.Open(fs.Arg(0), opts...)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "kv: cannot open %s: %v\n", fs.Arg(0), err)
+		return codeFor(err)
+	}
+	defer d.Close()
+
 	srv := server.New(d, server.Options{
-		Addr:                 ln.Addr().String(),
+		Addr:                 *addr,
 		Limits:               &limits,
 		Auth:                 auth,
 		PeerAuth:             peerAuth,
@@ -153,8 +174,21 @@ func cmdServe(args []string) int {
 	}
 
 	errc := make(chan error, 1)
-	go func() { errc <- srv.Serve(ln) }()
-	fmt.Fprintf(os.Stderr, "kv: serving %s on %s://%s\n", fs.Arg(0), httpScheme, ln.Addr().String())
+	listening := false
+
+	// The HTTP face is on by default and turned off with -addr "" for a server meant to speak
+	// only the binary or the Redis protocol. Bind before announcing so the printed address is
+	// the real one, including the OS-assigned port when -addr ends in :0, and so a bind failure
+	// is reported before any traffic is promised.
+	if *addr != "" {
+		ln, err := net.Listen("tcp", *addr)
+		if err != nil {
+			return fail(err)
+		}
+		go func() { errc <- srv.Serve(ln) }()
+		fmt.Fprintf(os.Stderr, "kv: serving %s on %s://%s\n", fs.Arg(0), httpScheme, ln.Addr().String())
+		listening = true
+	}
 
 	// The binary protocol is opt-in: when -binary-addr is set, bind a second listener and serve
 	// the efficient wire on it alongside HTTP. The same Service backs both, so the two faces
@@ -166,10 +200,40 @@ func cmdServe(args []string) int {
 		}
 		go func() { errc <- srv.ServeBinary(bln) }()
 		fmt.Fprintf(os.Stderr, "kv: serving %s binary on %s://%s\n", fs.Arg(0), binScheme, bln.Addr().String())
+		listening = true
 	}
 
-	// Run until the listener fails or an interrupt/terminate signal arrives, then drain
-	// in-flight requests with a bounded shutdown before the deferred Close folds the file.
+	// The Redis (RESP) face is opt-in too, on TCP and/or a unix socket. It is a separate front
+	// end over the same database, so a redis client and the native faces see one keyspace. The
+	// unix socket is for a local benchmark; a stale socket from a crashed run is removed first.
+	respSrv := resp.New(d)
+	if *respAddr != "" {
+		rln, err := net.Listen("tcp", *respAddr)
+		if err != nil {
+			return fail(err)
+		}
+		go func() { errc <- respSrv.Serve(rln) }()
+		fmt.Fprintf(os.Stderr, "kv: serving %s redis on redis://%s\n", fs.Arg(0), rln.Addr().String())
+		listening = true
+	}
+	if *respUnixSocket != "" {
+		_ = os.Remove(*respUnixSocket)
+		rln, err := net.Listen("unix", *respUnixSocket)
+		if err != nil {
+			return fail(err)
+		}
+		go func() { errc <- respSrv.Serve(rln) }()
+		fmt.Fprintf(os.Stderr, "kv: serving %s redis on unix:%s\n", fs.Arg(0), *respUnixSocket)
+		listening = true
+	}
+
+	if !listening {
+		return usageErr("kv serve: no listener enabled; set at least one of -addr, -binary-addr, -resp-addr, or -resp-unixsocket")
+	}
+
+	// Run until a listener fails or an interrupt/terminate signal arrives, then drain in-flight
+	// requests with a bounded shutdown before the deferred Close folds the file. The RESP server
+	// is closed alongside the native faces so its connections drop before the database closes.
 	sigc := make(chan os.Signal, 1)
 	signal.Notify(sigc, syscall.SIGINT, syscall.SIGTERM)
 	select {
@@ -180,10 +244,32 @@ func cmdServe(args []string) int {
 		return exitOK
 	case sig := <-sigc:
 		fmt.Fprintf(os.Stderr, "kv: %s, shutting down\n", sig)
+		_ = respSrv.Close()
 		if err := srv.Shutdown(context.Background()); err != nil {
 			return fail(err)
 		}
 		return exitOK
+	}
+}
+
+// parseSync maps a -synchronous flag value to a WAL durability level. The second result is false
+// for the empty string, so an unset flag leaves the database's own default in place rather than
+// forcing one. An unrecognized value is an error so a typo fails loudly instead of silently
+// picking a durability the operator did not ask for.
+func parseSync(s string) (kv.Sync, bool, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "":
+		return kv.SyncFull, false, nil
+	case "off":
+		return kv.SyncOff, true, nil
+	case "normal":
+		return kv.SyncNormal, true, nil
+	case "full":
+		return kv.SyncFull, true, nil
+	case "extra":
+		return kv.SyncExtra, true, nil
+	default:
+		return kv.SyncFull, false, fmt.Errorf("kv serve: unknown -synchronous %q (want off, normal, full, or extra)", s)
 	}
 }
 

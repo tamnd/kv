@@ -73,9 +73,9 @@ Every data command addresses one key: kv has no range scan or ordered iteration.
 
 | Command | Purpose |
 | --- | --- |
-| `serve <db>` | Serve the database over HTTP/JSON and an optional binary protocol. |
+| `serve <db>` | Serve the database over HTTP/JSON, an optional binary protocol, and an optional Redis (RESP) face. |
 
-`serve` carries an extensive set of flags for the listen addresses, authentication, TLS and mTLS, and rate and connection limits. The [server guide](/guides/server/) walks them; the highlights are `--addr` (default `:8480`), `--binary-addr`, `--auth-file` or the `--jwt-*` family, `--tls-cert`/`--tls-key`/`--tls-client-ca`, and the `--max-*` and `--rate*` limits.
+`serve` carries an extensive set of flags for the listen addresses, authentication, TLS and mTLS, and rate and connection limits. The [server guide](/guides/server/) walks them; the highlights are `--addr` (default `:8480`, set to `""` to turn the HTTP face off), `--binary-addr`, `--resp-addr`/`--resp-unixsocket` for the Redis (RESP) face, `--synchronous` to override WAL durability for the run, `--auth-file` or the `--jwt-*` family, `--tls-cert`/`--tls-key`/`--tls-client-ca`, and the `--max-*` and `--rate*` limits.
 
 ## Interactive shell
 

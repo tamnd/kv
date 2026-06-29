@@ -160,7 +160,7 @@ See the [durability guide](https://kv.tamnd.com/guides/durability/).
 
 - **Encryption at rest** with AES-256-GCM and in-place key rotation.
 - **Backup and replication**: consistent online backup, WAL shipping to read replicas, and point-in-time recovery.
-- **A server**: `kv serve` over HTTP/JSON and a pure-Go binary protocol, with token and JWT/OIDC auth, per-prefix authorization, TLS and mTLS, and a change feed.
+- **A server**: `kv serve` over HTTP/JSON, a pure-Go binary protocol, and a Redis (RESP) face an existing Redis client can drive, with token and JWT/OIDC auth, per-prefix authorization, TLS and mTLS, and a change feed.
 - **Observability**: Prometheus metrics, structured logging, and tracing hooks.
 
 The full story is in the [guides](https://kv.tamnd.com/guides/) and the [reference](https://kv.tamnd.com/reference/).
