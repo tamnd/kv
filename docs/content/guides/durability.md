@@ -64,7 +64,7 @@ Checkpointing keeps the WAL in check; vacuum keeps the main file in check. As ke
 reclaimed, err := db.Vacuum(0) // 0 = reclaim everything available
 ```
 
-It is incremental: pass a page budget to bound how much work one call does, so a large reclaim can be spread across several calls without a long pause. For a full rebuild into a fresh, maximally compact file, `kv.Compact` (and `kv vacuum --full` on the CLI) rewrites the database from scratch. You can also set an automatic policy with the `auto_vacuum` setting so space is returned without an explicit call.
+It is incremental: pass a page budget to bound how much work one call does, so a large reclaim can be spread across several calls without a long pause. The space that superseded versions hold inside the f2 log is reclaimed separately, by the engine's background compaction, which folds live records forward and drops the dead tail; `Stats().CompactionScore` reports how much of that work is pending. You can also set an automatic policy with the `auto_vacuum` setting so trailing free pages are returned without an explicit call.
 
 ## When durability is fenced off
 

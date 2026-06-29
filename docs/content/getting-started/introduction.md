@@ -1,18 +1,18 @@
 ---
 title: "Introduction"
-description: "The model behind kv: one file, ACID transactions over ordered keys, and a storage engine you choose rather than inherit."
+description: "The model behind kv: one file, ACID transactions, and a hash-indexed storage core built for fast point lookups."
 weight: 10
 ---
 
-A key/value store is the simplest useful database: keys map to values, and you `Get`, `Set`, and `Delete`. The simplicity is the trap. The moment two writers touch the same data, or a process dies mid-write, or you want every key under a prefix in order, the bare map stops being enough. You start bolting on locks, recovery, and iteration, and you are writing a database without having decided to.
+A key/value store is the simplest useful database: keys map to values, and you `Get`, `Set`, and `Delete`. The simplicity is the trap. The moment two writers touch the same data, or a process dies mid-write, the bare map stops being enough. You start bolting on locks and recovery, and you are writing a database without having decided to.
 
-kv decides to. It is an embedded ordered key/value database for Go, in the lineage of SQLite: not a server you run and connect to, but a library you import and a file on disk. The whole thing is built on four ideas.
+kv decides to. It is an embedded key/value database for Go, in the lineage of SQLite: not a server you run and connect to, but a library you import and a file on disk. The whole thing is built on three ideas.
 
 ## One file, no dependencies
 
 A kv database is a single file, by convention named `app.kv`, with a write-ahead log `app.kv-wal` kept alongside it while the database is open. You can copy it, back it up, or commit a small one to a repository. There is no directory of segments to keep together and no server process to supervise.
 
-The module depends on nothing outside the Go standard library. `go get github.com/tamnd/kv` pulls in no third-party packages, so it adds no transitive supply-chain surface and compiles into one static binary. That constraint is deliberate and it holds all the way down: the B-tree, the LSM tree, the write-ahead log, the encryption, and the server are all written against `os` and `crypto` and nothing else.
+The module depends on nothing outside the Go standard library. `go get github.com/tamnd/kv` pulls in no third-party packages, so it adds no transitive supply-chain surface and compiles into one static binary. That constraint is deliberate and it holds all the way down: the hash index, the hybrid log, the write-ahead log, the encryption, and the server are all written against `os` and `crypto` and nothing else.
 
 ## Transactions, not just operations
 
@@ -40,41 +40,20 @@ For a single key that does not need to agree with any other read, `db.Get([]byte
 
 The default isolation level is snapshot isolation, which is fast and correct for almost everything. When you need the strongest guarantee, open with `WithIsolation(kv.Serializable)` and kv validates read sets at commit, closing the one anomaly (write skew) that snapshot isolation permits. [The transactions guide](/guides/transactions/) goes deeper.
 
-## Keys are ordered
+## Built for point lookups
 
-kv keeps keys in sorted byte order, and that order is part of the contract. It is what makes range and prefix scans natural:
+kv is a point-lookup store. The operations are `Get`, `Set`, `Delete`, `Exists`, and `Merge`, each addressing one key at a time. There is no range scan or ordered iteration: keys are not kept in sorted order, so kv does not promise to walk them in order, and if you need that you keep an index in your own keys or reach for an ordered store instead.
 
-```go
-db.View(func(txn *kv.Txn) error {
-	it, err := txn.NewIterator(kv.IterOptions{Prefix: []byte("user:")})
-	if err != nil {
-		return err
-	}
-	defer it.Close()
-	for it.First(); it.Valid(); it.Next() {
-		fmt.Printf("%s\n", it.Key())
-	}
-	return it.Error()
-})
-```
-
-Because keys are ordered, you can model a lot on top of kv: secondary indexes as key prefixes, time series as sortable timestamps, composite keys that scan hierarchically. An iterator reads from the same kind of stable snapshot a `View` does, so a long scan is never torn by concurrent writes.
-
-## You choose the engine
-
-Storage engines trade off in a way no single design escapes: a B-tree updates data in place, which keeps reads cheap and the file compact but makes random writes do more work, while a log-structured merge (LSM) tree turns writes into fast sequential appends and pays for it later with background compaction and more work per read. Most databases pick one and that is that.
-
-kv makes it a per-database choice behind one option:
+What you get in exchange is a read path that does not slow down as the database grows. Keys live in a sharded hash index over a hybrid log: a get hashes the key, looks it up in the index, and reads one record. The index is split into many shards so concurrent readers and writers rarely contend, and the hot working set stays in memory while the cold tail lives on the log on disk.
 
 ```go
-// The default: a read-optimised B-tree.
-db, _ := kv.Open("reads.kv")
-
-// A write-optimised LSM tree, same API.
-db, _ := kv.Open("writes.kv", kv.WithEngine(kv.LSM))
+v, err := db.Get([]byte("user:1"))
+if errors.Is(err, kv.ErrNotFound) {
+	// the key is not present
+}
 ```
 
-The engine is fixed when the file is created and recorded in its header, so reopening is automatic. Everything above the engine, transactions, iterators, the CLI, the server, is identical either way. [The engines guide](/guides/engines/) explains when to pick which, and the tuning knobs each one exposes.
+The shape rewards workloads that are mostly keyed reads and writes: session stores, caches with durability, per-entity records, counters, and queues addressed by id. Compose keys however you like, but design for lookups by exact key rather than range.
 
 ## More than a library
 

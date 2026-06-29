@@ -15,7 +15,7 @@ kv serve app.kv
 # listening on :8480
 ```
 
-The default address is `:8480`. The server speaks HTTP with JSON bodies: unary requests for the point operations, newline-delimited JSON for scans, and server-sent events for the change feed. Every operation the library offers is available over the wire, so a remote client gets the same get, set, scan, transaction, and watch surface as an in-process one.
+The default address is `:8480`. The server speaks HTTP with JSON bodies: unary requests for the point operations, and server-sent events for the change feed. Every operation the library offers is available over the wire, so a remote client gets the same get, set, transaction, batch, and watch surface as an in-process one.
 
 Alongside HTTP, the server can speak a compact binary protocol, which is opt-in because it listens on a second address:
 
@@ -67,7 +67,6 @@ The server can bound both the size of what it accepts and the load it takes:
 | --- | --- |
 | `--max-key-size`, `--max-value-size` | The largest key and value it will accept. |
 | `--max-batch-ops` | Operations in one batch or transaction. |
-| `--max-scan-limit` | Pairs one scan can return. |
 | `--max-conns` | Open connections per listener. |
 | `--max-in-flight` | Concurrent in-progress requests. |
 | `--rate`, `--rate-burst` | Per-caller request rate and burst. |

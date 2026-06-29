@@ -52,40 +52,12 @@ func (txn *Txn) Exists(key []byte) (bool, error)
 func (txn *Txn) Set(key, value []byte) error
 func (txn *Txn) SetWithTTL(key, value []byte, ttl time.Duration) error
 func (txn *Txn) Delete(key []byte) error
-func (txn *Txn) DeleteRange(lo, hi []byte) error
 func (txn *Txn) Merge(key, operand []byte) error
-func (txn *Txn) NewIterator(opts IterOptions) (*Iterator, error)
 func (txn *Txn) Commit() error
 func (txn *Txn) Discard()
 ```
 
-`Get` returns bytes valid only until the transaction ends; `GetCopy` returns a copy you own past it. `Commit` applies an explicit transaction and may return `ErrConflict`. `Discard` releases the snapshot and is a no-op after a successful `Commit`; always call it, typically with `defer`.
-
-## Iterators
-
-```go
-type IterOptions struct {
-	Lower    []byte // inclusive lower bound; nil means unbounded below
-	Upper    []byte // exclusive upper bound; nil means unbounded above
-	Prefix   []byte // restrict to keys with this prefix
-	Reverse  bool   // iterate high to low
-	KeysOnly bool   // skip value materialization
-}
-
-func (it *Iterator) First() bool
-func (it *Iterator) Last() bool
-func (it *Iterator) Next() bool
-func (it *Iterator) Prev() bool
-func (it *Iterator) SeekGE(key []byte) bool
-func (it *Iterator) SeekLT(key []byte) bool
-func (it *Iterator) Valid() bool
-func (it *Iterator) Key() []byte
-func (it *Iterator) Value() ([]byte, error)
-func (it *Iterator) Error() error
-func (it *Iterator) Close() error
-```
-
-An iterator is snapshot-consistent over a prefix or a `[Lower, Upper)` range, forward or reverse. The cursor methods return whether they landed on a valid position, so `for it.First(); it.Valid(); it.Next()` and `for ok := it.First(); ok; ok = it.Next()` both work. Seek to a key with `SeekGE` (first key at or after) or `SeekLT` (last key before). Check `Error` after the loop for any deferred error, and `Close` when done.
+Every method addresses one key: kv is a point-lookup store with no range scan or ordered iteration. `Get` returns bytes valid only until the transaction ends; `GetCopy` returns a copy you own past it. `Exists` reports presence without materializing the value. `SetWithTTL` writes a value that expires after the given duration. `Merge` records an operand the registered merge operator folds into the value. `Commit` applies an explicit transaction and may return `ErrConflict`. `Discard` releases the snapshot and is a no-op after a successful `Commit`; always call it, typically with `defer`.
 
 ## Snapshots
 
@@ -119,12 +91,11 @@ A `WriteBatch` accumulates writes and flushes them in committed chunks of at mos
 func (db *DB) Checkpoint() error
 func (db *DB) CheckpointMode(m CheckpointMode) error
 func (db *DB) Vacuum(budget int) (int, error)
-func Compact(path string, opts ...Option) error
 func (db *DB) Stats() Stats
 func (db *DB) Check() (*CheckReport, error)
 ```
 
-`Checkpoint` folds the WAL into the main file; `CheckpointMode` does the same with an explicit passive, full, restart, or truncate mode. `Vacuum` returns up to `budget` trailing free pages to the OS (0 means all) and reports how many it reclaimed. `Compact` rewrites a database in place into a fresh, maximally compact file. `Stats` reports space and durability accounting, including per-engine detail like LSM `Levels`, `CompactionScore`, and `Amplification`. `Check` walks the structure and returns a report on its integrity.
+`Checkpoint` folds the WAL into the main file; `CheckpointMode` does the same with an explicit passive, full, restart, or truncate mode. `Vacuum` returns up to `budget` trailing free pages to the OS (0 means all) and reports how many it reclaimed. `Stats` reports space and durability accounting, including `CompactionScore`, the urgency of the most-pending compaction, and `Amplification`, physical bytes over live bytes. `Check` walks the structure and returns a report on its integrity.
 
 ## Backup and replication
 
@@ -156,11 +127,10 @@ func (db *DB) Subscribe(ctx context.Context, prefix []byte, fn func([]Change) er
 
 ## Options
 
-Every option is a function passed to `Open` (or `Compact`). Create-time options are recorded in the file and take effect only when it is created; open-time options apply on every open.
+Every option is a function passed to `Open`. Create-time options are recorded in the file and take effect only when it is created; open-time options apply on every open.
 
 | Option | When | Effect |
 | --- | --- | --- |
-| `WithEngine(EngineKind)` | create | `BTree` (default) or `LSM`. |
 | `WithPageSize(int)` | create | Page size in bytes for a fresh file. |
 | `WithEncryptionKey([]byte)` | create | 32-byte AES-256-GCM master key. |
 | `WithMergeOperator(name, fn)` | create + every open | Registers the associative merge operator. |
@@ -174,16 +144,6 @@ Every option is a function passed to `Open` (or `Compact`). Create-time options 
 | `WithLogger(*slog.Logger)` | open | Structured operational logging. |
 | `WithSlowOpThreshold(time.Duration)` | open | WARN log for ops at or above the threshold (needs `WithLogger`). |
 | `WithTracer(Tracer)` | open | Tracing hooks for OpenTelemetry. |
-| `WithFillFactor(float64)` | open | B-tree target leaf occupancy in (0, 1]. |
-| `WithMaxInlineValue(int)` | open | B-tree inline value cap; larger values overflow. |
-| `WithBtreeBuffers(bool)` | open | B-tree Bε buffered write path. |
-| `WithMemtableSize(int)` | open | LSM memtable flush threshold. |
-| `WithLevelRatio(int)` | open | LSM size multiplier between levels. |
-| `WithFilter(FilterKind)` | open | `FilterBloom` (default) or `FilterRibbon`; LSM only. |
-| `WithRangeIndex(bool)` | open | LSM REMIX scan index. |
-| `WithValueSeparation(int)` | open | LSM WiscKey value-log threshold in bytes. |
-| `WithCompression(bool)` | open | LSM heat-tiered block compression. |
-| `WithColdCompression(bool)` | open | LSM cold-levels-only compression; overrides `WithCompression`. |
 
 ## Errors
 

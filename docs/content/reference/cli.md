@@ -20,45 +20,33 @@ Keys and values are raw bytes. Commands that take or print them accept `--hex` a
 
 | Command | Purpose | Notable flags |
 | --- | --- | --- |
-| `create <db>` | Create a new database file. | `--engine btree\|lsm`, `--page-size N` |
+| `create <db>` | Create a new database file. | `--page-size N` |
 | `get <db> <key>` | Print the value for a key. | `--hex`, `--base64`, `--raw` |
 | `set <db> <key> [value]` | Upsert a key to a value. | `--hex`, `--base64`, `--value-file F` |
 | `del <db> <key>` | Delete one key. | `--hex`, `--base64` |
-| `del-range <db> <lo> <hi>` | Delete every key in `[lo, hi)`. | `--hex`, `--base64` |
 | `exists <db> <key>` | Exit 0 if present, 1 if absent. | `--hex`, `--base64` |
 | `merge <db> <key> <operand>` | Apply the registered merge operator. | `--hex`, `--base64` |
 
-`set` reads its value from `--value-file` when the value is large or binary, instead of from the argument. `get --raw` writes the value bytes with no formatting, for piping.
+Every data command addresses one key: kv has no range scan or ordered iteration. `set` reads its value from `--value-file` when the value is large or binary, instead of from the argument. `get --raw` writes the value bytes with no formatting, for piping.
 
-## Scanning
-
-| Command | Purpose | Notable flags |
-| --- | --- | --- |
-| `scan <db>` | Range or prefix scan. | `--prefix P`, `--from LO`, `--to HI`, `--reverse`, `--limit N`, `--keys-only`, `-f auto\|table\|jsonl\|json\|raw`, `--hex`, `--base64` |
-| `count <db>` | Count keys in a range or prefix. | `--prefix P`, `--from LO`, `--to HI`, `--limit N`, `--hex`, `--base64` |
-
-Use `--prefix` for all keys under a prefix or `--from`/`--to` for an explicit `[LO, HI)` range. The `-f` flag picks the output format: a readable table by default, or machine formats for scripting.
-
-## Moving data
+## Bulk loading
 
 | Command | Purpose | Notable flags |
 | --- | --- | --- |
-| `dump <db>` | Stream all pairs as JSONL. | `--hex`, `--base64` |
 | `load <db>` | Bulk-load JSONL pairs from stdin or a file. | `--input F`, `--hex`, `--base64` |
-| `export <db>` | Export pairs as CSV, TSV, or JSONL. | `--format csv\|tsv\|jsonl`, `--output F`, `--prefix P`, `--from LO`, `--to HI` |
 | `import <db>` | Import pairs from CSV, TSV, or JSONL. | `--format csv\|tsv\|jsonl`, `--input F`, `--key-col N`, `--val-col N`, `--batch N` |
 
-`dump` piped into `load` is the lossless way to copy a database or migrate it between engines. `export`/`import` are for interchange with other tools; `import --batch` bounds the transaction size so a large file loads incrementally.
+`load` reads the JSONL pair stream kv writes and is the efficient path for restoring a known key set. `import` ingests CSV, TSV, or JSONL from other tools; `import --batch` bounds the transaction size so a large file loads incrementally.
 
 ## Maintenance and durability
 
 | Command | Purpose | Notable flags |
 | --- | --- | --- |
 | `checkpoint <db>` | Fold the WAL into the main file. | `--mode passive\|full\|restart\|truncate` |
-| `vacuum <db>` | Return trailing free pages to the OS. | `--full`, `-n pages`, `--incremental` |
+| `vacuum <db>` | Return trailing free pages to the OS. | `-n pages`, `--incremental` |
 | `pragma <db> <name>[=<value>]` | Read or set a configuration knob. | `kv pragma <db> help` lists all |
 
-`vacuum --full` rebuilds the database into a fresh, compact file; `-n` bounds an incremental reclaim. See the [durability guide](/guides/durability/) and the [configuration reference](/reference/configuration/).
+`vacuum` returns trailing free pages to the OS; `-n` bounds how many it reclaims this round, and an empty or zero `-n` reclaims the whole trailing free run. See the [durability guide](/guides/durability/) and the [configuration reference](/reference/configuration/).
 
 ## Backup and replication
 
@@ -75,7 +63,7 @@ Use `--prefix` for all keys under a prefix or `--from`/`--to` for an explicit `[
 
 | Command | Purpose | Notable flags |
 | --- | --- | --- |
-| `info <db>` | Human-readable summary: engine, size, version. | |
+| `info <db>` | Human-readable summary: engine, size, commit version. | |
 | `stats <db>` | Space and durability accounting, as JSON. | |
 | `metrics <db>` | Observability metrics in Prometheus text format. | |
 | `check <db>` | Verify structural integrity. | `-f table\|json` |
@@ -95,12 +83,12 @@ Run `kv <db>` with no subcommand on an existing file to open an interactive sess
 
 ```
 $ kv app.kv
-kv 0.2.0  engine=btree  app.kv
+kv 0.3.0  engine=f2  app.kv
 kv> set user:1 alice
-kv> scan --prefix user:
-kv> .pragma synchronous
+kv> get user:1
+kv> .info
 kv> .help
 kv> .quit
 ```
 
-Data commands work without repeating the filename, and dot-commands (`.pragma`, `.help`, `.quit`, and friends) drive the session.
+Data commands work without repeating the filename, and dot-commands (`.info`, `.stats`, `.help`, `.quit`, and friends) drive the session.

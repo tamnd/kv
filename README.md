@@ -1,7 +1,7 @@
 # kv
 
-An embeddable ordered key/value database for Go.
-One file on disk, zero external dependencies, full ACID transactions, and a choice of B-tree or LSM storage behind a single API.
+An embeddable key/value database for Go.
+One file on disk, zero external dependencies, full ACID transactions, and a storage core built for fast point lookups.
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/tamnd/kv.svg)](https://pkg.go.dev/github.com/tamnd/kv)
 [![Go Report Card](https://goreportcard.com/badge/github.com/tamnd/kv)](https://goreportcard.com/report/github.com/tamnd/kv)
@@ -12,7 +12,7 @@ One file on disk, zero external dependencies, full ACID transactions, and a choi
 kv is what SQLite is for relational data, for keys and values.
 A database is a single file you open with a path and a line of code.
 The import graph is the Go standard library and nothing else.
-Reads and writes run inside real transactions, and you pick a read-optimized B-tree or a write-optimized LSM tree per database with one option, not a fork in the road you cannot walk back.
+Reads and writes run inside real transactions, and every key lookup goes through a sharded hash index over a self-durable log, so a get is a hash and a read, not a tree descent.
 
 ```go
 db, err := kv.Open("app.kv")
@@ -28,17 +28,14 @@ db.Update(func(txn *kv.Txn) error {
 
 ## Why kv
 
-Most embedded key/value stores ask you to choose early and live with it.
-A B-tree is fast to read and slow to write, or an LSM tree is the other way round.
-Many also drag in a tree of dependencies, store a database as a directory of files you cannot move atomically, or hand you a `Get`/`Put` API with no transactions and leave consistency to you.
+Most embedded key/value stores hand you a `Get`/`Put` API with no transactions and leave consistency to you, drag in a tree of dependencies, or store a database as a directory of files you cannot move atomically.
 
 kv takes a different line:
 
 - **One file, zero dependencies.** A database is a single `.kv` file plus a write-ahead log alongside it. The module imports only the standard library, so `go get` adds nothing else to your build.
 - **Real transactions.** `View` and `Update` run closures inside ACID transactions. Snapshot isolation is the default, serializable is one option away, and conflicts retry automatically.
-- **Two engines, one API.** The default B-tree updates in place and is tuned for low read latency. Open with `WithEngine(kv.LSM)` and the same API runs on a log-structured core tuned for write throughput. Nothing else in your code changes.
+- **Built for point lookups.** Keys live in a sharded, mostly lock-free hash index over a hybrid log. A get hashes the key and reads one record, so read latency stays flat as the database grows. Set, get, exists, delete, and merge are the core operations.
 - **Crash-safe by construction.** Every commit goes through a checksummed write-ahead log. After a crash, the next open replays the log and brings the file back to its last committed state. Durability is tunable from one fsync per commit down to none.
-- **Ordered, so you can scan.** Keys are sorted, so range scans, prefix scans, and reverse iteration are first-class. Iterators see a stable snapshot.
 - **More than a library.** The same surface ships as a command-line tool and an HTTP and binary server with auth, TLS, and a change feed, for when you need the database over a socket.
 
 ## Install
@@ -69,6 +66,7 @@ kv requires Go 1.23 or newer.
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log"
 
@@ -100,19 +98,10 @@ func main() {
 	}
 	fmt.Printf("user:1 = %s\n", v)
 
-	// Scan every key under a prefix.
-	db.View(func(txn *kv.Txn) error {
-		it, err := txn.NewIterator(kv.IterOptions{Prefix: []byte("user:")})
-		if err != nil {
-			return err
-		}
-		defer it.Close()
-		for it.First(); it.Valid(); it.Next() {
-			v, _ := it.Value()
-			fmt.Printf("%s = %s\n", it.Key(), v)
-		}
-		return it.Error()
-	})
+	// A missing key is an error you can test for, not a silent zero value.
+	if _, err := db.Get([]byte("user:3")); errors.Is(err, kv.ErrNotFound) {
+		fmt.Println("user:3 not found")
+	}
 }
 ```
 
@@ -124,29 +113,14 @@ The `kv` command is a thin layer over the same library, so a shell script reache
 kv create app.kv
 kv set app.kv user:1 alice
 kv set app.kv user:2 bob
-kv scan app.kv --prefix user:
+kv get app.kv user:1
 ```
 
 ```
-user:1	alice
-user:2	bob
+alice
 ```
 
 Run `kv app.kv` with no subcommand to drop into an interactive shell on the open file, the way `sqlite3 app.db` does.
-
-## Choosing an engine
-
-The engine is fixed when a database is created and remembered in the file, so reopening is automatic.
-
-```go
-db, _ := kv.Open("app.kv")                            // B-tree, the default
-db, _ := kv.Open("ingest.kv", kv.WithEngine(kv.LSM))  // LSM
-```
-
-Reach for the **B-tree** when reads dominate, when you want the smallest file, or when you are not sure.
-Reach for the **LSM tree** when you ingest large volumes of writes, absorb bursts, or run write-heavy and scan-heavy workloads like logs and time series.
-The transactions, iterators, CLI, and server are identical on both.
-See the [engine guide](https://kv.tamnd.com/guides/engines/).
 
 ## Transactions and isolation
 
@@ -196,7 +170,7 @@ The full story is in the [guides](https://kv.tamnd.com/guides/) and the [referen
 The complete documentation lives at **[kv.tamnd.com](https://kv.tamnd.com)**:
 
 - [Getting started](https://kv.tamnd.com/getting-started/): introduction, installation, and a first database in a minute.
-- [Guides](https://kv.tamnd.com/guides/): transactions, engines, durability, encryption, backup and replication, the server, and the command line.
+- [Guides](https://kv.tamnd.com/guides/): transactions, durability, encryption, backup and replication, the server, and the command line.
 - [Reference](https://kv.tamnd.com/reference/): the library API, the CLI, and every configuration option and pragma.
 
 ## License

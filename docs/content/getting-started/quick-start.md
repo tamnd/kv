@@ -1,10 +1,10 @@
 ---
 title: "Quick start"
-description: "From an empty editor to a transactional, ordered key/value database: open it, write in a transaction, read it back, and scan a prefix, in both Go and the CLI."
+description: "From an empty editor to a transactional key/value database: open it, write in a transaction, and read it back, in both Go and the CLI."
 weight: 30
 ---
 
-This walks the core loop twice, once from Go and once from the shell, so you can see that the CLI is the same database the library is. By the end you will have written keys in a transaction, read them back, and scanned a range.
+This walks the core loop twice, once from Go and once from the shell, so you can see that the CLI is the same database the library is. By the end you will have written keys in a transaction and read them back.
 
 ## In Go
 
@@ -14,6 +14,7 @@ This walks the core loop twice, once from Go and once from the shell, so you can
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log"
 
@@ -29,7 +30,7 @@ func main() {
 }
 ```
 
-`Open` creates the file if it does not exist and runs crash recovery if it does, so the same call works the first time and every time after. The default engine is the read-optimised B-tree; pass `kv.WithEngine(kv.LSM)` to create a write-optimised one instead. The choice is fixed at creation and remembered in the file.
+`Open` creates the file if it does not exist and runs crash recovery if it does, so the same call works the first time and every time after. An empty path opens a memory-only database that is discarded on close, which is handy for tests.
 
 ### 2. Write in a transaction
 
@@ -85,33 +86,11 @@ err = db.View(func(txn *kv.Txn) error {
 })
 ```
 
-### 4. Scan a prefix
-
-Because keys are ordered, every key under `user:` is a contiguous range:
-
-```go
-db.View(func(txn *kv.Txn) error {
-	it, err := txn.NewIterator(kv.IterOptions{Prefix: []byte("user:")})
-	if err != nil {
-		return err
-	}
-	defer it.Close()
-	for it.First(); it.Valid(); it.Next() {
-		v, _ := it.Value()
-		fmt.Printf("%s = %s\n", it.Key(), v)
-	}
-	return it.Error()
-})
-```
-
-```
-user:1 = alice
-user:2 = bob
-```
+kv addresses one key at a time: there is no range scan or ordered iteration. To enumerate a set of keys, keep your own list of them under a known key, or track them in your application.
 
 ## At the shell
 
-The same four steps, with no code:
+The same steps, with no code:
 
 ```bash
 # 1. Create the database
@@ -123,29 +102,23 @@ kv set app.kv user:2 bob
 
 # 3. Read one back
 kv get app.kv user:1
-# alice
-
-# 4. Scan the prefix
-kv scan app.kv --prefix user:
 ```
 
 ```
-user:1	alice
-user:2	bob
+alice
 ```
 
 Run `kv app.kv` with no subcommand and you drop into an interactive shell on the open file, the way `sqlite3 app.db` does:
 
 ```
 $ kv app.kv
-kv 0.2.0  engine=btree  app.kv
-kv> scan --prefix user:
-user:1	alice
-user:2	bob
+kv 0.3.0  engine=f2  app.kv
+kv> get user:1
+alice
 kv> .exit
 ```
 
 ## Where to go next
 
-- The [guides](/guides/) cover transactions, choosing an engine, durability, encryption, backup and replication, and running the server.
+- The [guides](/guides/) cover transactions, durability, encryption, backup and replication, and running the server.
 - The [library API reference](/reference/library/) lists every type and method; the [CLI reference](/reference/cli/) lists every command and flag.
