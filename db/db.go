@@ -25,6 +25,8 @@ import (
 	"github.com/tamnd/kv/btree"
 	"github.com/tamnd/kv/crypto"
 	"github.com/tamnd/kv/engine"
+	"github.com/tamnd/kv/f2"
+	"github.com/tamnd/kv/f2engine"
 	"github.com/tamnd/kv/format"
 	"github.com/tamnd/kv/lsm"
 	"github.com/tamnd/kv/pager"
@@ -35,6 +37,13 @@ import (
 // walSuffix is appended to the database path to name its write-ahead log sidecar,
 // matching the SQLite-style "-wal" convention (spec 07).
 const walSuffix = "-wal"
+
+// f2Suffix names the f2 core's self-durable data file, a sidecar next to the main
+// file. The f2 core owns its own log and index snapshot rather than living in the
+// pager's pages, so it persists into its own file; the host still keeps the main file
+// (for the header that records the engine kind) and the WAL (for the committed tail
+// past f2's durable point).
+const f2Suffix = "-f2"
 
 // Options configure a database at open. The zero value is usable: it selects the
 // B-tree core, a 4 KiB page size, and SyncFull durability.
@@ -472,7 +481,7 @@ func create(fs vfs.FS, path string, opts Options) (*DB, error) {
 		pgr.Close()
 		return nil, err
 	}
-	eng, err := newEngine(opts.engineKind(), pgr)
+	eng, err := newEngine(opts.engineKind(), pgr, path, opts.sync())
 	if err != nil {
 		w.Close()
 		pgr.Close()
@@ -508,7 +517,7 @@ func openExisting(fs vfs.FS, path string, opts Options) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	eng, err := newEngine(pgr.Header().Engine, pgr)
+	eng, err := newEngine(pgr.Header().Engine, pgr, path, opts.sync())
 	if err != nil {
 		pgr.Close()
 		return nil, err
@@ -668,8 +677,11 @@ func (d *DB) redo(rec wal.RecoverResult) (uint64, error) {
 	return maxVer, nil
 }
 
-// newEngine constructs the storage core for a kind.
-func newEngine(kind format.EngineKind, pgr *pager.Pager) (engine.Engine, error) {
+// newEngine constructs the storage core for a kind. The pager-backed cores live in the
+// pager's pages; the f2 core is self-durable and persists into its own sidecar file next
+// to the main file, so it takes the database path and the durability level rather than the
+// pager.
+func newEngine(kind format.EngineKind, pgr *pager.Pager, path string, sync wal.Sync) (engine.Engine, error) {
 	switch kind {
 	case format.EngineBTree:
 		return btree.New(pgr), nil
@@ -677,9 +689,25 @@ func newEngine(kind format.EngineKind, pgr *pager.Pager) (engine.Engine, error) 
 		return lsm.New(pgr), nil
 	case format.EngineBeta:
 		return betree.New(pgr), nil
+	case format.EngineF2:
+		return f2engine.New(f2engine.Config{
+			Path:       path + f2Suffix,
+			Durability: f2Durability(sync),
+		})
 	default:
 		return nil, fmt.Errorf("kv: unknown engine kind %d", kind)
 	}
+}
+
+// f2Durability maps the host WAL sync level onto the f2 core's durability. The host WAL is
+// the authority for an acked commit's durability, so f2 only needs to fsync its own file at
+// a checkpoint, which is DurabilityNormal. SyncOff is the one level that opts out of crash
+// durability entirely, so f2 skips its fsync too and runs at DurabilityNone.
+func f2Durability(sync wal.Sync) f2.Durability {
+	if sync == wal.SyncOff {
+		return f2.DurabilityNone
+	}
+	return f2.DurabilityNormal
 }
 
 // Write builds a batch at the next commit version, lets fn populate it, logs and
