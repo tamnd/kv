@@ -56,6 +56,7 @@ package hashlog
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"os"
@@ -237,8 +238,19 @@ type Store struct {
 
 // New builds a Store. It returns an error if the tunables are invalid, when a Dir is
 // set and a shard log file cannot be created, or when a Path is set and the durable
-// file cannot be opened.
+// file cannot be opened. It is NewContext with a background context, so opening a file
+// whose recovery replay is large cannot be cancelled; reach for NewContext when that
+// recovery should honour a deadline.
 func New(t Tunables) (*Store, error) {
+	return NewContext(context.Background(), t)
+}
+
+// NewContext builds a Store like New, threading ctx through recovery so opening a
+// durable file with a large log tail can be cancelled or bounded by a deadline. The
+// context covers recovery replay only; once the store is open it does not retain ctx,
+// and a cancellation after the open has no effect. Cancellation is observed at shard and
+// page boundaries during replay, so it bounds the work rather than aborting mid-record.
+func NewContext(ctx context.Context, t Tunables) (*Store, error) {
 	if t.Shards <= 0 || t.Shards&(t.Shards-1) != 0 {
 		return nil, errors.New("hashlog: Shards must be a power of two")
 	}
@@ -295,7 +307,7 @@ func New(t Tunables) (*Store, error) {
 	// checkpoint plus the durable log tail (doc 05 section 6, D9), before the store
 	// serves a single request. A brand-new file has nothing to recover.
 	if df != nil && df.existed {
-		if err := s.recover(); err != nil {
+		if err := s.recover(ctx); err != nil {
 			s.Close()
 			return nil, err
 		}
@@ -328,7 +340,7 @@ func (s *Store) checkpointLoop() {
 			if s.closed.Load() {
 				return
 			}
-			_ = s.checkpoint()
+			_ = s.checkpoint(context.Background())
 		}
 	}
 }
@@ -369,7 +381,7 @@ func (s *Store) Close() error {
 		// replays only the delta past the cut, not the whole generation. The checkpoint also
 		// flushes and syncs every shard's tail, so it carries the durability the per-shard
 		// flush below would; that flush stays as a cheap barrier.
-		if err := s.checkpoint(); err != nil && first == nil {
+		if err := s.checkpoint(context.Background()); err != nil && first == nil {
 			first = err
 		}
 	}
@@ -673,20 +685,29 @@ func (s *Store) Stats() Stats {
 // store also runs this on a background single-flight goroutine when the byte threshold is
 // crossed (audit L7); this exported call forces one synchronously for tests and operators.
 func (s *Store) Checkpoint() error {
+	return s.CheckpointContext(context.Background())
+}
+
+// CheckpointContext runs a checkpoint like Checkpoint, threading ctx so a checkpoint over
+// a store with many shards can be cancelled or bounded by a deadline. Cancellation is
+// observed between shard captures, before any of this round's work is committed, so a
+// cancelled checkpoint leaves the store exactly as it found it: no snapshot is written and
+// the retired extents stay pending for a later checkpoint to free.
+func (s *Store) CheckpointContext(ctx context.Context) error {
 	if s.df == nil {
 		return errors.New("hashlog: Checkpoint requires durable mode")
 	}
 	if s.closed.Load() {
 		return errors.New("hashlog: Checkpoint on a closed store")
 	}
-	return s.checkpoint()
+	return s.checkpoint(ctx)
 }
 
 // checkpoint is the checkpoint body without the durable-mode and closed guards, shared by
 // the exported Checkpoint, the background loop, and Close. ckptMu makes it single-flight:
 // at most one commit runs at a time, so two triggers never race the snapshot chain or the
 // pendingRetry list the commit rewrites.
-func (s *Store) checkpoint() error {
+func (s *Store) checkpoint(ctx context.Context) error {
 	s.ckptMu.Lock()
 	defer s.ckptMu.Unlock()
 	sections := make([]snapSection, len(s.shards))
@@ -696,6 +717,13 @@ func (s *Store) checkpoint() error {
 	pending := s.pendingRetry
 	s.pendingRetry = nil
 	for i, sh := range s.shards {
+		// Observe cancellation before each shard's cut, while nothing is committed yet: a
+		// cancel here keeps the retired extents pending and returns without writing a
+		// snapshot, so the store is unchanged.
+		if err := ctx.Err(); err != nil {
+			s.pendingRetry = pending
+			return err
+		}
 		var pf []int64
 		var err error
 		sections[i], frontiers[i], pf, err = sh.captureCut()

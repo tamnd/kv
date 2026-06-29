@@ -1,6 +1,7 @@
 package f2
 
 import (
+	"context"
 	"sort"
 	"time"
 )
@@ -39,7 +40,10 @@ import (
 // generation, a gap-truncated tail, an unheadered block) is returned to the free
 // list, so the space a crash mid-compaction stranded is reclaimed on reopen rather
 // than leaked.
-func (s *Store) recover() error {
+func (s *Store) recover(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	start := time.Now()
 	var replayed int64
 	defer func() {
@@ -109,6 +113,12 @@ func (s *Store) recover() error {
 
 	// Pass 2: rebuild each shard's log and index from its active generation.
 	for sid, all := range perShard {
+		// Observe cancellation before each shard's replay: a cancel during recovery stops
+		// the shards that have not started, so a deadline bounds the open rather than
+		// replaying every shard's log tail regardless.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if activeGen[sid] < 0 {
 			continue // no committed generation: no page 0 reached disk
 		}
@@ -206,6 +216,12 @@ func (s *Store) recover() error {
 		// frontier page instead starts at the frontier, a record boundary inside it.
 		lastWithin := int64(blocks[n-1].hdrLen)
 		for pi := replayPage; pi < n; pi++ {
+			// Observe cancellation per page so a long replay over a large delta honours a
+			// deadline. One check per page is off the per-record path, so it costs nothing
+			// on a normal recovery.
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			ref := d.refs[pi].Load()
 			buf := ref.mem
 			if buf == nil {
