@@ -412,3 +412,86 @@ func BenchmarkStats(b *testing.B) {
 		}
 	}
 }
+
+// benchCrash stops the background checkpoint loop and drops the file descriptor with no
+// clean-close checkpoint, leaving the file exactly as the last committed checkpoint and the
+// flushed tails left it. It is the benchmark's crash: the next New recovers that file.
+func benchCrash(s *Store) {
+	if s.bgStop != nil {
+		s.closed.Store(true)
+		close(s.bgStop)
+		s.bgWG.Wait()
+	}
+	_ = s.df.f.Close()
+}
+
+// prepareRecoveryFile writes a high-overwrite store to disk and crashes it, leaving a file a
+// later New must recover. With checkpoint set, a final snapshot is committed after the
+// writes, so recovery installs each shard's index from the cut and replays only the empty
+// tail; without it, no snapshot covers the writes and recovery replays every record of the
+// generation. This is the operability difference the background checkpoint (audit L7) gives
+// an operator for free: a long-lived durable store checkpoints itself, so its recovery stays
+// delta-bound instead of growing with the whole operation history.
+func prepareRecoveryFile(b *testing.B, keys, overwrites int, checkpoint bool) Tunables {
+	b.Helper()
+	tn := Tunables{
+		Shards:                64,
+		PageSize:              4096,
+		ExtentSize:            4096,
+		ResidentPagesPerShard: 4,
+		Path:                  filepath.Join(b.TempDir(), "rec.hlog"),
+		Durability:            DurabilityNone,
+	}
+	s, err := New(tn)
+	if err != nil {
+		b.Fatalf("New: %v", err)
+	}
+	v := benchValue(64)
+	for o := 0; o <= overwrites; o++ {
+		for i := 0; i < keys; i++ {
+			if err := s.Set(benchKey(i), v); err != nil {
+				b.Fatalf("Set: %v", err)
+			}
+		}
+	}
+	if checkpoint {
+		if err := s.Checkpoint(); err != nil {
+			b.Fatalf("Checkpoint: %v", err)
+		}
+	}
+	for _, sh := range s.shards { // flush tails so the crash keeps every record on disk
+		sh.mu.Lock()
+		_ = sh.flushDurable(true)
+		sh.mu.Unlock()
+	}
+	benchCrash(s)
+	return tn
+}
+
+// benchmarkRecover times New over a prepared file. Each iteration recovers, then crashes
+// the fd without a clean close so the file is byte-identical for the next iteration: every
+// reopen does the same recovery work. The history and delta variants share the same record
+// count, so the gap is exactly what the checkpoint removes from recovery.
+func benchmarkRecover(b *testing.B, checkpoint bool) {
+	tn := prepareRecoveryFile(b, 20000, 10, checkpoint) // 220k records over 20k live keys
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		s, err := New(tn)
+		if err != nil {
+			b.Fatalf("New: %v", err)
+		}
+		b.StopTimer()
+		benchCrash(s)
+		b.StartTimer()
+	}
+}
+
+// BenchmarkRecoverHistory recovers a file with no covering checkpoint: every record of the
+// generation is decoded and reinserted, the cost the checkpoint exists to remove.
+func BenchmarkRecoverHistory(b *testing.B) { benchmarkRecover(b, false) }
+
+// BenchmarkRecoverDelta recovers the same file with a committed checkpoint: the index is
+// installed from the cut and only the tail past the frontier is replayed, so recovery is
+// bounded by the live key count rather than the operation history.
+func BenchmarkRecoverDelta(b *testing.B) { benchmarkRecover(b, true) }

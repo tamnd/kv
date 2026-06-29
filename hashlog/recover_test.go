@@ -148,7 +148,15 @@ func TestM5ReopenWithCheckpoint(t *testing.T) {
 		put(i)
 	}
 
-	s2 := reopen(t, s, tun)
+	// Crash rather than close cleanly: a clean close would write a final checkpoint that
+	// captures the delta too, leaving nothing to replay. Crashing after the explicit
+	// checkpoint forces recovery to replay exactly the post-checkpoint delta this measures.
+	// Under Full every delta write is already synced, so the crash loses none of them.
+	crash(t, s)
+	s2, err := New(tun)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
 	defer s2.Close()
 	assertStoreMatches(t, s2, m)
 

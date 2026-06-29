@@ -169,9 +169,10 @@ func TestM4CheckpointCommitFlipsGeneration(t *testing.T) {
 		}
 	}
 	wantGen := s.df.sb.generation
-	if err := s.Close(); err != nil {
-		t.Fatal(err)
-	}
+	// Crash rather than close cleanly: a clean close would write one more checkpoint and
+	// bump the generation past the explicit count this test asserts. Under Full the
+	// explicit checkpoints are already synced, so the crash preserves their on-disk state.
+	crash(t, s)
 
 	// Reopen: the committed generation survives.
 	s2, err := New(ckptTunables(path, DurabilityFull))
@@ -228,9 +229,10 @@ func TestM4TornNewSlotFallsBack(t *testing.T) {
 	newerSlot := s.df.newerSlot
 	slotSize := s.df.slotSize
 	priorSnapRoot := s.df.sb.snapshotRoot
-	if err := s.Close(); err != nil {
-		t.Fatal(err)
-	}
+	// Crash rather than close cleanly: a clean close would write a third checkpoint into
+	// the other slot and flip newerSlot, so the slot this test tears below would no longer
+	// be the newest one. The crash leaves the two explicit checkpoints exactly as committed.
+	crash(t, s)
 
 	// Tear the newer slot: flip a byte inside it so its CRC fails, modelling a crash
 	// that interrupted the superblock write before it completed.

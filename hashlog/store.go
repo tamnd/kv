@@ -215,8 +215,24 @@ type Store struct {
 	// free this round (a commit error, or the inline free list was full, doc 06 section
 	// 7.3). The next checkpoint retries them. They stay holes in their shard's directory
 	// until freed, so they are not leaked and not reused early. Touched only by
-	// Checkpoint, which is not called concurrently with itself.
+	// checkpoint, which ckptMu keeps single-flight.
 	pendingRetry []int64
+
+	// Background checkpoint (audit L7). A durable store with a byte threshold runs its
+	// checkpoint off the write path: the SET or DELETE that crosses CheckpointBytes pokes
+	// ckptSig instead of running the whole flush-and-snapshot itself, so no single writer
+	// pays the periodic checkpoint cost. ckptSig is depth 1, so many crossings between two
+	// checkpoints coalesce into one queued run (single-flight). ckptMu serializes the
+	// background loop, an explicit Checkpoint, and the close-time checkpoint so two commits
+	// never race the snapshot chain or pendingRetry. bgStop stops the loop and bgWG waits
+	// for it to exit before Close touches the file. closed makes Close idempotent and lets
+	// the loop and Checkpoint bail out once the store is closing. All stay zero or nil on
+	// the memory-only profile, which has no df and starts no loop.
+	ckptMu  sync.Mutex
+	ckptSig chan struct{}
+	bgStop  chan struct{}
+	bgWG    sync.WaitGroup
+	closed  atomic.Bool
 }
 
 // New builds a Store. It returns an error if the tunables are invalid, when a Dir is
@@ -284,13 +300,79 @@ func New(t Tunables) (*Store, error) {
 			return nil, err
 		}
 	}
+	// A durable store runs its checkpoint on a background single-flight goroutine (audit
+	// L7). validateDurableTunables defaults CheckpointBytes to a non-zero value, so every
+	// durable store starts the loop; the memory-only profile has no df and never does.
+	if df != nil && s.t.CheckpointBytes > 0 {
+		s.ckptSig = make(chan struct{}, 1)
+		s.bgStop = make(chan struct{})
+		s.bgWG.Add(1)
+		go s.checkpointLoop()
+	}
 	return s, nil
+}
+
+// checkpointLoop runs a checkpoint whenever the write path signals the byte threshold was
+// crossed, until Close stops it. Keeping the checkpoint off the crossing SET removes the
+// periodic latency spike an inline checkpoint would put on one unlucky writer (audit L7).
+// A failed background checkpoint is dropped, the same as a failed background compaction in
+// the f2 engine: a checkpoint only bounds recovery replay, it never acknowledges a write,
+// so a miss costs replay time and nothing else, and the next crossing pokes a retry.
+func (s *Store) checkpointLoop() {
+	defer s.bgWG.Done()
+	for {
+		select {
+		case <-s.bgStop:
+			return
+		case <-s.ckptSig:
+			if s.closed.Load() {
+				return
+			}
+			_ = s.checkpoint()
+		}
+	}
+}
+
+// signalCheckpoint pokes the background loop when the durable bytes appended since the last
+// checkpoint have crossed the threshold. The send is non-blocking on a depth-1 channel, so
+// the crossing writer never waits and repeated crossings coalesce into one queued run. The
+// counter is reset to zero by the checkpoint commit, not here, so the threshold keeps
+// signalling until a checkpoint actually lands.
+func (s *Store) signalCheckpoint() {
+	if s.ckptSig == nil {
+		return
+	}
+	if s.df.bytesSinceCkpt.Load() >= s.t.CheckpointBytes {
+		select {
+		case s.ckptSig <- struct{}{}:
+		default:
+		}
+	}
 }
 
 // Close releases every shard's log file and, in durable mode, the single file. The
 // Store must not be used afterward.
 func (s *Store) Close() error {
+	if s.closed.Swap(true) {
+		return nil // idempotent: a second Close is a no-op, not a double free
+	}
 	var first error
+	// Stop the background checkpoint loop and wait for it to exit before touching the file,
+	// so the final checkpoint below never races a background one. bgStop is non-nil only for
+	// a store that opened successfully (the loop starts after recovery), so a Close that
+	// follows a failed open skips both the wait and the final checkpoint and keeps the old
+	// flush-only path.
+	if s.bgStop != nil {
+		close(s.bgStop)
+		s.bgWG.Wait()
+		// A clean close writes a final index snapshot so the reopen installs the index and
+		// replays only the delta past the cut, not the whole generation. The checkpoint also
+		// flushes and syncs every shard's tail, so it carries the durability the per-shard
+		// flush below would; that flush stays as a cheap barrier.
+		if err := s.checkpoint(); err != nil && first == nil {
+			first = err
+		}
+	}
 	// A clean close must leave the whole acknowledged workload durable (doc 05 section 8):
 	// for a clean close the recovered set equals the entire live set. Under Normal the tail
 	// page is synced only at a seal or a checkpoint, so the records appended since the last
@@ -330,14 +412,22 @@ func (s *Store) shardFor(key []byte) *shard {
 // Set stores value under key, replacing any previous value. The value bytes are
 // copied into the log, so the caller may reuse the slice after Set returns.
 func (s *Store) Set(key, value []byte) error {
-	return s.shardFor(key).set(key, value)
+	if err := s.shardFor(key).set(key, value); err != nil {
+		return err
+	}
+	s.signalCheckpoint()
+	return nil
 }
 
 // Delete removes key. It is a no-op if the key is absent. The log record is left
 // in place as garbage for a later compaction to reclaim; only the index entry is
 // dropped, so the key reads back as absent immediately.
 func (s *Store) Delete(key []byte) error {
-	return s.shardFor(key).delete(key)
+	if err := s.shardFor(key).delete(key); err != nil {
+		return err
+	}
+	s.signalCheckpoint()
+	return nil
 }
 
 // Get returns the value stored under key. found is false if the key is absent. In
@@ -432,8 +522,11 @@ func (s *Store) CheckpointStats() CheckpointStats {
 	if s.df == nil {
 		return CheckpointStats{}
 	}
+	// Read the generation through its atomic mirror, not the sb pointer: the background
+	// checkpoint loop (audit L7) reassigns sb off any lock, so a concurrent CheckpointStats
+	// call must not touch sb directly. gen advances in lockstep with every sb assignment.
 	return CheckpointStats{
-		Generation:           s.df.sb.generation,
+		Generation:           s.df.gen.Load(),
 		SnapshotBytes:        uint64(s.df.snapBytes.Load()),
 		BytesSinceCheckpoint: s.df.bytesSinceCkpt.Load(),
 	}
@@ -574,12 +667,26 @@ func (s *Store) Stats() Stats {
 // Checkpoint writes a durable index snapshot and commits it through the superblock
 // double-slot (doc 05 section 4, D8). It captures each shard's consistent cut, writes
 // the snapshot extents and fsyncs them, then flips the superblock generation in one
-// barrier, the atomic commit point. It is a no-op error in memory-only mode. M4
-// provides the explicit call; a background cadence scheduler is a later milestone.
+// barrier, the atomic commit point. It is a no-op error in memory-only mode. A durable
+// store also runs this on a background single-flight goroutine when the byte threshold is
+// crossed (audit L7); this exported call forces one synchronously for tests and operators.
 func (s *Store) Checkpoint() error {
 	if s.df == nil {
 		return errors.New("hashlog: Checkpoint requires durable mode")
 	}
+	if s.closed.Load() {
+		return errors.New("hashlog: Checkpoint on a closed store")
+	}
+	return s.checkpoint()
+}
+
+// checkpoint is the checkpoint body without the durable-mode and closed guards, shared by
+// the exported Checkpoint, the background loop, and Close. ckptMu makes it single-flight:
+// at most one commit runs at a time, so two triggers never race the snapshot chain or the
+// pendingRetry list the commit rewrites.
+func (s *Store) checkpoint() error {
+	s.ckptMu.Lock()
+	defer s.ckptMu.Unlock()
 	sections := make([]snapSection, len(s.shards))
 	frontiers := make([]shardFrontier, len(s.shards))
 	// Extents compaction retired and a prior checkpoint could not yet durably free are
