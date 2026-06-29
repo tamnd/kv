@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/tamnd/kv/format"
 	"github.com/tamnd/kv/vfs"
 )
 
@@ -19,23 +20,27 @@ var backupMagic = [8]byte{'K', 'V', 'B', 'A', 'C', 'K', 'U', 'P'}
 
 // backupFormatVersion is the container layout version, bumped if the header or section
 // order ever changes so an old reader rejects a new container instead of misparsing it.
-const backupFormatVersion uint32 = 1
+// Version 2 added the f2 sidecar section after the WAL.
+const backupFormatVersion uint32 = 2
 
 // backupHeaderSize is the fixed prefix: magic(8) + formatVersion(4) + pageSize(4) +
-// pageCount(4) + dbVersion(8) + walLen(8).
-const backupHeaderSize = 8 + 4 + 4 + 4 + 8 + 8
+// pageCount(4) + dbVersion(8) + walLen(8) + sidecarLen(8).
+const backupHeaderSize = 8 + 4 + 4 + 4 + 8 + 8 + 8
 
 // ErrBackupFormat means a stream handed to RestoreBackup is not a kv backup container, or
 // is a version this build does not understand, or is truncated. It is the loud refusal that
 // keeps a restore from writing a half-formed database from a corrupt or foreign stream.
 var ErrBackupFormat = errors.New("kv: not a valid backup stream")
 
-// backupHeader is the decoded container prefix.
+// backupHeader is the decoded container prefix. sidecarLen is the length of the f2 core's
+// self-durable file copied after the WAL; it is zero for the pager-backed cores, which keep
+// all their state in the main pages.
 type backupHeader struct {
-	pageSize  uint32
-	pageCount uint32
-	dbVersion uint64
-	walLen    uint64
+	pageSize   uint32
+	pageCount  uint32
+	dbVersion  uint64
+	walLen     uint64
+	sidecarLen uint64
 }
 
 func (h backupHeader) encode() []byte {
@@ -46,6 +51,7 @@ func (h backupHeader) encode() []byte {
 	binary.BigEndian.PutUint32(b[16:20], h.pageCount)
 	binary.BigEndian.PutUint64(b[20:28], h.dbVersion)
 	binary.BigEndian.PutUint64(b[28:36], h.walLen)
+	binary.BigEndian.PutUint64(b[36:44], h.sidecarLen)
 	return b
 }
 
@@ -60,10 +66,11 @@ func decodeBackupHeader(b []byte) (backupHeader, error) {
 		return backupHeader{}, fmt.Errorf("%w: unsupported format version %d", ErrBackupFormat, binary.BigEndian.Uint32(b[8:12]))
 	}
 	return backupHeader{
-		pageSize:  binary.BigEndian.Uint32(b[12:16]),
-		pageCount: binary.BigEndian.Uint32(b[16:20]),
-		dbVersion: binary.BigEndian.Uint64(b[20:28]),
-		walLen:    binary.BigEndian.Uint64(b[28:36]),
+		pageSize:   binary.BigEndian.Uint32(b[12:16]),
+		pageCount:  binary.BigEndian.Uint32(b[16:20]),
+		dbVersion:  binary.BigEndian.Uint64(b[20:28]),
+		walLen:     binary.BigEndian.Uint64(b[28:36]),
+		sidecarLen: binary.BigEndian.Uint64(b[36:44]),
 	}, nil
 }
 
@@ -73,6 +80,12 @@ func decodeBackupHeader(b []byte) (backupHeader, error) {
 // WAL section is whatever frames the engine still needs past its durable point, an empty log
 // for the B-tree core and the kept tail for the LSM core. The result restores with
 // RestoreBackup into a database that opens directly and passes Check.
+//
+// The f2 core is self-durable: its state lives in a sidecar file beside the main one, not in
+// the main pages. For an f2 database the image carries that sidecar verbatim after the WAL,
+// so the restore is the sidecar plus the kept WAL tail, exactly the pair f2 recovers from on
+// a normal reopen. The bytes are copied as they sit on disk, so a sealed sidecar stays
+// sealed in the backup and the same key restores it.
 //
 // Backup runs under the database's write lock for its duration, so it serializes with the
 // single writer: writers wait while the image is copied. This is the simple, always-correct
@@ -103,12 +116,23 @@ func (d *DB) Backup(w io.Writer) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
+	// The f2 core keeps its state in its own file, so copy it whole after the checkpoint.
+	// The write lock is held, so no writer is dirtying it and the on-disk bytes are the
+	// complete image at this version.
+	var sidecar []byte
+	if d.pgr.Header().Engine == format.EngineF2 {
+		sidecar, err = d.readF2Sidecar()
+		if err != nil {
+			return 0, err
+		}
+	}
 
 	hdr := backupHeader{
-		pageSize:  uint32(pageSize),
-		pageCount: pageCount,
-		dbVersion: dbVersion,
-		walLen:    uint64(len(walImg)),
+		pageSize:   uint32(pageSize),
+		pageCount:  pageCount,
+		dbVersion:  dbVersion,
+		walLen:     uint64(len(walImg)),
+		sidecarLen: uint64(len(sidecar)),
 	}
 	if _, err := w.Write(hdr.encode()); err != nil {
 		return 0, err
@@ -129,7 +153,32 @@ func (d *DB) Backup(w io.Writer) (uint64, error) {
 	if _, err := w.Write(walImg); err != nil {
 		return 0, err
 	}
+	if _, err := w.Write(sidecar); err != nil {
+		return 0, err
+	}
 	return dbVersion, nil
+}
+
+// readF2Sidecar reads the f2 core's self-durable file whole, for the backup image. The
+// caller holds the write lock and has just checkpointed, so the file is stable and complete
+// at the backup version. The bytes are copied verbatim, so a sealed sidecar stays sealed.
+func (d *DB) readF2Sidecar() ([]byte, error) {
+	f, err := d.fs.Open(d.path+f2Suffix, vfs.OpenReadWrite)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	size, err := f.Size()
+	if err != nil {
+		return nil, err
+	}
+	buf := make([]byte, size)
+	if size > 0 {
+		if _, err := f.ReadAt(buf, 0); err != nil {
+			return nil, err
+		}
+	}
+	return buf, nil
 }
 
 // RestoreBackup reconstructs a database from a stream produced by Backup, writing the main
@@ -138,19 +187,9 @@ func (d *DB) Backup(w io.Writer) (uint64, error) {
 // clobbers, so a mistaken target fails loudly instead of destroying a live database. The
 // restored pair is byte-identical to the source at the backup version, so opening it yields
 // the same engine, format, and contents; an encrypted backup restores to an encrypted
-// database that needs the original key.
+// database that needs the original key. An f2 backup also restores its sidecar file, so the
+// self-durable core opens from the same pair it was backed up from.
 func RestoreBackup(fs vfs.FS, path string, r io.Reader) error {
-	walPath := path + walSuffix
-	for _, p := range []string{path, walPath} {
-		exists, err := fs.Exists(p)
-		if err != nil {
-			return err
-		}
-		if exists {
-			return fmt.Errorf("kv: refusing to restore over existing file %s", p)
-		}
-	}
-
 	hb := make([]byte, backupHeaderSize)
 	if _, err := io.ReadFull(r, hb); err != nil {
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
@@ -161,6 +200,23 @@ func RestoreBackup(fs vfs.FS, path string, r io.Reader) error {
 	hdr, err := decodeBackupHeader(hb)
 	if err != nil {
 		return err
+	}
+
+	// A restore creates, it never clobbers, so refuse if any target file already exists. The
+	// sidecar is only in play when the container carries one.
+	walPath := path + walSuffix
+	targets := []string{path, walPath}
+	if hdr.sidecarLen > 0 {
+		targets = append(targets, path+f2Suffix)
+	}
+	for _, p := range targets {
+		exists, err := fs.Exists(p)
+		if err != nil {
+			return err
+		}
+		if exists {
+			return fmt.Errorf("kv: refusing to restore over existing file %s", p)
+		}
 	}
 
 	main, err := fs.Open(path, vfs.OpenReadWrite|vfs.OpenCreate|vfs.OpenExclusive)
@@ -192,7 +248,28 @@ func RestoreBackup(fs vfs.FS, path string, r io.Reader) error {
 		walFile.Close()
 		return err
 	}
-	return walFile.Close()
+	if err := walFile.Close(); err != nil {
+		return err
+	}
+
+	// The f2 sidecar, when the container carries one. Written last so a torn stream fails
+	// before the self-durable file exists, leaving nothing half-formed for Open to find.
+	if hdr.sidecarLen == 0 {
+		return nil
+	}
+	sidecar, err := fs.Open(path+f2Suffix, vfs.OpenReadWrite|vfs.OpenCreate|vfs.OpenExclusive)
+	if err != nil {
+		return err
+	}
+	if err := streamInto(sidecar, r, int64(hdr.sidecarLen)); err != nil {
+		sidecar.Close()
+		return err
+	}
+	if err := sidecar.Sync(vfs.SyncFull); err != nil {
+		sidecar.Close()
+		return err
+	}
+	return sidecar.Close()
 }
 
 // streamInto copies exactly n bytes from r into f at increasing offsets, in page-sized
