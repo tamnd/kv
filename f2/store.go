@@ -314,6 +314,7 @@ func newDurable(t Tunables) (*Store, error) {
 		ckptBytes:  ckpt,
 	}
 	df := &durableFile{f: f, pageSize: int64(t.PageSize), shards: t.Shards, dial: t.Durability, snapRoot: -1}
+	df.gcCond = sync.NewCond(&df.smu)
 	s.df = df
 	s.ep = newEpochs()
 

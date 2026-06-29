@@ -88,12 +88,71 @@ type durableFile struct {
 	syncCount atomic.Int64
 	syncNanos atomic.Int64
 	syncHook  func(*os.File) error
+
+	// Group commit (audit L4). Under the Full dial every shard fsyncs the shared file
+	// once per record, yet one device barrier flushes every shard's pending writes, so
+	// a caller that arrives while a barrier is in flight joins one batch and shares the
+	// next barrier rather than issuing its own. smu and gcCond guard the batch state and
+	// are independent of mu, so writeSuperblock can still sync while holding mu. syncing
+	// is true while a batch's leader runs the barrier; cur is the batch accepting joiners,
+	// nil when none is pending.
+	smu     sync.Mutex
+	gcCond  *sync.Cond
+	syncing bool
+	cur     *syncBatch
 }
 
-// sync issues a device barrier and records its count and wall time. Every barrier in
-// the durable path routes through here so the fsync accounting is complete. It takes
-// no lock, so writeSuperblock (which holds d.mu) can call it without deadlocking.
+// syncBatch is one group-commit batch: the writers whose records a single device
+// barrier flushes together. The batch's leader runs the one barrier, stores its
+// error, marks it done, and wakes the rest, each of which returns this batch's
+// error. Each caller captures its batch by pointer on entry, so a later batch's
+// error never aliases onto an earlier batch's waiters.
+type syncBatch struct {
+	err  error
+	done bool
+}
+
+// sync flushes the file to the device, coalescing concurrent callers into one
+// barrier. A caller joins the batch currently accepting joiners (creating it if
+// none) and either leads it, issuing the single barrier that covers everyone in the
+// batch, or waits for its leader. The leader detaches the batch under smu before
+// starting the barrier, and every batched record's WriteAt completed before its
+// writer entered sync, so the barrier is guaranteed to start after every write it is
+// meant to flush. This turns N shards fsyncing per record under the Full dial into
+// far fewer device barriers without weakening the durability any caller is promised.
+// It takes only smu, never mu, so writeSuperblock (which holds mu) can call it.
 func (d *durableFile) sync() error {
+	d.smu.Lock()
+	if d.cur == nil {
+		d.cur = &syncBatch{}
+	}
+	b := d.cur
+	for !b.done {
+		if d.syncing {
+			d.gcCond.Wait()
+			continue
+		}
+		// Become the leader for this batch. Detach it so callers arriving during the
+		// barrier form the next batch, then run the one barrier without holding smu.
+		d.syncing = true
+		d.cur = nil
+		d.smu.Unlock()
+		err := d.barrier()
+		d.smu.Lock()
+		b.err = err
+		b.done = true
+		d.syncing = false
+		d.gcCond.Broadcast()
+	}
+	err := b.err
+	d.smu.Unlock()
+	return err
+}
+
+// barrier issues one device barrier and records its count and wall time. Every
+// barrier in the durable path routes through here so the fsync accounting is
+// complete. It takes no lock, so the group-commit leader runs it with smu released.
+func (d *durableFile) barrier() error {
 	d.syncCount.Add(1)
 	start := time.Now()
 	var err error
