@@ -25,6 +25,26 @@ kv serve app.kv --addr :8480 --binary-addr :8481
 
 The binary protocol is pure Go with no external dependencies and adds interactive transactions, a session that interleaves reads and writes across several round trips, which the stateless HTTP path does not. Use HTTP for reach and tooling, the binary protocol for throughput and interactive sessions.
 
+## The Redis face
+
+kv can also speak the Redis wire protocol, so an existing Redis client, library, or benchmark can drive it without code changes. It is opt-in, on its own address or a unix socket:
+
+```bash
+kv serve app.kv --addr "" --resp-addr :6380
+redis-cli -p 6380 set greeting hello
+redis-cli -p 6380 get greeting
+```
+
+Setting `--addr ""` turns the HTTP face off, for a server meant to speak only Redis; leave it set to run both at once over one database. The Redis face is a front end over the same writer as HTTP and the binary protocol, so the three share one keyspace: a `SET` over Redis is readable as a `get` over HTTP. Each write is a full kv transaction, so the Redis face inherits kv's durability and MVCC rather than adding a second storage model.
+
+It implements the string commands a client and a benchmark use: `GET`, `SET`, `DEL`, `EXISTS`, `PING`, the `HELLO` handshake (RESP2 and RESP3), `DBSIZE`, and the introspection commands a client issues at connect. It is the string keyspace only, with no sorted iteration, lists, hashes, or expiry. `--synchronous` overrides the WAL durability for the run, which a benchmark uses to compare write paths with the per-commit fsync removed:
+
+```bash
+kv serve app.kv --addr "" --resp-unixsocket /tmp/kv.sock --synchronous off
+```
+
+The wire loop is adapted from the minimal RESP front end in [tamnd/aki](https://github.com/tamnd/aki), reworked over kv's transactional API.
+
 ## Securing it
 
 The server defaults to safe: it refuses to serve a non-loopback address in plaintext, so you cannot accidentally expose an unencrypted, unauthenticated database to the network. To serve off-host you either turn on TLS or, for a deliberately open setup on a trusted network, pass `--insecure`.
