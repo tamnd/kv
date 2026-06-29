@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"github.com/tamnd/kv/engine"
 	"github.com/tamnd/kv/f2"
@@ -52,6 +53,19 @@ type Engine struct {
 	// concurrent maintenance pass that rewrites the same group.
 	mu    sync.Mutex
 	merge func(existing, operand []byte) []byte
+
+	// pendingLSN is the WAL LSN the host announced for the next batch through NoteLSN.
+	// The host calls NoteLSN then Apply on the same goroutine, so Apply reads it without
+	// a lock and promotes it to appliedLSN once the batch's writes have landed.
+	pendingLSN uint64
+	// appliedLSN is the highest WAL LSN whose batch has fully landed in the store. Apply
+	// stores it under mu after the writes succeed, so a reader that takes mu sees only
+	// batches whose writes are complete. DurableLSN and Flush read it.
+	appliedLSN atomic.Uint64
+	// durableLSN is the highest WAL LSN whose effects a Checkpoint has fsynced into the
+	// f2 file. The host folds the WAL no further than this and replays the tail past it on
+	// the next open, so f2 owns its persistence while the host keeps the unflushed tail.
+	durableLSN atomic.Uint64
 }
 
 // New opens an f2 engine with the given configuration.
@@ -121,6 +135,10 @@ func (e *Engine) Apply(batch *engine.WriteBatch, commitVersion uint64) error {
 			return err
 		}
 	}
+	// All writes for this batch have landed, so the LSN the host announced for it is now
+	// applied. Storing it under mu means Flush, which also takes mu, never reads an LSN
+	// whose writes are still in flight.
+	e.appliedLSN.Store(e.pendingLSN)
 	return nil
 }
 
@@ -228,14 +246,54 @@ func (e *Engine) Reclaim(budget int) (int, error) { return 0, nil }
 // in-memory index for the host to ask it to rebuild after WAL replay.
 func (e *Engine) RecoverFinished(lastVersion uint64) error { return nil }
 
-// Checkpoint flushes the f2 store to its durable layout. The host calls it where it would
-// checkpoint a pager-backed core, so f2 owns its persistence. It is a no-op in memory-only
-// mode.
-func (e *Engine) Checkpoint() error { return e.s.Checkpoint() }
+// Checkpoint flushes the f2 store to its durable layout and advances the durable LSN to
+// the last applied batch. The host drives durability through Flush in its checkpoint path;
+// this method is the same fold for a direct caller or a test. It is a no-op in memory-only
+// mode, where there is nothing to fsync.
+func (e *Engine) Checkpoint() error { return e.checkpoint(nil) }
 
 // CheckpointContext is Checkpoint threaded with a context so a large checkpoint can be
 // bounded or cancelled.
-func (e *Engine) CheckpointContext(ctx context.Context) error { return e.s.CheckpointContext(ctx) }
+func (e *Engine) CheckpointContext(ctx context.Context) error { return e.checkpoint(ctx) }
+
+// checkpoint folds the store and records how far the fold reached. It reads the applied
+// mark under mu first, so the recorded durable LSN never runs ahead of a batch whose writes
+// are still in flight; the store fold that follows persists at least every batch up to that
+// mark, so the mark is a safe lower bound on what is now durable. A batch that commits
+// during the fold lands at a higher LSN and is simply kept in the host WAL for the next
+// open, never lost.
+func (e *Engine) checkpoint(ctx context.Context) error {
+	e.mu.Lock()
+	reached := e.appliedLSN.Load()
+	e.mu.Unlock()
+	var err error
+	if ctx == nil {
+		err = e.s.Checkpoint()
+	} else {
+		err = e.s.CheckpointContext(ctx)
+	}
+	if err != nil {
+		return err
+	}
+	e.durableLSN.Store(reached)
+	return nil
+}
+
+// Flush implements the host's self-durable seam: it persists every applied batch into the
+// f2 file and advances the durable LSN. The host calls it at the start of a checkpoint,
+// before it folds the WAL, so the WAL is reclaimed no further than f2's durable point.
+func (e *Engine) Flush() error { return e.checkpoint(nil) }
+
+// NoteLSN records the WAL LSN the host assigned to the next batch. The host calls it on the
+// same goroutine just before Apply, on both the live commit and the redo path, so Apply can
+// promote it to the applied mark once the batch lands.
+func (e *Engine) NoteLSN(lsn uint64) { e.pendingLSN = lsn }
+
+// DurableLSN reports the highest WAL LSN whose effects are fsynced into the f2 file. The
+// host folds the WAL no further than this and replays the tail past it on the next open, so
+// f2's own recovery and the host's WAL replay meet exactly at this point with no gap or
+// double count.
+func (e *Engine) DurableLSN() uint64 { return e.durableLSN.Load() }
 
 // reader is a point-read view at a fixed snapshot. f2 has no key order, so it serves point
 // reads and rejects range iteration.
