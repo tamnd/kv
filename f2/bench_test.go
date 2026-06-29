@@ -315,6 +315,73 @@ func BenchmarkF2Checkpoint(b *testing.B) {
 	}
 }
 
+// prepareRecoveryFile writes a high-overwrite store to disk and crashes it (closes the fd
+// without a clean-close checkpoint), leaving a file a later New must recover. With
+// checkpoint set, a snapshot is committed after all the writes, so recovery installs the
+// index from the cut and replays nothing; without it, no snapshot exists and recovery
+// replays every record of the active generation. The returned tunables reopen that file.
+func prepareRecoveryFile(b *testing.B, keys, overwrites int, checkpoint bool) Tunables {
+	b.Helper()
+	tn := Tunables{
+		Shards:                64,
+		PageSize:              4096,
+		ResidentPagesPerShard: 4,
+		Path:                  filepath.Join(b.TempDir(), "rec.db"),
+		Durability:            DurabilityNone,
+	}
+	s, err := New(tn)
+	if err != nil {
+		b.Fatalf("New: %v", err)
+	}
+	for o := 0; o <= overwrites; o++ {
+		for i := 0; i < keys; i++ {
+			if err := s.Set(tkey(i), tval(i)); err != nil {
+				b.Fatalf("Set: %v", err)
+			}
+		}
+	}
+	if checkpoint {
+		if err := s.Checkpoint(); err != nil {
+			b.Fatalf("Checkpoint: %v", err)
+		}
+	}
+	for _, sh := range s.shards { // flush tails so the crash keeps every record on disk
+		sh.mu.Lock()
+		_ = sh.log.flushTail()
+		sh.mu.Unlock()
+	}
+	_ = s.df.f.Close() // crash: no clean-close checkpoint, file left as-is for the reopen
+	return tn
+}
+
+// benchmarkRecover times New over a prepared file. Each iteration recovers, then crashes
+// the fd without a clean close so the file is byte-identical for the next iteration: every
+// reopen does the same recovery work. The history and delta variants share the same record
+// count, so the gap is exactly what the index snapshot removes from recovery.
+func benchmarkRecover(b *testing.B, checkpoint bool) {
+	tn := prepareRecoveryFile(b, 20000, 10, checkpoint) // 220k records over 20k live keys
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		s, err := New(tn)
+		if err != nil {
+			b.Fatalf("New: %v", err)
+		}
+		b.StopTimer()
+		_ = s.df.f.Close()
+		b.StartTimer()
+	}
+}
+
+// BenchmarkF2RecoverHistory recovers a file with no snapshot: every record of the active
+// generation is decoded and reinserted, the cost the snapshot exists to remove.
+func BenchmarkF2RecoverHistory(b *testing.B) { benchmarkRecover(b, false) }
+
+// BenchmarkF2RecoverDelta recovers the same file with a committed snapshot: the index is
+// installed from the cut as slot-word arithmetic and no record is replayed, so recovery is
+// bounded by the live key count rather than the operation history.
+func BenchmarkF2RecoverDelta(b *testing.B) { benchmarkRecover(b, true) }
+
 // BenchmarkScaleExtrapolate is not a timing benchmark; it is the billions-of-keys
 // memory proof printed as a table. It measures the real resident index cost per
 // key at a few million keys, where the per-key cost has already converged to its
