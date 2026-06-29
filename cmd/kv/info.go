@@ -39,20 +39,12 @@ type statsJSON struct {
 	Scans       uint64 `json:"scans"`
 	Commits     uint64 `json:"commits"`
 	CommitNanos uint64 `json:"commit_nanos"`
-	// LSM-internal shape (spec 19 §1.5), reflecting on-disk state and so meaningful on the
-	// CLI: per-level segment counts and bytes, youngest level first, omitted for a B-tree
-	// file, and the compaction-backlog score.
-	Levels          []levelJSON `json:"levels,omitempty"`
-	CompactionScore float64     `json:"compaction_score"`
+	// CompactionScore is the compaction-backlog urgency the f2 core self-schedules against
+	// (spec 19 §1.5), reflecting on-disk state and so meaningful on the CLI.
+	CompactionScore float64 `json:"compaction_score"`
 	// OldestSnapshotAgeNanos is the leaked-reader gauge (spec 19 §1.6); near zero on the
 	// CLI, where no reader is held across the snapshot.
 	OldestSnapshotAgeNanos uint64 `json:"oldest_snapshot_age_nanos"`
-}
-
-// levelJSON is one LSM level's shape in the JSON stats contract.
-type levelJSON struct {
-	Segments int   `json:"segments"`
-	Bytes    int64 `json:"bytes"`
 }
 
 func toJSON(s kv.Stats) statsJSON {
@@ -79,9 +71,6 @@ func toJSON(s kv.Stats) statsJSON {
 
 		CompactionScore:        s.CompactionScore,
 		OldestSnapshotAgeNanos: s.OldestSnapshotAgeNanos,
-	}
-	for _, lv := range s.Levels {
-		j.Levels = append(j.Levels, levelJSON{Segments: lv.Segments, Bytes: lv.Bytes})
 	}
 	return j
 }

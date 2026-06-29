@@ -49,7 +49,7 @@ func FuzzInternalKey(f *testing.F) {
 // re-encoded header round-trips.
 func FuzzHeader(f *testing.F) {
 	page := make([]byte, DefaultPageSize)
-	NewHeader(DefaultPageSize, EngineBTree, FlagWAL, ChecksumCRC32C).Encode(page)
+	NewHeader(DefaultPageSize, EngineF2, FlagWAL, ChecksumCRC32C).Encode(page)
 	f.Add(page)
 	f.Fuzz(func(t *testing.T, p []byte) {
 		if len(p) < HeaderSize {

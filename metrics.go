@@ -86,23 +86,9 @@ func WriteMetrics(w io.Writer, s Stats) error {
 	m.line("kv_commit_latency_seconds_sum", "", float64(s.CommitNanos)/1e9)
 	m.line("kv_commit_latency_seconds_count", "", float64(s.Commits))
 
-	// LSM internals (spec 19 §1.5): per-level segment counts and bytes, and the
-	// compaction-backlog score. These render only for an engine with a level structure;
-	// a B-tree file leaves Levels nil, so the labeled families are simply absent rather
-	// than asserting a flat zero for a shape the engine does not have.
-	if len(s.Levels) > 0 {
-		m.help("kv_lsm_segments", "Segments (sorted runs) resident at each LSM level.")
-		m.typ("kv_lsm_segments", gauge)
-		for i, lv := range s.Levels {
-			m.line("kv_lsm_segments", `level="`+strconv.Itoa(i)+`"`, float64(lv.Segments))
-		}
-		m.help("kv_lsm_level_bytes", "On-disk bytes resident at each LSM level.")
-		m.typ("kv_lsm_level_bytes", gauge)
-		for i, lv := range s.Levels {
-			m.line("kv_lsm_level_bytes", `level="`+strconv.Itoa(i)+`"`, float64(lv.Bytes))
-		}
-		m.gaugef("kv_lsm_compaction_score", "Urgency of the most-pending compaction; 1.0 is at-trigger, 0 when idle.", s.CompactionScore)
-	}
+	// Compaction backlog (spec 19 §1.5): the urgency of the most-pending compaction the
+	// f2 core self-schedules, 1.0 at-trigger and 0 when idle.
+	m.gaugef("kv_compaction_score", "Urgency of the most-pending compaction; 1.0 is at-trigger, 0 when idle.", s.CompactionScore)
 
 	// Reader age (spec 19 §1.6): the wall-clock age of the longest-held live read
 	// snapshot, in seconds. It reads 0 when no reader is live; a value that only climbs is

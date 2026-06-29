@@ -1,8 +1,8 @@
 // Package kv is the public, embeddable key/value database API: open a file, get a
 // handle, run transactions (spec 15). It is the contract the CLI (spec 16) and server
-// (spec 17) build on, and it is engine-agnostic: nothing here names the B-tree or LSM
-// core except the create-time WithEngine selector, so a program written against kv
-// works unchanged whichever engine its file uses (spec 04 §6, spec 15 §10).
+// (spec 17) build on. The storage core is the f2 engine (notes/Spec/2070), a sharded
+// hash index over a self-durable hybrid log; a program written against kv never names
+// it and works the same whichever release it links (spec 15 §10).
 //
 // The shape is familiar to anyone who has used bbolt or Badger, with SQLite's
 // operational feel. A *DB holds one file and is safe for concurrent use by many
@@ -23,29 +23,14 @@ import (
 	"time"
 
 	"github.com/tamnd/kv/db"
-	"github.com/tamnd/kv/engine"
 	"github.com/tamnd/kv/format"
 	"github.com/tamnd/kv/vfs"
 	"github.com/tamnd/kv/wal"
 )
 
-// EngineKind selects the storage core at create time. It is persisted in the file
-// header, so it is fixed for the life of a file (spec 02, spec 04 §5).
+// EngineKind names the storage core recorded in a file's header. kv runs one core, f2,
+// so this exists mainly so Stats can report which core a file uses (spec 02, spec 04 §5).
 type EngineKind = format.EngineKind
-
-const (
-	// BTree is the default B-tree core: read-optimized, in-place, a single ordered
-	// structure (spec 05).
-	BTree = format.EngineBTree
-	// LSM is the write-optimized log-structured core (spec 06). It is a later
-	// milestone; selecting it on a fresh file errors until it lands.
-	LSM = format.EngineLSM
-	// Beta is the unified Bε-tree core (the 2059 redesign). It is built behind the
-	// engine SPI and selectable on a fresh file, but it is not yet the default and the
-	// old cores are not yet retired: that switch is the redesign's flip milestone. Select
-	// it explicitly to exercise or measure the new core ahead of the flip.
-	Beta = format.EngineBeta
-)
 
 // Version is the current release of the kv library. It follows semantic versioning.
 // The 0.x series is the pre-1.0 line: the API is broadly stable and the on-disk
@@ -70,31 +55,6 @@ const (
 	SyncExtra = wal.SyncExtra
 )
 
-// FilterKind selects the LSM core's per-segment membership filter (spec 06 §5).
-// FilterBloom is the default; FilterRibbon trades some construction cost for smaller
-// filter storage, attractive on deep cold levels where the filter set is large.
-// The B-tree core ignores this setting.
-type FilterKind = engine.FilterKind
-
-const (
-	// FilterBloom is the default double-hashing Bloom filter.
-	FilterBloom FilterKind = engine.FilterBloom
-	// FilterRibbon is the opt-in Ribbon filter: same false-positive rate, ~30% smaller.
-	FilterRibbon FilterKind = engine.FilterRibbon
-)
-
-// CompressionMode refines block compression for the LSM core (spec 13 §3). It controls
-// which levels are compressed; the coarser WithCompression(true) enables the default
-// heat-tiered policy (all levels, hot with LZ4, cold with Zstd).
-type CompressionMode = engine.CompressionMode
-
-const (
-	// CompressColdOnly leaves the hot shallow levels (L0, L1) raw and compresses only the
-	// deep cold levels with Zstd, so the file shrinks toward sub-1.0x without adding
-	// decompress CPU on the hot read path (spec 13 §3.1).
-	CompressColdOnly CompressionMode = engine.CompressColdOnly
-)
-
 // Isolation selects a transaction's isolation level (spec 10 §3, §4). SnapshotIsolation
 // is the default; Serializable adds commit-time read-set validation.
 type Isolation = db.Isolation
@@ -117,10 +77,6 @@ type Tracer = db.Tracer
 // Span is one started trace span; End closes it, called exactly once.
 type Span = db.Span
 
-// LevelStats is one LSM level's segment count and on-disk footprint, the per-level shape
-// reported in Stats for the compaction-backlog view (spec 19 §1.5).
-type LevelStats = engine.LevelStats
-
 // Option is a functional configuration knob passed to Open. Options split into
 // create-time (persisted in the header, immutable for the file) and open-time
 // (runtime, changeable across opens), per spec 15 §8.
@@ -132,12 +88,6 @@ type config struct {
 	opts       db.Options
 	cacheBytes int
 	mergeName  string
-}
-
-// WithEngine selects the storage core for a fresh file (create-time). On an existing
-// file the header's engine wins and a conflicting selection is an error (spec 04 §5).
-func WithEngine(e EngineKind) Option {
-	return func(c *config) { c.opts.Engine = e }
 }
 
 // WithPageSize sets the page size for a fresh file (create-time); ignored when opening
@@ -247,104 +197,6 @@ func WithReadReplica() Option {
 // rather than lose a frame. A generation with no new commits is not handed to the sink.
 func WithWALArchive(sink func(delta []byte) error) Option {
 	return func(c *config) { c.opts.WALArchive = sink }
-}
-
-// WithMemtableSize sets the LSM core's memtable flush threshold in bytes (open-time,
-// spec 06 §2). When the active memtable reaches this size the LSM seals it and flushes
-// it to a new L0 segment. Zero takes the engine default (64 MiB). A smaller value
-// flushes sooner, keeping memory pressure and WAL backlog low; a larger value amortizes
-// flush overhead under sustained write load. The B-tree core ignores it.
-func WithMemtableSize(bytes int) Option {
-	return func(c *config) { c.opts.MemtableSize = bytes }
-}
-
-// WithRangeIndex turns on the LSM core's REMIX ordered index for scan-heavy workloads
-// (open-time, spec 06 §6, spec 11 §5.3). When on, each leveled level presents its
-// disjoint segments as one ordered cursor, cutting heap-merge comparisons and cursor
-// switches on long scans. Off by default: it helps scan-heavy workloads and the B-tree
-// core, a single ordered source, never needs it.
-func WithRangeIndex(on bool) Option {
-	return func(c *config) { c.opts.RangeIndex = on }
-}
-
-// WithFilter selects the LSM core's per-segment membership filter (open-time,
-// spec 06 §5). FilterBloom, the zero value, is the default double-hashing Bloom filter,
-// fast to probe on hot levels. FilterRibbon is the opt-in Ribbon filter: same
-// false-positive rate in ~30% less space, attractive on deep cold levels where filters
-// dominate the resident set, at some extra construction cost. The B-tree core ignores it.
-func WithFilter(f FilterKind) Option {
-	return func(c *config) { c.opts.Filter = f }
-}
-
-// WithBtreeBuffers turns on the B-tree core's Bε buffered write path (open-time,
-// spec 05 §4). When on, inserts park in interior-node message buffers and flush one
-// level down in batches, trading a small read-path overhead for significantly lower
-// per-key write amplification. Off by default: it helps write-heavy B-tree workloads;
-// read-heavy ones prefer the unmodified in-place path. The LSM core ignores it.
-func WithBtreeBuffers(on bool) Option {
-	return func(c *config) { c.opts.BufferedInserts = on }
-}
-
-// WithCompression turns on LSM block compression with the default heat-tiered policy
-// (open-time, spec 13): hot levels (L0/L1) use LZ4, cold deep levels use Zstd. Off by
-// default; set it when space or I/O is the bottleneck and the CPU cost of decompression
-// on the hot read path is acceptable. Use WithColdCompression for a cheaper variant that
-// avoids hot-read decompression cost. The B-tree core ignores it.
-func WithCompression(on bool) Option {
-	return func(c *config) { c.opts.Compression = on }
-}
-
-// WithColdCompression turns on LSM cold-level-only compression (open-time, spec 13
-// §3.1): L0 and L1 stay raw, deeper levels are compressed with Zstd. This is the
-// middle ground between no compression and heat-tiered: the file shrinks without adding
-// decompress CPU on the hot read path, since point reads almost never reach the cold
-// levels. When on it overrides WithCompression. The B-tree core ignores it.
-func WithColdCompression(on bool) Option {
-	return func(c *config) {
-		if on {
-			c.opts.CompressionMode = engine.CompressColdOnly
-		} else {
-			c.opts.CompressionMode = engine.CompressDefault
-		}
-	}
-}
-
-// WithFillFactor sets the B-tree core's target leaf occupancy before it splits a node,
-// in the range (0, 1] (open-time, spec 05 §3). Zero takes the engine default (~0.7). A
-// higher fill factor packs more entries per page (fewer pages, better read fan-out) at
-// the cost of more splits on random inserts; a lower one leaves headroom for in-place
-// updates, reducing splits. The LSM core ignores it.
-func WithFillFactor(f float64) Option {
-	return func(c *config) { c.opts.FillFactor = f }
-}
-
-// WithMaxInlineValue sets the maximum value size the B-tree core stores inline on a
-// leaf page; larger values overflow to dedicated overflow pages (open-time, spec 05
-// §2.2). Zero takes the engine default (¼ page). Increasing it avoids the overflow I/O
-// cost for medium-sized values at the cost of sparser leaves; decreasing it keeps leaves
-// dense for key-heavy workloads. The LSM core ignores it.
-func WithMaxInlineValue(bytes int) Option {
-	return func(c *config) { c.opts.MaxInlineValue = bytes }
-}
-
-// WithLevelRatio sets the LSM core's size multiplier between adjacent levels: each
-// level is LevelRatio × larger than the one above it (open-time, spec 06 §4). Zero
-// takes the engine default (10). A larger ratio reduces write amplification by doing
-// fewer, larger compactions at the cost of higher read fan-out on the cold levels; a
-// smaller ratio compacts more eagerly, trading write amplification for read efficiency.
-// The B-tree core ignores it.
-func WithLevelRatio(n int) Option {
-	return func(c *config) { c.opts.LevelRatio = n }
-}
-
-// WithValueSeparation turns on the LSM core's WiscKey value separation (open-time, spec
-// 06 §7): values larger than threshold bytes are written to a separate vLog file; the
-// segment tree holds only a pointer. This keeps the tree small and cache-resident for
-// large-value workloads, cutting read and write amplification in the segments at the
-// cost of one extra I/O per large-value lookup. Zero, the default, disables separation.
-// The B-tree core ignores it.
-func WithValueSeparation(threshold int) Option {
-	return func(c *config) { c.opts.ValueSepThreshold = threshold }
 }
 
 // DB is an open database over one file, safe for concurrent use by many goroutines
@@ -594,11 +446,8 @@ type Stats struct {
 	// successful, fsynced commit is counted, so the average is over acknowledged commits.
 	Commits     uint64
 	CommitNanos uint64
-	// Levels is the per-level segment-and-byte shape of an LSM file, youngest level first,
-	// or nil for a B-tree file (spec 19 §1.5).
-	Levels []LevelStats
-	// CompactionScore is the urgency of the most-pending LSM compaction, normalized so 1.0
-	// is at-trigger; 0 when nothing is due or for a B-tree file (spec 19 §1.5).
+	// CompactionScore is the urgency of the most-pending compaction, normalized so 1.0
+	// is at-trigger; 0 when nothing is due (spec 19 §1.5).
 	CompactionScore float64
 	// OldestSnapshotAgeNanos is the wall-clock age in nanoseconds of the longest-held live
 	// read snapshot, 0 when none is live. A value that only climbs is a snapshot or
@@ -639,7 +488,6 @@ func (kdb *DB) Stats() Stats {
 		Scans:                  s.Ops.Scans,
 		Commits:                s.Ops.Commits,
 		CommitNanos:            s.Ops.CommitNanos,
-		Levels:                 s.Levels,
 		CompactionScore:        s.CompactionScore,
 		OldestSnapshotAgeNanos: s.OldestSnapshotAgeNanos,
 		ReadReplica:            s.ReadReplica,

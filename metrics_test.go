@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/tamnd/kv"
+	"github.com/tamnd/kv/format"
 )
 
 // TestWriteMetricsRendersFromStats checks the pure renderer turns a Stats snapshot into
@@ -14,7 +15,7 @@ import (
 // and the right HELP/TYPE pairing for a counter versus a gauge.
 func TestWriteMetricsRendersFromStats(t *testing.T) {
 	s := kv.Stats{
-		Engine:        kv.LSM,
+		Engine:        format.EngineF2,
 		PageSize:      4096,
 		PageCount:     100,
 		FreePages:     10,
@@ -43,7 +44,7 @@ func TestWriteMetricsRendersFromStats(t *testing.T) {
 	out := buf.String()
 
 	for _, want := range []string{
-		`kv_engine_info{engine="lsm"} 1`,
+		`kv_engine_info{engine="f2"} 1`,
 		"# TYPE kv_fsync_total counter",
 		"kv_fsync_total 9",
 		"# TYPE kv_page_count gauge",
@@ -69,16 +70,11 @@ func TestWriteMetricsRendersFromStats(t *testing.T) {
 	}
 }
 
-// TestWriteMetricsRendersLSMInternals checks the per-level segment and byte gauges and the
-// compaction score render with one labeled sample per level, and that the reader-age gauge
-// turns nanoseconds into seconds.
-func TestWriteMetricsRendersLSMInternals(t *testing.T) {
+// TestWriteMetricsRendersCompactionAndReaderAge checks the compaction-backlog gauge renders
+// the score and the reader-age gauge turns nanoseconds into seconds.
+func TestWriteMetricsRendersCompactionAndReaderAge(t *testing.T) {
 	s := kv.Stats{
-		Engine: kv.LSM,
-		Levels: []kv.LevelStats{
-			{Segments: 4, Bytes: 8192},
-			{Segments: 2, Bytes: 65536},
-		},
+		Engine:                 format.EngineF2,
 		CompactionScore:        1.75,
 		OldestSnapshotAgeNanos: 3_000_000_000, // 3s
 	}
@@ -88,12 +84,7 @@ func TestWriteMetricsRendersLSMInternals(t *testing.T) {
 	}
 	out := buf.String()
 	for _, want := range []string{
-		"# TYPE kv_lsm_segments gauge",
-		`kv_lsm_segments{level="0"} 4`,
-		`kv_lsm_segments{level="1"} 2`,
-		`kv_lsm_level_bytes{level="0"} 8192`,
-		`kv_lsm_level_bytes{level="1"} 65536`,
-		"kv_lsm_compaction_score 1.75",
+		"kv_compaction_score 1.75",
 		"kv_oldest_snapshot_age_seconds 3",
 	} {
 		if !strings.Contains(out, want) {
@@ -102,30 +93,11 @@ func TestWriteMetricsRendersLSMInternals(t *testing.T) {
 	}
 }
 
-// TestWriteMetricsOmitsLSMInternalsForBTree checks a B-tree file, which has no level
-// structure, does not emit the per-level families at all rather than asserting a flat zero
-// for a shape it does not have. The reader-age gauge still renders, since it is engine-agnostic.
-func TestWriteMetricsOmitsLSMInternalsForBTree(t *testing.T) {
-	var buf bytes.Buffer
-	if err := kv.WriteMetrics(&buf, kv.Stats{Engine: kv.BTree}); err != nil {
-		t.Fatalf("WriteMetrics: %v", err)
-	}
-	out := buf.String()
-	for _, unwanted := range []string{"kv_lsm_segments", "kv_lsm_level_bytes", "kv_lsm_compaction_score"} {
-		if strings.Contains(out, unwanted) {
-			t.Errorf("%s should be omitted for a B-tree file, got:\n%s", unwanted, out)
-		}
-	}
-	if !strings.Contains(out, "kv_oldest_snapshot_age_seconds 0") {
-		t.Errorf("reader-age gauge should render for a B-tree file, got:\n%s", out)
-	}
-}
-
 // TestWriteMetricsHitRatioGuard confirms an idle database (no reads, no hits) reports a flat
 // zero hit ratio rather than a NaN that would poison a dashboard.
 func TestWriteMetricsHitRatioGuard(t *testing.T) {
 	var buf bytes.Buffer
-	if err := kv.WriteMetrics(&buf, kv.Stats{Engine: kv.BTree}); err != nil {
+	if err := kv.WriteMetrics(&buf, kv.Stats{Engine: format.EngineF2}); err != nil {
 		t.Fatalf("WriteMetrics: %v", err)
 	}
 	if !strings.Contains(buf.String(), "kv_cache_hit_ratio 0\n") {
@@ -137,7 +109,7 @@ func TestWriteMetricsHitRatioGuard(t *testing.T) {
 // when the engine does not compute them, so the surface does not assert a misleading zero.
 func TestWriteMetricsOmitsEmptyLiveCounts(t *testing.T) {
 	var buf bytes.Buffer
-	if err := kv.WriteMetrics(&buf, kv.Stats{Engine: kv.BTree}); err != nil {
+	if err := kv.WriteMetrics(&buf, kv.Stats{Engine: format.EngineF2}); err != nil {
 		t.Fatalf("WriteMetrics: %v", err)
 	}
 	if strings.Contains(buf.String(), "kv_live_keys") {

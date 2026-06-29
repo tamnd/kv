@@ -43,7 +43,7 @@ func (m *Model) SetMergeFunc(f func(existing, operand []byte) []byte) {
 }
 
 // Kind implements Engine.
-func (m *Model) Kind() Kind { return BTree }
+func (m *Model) Kind() Kind { return F2 }
 
 // Open implements Engine.
 func (m *Model) Open(env *Env) error {

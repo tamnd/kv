@@ -1,15 +1,15 @@
-// Package engine defines the storage-engine SPI: the seam that the two cores —
-// B-tree (spec 05) and LSM (spec 06) — implement, and the contract that lets
-// every layer above it (transactions, iterators, cache, API, CLI, server) be
-// written once, engine-agnostic (spec 04).
+// Package engine defines the storage-engine SPI: the seam that the f2 core
+// (notes/Spec/2070) implements, and the contract that lets every layer above it
+// (transactions, iterators, cache, API, CLI, server) be written once,
+// engine-agnostic (spec 04).
 //
 // The design rule for the seam is to push everything that can be shared above it
-// and confine to it only the physics that genuinely differ between an in-place
-// tree and a stack of sorted runs: how keys are physically laid out, how a point
-// read and a range scan are served, how a batch of writes is applied, how space
-// is reclaimed, and how the engine recovers. Everything else — the file
-// container, the pager, the WAL, MVCC versioning, the iterator protocol,
-// durability, the API — lives above the seam and is identical for both cores.
+// and confine to it only the physics that genuinely differ about a storage core:
+// how keys are physically laid out, how a point read is served, how a batch of
+// writes is applied, how space is reclaimed, and how the engine recovers.
+// Everything else, the file container, the pager, the WAL, MVCC versioning, the
+// iterator protocol, durability, and the API, lives above the seam and is
+// identical no matter which core sits under it.
 //
 // The host injects its shared substrate into a core through Env. Spec 04 sketches
 // those dependencies as concrete pointers (*Pager, *WAL, ...); this
@@ -31,10 +31,7 @@ import (
 type Kind = format.EngineKind
 
 const (
-	BTree = format.EngineBTree
-	LSM   = format.EngineLSM
-	Beta  = format.EngineBeta
-	F2    = format.EngineF2
+	F2 = format.EngineF2
 )
 
 // Engine is the top-level handle for an opened core (spec 04 §2.1).

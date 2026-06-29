@@ -84,74 +84,6 @@ type Options struct {
 	// §6). Zero selects the real monotonic-corrected system clock; a test injects a
 	// controllable clock here to drive expiry deterministically.
 	Clock func() uint64
-	// MemtableSize is the byte size at which the LSM core flushes its active memtable
-	// to an on-disk segment (spec 06 §2). Zero takes the engine default; the B-tree
-	// core ignores it. A smaller value flushes sooner, bounding memory and the WAL
-	// backlog at the cost of more, smaller segments.
-	MemtableSize int
-	// RangeIndex turns on the LSM core's REMIX ordered index (spec 06 §6, spec 11
-	// §5.3), which presents each leveled level's disjoint segments to a range scan as
-	// one ordered cursor instead of one per segment, cutting the heap-merge's
-	// comparisons and cursor switches. Off by default, since it helps only scan-heavy
-	// workloads and the B-tree core, a single ordered source, never needs it.
-	RangeIndex bool
-	// Filter selects the LSM core's per-segment membership filter (spec 06 §5).
-	// FilterBloom, the zero value, is the default double-hashing Bloom filter, fast to
-	// probe on the hot levels. FilterRibbon is the opt-in Ribbon filter, which reaches the
-	// same false-positive rate in meaningfully less space, attractive on the deep cold
-	// levels where filters dominate the resident set, at some extra construction cost. The
-	// B-tree core ignores it.
-	Filter engine.FilterKind
-	// BufferedInserts turns on the B-tree core's Bε buffered write path (spec 05 §4):
-	// inserts park as messages in interior node buffers and flush one level down in
-	// batches, trading a little read-path work and interior fan-out for sharply lower
-	// per-key write amplification. Off by default, since the in-place tree's read
-	// latency is the engine's headline; it helps write-heavier workloads that still
-	// want the B-tree's tight space and ordered scans. The LSM core ignores it.
-	BufferedInserts bool
-	// FillFactor is the B-tree core's target leaf occupancy before it splits a node, in
-	// the range (0, 1]. Zero takes the engine default (~0.7). A higher value packs more
-	// keys per page (fewer pages, better read fan-out) at the cost of more splits on
-	// random inserts. The LSM core ignores it (spec 05 §3).
-	FillFactor float64
-	// MaxInlineValue is the maximum value size the B-tree core stores inline on a leaf
-	// page; larger values overflow to dedicated overflow pages. Zero takes the engine
-	// default (¼ page). Increasing it avoids overflow page I/O for medium values at the
-	// cost of sparser leaves; decreasing it keeps leaves dense for key-heavy workloads
-	// (spec 05 §2.2). The LSM core ignores it.
-	MaxInlineValue int
-	// LevelRatio is the LSM core's size multiplier between adjacent levels: each level
-	// is LevelRatio times larger than the one above it (spec 06 §4). Zero takes the
-	// engine default (10). A larger ratio reduces write amplification by doing fewer,
-	// bigger compactions at the cost of higher read fan-out on the cold levels. The
-	// B-tree core ignores it.
-	LevelRatio int
-	// ValueSepThreshold, when positive, enables the LSM core's WiscKey value separation
-	// (spec 06 §7): values larger than this many bytes are written to a separate vLog
-	// file and only a pointer lives in the main segment, so large-value workloads keep
-	// the tree small and cache-resident. Zero disables separation. The B-tree core
-	// ignores it.
-	ValueSepThreshold int
-	// Compression turns on the LSM core's heat-tiered block compression (spec 13): segment
-	// data pages are compressed with a cheap fast codec on the hot shallow levels and a
-	// higher-ratio codec on the cold deep ones, packing more cells per page so the file
-	// shrinks and more data rides in each cached page, at the cost of decompress CPU on the
-	// read miss path. Off by default, since it trades read CPU for space; it helps
-	// space-bound or write-heavy workloads on storage slower than the CPU. The B-tree core
-	// ignores it.
-	Compression bool
-	// CompressionMode selects which levels the LSM core compresses, refining the on/off
-	// Compression bool. The zero value defers to that bool (off, or heat-tiered when the
-	// bool is set). engine.CompressColdOnly leaves the hot levels (L0, L1) raw and
-	// compresses only the cold deep levels where the bulk of the data settles, so the file
-	// shrinks toward sub-1.0x without putting decompress CPU on the hot read path (perf/05
-	// F4d). When set it overrides Compression. The B-tree core ignores it.
-	CompressionMode engine.CompressionMode
-	// disableAutoCompaction turns off the LSM core's background compaction scheduler so
-	// compaction runs only on an explicit Maintain. It is unexported: production always
-	// self-schedules compaction, and only an in-package test that drives compaction by hand
-	// to observe a precise segment shape or a deterministic crash window sets it.
-	disableAutoCompaction bool
 	// Logger is the structured-logging sink for database lifecycle, recovery,
 	// checkpoint, maintenance, the fatal durability fault, and slow operations (spec
 	// 19 §3). Nil, the default, disables logging entirely: no event is formatted and
@@ -267,20 +199,6 @@ func (o Options) sync() wal.Sync {
 	return o.Sync
 }
 
-// compressionMode resolves the on/off Compression bool and the finer CompressionMode into a
-// single mode for the engine. An explicit CompressionMode wins; otherwise the bool maps to
-// heat-tiered when set and off when not, so a caller that only flips Compression keeps the
-// behaviour it had before this knob existed.
-func (o Options) compressionMode() engine.CompressionMode {
-	if o.CompressionMode != engine.CompressDefault {
-		return o.CompressionMode
-	}
-	if o.Compression {
-		return engine.CompressHeatTiered
-	}
-	return engine.CompressOff
-}
-
 // DB is an open database: a pager over the main file, a WAL sidecar, and a storage
 // core, with a monotonic commit-version counter. It is safe for concurrent readers
 // and serializes writers through its mutex (group commit and MVCC concurrency are
@@ -313,19 +231,9 @@ type DB struct {
 	// derives the next epoch from it and swaps the pager's and WAL's schemes.
 	crypto *crypto.Scheme
 
-	merge           func(existing, operand []byte) []byte
-	maxRetries      int
-	isolation       Isolation
-	memtableSize    int
-	rangeIndex      bool
-	filter          engine.FilterKind
-	bufferedInserts bool
-	compression     engine.CompressionMode
-	noAutoCompact   bool
-	fillFactor      float64
-	maxInlineValue  int
-	levelRatio      int
-	valueSepThresh  int
+	merge      func(existing, operand []byte) []byte
+	maxRetries int
+	isolation  Isolation
 
 	// readReplica makes this a read-only follower (spec 18 §4): user writes are refused
 	// and state advances only through ApplyWAL replaying shipped frames. replicaHigh is
@@ -486,7 +394,7 @@ func create(fs vfs.FS, path string, opts Options) (*DB, error) {
 	}
 	chdr := pgr.Header()
 	d := &DB{rl: newRlatch(), fs: fs, path: path, pgr: pgr, wal: w, eng: eng, orc: newOracle(0), crypto: enc,
-		merge: opts.Merge, maxRetries: opts.maxRetries(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, bufferedInserts: opts.BufferedInserts, compression: opts.compressionMode(), noAutoCompact: opts.disableAutoCompaction, fillFactor: opts.FillFactor, maxInlineValue: opts.MaxInlineValue, levelRatio: opts.LevelRatio, valueSepThresh: opts.ValueSepThreshold, now: opts.clock(), logger: opts.Logger, slowOp: opts.SlowOpThreshold, tracer: opts.Tracer, readReplica: opts.ReadReplica, archive: opts.WALArchive,
+		merge: opts.Merge, maxRetries: opts.maxRetries(), isolation: opts.Isolation, now: opts.clock(), logger: opts.Logger, slowOp: opts.SlowOpThreshold, tracer: opts.Tracer, readReplica: opts.ReadReplica, archive: opts.WALArchive,
 		fullPageWrites: chdr.FullPageWritesOff == 0,
 		autoVacuumMode: chdr.AutoVacuumMode,
 	}
@@ -521,7 +429,7 @@ func openExisting(fs vfs.FS, path string, opts Options) (*DB, error) {
 	}
 	hdr := pgr.Header()
 	d := &DB{rl: newRlatch(), fs: fs, path: path, pgr: pgr, eng: eng, crypto: enc,
-		merge: opts.Merge, maxRetries: opts.maxRetries(), isolation: opts.Isolation, memtableSize: opts.MemtableSize, rangeIndex: opts.RangeIndex, filter: opts.Filter, bufferedInserts: opts.BufferedInserts, compression: opts.compressionMode(), noAutoCompact: opts.disableAutoCompaction, fillFactor: opts.FillFactor, maxInlineValue: opts.MaxInlineValue, levelRatio: opts.LevelRatio, valueSepThresh: opts.ValueSepThreshold, now: opts.clock(), logger: opts.Logger, slowOp: opts.SlowOpThreshold, tracer: opts.Tracer, readReplica: opts.ReadReplica, archive: opts.WALArchive,
+		merge: opts.Merge, maxRetries: opts.maxRetries(), isolation: opts.Isolation, now: opts.clock(), logger: opts.Logger, slowOp: opts.SlowOpThreshold, tracer: opts.Tracer, readReplica: opts.ReadReplica, archive: opts.WALArchive,
 		fullPageWrites: hdr.FullPageWritesOff == 0,
 		autoVacuumMode: hdr.AutoVacuumMode,
 	}
@@ -626,18 +534,7 @@ func (d *DB) openEngine(merge func(existing, operand []byte) []byte) error {
 		Pager: d.pgr,
 		Clock: engineWatermark{d},
 		Options: engine.EngineOptions{
-			PageSize:          d.pgr.PageSize(),
-			MemtableSize:      d.memtableSize,
-			RangeIndex:        d.rangeIndex,
-			Filter:            d.filter,
-			BufferedInserts:   d.bufferedInserts,
-			CompressionMode:   d.compression,
-			FillFactor:        d.fillFactor,
-			MaxInlineValue:    d.maxInlineValue,
-			LevelSizeRatio:    d.levelRatio,
-			ValueSepThreshold: d.valueSepThresh,
-
-			DisableAutoCompaction: d.noAutoCompact,
+			PageSize: d.pgr.PageSize(),
 		},
 	}
 	if err := d.eng.Open(env); err != nil {
@@ -1111,11 +1008,8 @@ type Stats struct {
 	// Ops is the cumulative-since-open per-operation tally and durable-commit latency
 	// (spec 19 §1.1): the throughput counters a dashboard rates over time.
 	Ops OpStats
-	// Levels is the per-level segment-and-byte shape of an LSM engine, youngest first,
-	// or nil for the B-tree (spec 19 §1.5).
-	Levels []engine.LevelStats
-	// CompactionScore is the urgency of the most-pending LSM compaction, 0 when nothing
-	// is due or for the B-tree (spec 19 §1.5).
+	// CompactionScore is the urgency of the most-pending compaction, 0 when nothing is
+	// due (spec 19 §1.5).
 	CompactionScore float64
 	// OldestSnapshotAgeNanos is the wall-clock age of the longest-held live read snapshot
 	// in nanoseconds, 0 when no reader is live; a value that only climbs is a reader that
@@ -1172,7 +1066,6 @@ func (d *DB) Stats() Stats {
 		PageReads:              io.PageReads,
 		CacheHits:              io.CacheHits,
 		Ops:                    d.counters.snapshot(),
-		Levels:                 es.Levels,
 		CompactionScore:        es.CompactionScore,
 		OldestSnapshotAgeNanos: d.oldestSnapshotAgeNanos(),
 		ReadReplica:            d.readReplica,

@@ -110,7 +110,7 @@ func TestPrefixSuccessor(t *testing.T) {
 
 func TestHeaderRoundTrip(t *testing.T) {
 	page := make([]byte, DefaultPageSize)
-	h := NewHeader(DefaultPageSize, EngineBTree, FlagWAL, ChecksumCRC32C)
+	h := NewHeader(DefaultPageSize, EngineF2, FlagWAL, ChecksumCRC32C)
 	h.UserVersion = 7
 	h.ApplicationID = 0xdeadbeef
 	h.EngineRoot = 2
@@ -120,7 +120,7 @@ func TestHeaderRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if got.PageSize != DefaultPageSize || got.Engine != EngineBTree ||
+	if got.PageSize != DefaultPageSize || got.Engine != EngineF2 ||
 		got.Flags != FlagWAL || got.Checksum != ChecksumCRC32C ||
 		got.UserVersion != 7 || got.ApplicationID != 0xdeadbeef || got.EngineRoot != 2 {
 		t.Fatalf("header field mismatch: %+v", got)
@@ -132,7 +132,7 @@ func TestHeaderRoundTrip(t *testing.T) {
 
 func TestHeaderPageSize64K(t *testing.T) {
 	page := make([]byte, MaxPageSize)
-	h := NewHeader(MaxPageSize, EngineLSM, 0, ChecksumNone)
+	h := NewHeader(MaxPageSize, EngineF2, 0, ChecksumNone)
 	h.Encode(page)
 	got, err := DecodeHeader(page)
 	if err != nil {
