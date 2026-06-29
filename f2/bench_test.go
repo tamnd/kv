@@ -297,6 +297,24 @@ func BenchmarkF2GetDurableEvicted(b *testing.B) {
 	})
 }
 
+// BenchmarkF2Checkpoint measures a checkpoint over a filled store: the per-shard
+// capture of the live slot words plus the snapshot chain write and superblock commit.
+// The None dial isolates the capture-and-serialize cost from disk latency, so this is
+// the CPU and allocation price a checkpoint pays per call, the work that buys recovery
+// its delta bound. Each call also frees the prior chain, so it measures steady state,
+// not a one-time first write.
+func BenchmarkF2Checkpoint(b *testing.B) {
+	s := fillF2Durable(b, benchKeys, 4096, 4, DurabilityNone)
+	defer s.Close()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := s.Checkpoint(); err != nil {
+			b.Fatalf("Checkpoint: %v", err)
+		}
+	}
+}
+
 // BenchmarkScaleExtrapolate is not a timing benchmark; it is the billions-of-keys
 // memory proof printed as a table. It measures the real resident index cost per
 // key at a few million keys, where the per-key cost has already converged to its

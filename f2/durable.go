@@ -47,7 +47,14 @@ const (
 
 	sbMagic    uint32 = 0x32424446 // "FDB2"
 	bhMagic    uint32 = 0x32485046 // "FPH2"
-	durVersion uint32 = 2          // 2 added the per-block generation; 1 files still open
+	durVersion uint32 = 3          // 3 added the index snapshot pointer; 2 and 1 files still open
+
+	// sbSnapOffset is where the index snapshot fields begin, after the version-2
+	// core and its CRC. They carry their own CRC over [sbSnapOffset, sbSnapCRC), so a
+	// version-2 reader that stops at the core CRC ignores them and a torn snapshot
+	// pointer reads as no snapshot. Layout: snapRoot(8) snapSeq(8) snapShards(4) crc(4).
+	sbSnapOffset = 36
+	sbSnapCRC    = 56
 )
 
 // durableFile owns the one file and hands out blocks. The mutex guards the block
@@ -63,6 +70,16 @@ type durableFile struct {
 	allocHigh int64   // next never-used data block
 	free      []int64 // blocks a compaction retired, available for reuse
 	seq       uint64
+
+	// snapRoot points at the committed index snapshot's first block (-1 for none),
+	// snapSeq stamps the chain so a stale or torn one is rejected, snapShards is the
+	// shard count it covers, and snapBlocks is the chain's block ids held in memory so
+	// a re-checkpoint can free the prior chain after committing the next one. All are
+	// guarded by mu, written only at a checkpoint.
+	snapRoot   int64
+	snapSeq    uint64
+	snapShards int
+	snapBlocks []int64
 
 	// syncCount counts device barriers issued and syncNanos accumulates their wall
 	// time, so Stats can report whether the Full dial is disk-bound. Both are read
@@ -173,6 +190,13 @@ func (d *durableFile) writeSuperblock() error {
 	binary.LittleEndian.PutUint64(buf[16:], d.seq)
 	binary.LittleEndian.PutUint64(buf[24:], uint64(d.allocHigh))
 	binary.LittleEndian.PutUint32(buf[32:], crc32.Checksum(buf[0:32], crcTable))
+	// The index snapshot pointer lives past the version-2 core CRC with its own CRC,
+	// so an older reader ignores it and a torn pointer reads as no snapshot. snapRoot is
+	// -1 until the first checkpoint writes a chain.
+	binary.LittleEndian.PutUint64(buf[sbSnapOffset:], uint64(d.snapRoot))
+	binary.LittleEndian.PutUint64(buf[sbSnapOffset+8:], d.snapSeq)
+	binary.LittleEndian.PutUint32(buf[sbSnapOffset+16:], uint32(d.snapShards))
+	binary.LittleEndian.PutUint32(buf[sbSnapCRC:], crc32.Checksum(buf[sbSnapOffset:sbSnapCRC], crcTable))
 	slot := int64(d.seq % numSuperblocks)
 	if _, err := d.f.WriteAt(buf, slot*sbSize); err != nil {
 		return err
@@ -203,6 +227,15 @@ type superblock struct {
 	seq       uint64
 	allocHigh int64
 	valid     bool
+
+	// snapRoot is the committed index snapshot chain's first block, -1 when the file
+	// carries no snapshot (a version-2 file, or a torn snapshot pointer). snapSeq and
+	// snapShards describe the chain. snapValid records that the snapshot CRC checked,
+	// so recovery never follows a partial pointer.
+	snapRoot   int64
+	snapSeq    uint64
+	snapShards int
+	snapValid  bool
 }
 
 // readSuperblock returns the newest valid superblock across the two slots, or an
@@ -226,6 +259,16 @@ func readSuperblock(f *os.File) superblock {
 				seq:       seq,
 				allocHigh: int64(binary.LittleEndian.Uint64(buf[24:])),
 				valid:     true,
+				snapRoot:  -1,
+			}
+			// The snapshot pointer is present only on a version-3 slot and only when its
+			// own CRC checks; otherwise the slot reads as carrying no snapshot.
+			if n >= sbSnapCRC+4 &&
+				binary.LittleEndian.Uint32(buf[sbSnapCRC:]) == crc32.Checksum(buf[sbSnapOffset:sbSnapCRC], crcTable) {
+				best.snapRoot = int64(binary.LittleEndian.Uint64(buf[sbSnapOffset:]))
+				best.snapSeq = binary.LittleEndian.Uint64(buf[sbSnapOffset+8:])
+				best.snapShards = int(binary.LittleEndian.Uint32(buf[sbSnapOffset+16:]))
+				best.snapValid = best.snapRoot >= 0
 			}
 		}
 	}
