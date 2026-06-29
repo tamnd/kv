@@ -34,6 +34,7 @@ const (
 	BTree = format.EngineBTree
 	LSM   = format.EngineLSM
 	Beta  = format.EngineBeta
+	F2    = format.EngineF2
 )
 
 // Engine is the top-level handle for an opened core (spec 04 §2.1).

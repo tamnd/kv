@@ -29,6 +29,12 @@ const (
 	// major-version bump arrive in the later M0 PRs; this constant is the seam that
 	// lets the core be selected and oracle-tested alongside the shipped cores first.
 	EngineBeta EngineKind = 3
+	// EngineF2 selects the f2 core: a sharded hash index over a self-durable hybrid
+	// log (notes/Spec/2070). It is a new selector value, not a reuse of an old one, so
+	// an old file never claims to be an f2 file. f2 resolves point reads (get, set,
+	// delete) at any snapshot; it has no key order, so it does not serve range scans or
+	// range deletes, and a file it creates records 4.
+	EngineF2 EngineKind = 4
 )
 
 // String renders an EngineKind.
@@ -40,6 +46,8 @@ func (e EngineKind) String() string {
 		return "lsm"
 	case EngineBeta:
 		return "betree"
+	case EngineF2:
+		return "f2"
 	default:
 		return "engine?"
 	}
