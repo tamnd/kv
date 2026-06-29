@@ -2,10 +2,12 @@ package resp
 
 import (
 	"bufio"
+	"fmt"
 	"net"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -186,6 +188,65 @@ func TestHelloHandshake(t *testing.T) {
 		t.Fatalf("PING after HELLO = %q, want +PONG", got)
 	}
 }
+
+// TestConcurrentSetNoConflict drives a small, overlapping keyspace from several
+// connections at once. An optimistic kv transaction would lose a write-write race
+// here and surface "transaction conflict", and a retrying one would livelock on a
+// hot key; the Redis face writes blind commits instead, which are last-writer-wins
+// and never conflict, so every SET must return +OK and the run must not stall.
+func TestConcurrentSetNoConflict(t *testing.T) {
+	db, err := kv.Open(filepath.Join(t.TempDir(), "kv.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	srv := New(db)
+	done := make(chan struct{})
+	go func() { _ = srv.Serve(ln); close(done) }()
+	defer func() {
+		_ = srv.Close()
+		_ = ln.Close()
+		<-done
+		_ = db.Close()
+	}()
+
+	const writers = 8
+	const iters = 200
+	errs := make(chan error, writers)
+	var wg sync.WaitGroup
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			conn, err := net.Dial("tcp", ln.Addr().String())
+			if err != nil {
+				errs <- err
+				return
+			}
+			defer conn.Close()
+			cli := &client{conn: conn, r: bufio.NewReader(conn)}
+			for i := 0; i < iters; i++ {
+				// Ten shared keys, so writers race on the same keys constantly.
+				key := "k" + strconv.Itoa(i%10)
+				cli.send(t, "SET", key, strconv.Itoa(w))
+				if got := cli.readReply(t); got != "+OK" {
+					errs <- fmtErr("writer %d SET %s = %q, want +OK", w, key, got)
+					return
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	close(errs)
+	for e := range errs {
+		t.Fatal(e)
+	}
+}
+
+func fmtErr(format string, a ...any) error { return fmt.Errorf(format, a...) }
 
 func TestInlinePing(t *testing.T) {
 	cli, cleanup := startServer(t)

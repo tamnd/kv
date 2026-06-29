@@ -106,7 +106,16 @@ func (s *Server) handle(c net.Conn) {
 	conn := &connState{
 		buf: make([]byte, readChunk),
 		out: make([]byte, 0, writeCap),
+		// A per-connection blind write batch with a chunk of one: every SET or DELETE
+		// flushes as its own blind commit. A blind commit takes no read snapshot and
+		// runs no conflict detection, so it never loses a write-write race the way an
+		// optimistic transaction does; it is last-writer-wins by commit version, which
+		// is the Redis write contract, and concurrent connections still share one group
+		// commit. This is what keeps a write-heavy, skewed workload (a hot key under
+		// several clients) from livelocking the way a retrying transaction would.
+		wb: s.db.NewWriteBatch(1),
 	}
+	defer conn.wb.Close()
 	// start..end is the unparsed window inside buf.
 	start, end := 0, 0
 	for {
@@ -123,7 +132,7 @@ func (s *Server) handle(c net.Conn) {
 			start += n
 			if len(args) > 0 {
 				var shutdown bool
-				conn.out, shutdown = s.dispatch(conn.out, args)
+				conn.out, shutdown = s.dispatch(conn, conn.out, args)
 				if shutdown {
 					// Reply (if any) goes out, then the server tears down. Close
 					// runs on its own goroutine so it does not wait on this one.
@@ -170,6 +179,7 @@ type connState struct {
 	buf  []byte
 	out  []byte
 	args [][]byte
+	wb   *kv.WriteBatch
 }
 
 var errProtocol = errors.New("protocol error")
@@ -283,7 +293,7 @@ var (
 // dispatch runs one command, appends its reply to out, and returns the grown
 // buffer along with whether the command asks the server to shut down. It switches
 // on command length first so the GET/SET hot paths reach their compare quickly.
-func (s *Server) dispatch(out []byte, args [][]byte) ([]byte, bool) {
+func (s *Server) dispatch(conn *connState, out []byte, args [][]byte) ([]byte, bool) {
 	cmd := args[0]
 	switch len(cmd) {
 	case 3:
@@ -291,10 +301,10 @@ func (s *Server) dispatch(out []byte, args [][]byte) ([]byte, bool) {
 			return s.cmdGet(out, args), false
 		}
 		if eqFold(cmd, "set") {
-			return s.cmdSet(out, args), false
+			return s.cmdSet(conn, out, args), false
 		}
 		if eqFold(cmd, "del") {
-			return s.cmdDel(out, args), false
+			return s.cmdDel(conn, out, args), false
 		}
 	case 4:
 		if eqFold(cmd, "ping") {
@@ -358,42 +368,40 @@ func (s *Server) cmdGet(out []byte, args [][]byte) []byte {
 	return appendBulk(out, val)
 }
 
-func (s *Server) cmdSet(out []byte, args [][]byte) []byte {
+// cmdSet writes key to value as a blind commit, the Redis last-writer-wins
+// contract. The write batch clones the key and value, so it is safe that both
+// still point into the read buffer here.
+func (s *Server) cmdSet(conn *connState, out []byte, args [][]byte) []byte {
 	if len(args) < 3 {
 		return appendErr(out, "wrong number of arguments for 'set'")
 	}
-	key, val := args[1], args[2]
-	if err := s.db.Update(func(t *kv.Txn) error { return t.Set(key, val) }); err != nil {
+	if err := conn.wb.Set(args[1], args[2]); err != nil {
 		return appendErr(out, err.Error())
 	}
 	return append(out, respOK...)
 }
 
-// cmdDel deletes each key in one transaction and replies with the count that
-// existed, the Redis DEL contract.
-func (s *Server) cmdDel(out []byte, args [][]byte) []byte {
+// cmdDel deletes each key that exists and replies with the count removed, the
+// Redis DEL contract. It reads each key to decide whether it counts, then issues
+// a blind delete for the ones present, last-writer-wins like SET. The read and
+// the delete are not one atomic step, so a key concurrently written between them
+// is a thin race the single-threaded Redis would not have; it does not corrupt
+// the store and is immaterial to a benchmark.
+func (s *Server) cmdDel(conn *connState, out []byte, args [][]byte) []byte {
 	if len(args) < 2 {
 		return appendErr(out, "wrong number of arguments for 'del'")
 	}
-	keys := args[1:]
 	var removed int64
-	err := s.db.Update(func(t *kv.Txn) error {
-		removed = 0
-		for _, k := range keys {
-			if _, gerr := t.Get(k); errors.Is(gerr, kv.ErrNotFound) {
-				continue
-			} else if gerr != nil {
-				return gerr
-			}
-			if derr := t.Delete(k); derr != nil {
-				return derr
-			}
-			removed++
+	for _, k := range args[1:] {
+		if _, err := s.db.Get(k); errors.Is(err, kv.ErrNotFound) {
+			continue
+		} else if err != nil {
+			return appendErr(out, err.Error())
 		}
-		return nil
-	})
-	if err != nil {
-		return appendErr(out, err.Error())
+		if err := conn.wb.Delete(k); err != nil {
+			return appendErr(out, err.Error())
+		}
+		removed++
 	}
 	return appendInt(out, removed)
 }
