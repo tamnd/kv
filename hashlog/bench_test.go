@@ -381,3 +381,34 @@ func BenchmarkResidentCeilingGet(b *testing.B) {
 		}
 	})
 }
+
+// BenchmarkStats measures the operability snapshot so its cost stays low enough to poll on
+// a metrics cadence (audit A6, A7). The store holds many resident pages across 8 shards, so
+// the walk touches every shard's read lock and sums its per-page dead and fill arrays, the
+// work that scales with the store. It is a per-shard linear pass, not a per-key one, so it
+// should stay microsecond-class regardless of key count.
+func BenchmarkStats(b *testing.B) {
+	t := Tunables{Shards: 8, PageSize: 1 << 16, ResidentPagesPerShard: 0}
+	s, err := New(t)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer s.Close()
+
+	const keys = 100000
+	v := benchValue(64)
+	for i := 0; i < keys; i++ {
+		if err := s.Set(benchKey(i), v); err != nil {
+			b.Fatal(err)
+		}
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		st := s.Stats()
+		if st.LiveKeys != keys {
+			b.Fatalf("LiveKeys = %d, want %d", st.LiveKeys, keys)
+		}
+	}
+}

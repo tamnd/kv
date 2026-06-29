@@ -7,6 +7,7 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // recover.go is M5: it rebuilds every shard's resident index from the last valid
@@ -44,6 +45,7 @@ type recoveryStats struct {
 	replayedRecords int64
 	bytesReplayed   []int64
 	tornTailOff     []int64
+	duration        time.Duration
 }
 
 // extentRef is one of a shard's log extents as found by the header scan: its id and the
@@ -62,6 +64,8 @@ type extentRef struct {
 // disk where the locations point, the larger-than-memory property carried into recovery
 // (doc 05 section 9).
 func (s *Store) recover() error {
+	start := time.Now()
+	defer func() { s.rec.duration = time.Since(start) }()
 	d := s.df
 	pageSize := int64(s.t.PageSize)
 

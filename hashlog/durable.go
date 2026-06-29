@@ -8,6 +8,7 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // durableFile is the one file a durable hashlog Store lives in (spec 2070 doc 03).
@@ -47,10 +48,13 @@ type durableFile struct {
 	fileEndAtomic atomic.Int64
 
 	// syncCount counts device barriers issued, so a test can assert the dial's flush
-	// points (None issues none, Full one per SET). syncHook, when set, replaces the
-	// real barrier; the crash scaffold uses it to freeze the file image at an fsync
-	// boundary. Production leaves it nil and goes straight to platformSyncData.
+	// points (None issues none, Full one per SET). syncNanos accumulates the wall time
+	// spent in those barriers, so Stats can report an average barrier latency, the number
+	// that tells an operator whether the Full dial is disk-bound. syncHook, when set,
+	// replaces the real barrier; the crash scaffold uses it to freeze the file image at an
+	// fsync boundary. Production leaves it nil and goes straight to platformSyncData.
 	syncCount atomic.Int64
+	syncNanos atomic.Int64
 	syncHook  func(*os.File) error
 
 	// sb is the current durable superblock (the content of the newer slot), and
@@ -273,10 +277,15 @@ func (d *durableFile) nextLSN() uint64 {
 // image at the boundary.
 func (d *durableFile) syncData() error {
 	d.syncCount.Add(1)
+	start := time.Now()
+	var err error
 	if d.syncHook != nil {
-		return d.syncHook(d.f)
+		err = d.syncHook(d.f)
+	} else {
+		err = platformSyncData(d.f)
 	}
-	return platformSyncData(d.f)
+	d.syncNanos.Add(int64(time.Since(start)))
+	return err
 }
 
 // commit writes a new checkpoint into the older slot with a generation one higher
