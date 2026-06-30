@@ -5,6 +5,53 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.3.0] — 2026-06-30
+
+A consolidation release and a deliberate breaking change. kv had shipped two storage
+cores and let you pick one per database; benchmarking settled the question, so the
+project now runs a single engine, f2, a sharded hash index over a self-durable hybrid
+log, and the rest was removed to keep the surface small. A database created by 0.1.0 or
+0.2.0 does not open in 0.3.0; the f2 on-disk format is the one the project carries
+forward.
+
+### Added
+
+- A Redis (RESP) face for `kv serve`, bound with `-resp-addr` or `-resp-unixsocket`, so a
+  redis client, library, or benchmark drives the same database as the HTTP and binary
+  faces. It serves the string keyspace (`GET`, `SET`, `DEL`, `EXISTS`, `PING`, the
+  `HELLO` handshake for RESP2 and RESP3, and `DBSIZE`) over one writer shared with the
+  other faces. The wire loop is adapted from `tamnd/aki`, reworked over kv's API.
+- An in-memory mode: `kv.OpenMem` and `kv serve :memory:` run the whole stack in RAM with
+  nothing written to disk, for a throwaway cache or a benchmark that wants the engine
+  without the file.
+
+### Changed
+
+- f2 is the only engine and the default. A get is a hash and one record read, so read
+  latency stays flat as the database grows, and the index stays compact at roughly 10 to
+  13 bytes per key regardless of key length, which keeps a billion keys near 15 GiB.
+- The hybrid log bounds resident memory with `WithCacheSize` and faults cold pages in from
+  the file by offset, so a database can run many times larger than the memory it holds.
+
+### Removed
+
+- The B-tree and LSM cores and the engine selector: `WithEngine`, `kv.BTree`, `kv.LSM`,
+  and the per-core tuning options (`WithMemtableSize`, `WithLevelRatio`, `WithFilter`,
+  `WithRangeIndex`, `WithValueSeparation`, `WithCompression`, `WithColdCompression`,
+  `WithFillFactor`, `WithMaxInlineValue`, `WithBtreeBuffers`).
+- Ordered iteration, which f2 does not keep keys in order to provide: `Txn.NewIterator`,
+  `IterOptions`, the `Iterator` type, and `Txn.DeleteRange`, plus the CLI's `scan`,
+  `count`, `dump`, and `export`. The operations are the point ones: get, set, exists,
+  delete, and merge.
+
+### Upgrading
+
+A database from before 0.3.0 cannot be opened; recreate it on 0.3.0 and reload from the
+source you loaded it from. If you relied on scans or the LSM core, 0.2.0 remains
+available, and the pre-consolidation code is preserved in the `tamnd/kv-v1` repository.
+
+---
+
 ## [0.2.0] — 2026-06-25
 
 A performance and ergonomics release. Drop-in over 0.1.0: the on-disk format is unchanged
