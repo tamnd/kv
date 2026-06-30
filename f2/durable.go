@@ -125,6 +125,22 @@ type durableFile struct {
 	gcCond  *sync.Cond
 	syncing bool
 	cur     *syncBatch
+
+	// Seal-sync cadence (redesign-v2 doc 09). Under Normal a page seal used to fsync
+	// the file once per sealed page, so a smaller page (which seals more often) paid
+	// proportionally more device barriers, the whole cost the 64 KiB measurement
+	// isolated. syncEvery decouples the two: a seal writes its page through (WriteAt)
+	// and adds its bytes to dirtyBytes, and a barrier is issued only when the unsynced
+	// total crosses syncEvery, so the fsync cadence is set by bytes written, not by the
+	// page-roll rate. dirtyBytes is reset to zero whenever any barrier runs, since one
+	// whole-file barrier flushes every WriteAt that completed before it. The Normal
+	// crash-loss window is at most syncEvery bytes plus one syncInterval. flushStop and
+	// flushWG own the background time flusher that bounds that window in wall time when
+	// the byte threshold is not being crossed; both are nil unless the dial is Normal.
+	syncEvery  int64
+	dirtyBytes atomic.Int64
+	flushStop  chan struct{}
+	flushWG    sync.WaitGroup
 }
 
 // syncBatch is one group-commit batch: the writers whose records a single device
@@ -159,8 +175,14 @@ func (d *durableFile) sync() error {
 		}
 		// Become the leader for this batch. Detach it so callers arriving during the
 		// barrier form the next batch, then run the one barrier without holding smu.
+		// Clear the dirty counter here, at the barrier's start: this one whole-file
+		// barrier flushes every WriteAt that has completed, so the bytes counted so far
+		// are about to reach the device and no longer count toward the next cadence. A
+		// seal that adds to dirtyBytes after this point is at worst counted twice, which
+		// only makes the next cadence barrier come a little sooner, never later.
 		d.syncing = true
 		d.cur = nil
+		d.dirtyBytes.Store(0)
 		d.smu.Unlock()
 		err := d.barrier()
 		d.smu.Lock()
@@ -190,6 +212,66 @@ func (d *durableFile) barrier() error {
 	}
 	d.syncNanos.Add(int64(time.Since(start)))
 	return err
+}
+
+// sealSync records that n bytes of a just-sealed page reached the file (the seal's
+// WriteAt has completed) and issues one group-commit barrier only when the unsynced
+// total crosses syncEvery. It is the Normal-dial seal path: between barriers the
+// sealed bytes sit in the OS page cache, durable on a clean exit (Close checkpoints)
+// and at risk only of a crash that loses at most the dirty window. Decoupling the
+// barrier from the seal is what lets a small page win on space without paying a
+// device barrier per page roll (redesign-v2 doc 09). A syncEvery of zero or below
+// keeps the old seal-by-seal cadence, one barrier per sealed page.
+func (d *durableFile) sealSync(n int64) error {
+	if d.syncEvery <= 0 {
+		return d.sync()
+	}
+	if d.dirtyBytes.Add(n) < d.syncEvery {
+		return nil
+	}
+	return d.sync()
+}
+
+// startSyncLoop launches the background time flusher that bounds the Normal-dial
+// crash-loss window in wall time: if writes stop just short of the byte threshold,
+// the sealed-but-unsynced bytes would otherwise wait for the next checkpoint, so a
+// ticker issues one barrier per interval whenever any bytes are dirty. It is started
+// only under the Normal dial (None never syncs, Full syncs per record), and the
+// barrier it issues coalesces with any concurrent writer's through the same group
+// commit. A non-positive interval leaves the loop off, so the cadence is byte-only.
+func (d *durableFile) startSyncLoop(interval time.Duration) {
+	if interval <= 0 {
+		return
+	}
+	d.flushStop = make(chan struct{})
+	d.flushWG.Add(1)
+	go func() {
+		defer d.flushWG.Done()
+		tk := time.NewTicker(interval)
+		defer tk.Stop()
+		for {
+			select {
+			case <-d.flushStop:
+				return
+			case <-tk.C:
+				if d.dirtyBytes.Load() > 0 {
+					_ = d.sync()
+				}
+			}
+		}
+	}()
+}
+
+// stopSyncLoop stops the background time flusher and waits for it to exit, so no
+// barrier runs after Close begins tearing the file down. It is idempotent and a
+// no-op when the loop was never started.
+func (d *durableFile) stopSyncLoop() {
+	if d.flushStop == nil {
+		return
+	}
+	close(d.flushStop)
+	d.flushWG.Wait()
+	d.flushStop = nil
 }
 
 // blockOffset is the byte offset of data block b in the file.

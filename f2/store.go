@@ -75,8 +75,13 @@ const (
 	// larger-than-memory speed ceiling. It is the zero value, so the default store
 	// is None.
 	DurabilityNone Durability = iota
-	// DurabilityNormal fsyncs on seal boundaries and at checkpoints, not on every
-	// SET. The loss window on a crash is the writes since the last seal sync.
+	// DurabilityNormal fsyncs on a byte cadence and at checkpoints, not on every SET
+	// and not once per sealed page. A seal writes its page through to the file and a
+	// device barrier is issued when the unsynced bytes cross SyncBytes, so the fsync
+	// rate is set by bytes written rather than by the page-roll rate (which a smaller
+	// page would inflate). The crash-loss window is at most SyncBytes of writes, or one
+	// SyncInterval when the optional wall-time backstop is enabled; a clean Close loses
+	// nothing because it checkpoints.
 	DurabilityNormal
 	// DurabilityFull fsyncs before every SET returns: nothing acknowledged is lost.
 	DurabilityFull
@@ -146,6 +151,27 @@ type Tunables struct {
 	// is due, capping recovery replay. Zero defaults to 256 MiB in durable mode.
 	CheckpointBytes int64
 
+	// SyncBytes bounds the durable bytes a Normal-dial store may seal to the file
+	// without a device barrier: when a page seal pushes the unsynced total past it,
+	// the sealing writer issues one group-commit barrier covering every shard's
+	// pending writes. It decouples the fsync cadence from the page-seal cadence, so a
+	// smaller page (which seals more often) does not multiply device barriers. Zero
+	// defaults to 16 MiB. It has no effect under None (never syncs) or Full (a barrier
+	// per SET). A value of one byte reproduces the old behavior, a barrier per seal.
+	SyncBytes int64
+
+	// SyncInterval, when positive, adds a wall-time bound to the Normal cadence: a
+	// background flusher issues one barrier per interval whenever any bytes are dirty,
+	// so a store that stalls just short of SyncBytes does not hold the sealed bytes
+	// unsynced indefinitely. Zero (the default) leaves the cadence byte-only, where the
+	// loss window is bounded by SyncBytes and by the next checkpoint rather than by
+	// time. Set it when an idle-then-crash loss window must be bounded in seconds; a
+	// steady writer crosses SyncBytes first and rarely sees the timer. It costs one
+	// device barrier per interval while any bytes are dirty, so a small interval taxes a
+	// slow-but-steady writer; the byte bound alone is enough for most workloads. It has
+	// no effect under None or Full.
+	SyncInterval time.Duration
+
 	// CompactionThreshold is the dead fraction at which a shard is rewritten to
 	// reclaim its stranded bytes. Zero defaults to 0.5 (half the shard's log bytes
 	// dead). It bounds steady-state space at the cost of rewrite work; a higher
@@ -188,6 +214,13 @@ func DefaultTunables() Tunables {
 // leaves CheckpointBytes zero: a checkpoint fsyncs sealed pages and advances the
 // superblock, bounding how much a crash must replay.
 const defaultCheckpointBytes = 256 << 20
+
+// defaultSyncBytes is the Normal-dial seal-sync cadence when Tunables leaves SyncBytes
+// zero: a barrier is issued every 16 MiB of sealed bytes, so the crash-loss window is
+// bounded by data written while the fsync rate stays far below one barrier per sealed
+// page (redesign-v2 doc 09). The wall-time backstop (SyncInterval) is off by default,
+// since a periodic barrier taxes a steady writer and the byte bound already caps loss.
+const defaultSyncBytes = 16 << 20
 
 var (
 	errBadShards        = errors.New("f2: Shards must be a power of two greater than zero")
@@ -377,6 +410,16 @@ func newDurable(ctx context.Context, t Tunables) (*Store, error) {
 	}
 	df := &durableFile{f: f, pageSize: int64(t.PageSize), shards: t.Shards, dial: t.Durability, snapRoot: -1, enc: t.Crypto}
 	df.gcCond = sync.NewCond(&df.smu)
+	// Set the Normal-dial seal-sync cadence: a barrier every syncEvery sealed bytes,
+	// with a background timer bounding the window when writes stall short of it. The
+	// dial gate keeps None (never syncs) and Full (a barrier per record) on their
+	// existing paths, where the cadence is meaningless.
+	if t.Durability == DurabilityNormal {
+		df.syncEvery = t.SyncBytes
+		if df.syncEvery == 0 {
+			df.syncEvery = defaultSyncBytes
+		}
+	}
 	s.df = df
 	s.ep = newEpochs()
 
@@ -419,6 +462,14 @@ func newDurable(ctx context.Context, t Tunables) (*Store, error) {
 		s.ckptSig = make(chan struct{}, 1)
 		s.bgWG.Add(1)
 		go s.checkpointLoop()
+	}
+	// The seal-sync time flusher bounds the Normal loss window in wall time when an
+	// interval is set. It is off by default (the byte cadence bounds loss without a
+	// periodic-barrier tax). It is its own goroutine on the durable file, not the
+	// store's background group, so Close can stop it before the final checkpoint
+	// without ordering it against the compactor.
+	if t.Durability == DurabilityNormal && t.SyncInterval > 0 {
+		df.startSyncLoop(t.SyncInterval)
 	}
 	return s, nil
 }
@@ -653,6 +704,9 @@ func (s *Store) Close() error {
 		s.bgWG.Wait()
 	}
 	if s.df != nil {
+		// Stop the seal-sync time flusher before the final checkpoint so no background
+		// barrier races the close-time commit; the checkpoint below issues its own.
+		s.df.stopSyncLoop()
 		// A final checkpoint flushes every tail and writes a fresh index snapshot even
 		// under None, so a clean close is always fully recoverable and the reopen is
 		// delta-bound rather than replaying the whole generation; only a crash exposes
