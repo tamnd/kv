@@ -221,6 +221,31 @@ func Open(path string, opts ...Option) (*DB, error) {
 	return &DB{d: d}, nil
 }
 
+// OpenMem opens a database that lives entirely in memory, backed by an in-memory
+// filesystem instead of a file on disk (spec 03 §5). Nothing is read from or
+// written to the disk, and the database is gone once it is Closed, so OpenMem is
+// for an ephemeral cache, a fast deterministic test, or a throwaway scratch
+// database. It takes the same options as Open, but the ones that describe on-disk
+// behavior have no observable effect: there is no file to fsync, so the WAL
+// durability level changes nothing a reader can see, and the database always
+// starts empty since there is no file to recover. The kv serve command opens one
+// of these when its database argument is ":memory:", which is how the Redis face
+// runs as an in-memory cache next to the in-memory servers.
+func OpenMem(opts ...Option) (*DB, error) {
+	c := &config{}
+	for _, o := range opts {
+		o(c)
+	}
+	c.resolveCache()
+	// The path names the file inside the private in-memory filesystem; the FS is
+	// isolated per instance, so the name is immaterial and never touches the disk.
+	d, err := db.Open(vfs.NewMem(), "kv.db", c.opts)
+	if err != nil {
+		return nil, wrap(err)
+	}
+	return &DB{d: d}, nil
+}
+
 // RestoreBackup reconstructs a database at path from a stream produced by DB.Backup, writing
 // the main file and its -wal sidecar so a subsequent Open reads the restored database (spec
 // 18 §2). It refuses to overwrite an existing file at either path: restore creates, it never

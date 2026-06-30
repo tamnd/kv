@@ -83,7 +83,7 @@ func cmdServe(args []string) int {
 		return exitUsage
 	}
 	if fs.NArg() != 1 {
-		return usageErr("usage: kv serve <db> [-addr host:port] [-binary-addr host:port] [-resp-addr host:port] [-resp-unixsocket path] [-synchronous off|normal|full|extra] [-auth-file path | -jwt-jwks-url url] [-tls-cert path -tls-key path] [limit flags]")
+		return usageErr("usage: kv serve <db|:memory:> [-addr host:port] [-binary-addr host:port] [-resp-addr host:port] [-resp-unixsocket path] [-synchronous off|normal|full|extra] [-auth-file path | -jwt-jwks-url url] [-tls-cert path -tls-key path] [limit flags]")
 	}
 	limits := server.Limits{
 		MaxKeySize:   *maxKeySize,
@@ -137,7 +137,10 @@ func cmdServe(args []string) int {
 
 	// serve creates the database if it does not exist yet, so a fresh data directory comes up
 	// as an empty server rather than an error: kv.Open creates the file with defaults when it is
-	// missing. -synchronous, when set, overrides the WAL durability for this process only.
+	// missing. The database argument ":memory:" opens an in-memory database instead, backed by
+	// RAM with nothing written to disk, so a benchmark or a throwaway cache serves the Redis and
+	// native faces without a file. -synchronous, when set, overrides the WAL durability for this
+	// process only; against an in-memory database it changes nothing observable.
 	var opts []kv.Option
 	sync, ok, err := parseSync(*synchronous)
 	if err != nil {
@@ -146,7 +149,12 @@ func cmdServe(args []string) int {
 	if ok {
 		opts = append(opts, kv.WithSynchronous(sync))
 	}
-	d, err := kv.Open(fs.Arg(0), opts...)
+	var d *kv.DB
+	if fs.Arg(0) == ":memory:" {
+		d, err = kv.OpenMem(opts...)
+	} else {
+		d, err = kv.Open(fs.Arg(0), opts...)
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "kv: cannot open %s: %v\n", fs.Arg(0), err)
 		return codeFor(err)
