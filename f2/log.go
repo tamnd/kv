@@ -339,7 +339,10 @@ func (l *log) sealPage(pi int) error {
 		return err
 	}
 	if l.df.dial == DurabilityNormal {
-		return l.df.sync()
+		// Defer the device barrier to the byte cadence rather than fsyncing this one
+		// sealed page: a smaller page seals more often, so a per-seal barrier would
+		// scale the fsync count with the page-roll rate (redesign-v2 doc 09).
+		return l.df.sealSync(int64(len(ref.mem)))
 	}
 	return nil
 }
