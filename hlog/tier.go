@@ -34,7 +34,7 @@ import (
 type TieredDB struct {
 	mu       sync.Mutex // guards the seal-and-swap only; the read and write fast paths are lock-free
 	active   atomic.Pointer[segment]
-	sealed   atomic.Pointer[segment]
+	sealed   atomic.Pointer[sealedNode] // newest-first list of sealed segments not yet drained
 	cold     *DB
 	cache    *readCache
 	segBytes int64
@@ -44,6 +44,34 @@ type TieredDB struct {
 	migrate chan *segment
 	closed  chan struct{}
 	wg      sync.WaitGroup
+}
+
+// maxSealed bounds how many sealed segments may be outstanding at once, the pipeline depth
+// between the writers and the single migrator. One segment was the original design: a writer
+// that filled the active had to wait for the whole previous segment to drain before it could
+// seal, so at high write concurrency all writers stalled in bursts and fill throughput sagged
+// and jittered (note 182). A small queue lets writers keep sealing while the migrator works
+// through the backlog, which smooths the stall and lifts throughput toward the migrator's steady
+// drain rate, while still bounding hot memory to maxSealed+1 segments.
+const maxSealed = 4
+
+// sealedNode is one entry in the newest-first list of sealed segments. The list is immutable
+// once published: seal prepends a new head and the migrator republishes a rebuilt list with a
+// drained segment removed, so a reader walking the chain holds a consistent snapshot without a
+// lock and the segment it is reading stays alive as long as it holds the pointer.
+type sealedNode struct {
+	seg  *segment
+	next *sealedNode
+}
+
+// sealedLen counts the segments in a sealed list, the outstanding pipeline depth seal checks
+// against maxSealed.
+func sealedLen(n *sealedNode) int {
+	c := 0
+	for ; n != nil; n = n.next {
+		c++
+	}
+	return c
 }
 
 // segment is an in-memory append region plus its own index. It is write-once per record: an
@@ -61,65 +89,64 @@ func newSegment(capBytes int64, capKeys int) *segment {
 	return &segment{buf: make([]byte, capBytes), cap: capBytes, ix: NewIndex(capKeys)}
 }
 
-// put writes the record for key and value and indexes it at its address. It returns false if
-// the segment cannot fit the record, in which case nothing was indexed and the caller should
-// seal this segment and retry on a fresh one. The tail may overshoot cap on a failed put,
+// put writes the record for key and value under op and indexes it at its address. It returns
+// false if the segment cannot fit the record, in which case nothing was indexed and the caller
+// should seal this segment and retry on a fresh one. The tail may overshoot cap on a failed put,
 // which is harmless because a failed put indexes nothing and the segment is about to be sealed.
-func (s *segment) put(fp uint64, key, value []byte) bool {
-	payload := keyLenSize + len(key) + len(value)
+func (s *segment) put(fp uint64, op byte, key, value []byte) bool {
+	payload := recordLen(key, value)
 	total := int64(hdrLen + payload)
 	off := s.tail.Add(total) - total
 	if off+total > s.cap {
 		return false
 	}
 	binary.LittleEndian.PutUint32(s.buf[off:], uint32(payload))
-	p := off + hdrLen
-	binary.LittleEndian.PutUint16(s.buf[p:], uint16(len(key)))
-	copy(s.buf[p+keyLenSize:], key)
-	copy(s.buf[p+keyLenSize+int64(len(key)):], value)
-	s.ix.Put(fp, off) // the index store publishes the record: a reader that sees it sees the bytes
-	return true
+	frameRecord(s.buf[off+hdrLen:off+hdrLen+int64(payload)], op, key, value)
+	// The index store publishes the record: a reader that sees the entry sees the bytes. If the
+	// index is full this reports full just as a full buffer does, so the caller seals and retries
+	// the record on a fresh segment. The bytes already written here are then orphaned, never
+	// indexed, and dropped on drain, so a too-small index costs an early seal, never a lost write.
+	return s.ix.Put(fp, off)
 }
 
-// get returns the value for key if this segment holds the live version, copied into scratch so
-// it stays valid after the segment is dropped. It verifies the stored key, so a stale index
-// entry whose record was superseded is a clean miss.
-func (s *segment) get(fp uint64, key, scratch []byte) ([]byte, bool) {
+// get reports this segment's view of key: found with a value, found as a tombstone, or not
+// present. The three-way answer is what lets a tombstone in a higher tier shadow an older value
+// in a lower one: a tombstone returns tomb=true so the cascade stops here and reports the key
+// deleted instead of falling through to the stale value below. The value is copied into scratch
+// so it stays valid after the segment is dropped. A stale index entry whose key does not match,
+// a superseded record, is a clean miss.
+func (s *segment) get(fp uint64, key, scratch []byte) (val []byte, found, tomb bool) {
 	addr, ok := s.ix.Get(fp)
 	if !ok {
-		return nil, false
+		return nil, false, false
 	}
 	payload := int64(binary.LittleEndian.Uint32(s.buf[addr:]))
-	p := addr + hdrLen
-	klen := int64(binary.LittleEndian.Uint16(s.buf[p:]))
-	if klen+keyLenSize > payload {
-		return nil, false
+	op, recKey, value, ok := parseRecord(s.buf[addr+hdrLen : addr+hdrLen+payload])
+	if !ok || !bytes.Equal(recKey, key) {
+		return nil, false, false
 	}
-	if !bytes.Equal(s.buf[p+keyLenSize:p+keyLenSize+klen], key) {
-		return nil, false
+	if op == opDel {
+		return nil, false, true
 	}
-	v := s.buf[p+keyLenSize+klen : p+payload]
-	return append(scratch[:0], v...), true
+	return append(scratch[:0], value...), true, false
 }
 
 // rangeRecords calls fn for every record in the segment in address order, up to the committed
 // tail. The migrator uses it to walk a sealed segment; fn gets the address so it can ask the
-// index whether this record is still the live version for its key.
-func (s *segment) rangeRecords(fn func(addr int64, key, value []byte)) {
+// index whether this record is still the live version for its key, and the op so it can carry a
+// tombstone to cold rather than dropping it.
+func (s *segment) rangeRecords(fn func(addr int64, op byte, key, value []byte)) {
 	end := min(s.tail.Load(), s.cap)
 	for off := int64(0); off+hdrLen <= end; {
 		payload := int64(binary.LittleEndian.Uint32(s.buf[off:]))
 		if payload <= 0 || off+hdrLen+payload > end {
 			return
 		}
-		p := off + hdrLen
-		klen := int64(binary.LittleEndian.Uint16(s.buf[p:]))
-		if klen+keyLenSize > payload {
+		op, key, value, ok := parseRecord(s.buf[off+hdrLen : off+hdrLen+payload])
+		if !ok {
 			return
 		}
-		key := s.buf[p+keyLenSize : p+keyLenSize+klen]
-		value := s.buf[p+keyLenSize+klen : p+payload]
-		fn(off, key, value)
+		fn(off, op, key, value)
 		off += hdrLen + payload
 	}
 }
@@ -139,7 +166,7 @@ func OpenTiered(path string, segBytes int64, segKeys int, ringBytes int64, coldK
 		segBytes: segBytes,
 		segKeys:  segKeys,
 		seed:     maphash.MakeSeed(),
-		migrate:  make(chan *segment, 1),
+		migrate:  make(chan *segment, maxSealed),
 		closed:   make(chan struct{}),
 	}
 	t.active.Store(newSegment(segBytes, segKeys))
@@ -152,11 +179,27 @@ func OpenTiered(path string, segBytes int64, segKeys int, ringBytes int64, coldK
 // active segment. When the active segment fills, Set seals it, hands it to the background
 // migrator, and installs a fresh active segment, then retries; this is the only path that
 // takes the lock, and it runs once per segment, not once per write.
-func (t *TieredDB) Set(key, value []byte) {
+func (t *TieredDB) Set(key, value []byte) { t.write(opSet, key, value) }
+
+// Delete writes a tombstone for key in the hot tier. The key reads as absent afterward across
+// every tier: the hot tombstone shadows an older value in a sealed segment or in cold, and it
+// migrates to cold as a tombstone so the delete survives a reopen. It is one append, the same
+// fast path as Set.
+func (t *TieredDB) Delete(key []byte) { t.write(opDel, key, nil) }
+
+// write appends a record under op into the active segment, sealing and retrying on a full
+// segment, then invalidates the read-cache cell for the key. The invalidation is what keeps a
+// read correct across the hot-to-cold migration: the cache holds values read from cold, and once
+// this newer record migrates to cold the cached value would be stale, so a write drops the cell
+// and the next cold read repopulates it from the migrated record. Without it an overwrite or a
+// delete could be shadowed in the hot tier yet still served stale from the cache after the hot
+// record drained away.
+func (t *TieredDB) write(op byte, key, value []byte) {
 	fp := forceFP(maphash.Bytes(t.seed, key))
 	for {
 		a := t.active.Load()
-		if a.put(fp, key, value) {
+		if a.put(fp, op, key, value) {
+			t.cache.invalidate(fp)
 			return
 		}
 		t.seal(a)
@@ -165,16 +208,18 @@ func (t *TieredDB) Set(key, value []byte) {
 
 // seal swaps the full segment out for a fresh one and queues it for migration. It re-checks
 // under the lock so that only the first caller to see a given full segment seals it; the rest
-// observe the already-swapped active and loop back to retry their put. If a previous sealed
-// segment is still draining, seal waits for it, which is the backpressure that bounds hot
-// memory to two segments and preserves version order across seals.
+// observe the already-swapped active and loop back to retry their put. It prepends the segment to
+// the newest-first sealed list and hands it to the migrator in seal order. When the list already
+// holds maxSealed segments it waits for the migrator to drain one, which is the backpressure that
+// bounds hot memory; version order is preserved because the list is newest-first for reads and
+// the migrator drains in seal order, so an older value always reaches cold before a newer one.
 func (t *TieredDB) seal(full *segment) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.active.Load() != full {
 		return // another writer already sealed this one
 	}
-	for t.sealed.Load() != nil {
+	for sealedLen(t.sealed.Load()) >= maxSealed {
 		t.mu.Unlock()
 		runtime.Gosched()
 		t.mu.Lock()
@@ -182,9 +227,29 @@ func (t *TieredDB) seal(full *segment) {
 			return
 		}
 	}
-	t.sealed.Store(full)
+	t.sealed.Store(&sealedNode{seg: full, next: t.sealed.Load()})
 	t.active.Store(newSegment(t.segBytes, t.segKeys))
 	t.migrate <- full
+}
+
+// removeSealed republishes the sealed list with seg dropped, called by the migrator once it has
+// finished draining seg into cold. It rebuilds the chain rather than mutating it in place so a
+// reader walking the old chain keeps a consistent snapshot; the new chain reuses the surviving
+// segments and only the drained one falls out, to become garbage once no reader holds it.
+func (t *TieredDB) removeSealed(seg *segment) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	var keep []*segment
+	for n := t.sealed.Load(); n != nil; n = n.next {
+		if n.seg != seg {
+			keep = append(keep, n.seg)
+		}
+	}
+	var head *sealedNode
+	for i := len(keep) - 1; i >= 0; i-- {
+		head = &sealedNode{seg: keep[i], next: head}
+	}
+	t.sealed.Store(head)
 }
 
 // Get returns the value for key. It checks the hot tiers first, active then sealed, then the
@@ -192,22 +257,30 @@ func (t *TieredDB) seal(full *segment) {
 // value is copied into and may be reused across calls.
 func (t *TieredDB) Get(key, scratch []byte) ([]byte, bool, error) {
 	fp := forceFP(maphash.Bytes(t.seed, key))
-	if v, ok := t.active.Load().get(fp, key, scratch); ok {
+	if v, found, tomb := t.active.Load().get(fp, key, scratch); found {
 		return v, true, nil
+	} else if tomb {
+		return nil, false, nil
 	}
-	if s := t.sealed.Load(); s != nil {
-		if v, ok := s.get(fp, key, scratch); ok {
+	for n := t.sealed.Load(); n != nil; n = n.next {
+		if v, found, tomb := n.seg.get(fp, key, scratch); found {
 			return v, true, nil
+		} else if tomb {
+			return nil, false, nil
 		}
 	}
 	if v, ok := t.cache.get(fp, key, scratch); ok {
 		return v, true, nil
 	}
-	v, ok, err := t.cold.Get(key, scratch)
+	v, ok, fromDisk, err := t.cold.get(key, scratch)
 	if err != nil || !ok {
 		return nil, false, err
 	}
-	t.cache.put(fp, key, v)
+	// Only a disk-sourced read is worth caching: a value the cold log served from its resident
+	// ring is already in memory, so caching it would spend RAM and an allocation to save nothing.
+	if fromDisk {
+		t.cache.put(fp, key, v)
+	}
 	return v, true, nil
 }
 
@@ -222,14 +295,14 @@ func (t *TieredDB) migrateLoop() {
 		select {
 		case seg := <-t.migrate:
 			t.drain(seg)
-			t.sealed.Store(nil)
+			t.removeSealed(seg)
 		case <-t.closed:
 			// Drain anything still queued so Close persists every set.
 			for {
 				select {
 				case seg := <-t.migrate:
 					t.drain(seg)
-					t.sealed.Store(nil)
+					t.removeSealed(seg)
 				default:
 					return
 				}
@@ -242,11 +315,17 @@ func (t *TieredDB) migrateLoop() {
 // segment's index still maps its key to this record's address; a record superseded by a later
 // write in the same segment points elsewhere and is dropped.
 func (t *TieredDB) drain(seg *segment) {
-	seg.rangeRecords(func(addr int64, key, value []byte) {
+	seg.rangeRecords(func(addr int64, op byte, key, value []byte) {
 		fp := forceFP(maphash.Bytes(t.seed, key))
-		if cur, ok := seg.ix.Get(fp); ok && cur == addr {
-			t.cold.Set(key, value)
+		cur, ok := seg.ix.Get(fp)
+		if !ok || cur != addr {
+			return // superseded within the segment, dropped as compaction
 		}
+		if op == opDel {
+			t.cold.Delete(key) // carry the tombstone to cold so the delete survives a reopen
+			return
+		}
+		t.cold.Set(key, value)
 	})
 }
 

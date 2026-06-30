@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // HybridLog is the larger-than-memory log: one growing file whose recent tail is held in
@@ -49,10 +50,17 @@ type HybridLog struct {
 	flushed   atomic.Int64
 	synced    atomic.Int64 // highest address fsynced to disk, the durability watermark
 
+	flushTrigger int64 // wake the flusher only once this many committed-but-unflushed bytes pile up
+
 	flushWake chan struct{}
 	closed    chan struct{}
 	wg        sync.WaitGroup
 }
+
+// flushTick is the backstop interval: even when the unflushed prefix never reaches flushTrigger,
+// the flusher wakes this often to drain the tail, so a trickle of writes still reaches the file
+// within a bounded delay instead of waiting for the next trigger crossing or for Close.
+const flushTick = 2 * time.Millisecond
 
 // maxRecord bounds a single record so a torn length read during a racing ring read is
 // rejected by a sanity check instead of driving an out-of-range copy. It also bounds the
@@ -82,13 +90,14 @@ func OpenHybridLog(path string, ringBytes int64) (*HybridLog, error) {
 		return nil, err
 	}
 	l := &HybridLog{
-		buf:       make([]byte, n),
-		ringBytes: n,
-		mask:      n - 1,
-		f:         f,
-		cf:        cf,
-		flushWake: make(chan struct{}, 1),
-		closed:    make(chan struct{}),
+		buf:          make([]byte, n),
+		ringBytes:    n,
+		mask:         n - 1,
+		f:            f,
+		cf:           cf,
+		flushTrigger: min(n/8, 1<<20), // batch wakeups: a flush covers up to ~1 MiB or an eighth of the ring
+		flushWake:    make(chan struct{}, 1),
+		closed:       make(chan struct{}),
 	}
 	if err := l.recover(); err != nil {
 		f.Close()
@@ -195,6 +204,37 @@ func (l *HybridLog) Append(rec []byte) int64 {
 	return off
 }
 
+// AppendFrame writes one record framed as [op][klen][key][value] and returns its logical
+// address, framing straight into the ring instead of taking a caller-staged buffer. It saves a
+// copy over framing into a scratch buffer and handing that to Append: the value, the large part,
+// lands in its ring slot in one memmove rather than being copied into a staging buffer first and
+// into the ring second. The profiler put that second copy at a third of the write path on a
+// 1 KiB value (note 182), so the durable store frames here rather than through Append. The small
+// header parts, the op, the key length, and the key, are tiny next to the value. The length
+// header is still written last so its nonzero value marks the record complete, the same publish
+// order Append uses, and the same backpressure wait guards a not-yet-flushed ring slot.
+func (l *HybridLog) AppendFrame(op byte, key, value []byte) int64 {
+	payload := int64(recordLen(key, value))
+	total := hdrLen + payload
+	off := l.tail.Add(total) - total
+	for off+total > l.flushed.Load()+l.ringBytes {
+		l.wakeFlusher()
+		runtime.Gosched()
+	}
+	base := off + hdrLen
+	var meta [opSize + keyLenSize]byte
+	meta[0] = op
+	binary.LittleEndian.PutUint16(meta[opSize:], uint16(len(key)))
+	l.ringWrite(base, meta[:])
+	l.ringWrite(base+opSize+keyLenSize, key)
+	l.ringWrite(base+opSize+keyLenSize+int64(len(key)), value) // the big copy: value straight to its slot
+	var hdr [hdrLen]byte
+	binary.LittleEndian.PutUint32(hdr[:], uint32(payload))
+	l.ringWrite(off, hdr[:]) // header last: its nonzero value marks the record complete
+	l.commit(off, total)
+	return off
+}
+
 // commit advances the committed watermark in address order. The appender whose record
 // starts at the current watermark moves it past its own record; a later appender that
 // finished first waits its turn, so committed only ever exposes a contiguous fully-written
@@ -204,8 +244,16 @@ func (l *HybridLog) commit(off, total int64) {
 	for l.committed.Load() != off {
 		runtime.Gosched()
 	}
-	l.committed.Store(off + total)
-	l.wakeFlusher()
+	c := off + total
+	l.committed.Store(c)
+	// Wake the flusher only once enough unflushed bytes have piled up, not on every record. A
+	// per-record signal was a cond-signal storm that dominated the write path under profiling: the
+	// migrator appended a million records and woke the flusher a million times. Batching the wake
+	// to a flushTrigger-sized prefix collapses that to a handful of wakeups per burst, and the
+	// ticker backstop in flushLoop still drains a trickle that never reaches the trigger.
+	if c-l.flushed.Load() >= l.flushTrigger {
+		l.wakeFlusher()
+	}
 }
 
 func (l *HybridLog) wakeFlusher() {
@@ -220,6 +268,8 @@ func (l *HybridLog) wakeFlusher() {
 // record's logical offset, so the file mirrors the address space exactly.
 func (l *HybridLog) flushLoop() {
 	defer l.wg.Done()
+	ticker := time.NewTicker(flushTick)
+	defer ticker.Stop()
 	for {
 		c := l.committed.Load()
 		f := l.flushed.Load()
@@ -239,6 +289,7 @@ func (l *HybridLog) flushLoop() {
 			}
 			return
 		case <-l.flushWake:
+		case <-ticker.C: // backstop: drain a tail that never reached the trigger
 		}
 	}
 }
@@ -285,9 +336,18 @@ var errShortRecord = errors.New("hlog: record past tail")
 // before being overwritten), so it falls back to a file read. A record comfortably inside
 // the window takes the lock-free ring path.
 func (l *HybridLog) At(addr int64, dst []byte) ([]byte, error) {
+	dst, _, err := l.AtSource(addr, dst)
+	return dst, err
+}
+
+// AtSource is At plus whether the record was served from disk rather than the resident ring.
+// The tier uses the flag to cache only disk-sourced reads: a record already resident in the ring
+// is served from memory at full speed, so a second copy of it in the read cache would only spend
+// RAM to save nothing, while a disk-sourced read is exactly the one worth caching.
+func (l *HybridLog) AtSource(addr int64, dst []byte) ([]byte, bool, error) {
 	t := l.tail.Load()
 	if addr < 0 || addr+hdrLen > t {
-		return nil, errShortRecord
+		return nil, false, errShortRecord
 	}
 	if addr >= t-l.ringBytes {
 		// Resident path: read length, sanity-check, read payload, then validate.
@@ -298,12 +358,13 @@ func (l *HybridLog) At(addr int64, dst []byte) ([]byte, error) {
 			dst = grow(dst, int(n))
 			l.ringRead(addr+hdrLen, dst)
 			if addr >= l.tail.Load()-l.ringBytes {
-				return dst, nil
+				return dst, false, nil
 			}
 		}
 		// Window moved during the read, or a torn length: serve from disk below.
 	}
-	return l.readDisk(addr, dst)
+	dst, err := l.readDisk(addr, dst)
+	return dst, true, err
 }
 
 // readDisk reads a record straight from the file at offset addr. The file mirrors the

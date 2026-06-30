@@ -117,6 +117,93 @@ func TestTieredConcurrent(t *testing.T) {
 	rg.Wait()
 }
 
+// TestTieredDelete checks a delete shadows the value across the tiers it can sit above. It
+// writes a key, forces it down to cold with a Sync, reads it so the read cache holds it, then
+// deletes it. The key must read absent whether the tombstone is still in the hot tier or has
+// itself migrated to cold, and the stale cached value must not leak through.
+func TestTieredDelete(t *testing.T) {
+	const segBytes = 1 << 16
+	path := filepath.Join(t.TempDir(), "tier.log")
+	d, err := OpenTiered(path, segBytes, 4096, 1<<20, 4096, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	key := []byte("victim")
+	d.Set(key, []byte("present"))
+	if err := d.Sync(); err != nil { // push the value to cold
+		t.Fatal(err)
+	}
+	if v, ok, _ := d.Get(key, nil); !ok || string(v) != "present" { // fill the read cache from cold
+		t.Fatalf("get before delete: got (%q,%v) want (present,true)", v, ok)
+	}
+	d.Delete(key)
+	if _, ok, _ := d.Get(key, nil); ok { // tombstone in the hot tier shadows the cold value and the cache
+		t.Fatal("get after delete (hot tombstone): want miss")
+	}
+	if err := d.Sync(); err != nil { // migrate the tombstone to cold
+		t.Fatal(err)
+	}
+	if _, ok, _ := d.Get(key, nil); ok { // tombstone now in cold still wins
+		t.Fatal("get after delete (cold tombstone): want miss")
+	}
+}
+
+// TestTieredDeleteThenReinsert checks a key can come back after a delete: the reinserted value
+// must win over the tombstone, the same latest-wins order an overwrite uses.
+func TestTieredDeleteThenReinsert(t *testing.T) {
+	const segBytes = 1 << 16
+	path := filepath.Join(t.TempDir(), "tier.log")
+	d, err := OpenTiered(path, segBytes, 4096, 1<<20, 4096, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	key := []byte("phoenix")
+	d.Set(key, []byte("first"))
+	d.Delete(key)
+	d.Set(key, []byte("second"))
+	if err := d.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok, _ := d.Get(key, nil); !ok || string(v) != "second" {
+		t.Fatalf("get after reinsert: got (%q,%v) want (second,true)", v, ok)
+	}
+}
+
+// TestTieredOverwriteAfterCacheFill is the regression for the stale-cache bug the delete work
+// surfaced: a value read from cold lands in the read cache, then the key is overwritten and the
+// new value migrates to cold. The cached old value must not be served after the hot record that
+// shadowed it has drained away. Without the write-side cache invalidation this returns the old
+// value.
+func TestTieredOverwriteAfterCacheFill(t *testing.T) {
+	const segBytes = 1 << 16
+	path := filepath.Join(t.TempDir(), "tier.log")
+	d, err := OpenTiered(path, segBytes, 4096, 1<<20, 4096, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	key := []byte("mutable")
+	d.Set(key, []byte("old"))
+	if err := d.Sync(); err != nil { // old to cold
+		t.Fatal(err)
+	}
+	if v, ok, _ := d.Get(key, nil); !ok || string(v) != "old" { // cache the old value from cold
+		t.Fatalf("get old: got (%q,%v) want (old,true)", v, ok)
+	}
+	d.Set(key, []byte("new"))
+	if err := d.Sync(); err != nil { // new overwrites old in cold; cache must have been invalidated
+		t.Fatal(err)
+	}
+	if v, ok, _ := d.Get(key, nil); !ok || string(v) != "new" {
+		t.Fatalf("get new: got (%q,%v) want (new,true)", v, ok)
+	}
+}
+
 // TestReadCacheRoundTrip checks the seqlock cache in isolation: put then get returns the
 // value, a different key on the same slot is a miss, and an overwrite is visible.
 func TestReadCacheRoundTrip(t *testing.T) {

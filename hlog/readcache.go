@@ -52,6 +52,15 @@ func (c *readCache) put(fp uint64, key, value []byte) {
 	c.cells[fp&c.mask].Store(e)
 }
 
+// invalidate clears the cell the fingerprint maps to with one atomic store, so a later read of
+// that cell misses and refills from the live tier. A write calls it after appending a newer
+// record for the key, because the cached value, read from cold, goes stale the moment that newer
+// record exists. Clearing by cell is correct even on a fingerprint collision: it may evict an
+// unrelated key that shares the slot, which only costs that key one cold read.
+func (c *readCache) invalidate(fp uint64) {
+	c.cells[fp&c.mask].Store(nil)
+}
+
 // get returns the cached value for key, copied into scratch, if the cell holds it. It loads
 // the cell's current entry atomically and verifies the key, since the cell is direct-mapped
 // and may hold a different key that hashed to the same slot.
