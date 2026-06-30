@@ -14,14 +14,22 @@ import (
 	"github.com/tamnd/kv"
 )
 
-// startServer opens a fresh database in a temp dir, serves it over RESP on a
-// loopback port, and returns a connected client plus a cleanup the test defers.
+// startServer opens a fresh on-disk database in a temp dir, serves it over RESP on
+// a loopback port, and returns a connected client plus a cleanup the test defers.
 func startServer(t *testing.T) (*client, func()) {
 	t.Helper()
 	db, err := kv.Open(filepath.Join(t.TempDir(), "kv.db"))
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
+	return startServerOn(t, db)
+}
+
+// startServerOn serves an already-open database over RESP on a loopback port and
+// returns a connected client plus a cleanup. It is the shared body behind the
+// on-disk and in-memory variants, so both exercise the identical wire path.
+func startServerOn(t *testing.T, db *kv.DB) (*client, func()) {
+	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -247,6 +255,32 @@ func TestConcurrentSetNoConflict(t *testing.T) {
 }
 
 func fmtErr(format string, a ...any) error { return fmt.Errorf(format, a...) }
+
+// TestInMemoryServer drives the same SET/GET/DEL path against a database opened
+// with kv.OpenMem, the backend the Redis face uses when it serves ":memory:" as an
+// in-memory cache. The wire loop is identical to the on-disk server, so this only
+// has to confirm the in-memory store reads and writes through it.
+func TestInMemoryServer(t *testing.T) {
+	db, err := kv.OpenMem()
+	if err != nil {
+		t.Fatalf("OpenMem: %v", err)
+	}
+	cli, cleanup := startServerOn(t, db)
+	defer cleanup()
+
+	if got := cli.cmd(t, "SET", "alpha", "one"); got != "+OK" {
+		t.Fatalf("SET = %q, want +OK", got)
+	}
+	if got := cli.cmd(t, "GET", "alpha"); got != "one" {
+		t.Fatalf("GET alpha = %q, want one", got)
+	}
+	if got := cli.cmd(t, "DEL", "alpha"); got != ":1" {
+		t.Fatalf("DEL = %q, want :1", got)
+	}
+	if got := cli.cmd(t, "GET", "alpha"); got != "<nil>" {
+		t.Fatalf("GET alpha after DEL = %q, want <nil>", got)
+	}
+}
 
 func TestInlinePing(t *testing.T) {
 	cli, cleanup := startServer(t)
