@@ -164,6 +164,34 @@ func BenchmarkF2SetParallelShards(b *testing.B) {
 	}
 }
 
+// BenchmarkF2OverwriteDurableSpace measures the space a hot same-size overwrite
+// band strands on the durable evicting profile, the profile in-place targets. Each
+// Set repoints an existing key with a fresh value of the current size (tval is fixed
+// width). Without in-place every overwrite appends a record and strands the old one,
+// so LogBytes and the space amplification climb with b.N; with in-place a hot key
+// whose record is still in the resident unflushed tail is rewritten where it sits, so
+// the log does not grow. The reported metrics are the space side, not ns/op: space-amp
+// is LogBytes/LiveBytes after the run, and logbytes/op is the bytes appended per Set.
+func BenchmarkF2OverwriteDurableSpace(b *testing.B) {
+	for _, hot := range []int{1, 64} {
+		b.Run(fmt.Sprintf("hot=%d", hot), func(b *testing.B) {
+			s := fillF2Durable(b, hot, 4096, 4, DurabilityNone)
+			defer s.Close()
+			before := s.Stats().LogBytes
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				_ = s.Set(tkey(i%hot), tval(i))
+			}
+			b.StopTimer()
+			st := s.Stats()
+			b.ReportMetric(st.SpaceAmplification, "space-amp")
+			b.ReportMetric(float64(st.LogBytes-before)/float64(b.N), "logbytes/op")
+			b.ReportMetric(float64(s.InPlaceUpdates()), "inplace")
+		})
+	}
+}
+
 func BenchmarkF2Get(b *testing.B) {
 	s := fillF2(b, benchKeys)
 	defer s.Close()

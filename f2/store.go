@@ -638,6 +638,21 @@ func (s *Store) Close() error {
 
 // Stats sums the per-shard accounting into one snapshot. It takes each shard's
 // read lock briefly, so it is consistent per shard but not a global instant.
+// InPlaceUpdates returns the total number of overwrites taken on the in-place path
+// (FASTER's same-size overwrite of a record still in the resident, unflushed tail),
+// summed across shards. It is zero on every profile but the durable evicting non-Full
+// one, and on a hot same-size workload there it climbs while LogBytes and the space
+// amplification stay flat, which is the in-place win made measurable.
+func (s *Store) InPlaceUpdates() int64 {
+	var n int64
+	for _, sh := range s.shards {
+		sh.mu.RLock()
+		n += sh.inPlaceCount
+		sh.mu.RUnlock()
+	}
+	return n
+}
+
 func (s *Store) Stats() Stats {
 	st := Stats{MinShardKeys: -1}
 	for _, sh := range s.shards {
