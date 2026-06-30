@@ -46,18 +46,30 @@ func New(capBytes int64) *Log {
 	return &Log{buf: make([]byte, capBytes), cap: capBytes}
 }
 
-// Append writes one record and returns its logical address. It reserves the record's
-// bytes with one atomic fetch-add on the tail, so concurrent appenders get disjoint
-// spans without a lock, then copies the payload and writes the length prefix. The
-// payload is copied before the prefix is set, so a concurrent scanner that reads a
-// nonzero length at this address sees a fully written payload behind it; the engine's
-// real publication point is the index store that follows the append, which carries the
-// release barrier a reader synchronizes against.
+// Reserve claims space for one record of n payload bytes and returns its logical address
+// together with the payload slice the caller fills in place. It is the zero-copy write
+// primitive: the caller frames its record (a key and a value, say) straight into the
+// returned slice with no temporary buffer and no allocation. The reservation is one
+// atomic fetch-add on the tail, so two callers never block and never overlap.
+//
+// A record is published to readers by the index store that follows, which carries the
+// happens-before a reader synchronizes against, so the order in which the prefix and the
+// payload are written within the reservation does not matter for index-based reads. A
+// forward scan reads the prefix to find boundaries, and that runs only during recovery
+// when no appender is concurrent.
+func (l *Log) Reserve(n int) (int64, []byte) {
+	total := int64(hdrLen + n)
+	off := l.tail.Add(total) - total
+	binary.LittleEndian.PutUint32(l.buf[off:off+hdrLen], uint32(n))
+	return off, l.buf[off+hdrLen : off+total]
+}
+
+// Append writes one record and returns its logical address. It is Reserve plus a copy,
+// kept for callers that already hold the record bytes; the hot write path uses Reserve
+// directly to avoid the intermediate buffer.
 func (l *Log) Append(rec []byte) int64 {
-	n := int64(hdrLen + len(rec))
-	off := l.tail.Add(n) - n
-	copy(l.buf[off+hdrLen:off+n], rec)
-	binary.LittleEndian.PutUint32(l.buf[off:off+hdrLen], uint32(len(rec)))
+	off, dst := l.Reserve(len(rec))
+	copy(dst, rec)
 	return off
 }
 
