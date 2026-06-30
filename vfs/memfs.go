@@ -190,12 +190,40 @@ func (f *memFile) WriteAt(p []byte, off int64) (int, error) {
 	defer f.data.mu.Unlock()
 	end := int(off) + len(p)
 	if end > len(f.data.live) {
-		grown := make([]byte, end)
-		copy(grown, f.data.live)
-		f.data.live = grown
+		oldLen := len(f.data.live)
+		f.data.live = growBytes(f.data.live, end)
+		// Zero any gap between the old end and the write offset so a sparse write
+		// never exposes stale bytes left in a reused backing array. For the common
+		// append (off == oldLen) this runs zero times.
+		for i := oldLen; i < int(off); i++ {
+			f.data.live[i] = 0
+		}
 	}
 	copy(f.data.live[off:], p)
 	return len(p), nil
+}
+
+// growBytes returns b extended to length n, growing the backing array's capacity
+// geometrically rather than to exactly n. A memfs file grows by repeated WriteAt
+// at its end (the WAL append pattern), so allocating exactly n bytes and copying
+// every time would recopy the whole file on each append, making a run of N writes
+// cost O(N^2). Doubling the capacity instead makes it amortized O(total bytes),
+// which is what keeps an in-memory database's write path fast. Newly made bytes
+// are zero, matching a fresh allocation; bytes already in b are preserved.
+func growBytes(b []byte, n int) []byte {
+	if n <= cap(b) {
+		return b[:n]
+	}
+	newCap := cap(b)
+	if newCap == 0 {
+		newCap = 64
+	}
+	for newCap < n {
+		newCap *= 2
+	}
+	grown := make([]byte, n, newCap)
+	copy(grown, b)
+	return grown
 }
 
 func (f *memFile) Sync(mode SyncMode) error {
