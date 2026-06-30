@@ -77,6 +77,14 @@ type Engine struct {
 	// f2 file. The host folds the WAL no further than this and replays the tail past it on
 	// the next open, so f2 owns its persistence while the host keeps the unflushed tail.
 	durableLSN atomic.Uint64
+
+	// gcWatermark is the version-GC horizon the host last announced through NoteWatermark:
+	// the oldest version any live or future reader can still observe. Apply prunes a key's
+	// version group to this horizon before writing it back, so a hot key under update churn
+	// keeps only the cells a live snapshot can reach rather than every version ever written
+	// (redesign-v2 doc 02). A zero watermark, the value before the host announces one and the
+	// value during recovery, prunes nothing, which is always safe.
+	gcWatermark atomic.Uint64
 }
 
 // New opens an f2 engine with the given configuration.
@@ -143,6 +151,7 @@ func (e *Engine) Apply(batch *engine.WriteBatch, commitVersion uint64) error {
 			return err
 		}
 		cells = upsertCell(cells, cell{version: format.Version(ik), kind: kind, value: ent.Value})
+		cells = pruneCells(cells, e.gcWatermark.Load())
 		scratch = encodeGroup(scratch[:0], cells)
 		if err := e.s.Set(uk, scratch); err != nil {
 			return err
@@ -192,6 +201,49 @@ func upsertCell(cells []cell, nc cell) []cell {
 	}
 	return append(cells, nc)
 }
+
+// isBaseKind reports whether a cell of this kind resolves a fold without needing any older
+// cell beneath it: a set, a delete tombstone, a TTL set, or a separated set. A merge is not a
+// base, since folding it consumes the value below. pruneCells may drop cells older than the
+// newest base at or below the watermark precisely because a fold that lands on a base stops
+// there.
+func isBaseKind(k format.Kind) bool {
+	switch k {
+	case format.KindSet, format.KindDelete, format.KindSetWithTTL, format.KindSetSep:
+		return true
+	default:
+		return false
+	}
+}
+
+// pruneCells drops the cells no reader at or above the watermark can observe, the
+// snapshot-isolation GC rule specialized to one key's version group (redesign-v2 doc 02).
+// cells are newest-first. Every cell with version above the watermark is kept, since a live
+// snapshot can sit anywhere at or above it. Among the cells at or below the watermark, the
+// newest base cell is the deepest one any reachable fold can reach, so that cell and
+// everything newer is kept and everything older is dropped. A watermark of zero, or a group
+// with no base cell at or below it, prunes nothing, which is always correct and merely less
+// compact. The returned slice aliases the input's backing array; the caller encodes it before
+// the next store call, so the truncation never outlives the bytes it points at.
+func pruneCells(cells []cell, watermark uint64) []cell {
+	if watermark == 0 {
+		return cells
+	}
+	for i := range cells {
+		if cells[i].version <= watermark && isBaseKind(cells[i].kind) {
+			return cells[:i+1]
+		}
+	}
+	return cells
+}
+
+// NoteWatermark records the version-GC horizon the host announces for the write path: the
+// oldest version any live or future reader can still observe. The host calls it once per
+// commit group, before Apply, so Apply prunes each key's version group to this horizon as it
+// writes it back. It mirrors NoteLSN: a plain atomic store the apply path reads without a
+// lock. A stale value only keeps a few extra dead cells until the next write, so the host may
+// announce a conservative (lower) watermark freely.
+func (e *Engine) NoteWatermark(w uint64) { e.gcWatermark.Store(w) }
 
 // NewReader implements engine.Engine.
 func (e *Engine) NewReader(snap engine.Snapshot) (engine.Reader, error) {

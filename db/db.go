@@ -1471,6 +1471,19 @@ func (d *DB) noteLSN(lsn uint64) {
 	}
 }
 
+// noteWatermark passes the version-GC horizon to an engine that prunes per-key version
+// state on the write path, the companion of noteLSN. The f2 core prunes a key's MVCC version
+// group to this horizon as it applies a write, so a hot key under update churn keeps only the
+// versions a live snapshot can reach (redesign-v2 doc 02). The host calls it once per commit
+// group before the apply phase, so the readMark cost is amortized across the batch. An engine
+// that does not prune (the B-tree core, which GCs through Maintain) does not implement it and
+// the call is a no-op.
+func (d *DB) noteWatermark(w uint64) {
+	if n, ok := d.eng.(interface{ NoteWatermark(uint64) }); ok {
+		n.NoteWatermark(w)
+	}
+}
+
 // flushEngine drains an engine that holds committed writes in an in-memory region the
 // checkpoint's page fold would otherwise miss, so the fold that follows captures them.
 // The Bε-tree core's mutable hot tail is such a region: a write rests in the tail

@@ -116,6 +116,13 @@ func (d *DB) processGroup(group []*commitReq) {
 	// inserts across cores; the bookkeeping that makes each batch visible still runs serially in
 	// version order. An engine without that capability (the B-tree core) takes one Apply per
 	// batch.
+	// Announce the version-GC horizon once for the whole group so an engine that prunes
+	// per-key version state on the write path (the f2 core) keeps each key's group bounded
+	// to what a live snapshot can still reach. One readMark read amortized across the batch
+	// (redesign-v2 doc 02).
+	if len(appended) > 0 {
+		d.noteWatermark(d.orc.readMark())
+	}
 	if ga, ok := d.eng.(engine.GroupApplier); ok && len(appended) > 0 {
 		d.applyGroupDurable(ga, appended, durable)
 	} else {
