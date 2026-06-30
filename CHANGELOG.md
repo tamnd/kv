@@ -5,6 +5,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Unreleased]
+
+### Changed
+
+- The shipped default durability is now `SyncNormal` (group commit) instead of
+  `SyncFull`. kv fdatasyncs the WAL at each checkpoint and on a short timer rather than on
+  every commit, so out-of-box write throughput is tens of thousands of commits per second
+  instead of the few hundred per second an fsync-on-every-commit default gives. This is the
+  trade SQLite WAL with `synchronous=NORMAL`, badger, pebble and rocksdb all default to. A
+  power failure never corrupts the file; the only thing it can lose is the last sub-second
+  of acknowledged commits. If you need zero acked-commit loss, open with
+  `WithSynchronous(kv.SyncFull)` or set `synchronous=full`; that path is unchanged and one
+  option away. No on-disk format change.
+
+---
+
 ## [0.3.0] — 2026-06-30
 
 A consolidation release and a deliberate breaking change. kv had shipped two storage

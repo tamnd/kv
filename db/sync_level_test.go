@@ -17,7 +17,7 @@ import (
 // The proof is the WAL fsync counter (Stats().Syncs). Auto-checkpointing is disabled so
 // the only thing that could sync during the run is a commit; under SyncOff a commit must
 // not. The contrast cases hold the counter to the level's contract: SyncFull syncs once
-// per commit, and an unset Options behaves as SyncFull, preserving the safe default.
+// per commit, and an unset Options behaves as SyncNormal, the shipped group-commit default.
 func TestSyncOffSkipsEveryFsync(t *testing.T) {
 	const commits = 200
 
@@ -56,11 +56,13 @@ func TestSyncOffSkipsEveryFsync(t *testing.T) {
 		}
 	})
 
-	t.Run("unset Options keeps the safe SyncFull default", func(t *testing.T) {
-		// The whole point of reserving the zero value is that an unconfigured database is
-		// still fully durable. A regression that made zero mean OFF would drop this to 0.
-		if got := run(t, Options{}); got < commits {
-			t.Fatalf("unset Sync fsynced %d times over %d commits, want at least %d (SyncFull default)", got, commits, commits)
+	t.Run("unset Options resolves to the SyncNormal default", func(t *testing.T) {
+		// The shipped default is SyncNormal: group commit that finalizes durability at
+		// checkpoint, not per commit. With checkpointing disabled a commit never syncs, so
+		// this must read zero just like an explicit SyncNormal. The reserved zero sentinel
+		// is still what keeps SyncOff a distinct, non-zero choice rather than the default.
+		if got := run(t, Options{}); got != 0 {
+			t.Fatalf("unset Sync fsynced %d times over %d commits, want 0 (SyncNormal default)", got, commits)
 		}
 	})
 }

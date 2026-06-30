@@ -77,7 +77,7 @@ func cmdServe(args []string) int {
 	respUnixSocket := fs.String("resp-unixsocket", "", "unix socket path for the Redis (RESP) protocol (empty disables it)")
 	// -synchronous overrides the WAL durability for this run, so a benchmark can compare
 	// write paths with the per-commit fsync removed without rewriting the file. Empty keeps
-	// the database's own default, which is SyncFull.
+	// the database's own default, which is SyncNormal.
 	synchronous := fs.String("synchronous", "", "WAL durability for this run: off, normal, full, or extra (empty keeps the default)")
 	if err := parseArgs(fs, args); err != nil {
 		return exitUsage

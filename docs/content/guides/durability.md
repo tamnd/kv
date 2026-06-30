@@ -21,19 +21,25 @@ A frame that fails its checksum marks the end of the valid log: kv stops there, 
 | Level | What it does | Loses on power failure |
 | --- | --- | --- |
 | `SyncOff` | Never fsyncs. The OS flushes on its own schedule. | Recent commits, possibly many. |
-| `SyncNormal` | fdatasyncs at checkpoint and periodically. | A small window of recent commits. |
+| `SyncNormal` | fdatasyncs at checkpoint and on a short timer, not on every commit. The shipped default. | The last sub-second of commits. |
 | `SyncBarrier` | A write-ordering barrier on every commit (`F_BARRIERFSYNC` on macOS, fdatasync on Linux). | Nothing reordered past the barrier, though the very last commit may not be flushed. |
-| `SyncFull` | fdatasyncs on every commit, batched across concurrent committers. The safe default. | Nothing acknowledged. |
+| `SyncFull` | fdatasyncs on every commit, batched across concurrent committers. | Nothing acknowledged. |
 | `SyncExtra` | `SyncFull` plus a directory sync when the file grows. | Nothing, including the file's existence after growth. |
 
-`SyncFull` is the default and is what you want unless you have a specific reason to change it. It guarantees that once a commit returns, the data is on disk; a power failure the instant after cannot lose it.
+`SyncNormal` is the shipped default. It is group commit: kv fdatasyncs the WAL at each checkpoint and on a short timer rather than on every individual commit, so out-of-box write throughput is tens of thousands of commits per second instead of the few hundred per second an fsync-on-every-commit default would give you. This is the same trade SQLite's WAL mode with `PRAGMA synchronous=NORMAL`, badger, pebble and rocksdb all default to.
+
+The guarantee is honest about its one gap. A power failure never corrupts the file: the checksum chain still holds and recovery comes back at a consistent committed state. What it can lose is the last sub-second of commits, the ones that were acknowledged but had not yet been fsynced when the power went. If you cannot tolerate losing any acknowledged commit, ask for `SyncFull`, which fdatasyncs on every commit so once `Commit` returns the data is on the platter and nothing after a power cut can lose it. `SyncFull` is one option away, no format change involved.
 
 Set the level at open time or change it at runtime:
 
 ```go
+// the default, group commit, is SyncNormal; pass nothing to get it
+db, _ := kv.Open("app.kv")
+
+// ask for zero acked-commit loss
 db, _ := kv.Open("app.kv", kv.WithSynchronous(kv.SyncFull))
 
-// or later, for example to bulk-load fast then tighten back up
+// or change it later, for example to bulk-load fast then tighten back up
 db.SetSynchronous(kv.SyncOff)
 // ... load a million keys ...
 db.SetSynchronous(kv.SyncFull)
@@ -44,7 +50,7 @@ That bulk-load pattern, drop to `SyncOff`, load, restore the level, and checkpoi
 
 ## Group commit
 
-`SyncFull` fsyncs on every commit, but it does not fsync once per commit when many commits arrive at once. kv batches concurrent committers so that one fsync covers a whole group, which is why write throughput under concurrency stays high even at the safe durability level. You can widen the batching window deliberately with the `commit_linger_us` setting, which makes a commit wait a few microseconds for others to join its group, trading a little latency for fewer fsyncs under heavy write load.
+Even when you ask for `SyncFull`, kv does not fsync once per commit when many commits arrive at once. It batches concurrent committers so that one fsync covers a whole group, which is why write throughput under concurrency stays high even at the strictest level. You can widen the batching window deliberately with the `commit_linger_us` setting, which makes a commit wait a few microseconds for others to join its group, trading a little latency for fewer fsyncs under heavy write load.
 
 ## Checkpointing
 

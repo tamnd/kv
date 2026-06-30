@@ -35,21 +35,24 @@ type EngineKind = format.EngineKind
 // Version is the current release of the kv library. It follows semantic versioning.
 // The 0.x series is the pre-1.0 line: the API is broadly stable and the on-disk
 // format is fixed, but the surface may still change before the 1.0 commitment.
-const Version = "0.3.0"
+const Version = "0.3.1"
 
-// Sync is the WAL durability level (spec 07 §6). SyncFull, the default, makes every
-// acked commit survive a crash.
+// Sync is the WAL durability level (spec 07 §6). SyncNormal, the shipped default, is
+// group commit: no corruption on power loss, with the last sub-second of commits as the
+// loss window. SyncFull asks for an fdatasync on every commit so no acked commit is lost.
 type Sync = wal.Sync
 
 const (
 	// SyncOff never fsyncs the WAL; fastest, loses recent commits on power loss.
 	SyncOff = wal.SyncOff
-	// SyncNormal fdatasyncs at checkpoint and periodically, not every commit.
+	// SyncNormal fdatasyncs at checkpoint and periodically, not every commit; the
+	// shipped default. No corruption on power loss, only a sub-second loss window. This
+	// is the trade SQLite WAL+NORMAL, badger, pebble and rocksdb default to.
 	SyncNormal = wal.SyncNormal
 	// SyncBarrier issues a write-ordering barrier on every commit (F_BARRIERFSYNC on
 	// macOS, fdatasync on Linux); crash-durable but not power-loss-durable.
 	SyncBarrier = wal.SyncBarrier
-	// SyncFull fdatasyncs on every commit (group-batched); the safe default.
+	// SyncFull fdatasyncs on every commit (group-batched); no acked commit is ever lost.
 	SyncFull = wal.SyncFull
 	// SyncExtra is SyncFull plus a directory sync on file growth.
 	SyncExtra = wal.SyncExtra

@@ -747,10 +747,10 @@ func TestWatchPrefixBadEncoding(t *testing.T) {
 // TestPragmaSynchronous reads and sets the WAL sync level through the pragma surface.
 func TestPragmaSynchronous(t *testing.T) {
 	p := dbPath(t)
-	// Initial level is full (the default).
+	// Initial level is normal (the shipped default).
 	got := strings.TrimSpace(capture(t, func() { run([]string{"pragma", p, "synchronous"}) }))
-	if got != "full" {
-		t.Fatalf("synchronous = %q, want full", got)
+	if got != "normal" {
+		t.Fatalf("synchronous = %q, want normal", got)
 	}
 	// Set to off and read back; result echoes the new name.
 	out := strings.TrimSpace(capture(t, func() {

@@ -43,7 +43,7 @@ const walSuffix = "-wal"
 const f2Suffix = "-f2"
 
 // Options configure a database at open. The zero value is usable: it selects the
-// B-tree core, a 4 KiB page size, and SyncFull durability.
+// B-tree core, a 4 KiB page size, and SyncNormal durability.
 type Options struct {
 	// PageSize is the page size for a freshly created file; ignored when opening an
 	// existing file (its header's page size wins).
@@ -58,11 +58,12 @@ type Options struct {
 	// torn writes and bit rot out of the box; set format.ChecksumXXH64 for the wider
 	// digest. Ignored when opening an existing file (its header's choice wins).
 	Checksum format.ChecksumAlgo
-	// Sync is the WAL durability level (spec 07 §6). Zero is SyncFull, the safe
-	// default: every acked commit survives a crash. SyncBarrier is the cheaper
-	// middle ground, durable on a process or kernel crash but not guaranteed on
-	// power loss, for callers that want most of SyncOff's throughput while staying
-	// crash-safe (perf/06 F2).
+	// Sync is the WAL durability level (spec 07 §6). Zero is SyncNormal, the shipped
+	// default: group commit that fdatasyncs at checkpoint and on a short timer, not on
+	// every commit. No corruption on power loss, with a bounded loss window of the last
+	// sub-second of commits. SyncFull asks for an fdatasync on every commit, so no acked
+	// commit is ever lost. SyncBarrier is the middle ground, durable on a process or
+	// kernel crash but not guaranteed on power loss (perf/06 F2).
 	Sync wal.Sync
 	// Merge folds an existing value and a merge operand into a new value during read
 	// resolution (spec 15). If nil, a merge operand behaves as a plain set.
@@ -190,11 +191,14 @@ func (o Options) clock() func() uint64 {
 
 func (o Options) sync() wal.Sync {
 	// The zero value of wal.Sync is the reserved "unset" sentinel, not a real level, so
-	// an unconfigured Options maps to SyncFull, the safe default. Any explicit choice,
+	// an unconfigured Options maps to SyncNormal, the shipped default: durable group
+	// commit, the same trade SQLite WAL+NORMAL, badger, pebble and rocksdb default to. No
+	// corruption on power loss, the last sub-second of commits can be lost. A caller that
+	// wants zero acked-commit loss asks for SyncFull explicitly. Any explicit choice,
 	// including SyncOff, is non-zero and passes through untouched, which is what lets a
 	// caller actually turn fsync off (perf/06 F1).
 	if o.Sync == 0 {
-		return wal.SyncFull
+		return wal.SyncNormal
 	}
 	return o.Sync
 }
