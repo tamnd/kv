@@ -1,7 +1,7 @@
 # kv
 
 An embeddable key/value database for Go.
-One file on disk, zero external dependencies, full ACID transactions, and a storage core built for fast point lookups.
+One file on disk, zero external dependencies, full ACID transactions, and a sharded hash-log storage core built for fast point lookups over datasets larger than memory.
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/tamnd/kv.svg)](https://pkg.go.dev/github.com/tamnd/kv)
 [![Go Report Card](https://goreportcard.com/badge/github.com/tamnd/kv)](https://goreportcard.com/report/github.com/tamnd/kv)
@@ -34,8 +34,9 @@ kv takes a different line:
 
 - **One file, zero dependencies.** A database is a single `.kv` file plus a write-ahead log alongside it. The module imports only the standard library, so `go get` adds nothing else to your build.
 - **Real transactions.** `View` and `Update` run closures inside ACID transactions. Snapshot isolation is the default, serializable is one option away, and conflicts retry automatically.
-- **Built for point lookups.** Keys live in a sharded, mostly lock-free hash index over a hybrid log. A get hashes the key and reads one record, so read latency stays flat as the database grows. Set, get, exists, delete, and merge are the core operations.
-- **Crash-safe by construction.** Every commit goes through a checksummed write-ahead log. After a crash, the next open replays the log and brings the file back to its last committed state. Durability is tunable from one fsync per commit down to none.
+- **Fast point lookups that stay flat.** Keys live in a sharded, mostly lock-free hash index over a hybrid log. A get hashes the key and reads one record, with no tree to descend, so latency does not grow with the database. In memory on an Apple M4 a random read across a million keys is about 60 ns and allocates nothing, where the previous B-tree core took several microseconds for the same read. Reads take no lock on the common path, so they scale across cores. Set, get, exists, delete, and merge are the core operations.
+- **Larger than memory.** The hybrid log keeps the working set you touch in RAM and leaves the cold tail in the file. The resident memory is bounded by `WithCacheSize`, so the database can be many times larger than the cache; a read that misses the resident set faults its page in from the file, and you pay a disk read only for the cold keys you actually reach. The index itself is compact, around 10 to 13 bytes per key whatever the key length, so a billion keys cost roughly 15 GiB of index.
+- **Crash-safe by construction.** Every commit goes through a checksummed write-ahead log. After a crash, the next open replays the log and brings the file back to its last committed state. Durability is tunable from one fsync per commit down to none, and group commit batches concurrent committers so write throughput holds up at the safe level.
 - **More than a library.** The same surface ships as a command-line tool and an HTTP and binary server with auth, TLS, and a change feed, for when you need the database over a socket.
 
 ## Install

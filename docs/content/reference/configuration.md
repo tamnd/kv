@@ -38,7 +38,7 @@ These apply per run and may differ each time.
 
 | Option | Default | Effect |
 | --- | --- | --- |
-| `WithCacheSize(int)` | engine default | Buffer-pool capacity in bytes. |
+| `WithCacheSize(int)` | engine default | The bound on the engine's resident memory in bytes, the dial behind running [larger than memory](/guides/engines/#larger-than-memory). Size it to your working set. |
 | `WithSynchronous(Sync)` | `SyncFull` | WAL sync level (see below). |
 | `WithAutoCheckpoint(int)` | engine default | WAL frame backlog before a background checkpoint; negative disables. |
 | `WithMaxRetries(int)` | small default | Bound on automatic `Update` conflict retries. |
@@ -105,7 +105,7 @@ kv pragma app.kv help                 # list all
 | `commit_version` | Latest committed version. |
 | `wal_frames`, `wal_backlog` | Frames written, and frames committed but not yet checkpointed. |
 | `syncs` | Fsyncs since open. |
-| `cache_size` | Buffer-pool capacity in frames. |
+| `cache_size` | Resident memory bound, in frames. The larger-than-memory dial; see the [storage engine guide](/guides/engines/#larger-than-memory). |
 | `wal_checkpoint` | Checkpoint the WAL; the value selects the mode. |
 
 ## On-disk layout

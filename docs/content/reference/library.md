@@ -134,7 +134,7 @@ Every option is a function passed to `Open`. Create-time options are recorded in
 | `WithPageSize(int)` | create | Page size in bytes for a fresh file. |
 | `WithEncryptionKey([]byte)` | create | 32-byte AES-256-GCM master key. |
 | `WithMergeOperator(name, fn)` | create + every open | Registers the associative merge operator. |
-| `WithCacheSize(int)` | open | Buffer-pool capacity in bytes. |
+| `WithCacheSize(int)` | open | Resident memory bound in bytes, the [larger-than-memory](/guides/engines/#larger-than-memory) dial. |
 | `WithSynchronous(Sync)` | open | `SyncOff`, `SyncNormal`, `SyncBarrier`, `SyncFull` (default), `SyncExtra`. |
 | `WithAutoCheckpoint(int)` | open | WAL frame backlog before background checkpoint; negative disables. |
 | `WithMaxRetries(int)` | open | Bound on `Update` conflict retries. |
