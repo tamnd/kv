@@ -18,6 +18,7 @@ the winners; the reasons live here and in the matching impl note under
 | [mapping](mapping) | logical address to file offset: direct or block table? | direct mapping | 178 |
 | [hotindex](hotindex) | does bounding the index to the working set pay off? | yes, 4x to 11x | 179 |
 | [cache](cache) | how is a read-cache cell read and written concurrently? | atomic-pointer copy-on-write | 180 |
+| [commit](commit) | fsync once per append or amortize over a batch? | group commit at the flush batch | 181 |
 
 ## Running one
 
