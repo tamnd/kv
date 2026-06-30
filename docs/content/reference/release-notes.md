@@ -10,6 +10,10 @@ The authoritative, full changelog lives in [CHANGELOG.md](https://github.com/tam
 
 kv follows semantic versioning. While the project is in its 0.x series, the API and on-disk format are still settling toward a 1.0 commitment, and any breaking change is called out in the release notes. 0.3.0 consolidated the storage engine and is a clean break: a database created by 0.1.0 or 0.2.0 does not open in 0.3.0 or later. From 0.3.0 on, the f2 on-disk format is the one the project carries forward.
 
+## Unreleased
+
+- **Group commit is the default.** The shipped default durability is now `SyncNormal`, group commit, instead of `SyncFull`. kv fdatasyncs the WAL at each checkpoint and on a short timer rather than on every commit, so out-of-box write throughput is tens of thousands of commits per second rather than the few hundred an fsync-on-every-commit default gives. This is the trade SQLite WAL with `synchronous=NORMAL`, badger, pebble and rocksdb all default to. A power failure never corrupts the file; the only thing it can lose is the last sub-second of acknowledged commits. For zero acked-commit loss, open with `WithSynchronous(kv.SyncFull)` or set `synchronous=full`. No on-disk format change.
+
 ## 0.3.0
 
 A consolidation release, and a deliberate breaking change. kv had shipped two storage cores and let you pick one per database; benchmarking settled the question, so the project now has a single engine, f2, a sharded hash index over a self-durable log, and the rest was removed to keep the surface small and the code honest.

@@ -48,10 +48,10 @@ type Sync int
 
 const (
 	// syncDefault is the zero value and means "the caller did not choose a level".
-	// It never reaches the WAL: db.Options.sync() resolves it to SyncFull, the safe
-	// default, before the log is built. Reserving the zero value for "unset" is what
-	// makes SyncOff a distinguishable, explicit choice, so a caller that asks for no
-	// fsync actually gets none instead of silently running at SyncFull (perf/06 F1).
+	// It never reaches the WAL: db.Options.sync() resolves it to SyncNormal, the shipped
+	// group-commit default, before the log is built. Reserving the zero value for "unset"
+	// is what makes SyncOff a distinguishable, explicit choice, so a caller that asks for
+	// no fsync actually gets none instead of silently running at the default (perf/06 F1).
 	syncDefault Sync = iota
 	// SyncOff never fsyncs the WAL; the OS flushes on its own schedule. No
 	// corruption (the checksum chain still holds), but recent commits can be lost.

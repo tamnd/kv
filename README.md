@@ -150,9 +150,9 @@ The synchronous level is the durability-versus-speed dial:
 | Level | Guarantee |
 | --- | --- |
 | `SyncOff` | No fsync; fastest, loses recent commits on power failure. |
-| `SyncNormal` | fdatasync at checkpoint and periodically. |
+| `SyncNormal` | fdatasync at checkpoint and periodically. The default: no corruption on power loss, only the last sub-second of commits at risk. |
 | `SyncBarrier` | A write-ordering barrier on every commit. |
-| `SyncFull` | fdatasync on every commit. The safe default. |
+| `SyncFull` | fdatasync on every commit; no acked commit is ever lost. |
 | `SyncExtra` | `SyncFull` plus a directory sync on growth. |
 
 See the [durability guide](https://kv.tamnd.com/guides/durability/).

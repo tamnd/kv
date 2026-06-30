@@ -12,7 +12,7 @@ This page collects the dials in one place: the Go options you pass to `Open`, th
 | --- | --- |
 | Engine | f2 |
 | Page size | 4096 bytes |
-| Synchronous level | `SyncFull` |
+| Synchronous level | `SyncNormal` |
 | Isolation | Snapshot |
 | Auto-vacuum | off |
 | Encryption | off |
@@ -39,7 +39,7 @@ These apply per run and may differ each time.
 | Option | Default | Effect |
 | --- | --- | --- |
 | `WithCacheSize(int)` | engine default | The bound on the engine's resident memory in bytes, the dial behind running [larger than memory](/guides/engines/#larger-than-memory). Size it to your working set. |
-| `WithSynchronous(Sync)` | `SyncFull` | WAL sync level (see below). |
+| `WithSynchronous(Sync)` | `SyncNormal` | WAL sync level (see below). |
 | `WithAutoCheckpoint(int)` | engine default | WAL frame backlog before a background checkpoint; negative disables. |
 | `WithMaxRetries(int)` | small default | Bound on automatic `Update` conflict retries. |
 | `WithIsolation(Isolation)` | `SnapshotIsolation` | `SnapshotIsolation` or `Serializable`. |
@@ -56,9 +56,9 @@ The `synchronous` setting is the durability-versus-speed dial, set with `WithSyn
 | Level | Pragma value | Guarantee |
 | --- | --- | --- |
 | `SyncOff` | `off` | No fsync; the OS flushes on its own schedule. |
-| `SyncNormal` | `normal` | fdatasync at checkpoint and periodically. |
+| `SyncNormal` | `normal` | fdatasync at checkpoint and periodically (the default). |
 | `SyncBarrier` | `barrier` | A write-ordering barrier on every commit. |
-| `SyncFull` | `full` | fdatasync on every commit (the default). |
+| `SyncFull` | `full` | fdatasync on every commit; no acked commit is ever lost. |
 | `SyncExtra` | `extra` | `SyncFull` plus a directory sync on file growth. |
 
 The [durability guide](/guides/durability/) explains what each one loses on a power failure.

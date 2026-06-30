@@ -133,7 +133,9 @@ func TestRecoverAfterCrashNoCheckpoint(t *testing.T) {
 // folded data with the redone post-checkpoint tail.
 func TestCrashAfterCheckpoint(t *testing.T) {
 	fs := vfs.NewMem()
-	d, err := Open(fs, "test.kv", Options{PageSize: 4096})
+	// SyncFull so the post-checkpoint tail is fsynced per commit and survives the crash;
+	// this test is about redo folding past a checkpoint, not the group-commit default.
+	d, err := Open(fs, "test.kv", Options{PageSize: 4096, Sync: wal.SyncFull})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -288,7 +290,9 @@ func TestSyncBarrierSurvivesCrashWithoutCheckpoint(t *testing.T) {
 // across many pages, proving recovery drives the same split path normal writes do.
 func TestRecoverLargeBatchWithSplits(t *testing.T) {
 	fs := vfs.NewMem()
-	d, err := Open(fs, "test.kv", Options{PageSize: 512, CacheFrames: 16})
+	// SyncFull so the batch is durable before the crash; this test exercises the redo
+	// split path, not the group-commit default that defers the sync to checkpoint.
+	d, err := Open(fs, "test.kv", Options{PageSize: 512, CacheFrames: 16, Sync: wal.SyncFull})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -319,7 +323,9 @@ func TestRecoverLargeBatchWithSplits(t *testing.T) {
 // checkpoint, and recovers a second time. Redo must be safe to run twice.
 func TestRepeatedCrashRecoveryIsIdempotent(t *testing.T) {
 	fs := vfs.NewMem()
-	d, _ := Open(fs, "test.kv", Options{PageSize: 4096})
+	// SyncFull so the commits are durable before the crash; this test is about redo being
+	// idempotent across repeated recoveries, not the group-commit default.
+	d, _ := Open(fs, "test.kv", Options{PageSize: 4096, Sync: wal.SyncFull})
 	d.Write(func(b *engine.WriteBatch) { b.Set([]byte("k"), []byte("v")) })
 	d.Write(func(b *engine.WriteBatch) { b.Merge([]byte("m"), []byte("a")) })
 	d.Write(func(b *engine.WriteBatch) { b.Merge([]byte("m"), []byte("b")) })
