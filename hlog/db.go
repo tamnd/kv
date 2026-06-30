@@ -34,14 +34,42 @@ func OpenDB(path string, ringBytes int64, capKeys int) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &DB{
+	d := &DB{
 		log:  log,
 		ix:   NewIndex(capKeys),
 		seed: maphash.MakeSeed(),
 		bufPool: sync.Pool{
 			New: func() any { return make([]byte, 0, 256) },
 		},
-	}, nil
+	}
+	if err := d.replay(); err != nil {
+		log.Close()
+		return nil, err
+	}
+	return d, nil
+}
+
+// replay rebuilds the index from the recovered log so a reopen serves every durable record. It
+// walks the records in address order and points the index at each, so a later overwrite of a
+// key wins by being indexed last, the same latest-wins order the live write path produces. The
+// fingerprints are recomputed with this process's seed, so the seed need not be persisted. A
+// fresh file replays nothing.
+func (d *DB) replay() error {
+	if d.log.Tail() == 0 {
+		return nil
+	}
+	return d.log.Range(func(addr int64, rec []byte) bool {
+		if len(rec) < keyLenSize {
+			return true
+		}
+		klen := int(binary.LittleEndian.Uint16(rec))
+		if keyLenSize+klen > len(rec) {
+			return true
+		}
+		key := rec[keyLenSize : keyLenSize+klen]
+		d.ix.Put(maphash.Bytes(d.seed, key), addr)
+		return true
+	})
 }
 
 // Set stores value under key. It frames the record, a key-length prefix then the key then
@@ -86,6 +114,10 @@ func (d *DB) Get(key, scratch []byte) ([]byte, bool, error) {
 	}
 	return rec[keyLenSize+klen:], true, nil
 }
+
+// Sync forces every set so far durable before returning. Callers that need a crash-safe
+// barrier use it; the normal path relies on the background group commit.
+func (d *DB) Sync() error { return d.log.Sync() }
 
 // Close flushes and closes the backing file. After Close every set is on disk.
 func (d *DB) Close() error { return d.log.Close() }

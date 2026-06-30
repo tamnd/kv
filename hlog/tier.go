@@ -106,10 +106,7 @@ func (s *segment) get(fp uint64, key, scratch []byte) ([]byte, bool) {
 // tail. The migrator uses it to walk a sealed segment; fn gets the address so it can ask the
 // index whether this record is still the live version for its key.
 func (s *segment) rangeRecords(fn func(addr int64, key, value []byte)) {
-	end := s.tail.Load()
-	if end > s.cap {
-		end = s.cap
-	}
+	end := min(s.tail.Load(), s.cap)
 	for off := int64(0); off+hdrLen <= end; {
 		payload := int64(binary.LittleEndian.Uint32(s.buf[off:]))
 		if payload <= 0 || off+hdrLen+payload > end {
@@ -251,6 +248,32 @@ func (t *TieredDB) drain(seg *segment) {
 			t.cold.Set(key, value)
 		}
 	})
+}
+
+// Sync forces a durability barrier: it seals and drains the hot tier into cold, then fsyncs
+// cold, so every set so far is on disk and recoverable. It is the crash-safe checkpoint point.
+// The normal path leaves the hot tier in memory and relies on Close to migrate it; between
+// syncs a crash loses the un-migrated hot records, bounded to at most two segments, which is
+// the cost of keeping the hot write path lock-free and allocation-light. Callers that need a
+// tighter window call Sync more often.
+func (t *TieredDB) Sync() error {
+	a := t.active.Load()
+	if a.tail.Load() > 0 {
+		t.seal(a)
+	}
+	t.drainPending()
+	return t.cold.Sync()
+}
+
+// drainPending blocks until the migrator has emptied the seal queue and cleared the sealed
+// slot, so every sealed record has reached cold. It is the wait a durability barrier needs.
+func (t *TieredDB) drainPending() {
+	for {
+		if len(t.migrate) == 0 && t.sealed.Load() == nil {
+			return
+		}
+		runtime.Gosched()
+	}
 }
 
 // Close stops the migrator after draining queued segments, then closes the cold tier so every

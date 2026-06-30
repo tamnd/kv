@@ -102,25 +102,33 @@ func TestDBPersistsToDisk(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	addrs := make(map[string]int64)
-	last := ""
 	for i := range 500 {
 		key := fmt.Sprintf("k%04d", i)
 		d.Set([]byte(key), fmt.Appendf(nil, "value-%04d", i))
-		addrs[key] = d.log.Tail()
-		last = key
 	}
-	_ = last
 	if err := d.Close(); err != nil {
 		t.Fatal(err)
 	}
-	// The file should be non-empty and at least as large as the logical tail of early data.
-	// A direct read-back of recovery is step five; here we just confirm Close persisted.
-	d2, err := OpenDB(filepath.Join(t.TempDir(), "other.log"), ringBytes, 10)
+	// Reopen the same file and confirm every record comes back, the latest value for its key.
+	d2, err := OpenDB(path, ringBytes, 1000)
 	if err != nil {
 		t.Fatal(err)
 	}
-	d2.Close()
+	defer d2.Close()
+	var scratch []byte
+	for i := range 500 {
+		key := fmt.Sprintf("k%04d", i)
+		v, ok, err := d2.Get([]byte(key), scratch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !ok {
+			t.Fatalf("key %s missing after reopen", key)
+		}
+		if want := fmt.Sprintf("value-%04d", i); string(v) != want {
+			t.Fatalf("key %s = %q, want %q", key, v, want)
+		}
+	}
 }
 
 var dbScratchVal = []byte("a-hundred-byte-value-padded-out-to-look-like-a-realistic-record-payload-for-the-out-of-cache-readxx")
