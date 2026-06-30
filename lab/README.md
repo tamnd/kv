@@ -20,6 +20,7 @@ the winners; the reasons live here and in the matching impl note under
 | [cache](cache) | how is a read-cache cell read and written concurrently? | atomic-pointer copy-on-write | 180 |
 | [commit](commit) | fsync once per append or amortize over a batch? | group commit at the flush batch | 181 |
 | [codec](codec) | which compression codec for the cold tier? | flate level 1 (space lever, not throughput) | 182 |
+| [migrate](migrate) | how deep should the seal-to-migrate pipeline be? | depth four: overlap plus burst headroom | 184 |
 
 ## Running one
 
