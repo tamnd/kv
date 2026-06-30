@@ -17,7 +17,7 @@ import (
 // bouncing between cores. Run with -cpu=1,2,4,8 and read the trend, not a single row.
 //
 // The verdict and the measured board live in the impl note,
-// notes/Spec/2059/implementation/101-lock-free-append.md. The losing candidate stays
+// notes/Spec/2059/implementation/173-lock-free-append.md. The losing candidate stays
 // here as lockedLog so the comparison is reproducible and the decision is auditable.
 
 // lockedLog is the mutex-guarded append the lock-free Log replaces. It does identical
