@@ -32,6 +32,20 @@ type shard struct {
 	// race-free.
 	budgeted bool
 
+	// inPlace is true on the durable evicting non-Full profile, the only one where a
+	// hot same-size overwrite would otherwise grow a real durable log. There a SET that
+	// repoints a key whose record still sits in the resident, unflushed tail page rewrites
+	// the value over its existing bytes (FASTER's in-place update) instead of appending a
+	// fresh record and stranding the old one. It is safe to mutate live bytes here because
+	// a budgeted read takes the shard read lock (getLocked), which the write lock excludes,
+	// so no reader can alias the bytes mid-rewrite. It is off on the memory-only and
+	// unbudgeted-durable profiles, whose lock-free aliasing reads are the benchmarked
+	// ceiling and must not see a byte change underfoot, and off under Full, which flushes
+	// the tail per write so its bytes are already durable and in-place would be the ARIES
+	// in-place durable mutation the append-only log exists to avoid.
+	inPlace      bool
+	inPlaceCount int64 // count of overwrites taken in place, read under mu by InPlaceUpdates
+
 	// deferred holds file blocks a compaction retired, each waiting behind the safe
 	// epoch before it returns to the allocator. Guarded by mu. Empty until the
 	// compactor (a later increment) populates it.
@@ -50,6 +64,7 @@ type shard struct {
 // state in durable mode, nil in memory-only.
 func newShard(pageSize int, df *durableFile, shardID, budget int, ep *epochs) *shard {
 	s := &shard{log: newLog(pageSize, df, shardID, budget), ep: ep, budgeted: budget > 0}
+	s.inPlace = s.budgeted && df != nil && df.dial != DurabilityFull
 	idx := newIndex(minIndexSlots)
 	idx.log = s.log
 	s.index.Store(idx)
@@ -168,6 +183,11 @@ func (s *shard) set(h uint64, key, value []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.inPlace && s.tryInPlace(h, key, value) {
+		s.inPlaceCount++
+		return nil
+	}
+
 	off, n, err := s.log.append(key, value, false)
 	if err != nil {
 		return err
@@ -180,6 +200,41 @@ func (s *shard) set(h uint64, key, value []byte) error {
 	}
 	s.put(idx, h, key, off, n)
 	return nil
+}
+
+// tryInPlace handles a SET in place when the key is present and its record still sits
+// in the resident, unflushed tail page with the same value size, and reports whether it
+// did. It runs under the shard write lock, before the append path, on the in-place
+// profile only. A hit rewrites the value over the record's existing bytes, leaving the
+// log length, the dead-byte count, and the index slot untouched: the address does not
+// move, so there is nothing to repoint. A miss (absent key, a size change, or a record
+// that has rolled out of the tail or been flushed) returns false and SET appends as
+// usual. The read of the old record here is the same read the append path's put would
+// make to size the stranded bytes, so a miss does not read the log a second time on the
+// common hot-key path, where the next overwrite hits.
+func (s *shard) tryInPlace(h uint64, key, value []byte) bool {
+	idx := s.index.Load()
+	mix := mixOf(h)
+	fp := fpOf(mix)
+	mask := idx.mask
+	i := mix & mask
+	for {
+		slot := idx.slots[i].Load()
+		if slot == 0 {
+			return false // key absent: nothing to overwrite in place, SET appends
+		}
+		if slot&slotTombstone == 0 && slotFP(slot) == fp {
+			off := slotAddr(slot)
+			rkey, rval := s.log.read(off)
+			if bytesEqual(rkey, key) {
+				if len(rval) != len(value) {
+					return false // size change: the record span would differ, must append
+				}
+				return s.log.overwriteInPlace(off, key, value)
+			}
+		}
+		i = (i + 1) & mask
+	}
 }
 
 // put installs the address for h/key into idx, either claiming a fresh slot for a

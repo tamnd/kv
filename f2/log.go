@@ -62,6 +62,13 @@ type log struct {
 	evict     int     // index of the next page to evict, the front of the window
 	npages    int     // pages allocated so far
 
+	// tailFlushed is true once the current tail page has been written to disk (by a
+	// checkpoint's flushTail or a compaction's commit) and stays true until a new tail
+	// page rolls. The in-place overwrite path reads it to refuse mutating bytes that a
+	// flushed page already carries, which would be an in-place durable mutation. It is
+	// touched only under the shard write lock, alongside the writes that flush the tail.
+	tailFlushed bool
+
 	// freeBufs is the page-buffer recycle pool (audit L5), filled by eviction and
 	// drawn from when a new page rolls. It is touched only under the shard write lock,
 	// which is also where eviction runs, so an evicted buffer goes straight into the
@@ -208,10 +215,36 @@ func (l *log) addPage() error {
 	ref := &pageRef{mem: buf}
 	d.refs[pi].Store(ref)
 	l.npages++
+	l.tailFlushed = false // a fresh tail page has no record bytes on disk yet
 	for l.budget > 0 && l.npages-l.evict > l.budget {
 		l.evictFront()
 	}
 	return nil
+}
+
+// overwriteInPlace rewrites the same-size record at logical address off with key and
+// value over its existing byte span, FASTER's in-place update. It succeeds only when the
+// record is in the current tail page, that page is resident, and the tail page has not
+// been written to disk since it became the tail, so the rewrite never mutates bytes a
+// sealed or flushed page already carries (the ARIES in-place durable mutation an
+// append-only log exists to avoid). The caller holds the shard write lock and has
+// confirmed the new value matches the old record's size, so the re-encode lands in the
+// same span and the record's address does not move. It returns whether it rewrote.
+func (l *log) overwriteInPlace(off int64, key, value []byte) bool {
+	pi := int(off / l.pageSize)
+	if pi != l.npages-1 {
+		return false // a sealed page below the tail is already on disk, never rewrite it
+	}
+	if l.tailFlushed {
+		return false // the tail page is on disk; mutating it would diverge from the durable copy
+	}
+	ref := l.dir.Load().refs[pi].Load()
+	if ref.mem == nil {
+		return false // tail page not resident (it always is, but stay defensive)
+	}
+	w := off % l.pageSize
+	encodeDurable(ref.mem[w:], key, value, false)
+	return true
 }
 
 // newPageBuf returns a zeroed page buffer, drawing from the recycle pool a budgeted
@@ -290,6 +323,9 @@ func (l *log) flushTail() error {
 	if ref.mem == nil {
 		return nil
 	}
+	// The tail page's bytes are now on disk, so an in-place overwrite of them would
+	// diverge the resident copy from the durable one; refuse in-place until the page rolls.
+	l.tailFlushed = true
 	return l.df.writeData(l.pageBlock[pi], ref.mem)
 }
 
@@ -399,6 +435,9 @@ func (l *log) commitGeneration() error {
 	if err := l.df.writeData(l.pageBlock[0], buf0); err != nil {
 		return err
 	}
+	// The whole rebuilt generation, tail page included, is now on disk; refuse in-place
+	// on the tail until a fresh page rolls, the same fence flushTail sets.
+	l.tailFlushed = true
 	if l.df.dial != DurabilityNone {
 		return l.df.sync()
 	}
