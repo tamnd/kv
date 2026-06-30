@@ -62,12 +62,21 @@ type log struct {
 	evict     int     // index of the next page to evict, the front of the window
 	npages    int     // pages allocated so far
 
-	// tailFlushed is true once the current tail page has been written to disk (by a
-	// checkpoint's flushTail or a compaction's commit) and stays true until a new tail
-	// page rolls. The in-place overwrite path reads it to refuse mutating bytes that a
-	// flushed page already carries, which would be an in-place durable mutation. It is
-	// touched only under the shard write lock, alongside the writes that flush the tail.
-	tailFlushed bool
+	// mutableWindow is how many pages at the tail stay unsealed and so eligible for an
+	// in-place overwrite, FASTER's mutable region. It is 1 on every profile but the
+	// budgeted in-place one, where the surrounding store may widen it (clamped to the
+	// resident budget so a window page is never evicted before it is sealed) to keep a
+	// hot key rewriting in place across a page roll instead of declining once its record
+	// falls behind the tail. A wider window seals a page later, when it leaves the window
+	// rather than when the writer moves on, which under Normal defers that page's sync.
+	mutableWindow int
+
+	// flushedTail is the page count a checkpoint last flushed: pages below it reached
+	// disk in flushTail or commitGeneration, so an in-place overwrite of one would
+	// diverge the resident copy from the durable one and is refused. Combined with the
+	// seal frontier (npages-mutableWindow), it tells onDisk which window pages are still
+	// safe to rewrite. It is touched only under the shard write lock.
+	flushedTail int
 
 	// freeBufs is the page-buffer recycle pool (audit L5), filled by eviction and
 	// drawn from when a new page rolls. It is touched only under the shard write lock,
@@ -95,12 +104,16 @@ type pageDir struct {
 
 // newLog builds a memory-only log (df nil) or a single-file log (df set). When df
 // is set each page reserves a header for recovery.
-func newLog(pageSize int, df *durableFile, shardID, budget int) *log {
+func newLog(pageSize int, df *durableFile, shardID, budget, window int) *log {
+	if window < 1 {
+		window = 1
+	}
 	l := &log{
-		pageSize: int64(pageSize),
-		df:       df,
-		shardID:  shardID,
-		budget:   budget,
+		pageSize:      int64(pageSize),
+		df:            df,
+		shardID:       shardID,
+		budget:        budget,
+		mutableWindow: window,
 	}
 	if df != nil {
 		l.hdr = blockHeaderSize
@@ -181,9 +194,15 @@ func (l *log) pageFor(pi int) ([]byte, error) {
 // appends one fresh resident page, and evicts the front while over budget. The
 // caller holds the shard write lock.
 func (l *log) addPage() error {
-	if l.df != nil && l.npages > 0 {
-		if err := l.sealPage(l.npages - 1); err != nil { // flush the page we are leaving
-			return err
+	if l.df != nil {
+		// Seal the page that falls out of the mutable window as the new tail rolls in,
+		// not the page just left: with a window of one this is the page we are leaving
+		// (today's behavior), with a wider window it lags by window-1 pages so the last
+		// window pages stay rewritable.
+		if toSeal := l.npages - l.mutableWindow; toSeal >= 0 {
+			if err := l.sealPage(toSeal); err != nil {
+				return err
+			}
 		}
 	}
 	d := l.ensureCap(l.npages + 1)
@@ -215,32 +234,47 @@ func (l *log) addPage() error {
 	ref := &pageRef{mem: buf}
 	d.refs[pi].Store(ref)
 	l.npages++
-	l.tailFlushed = false // a fresh tail page has no record bytes on disk yet
+	// No flushedTail reset is needed: the fresh tail page's index is npages-1, at or
+	// above flushedTail, so onDisk already reports it unwritten and rewritable.
 	for l.budget > 0 && l.npages-l.evict > l.budget {
 		l.evictFront()
 	}
 	return nil
 }
 
+// onDisk reports whether page pi's current bytes are already on disk, so an in-place
+// rewrite of them would diverge the resident copy from the durable one. A page is on
+// disk once it is sealed (it has fallen below the seal frontier npages-mutableWindow) or
+// once a checkpoint flushed it (it sits below flushedTail). The window pages between the
+// two frontiers are the ones a rewrite may still land on. The caller holds the shard
+// write lock.
+func (l *log) onDisk(pi int) bool {
+	frontier := l.npages - l.mutableWindow
+	if l.flushedTail > frontier {
+		frontier = l.flushedTail
+	}
+	return pi < frontier
+}
+
 // overwriteInPlace rewrites the same-size record at logical address off with key and
 // value over its existing byte span, FASTER's in-place update. It succeeds only when the
-// record is in the current tail page, that page is resident, and the tail page has not
-// been written to disk since it became the tail, so the rewrite never mutates bytes a
-// sealed or flushed page already carries (the ARIES in-place durable mutation an
-// append-only log exists to avoid). The caller holds the shard write lock and has
-// confirmed the new value matches the old record's size, so the re-encode lands in the
-// same span and the record's address does not move. It returns whether it rewrote.
+// record is in the mutable window (the last mutableWindow pages), that page is resident,
+// and the page has not been written to disk, so the rewrite never mutates bytes a sealed
+// or flushed page already carries (the ARIES in-place durable mutation an append-only log
+// exists to avoid). The caller holds the shard write lock and has confirmed the new value
+// matches the old record's size, so the re-encode lands in the same span and the record's
+// address does not move. It returns whether it rewrote.
 func (l *log) overwriteInPlace(off int64, key, value []byte) bool {
 	pi := int(off / l.pageSize)
-	if pi != l.npages-1 {
-		return false // a sealed page below the tail is already on disk, never rewrite it
+	if pi < l.npages-l.mutableWindow || pi >= l.npages {
+		return false // outside the mutable window: sealed below it, or not yet allocated
 	}
-	if l.tailFlushed {
-		return false // the tail page is on disk; mutating it would diverge from the durable copy
+	if l.onDisk(pi) {
+		return false // already on disk; mutating it would diverge from the durable copy
 	}
 	ref := l.dir.Load().refs[pi].Load()
 	if ref.mem == nil {
-		return false // tail page not resident (it always is, but stay defensive)
+		return false // window page not resident (it always is when window <= budget, stay defensive)
 	}
 	w := off % l.pageSize
 	encodeDurable(ref.mem[w:], key, value, false)
@@ -317,16 +351,28 @@ func (l *log) flushTail() error {
 	if l.df == nil || l.npages == 0 {
 		return nil
 	}
-	pi := l.npages - 1
+	// Flush every unsealed window page, not just the last one: with a wider window the
+	// pages behind the tail hold records the snapshot's index points at, so they must
+	// reach disk for recovery to read them back. Pages below the seal frontier are
+	// already on disk. With a window of one this flushes the tail alone, as before.
 	d := l.dir.Load()
-	ref := d.refs[pi].Load()
-	if ref.mem == nil {
-		return nil
+	start := l.npages - l.mutableWindow
+	if start < 0 {
+		start = 0
 	}
-	// The tail page's bytes are now on disk, so an in-place overwrite of them would
-	// diverge the resident copy from the durable one; refuse in-place until the page rolls.
-	l.tailFlushed = true
-	return l.df.writeData(l.pageBlock[pi], ref.mem)
+	for pi := start; pi < l.npages; pi++ {
+		ref := d.refs[pi].Load()
+		if ref.mem == nil {
+			continue // evicted, hence already on disk
+		}
+		if err := l.df.writeData(l.pageBlock[pi], ref.mem); err != nil {
+			return err
+		}
+	}
+	// The window's bytes are now on disk, so an in-place overwrite of them would diverge
+	// the resident copy from the durable one; refuse in-place on them until they roll out.
+	l.flushedTail = l.npages
+	return nil
 }
 
 // evictFront drops the front resident page from RAM. The page is already on disk
@@ -435,9 +481,9 @@ func (l *log) commitGeneration() error {
 	if err := l.df.writeData(l.pageBlock[0], buf0); err != nil {
 		return err
 	}
-	// The whole rebuilt generation, tail page included, is now on disk; refuse in-place
-	// on the tail until a fresh page rolls, the same fence flushTail sets.
-	l.tailFlushed = true
+	// The whole rebuilt generation is now on disk; refuse in-place on every page until a
+	// fresh one rolls, the same fence flushTail sets.
+	l.flushedTail = l.npages
 	if l.df.dial != DurabilityNone {
 		return l.df.sync()
 	}
