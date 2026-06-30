@@ -107,6 +107,17 @@ type Tunables struct {
 	// page resident, so a non-zero budget is at least one.
 	ResidentPagesPerShard int
 
+	// MutableWindowPages is how many pages at each shard's tail stay rewritable in
+	// place, FASTER's mutable region. Zero or one keeps the historical behavior, only
+	// the tail page taking same-size overwrites in place. A larger value lets a hot key
+	// keep rewriting in place across a page roll, raising the in-place hit rate on a band
+	// wider than one page at the cost of sealing each page later (under Normal, deferring
+	// its sync to when it leaves the window or a checkpoint flushes it). It is honored
+	// only on the budgeted in-place profile (a Path, a resident budget, not the Full
+	// dial) and is clamped to the resident budget so a window page is never evicted
+	// before it is sealed. Other profiles ignore it and keep a window of one.
+	MutableWindowPages int
+
 	// Path selects the single-file mode: one file that is both the
 	// larger-than-memory backing and, at Normal or Full, the crash-recoverable
 	// store. Empty keeps the memory-only mode, the benchmarked ceiling.
@@ -146,6 +157,24 @@ type Tunables struct {
 	// operator calling it. Zero leaves compaction manual, which is the default so a
 	// benchmark is never perturbed by a background rewrite.
 	CompactionInterval time.Duration
+}
+
+// windowPages is the effective in-place mutable-window page count for these tunables.
+// Only the budgeted in-place profile widens past one page (a resident budget is the gate,
+// and the window is clamped to it so a window page is sealed before it can be evicted);
+// every other profile keeps a window of one, its historical sealing behavior unchanged.
+func windowPages(t Tunables) int {
+	if t.ResidentPagesPerShard <= 0 {
+		return 1
+	}
+	w := t.MutableWindowPages
+	if w < 1 {
+		w = 1
+	}
+	if w > t.ResidentPagesPerShard {
+		w = t.ResidentPagesPerShard
+	}
+	return w
 }
 
 // DefaultTunables returns a full-resident, memory-only configuration: 256 shards,
@@ -310,7 +339,7 @@ func newMemory(t Tunables) *Store {
 		t:          t,
 	}
 	for i := range s.shards {
-		s.shards[i] = newShard(t.PageSize, nil, i, 0, nil)
+		s.shards[i] = newShard(t.PageSize, nil, i, 0, 1, nil)
 	}
 	return s
 }
@@ -364,8 +393,9 @@ func newDurable(ctx context.Context, t Tunables) (*Store, error) {
 		return nil, errEncryptMismatch
 	}
 	df.seq = sb.seq
+	window := windowPages(t)
 	for i := range s.shards {
-		s.shards[i] = newShard(t.PageSize, df, i, t.ResidentPagesPerShard, s.ep)
+		s.shards[i] = newShard(t.PageSize, df, i, t.ResidentPagesPerShard, window, s.ep)
 	}
 	if sb.valid {
 		if err := s.recover(ctx); err != nil {

@@ -192,6 +192,52 @@ func BenchmarkF2OverwriteDurableSpace(b *testing.B) {
 	}
 }
 
+// BenchmarkF2OverwriteWideband concentrates a hot band that spans many pages on a
+// single shard, so most live records sit in sealed pages behind the tail. With the
+// mutable window at the tail page alone, only the records that happen to be in the tail
+// rewrite in place; the rest decline and append, stranding the old copy, so the log
+// grows and the space amplification climbs. The per-shard band, not the total key count,
+// is what the window has to cover, so this uses few shards to make one shard hold it.
+func BenchmarkF2OverwriteWideband(b *testing.B) {
+	for _, perShardPages := range []int{2, 8, 32} {
+		const shards, pageSize = 4, 4096
+		recsPerPage := 100 // ~39-byte records in a 4096-byte page
+		band := shards * perShardPages * recsPerPage
+		budget := perShardPages + 8 // keep the whole band resident, room to roll
+		// window=1 is the tail-only default; window=budget covers the whole resident
+		// band, so a hot key keeps rewriting in place across page rolls.
+		for _, window := range []int{1, budget} {
+			b.Run(fmt.Sprintf("pages=%d/window=%d", perShardPages, window), func(b *testing.B) {
+				s, err := New(Tunables{
+					Shards: shards, PageSize: pageSize, ResidentPagesPerShard: budget,
+					MutableWindowPages: window,
+					Path:               filepath.Join(b.TempDir(), "f2.db"), Durability: DurabilityNone,
+				})
+				if err != nil {
+					b.Fatalf("New: %v", err)
+				}
+				defer s.Close()
+				for i := 0; i < band; i++ {
+					if err := s.Set(tkey(i), tval(i)); err != nil {
+						b.Fatalf("seed: %v", err)
+					}
+				}
+				before := s.Stats().LogBytes
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					_ = s.Set(tkey(i%band), tval(i))
+				}
+				b.StopTimer()
+				st := s.Stats()
+				b.ReportMetric(st.SpaceAmplification, "space-amp")
+				b.ReportMetric(float64(st.LogBytes-before)/float64(b.N), "logbytes/op")
+				b.ReportMetric(float64(s.InPlaceUpdates())/float64(b.N), "inplace-frac")
+			})
+		}
+	}
+}
+
 func BenchmarkF2Get(b *testing.B) {
 	s := fillF2(b, benchKeys)
 	defer s.Close()

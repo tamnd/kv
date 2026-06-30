@@ -61,9 +61,10 @@ type shard struct {
 // newShard builds a shard. df is nil for the memory-only core and the shared
 // durable file in single-file mode; shardID names this shard's blocks in that
 // file; budget is the resident page cap (zero unbounded); ep is the shared epoch
-// state in durable mode, nil in memory-only.
-func newShard(pageSize int, df *durableFile, shardID, budget int, ep *epochs) *shard {
-	s := &shard{log: newLog(pageSize, df, shardID, budget), ep: ep, budgeted: budget > 0}
+// state in durable mode, nil in memory-only; window is the in-place mutable-window page
+// count, 1 on every profile but the budgeted in-place one.
+func newShard(pageSize int, df *durableFile, shardID, budget, window int, ep *epochs) *shard {
+	s := &shard{log: newLog(pageSize, df, shardID, budget, window), ep: ep, budgeted: budget > 0}
 	s.inPlace = s.budgeted && df != nil && df.dial != DurabilityFull
 	idx := newIndex(minIndexSlots)
 	idx.log = s.log

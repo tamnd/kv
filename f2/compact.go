@@ -107,7 +107,7 @@ func (s *Store) compactLocked(sh *shard) error {
 	// A fresh log one generation higher than the current one, built fully resident:
 	// no disk IO during the build, so the shard lock is held only for an in-memory
 	// copy plus the final bulk write.
-	nl := newLog(int(oldLog.pageSize), s.df, oldLog.shardID, oldLog.budget)
+	nl := newLog(int(oldLog.pageSize), s.df, oldLog.shardID, oldLog.budget, oldLog.mutableWindow)
 	nl.gen = oldLog.gen + 1
 
 	// Size the new index up front to hold the live set under the load factor, so the

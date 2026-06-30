@@ -28,6 +28,27 @@ func durableEvicting(t *testing.T, dial Durability) (*Store, Tunables) {
 	return s, tn
 }
 
+// durableEvictingWindow opens a budgeted single-file store with a mutable window wider
+// than the tail page, the profile the wide-window in-place tests target. Two shards keep
+// each shard's band wide enough to span several pages. The path is returned so a test can
+// crash and reopen the same file.
+func durableEvictingWindow(t *testing.T, dial Durability, budget, window int) (*Store, Tunables) {
+	t.Helper()
+	tn := Tunables{
+		Shards:                2,
+		PageSize:              4096,
+		ResidentPagesPerShard: budget,
+		MutableWindowPages:    window,
+		Path:                  filepath.Join(t.TempDir(), "inplace.db"),
+		Durability:            dial,
+	}
+	s, err := New(tn)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return s, tn
+}
+
 // TestInPlaceSameSizeDoesNotGrowLog is the core in-place property: a hot key overwritten
 // many times with a same-size value is rewritten where it sits, so InPlaceUpdates climbs
 // to the overwrite count, the log does not grow past the single seed record, the space
@@ -278,5 +299,197 @@ func TestInPlaceCrashUnsyncedNoTorn(t *testing.T) {
 	}
 	if ok && !written[string(v)] {
 		t.Fatalf("recovered value = %q, which was never written (torn record)", v)
+	}
+}
+
+// TestInPlaceWideWindowSpansPages is the wide-window property: a hot band that spans
+// several pages per shard, with the mutable window covering the whole resident budget,
+// rewrites every overwrite in place even though most records sit behind the tail. With a
+// tail-only window these would decline and append; here InPlaceUpdates reaches the
+// overwrite count, the log does not grow, and the space amplification stays 1.0.
+func TestInPlaceWideWindowSpansPages(t *testing.T) {
+	const budget = 24
+	s, _ := durableEvictingWindow(t, DurabilityNone, budget, budget)
+	defer s.Close()
+
+	const band = 1500 // ~7.5 pages per shard over 2 shards, inside the 24-page budget
+	for i := 0; i < band; i++ {
+		if err := s.Set(tkey(i), tval(i)); err != nil {
+			t.Fatalf("seed %d: %v", i, err)
+		}
+	}
+	seedLog := s.Stats().LogBytes
+
+	const n = 6000
+	for i := 0; i < n; i++ {
+		if err := s.Set(tkey(i%band), tval(band+i)); err != nil { // same width as the seed value
+			t.Fatalf("overwrite %d: %v", i, err)
+		}
+	}
+	if got := s.InPlaceUpdates(); got != n {
+		t.Fatalf("InPlaceUpdates = %d, want %d (the whole resident band should rewrite in place)", got, n)
+	}
+	if got := s.Stats().LogBytes; got != seedLog {
+		t.Fatalf("LogBytes = %d, want %d (wide-window in-place must not grow the log)", got, seedLog)
+	}
+	if amp := s.Stats().SpaceAmplification; amp != 1.0 {
+		t.Fatalf("SpaceAmplification = %v, want 1.0", amp)
+	}
+}
+
+// TestInPlaceWideWindowCrashAfterCheckpoint overwrites every key of a multi-page band in
+// place, hitting pages well behind the tail, then checkpoints, crashes, and reopens. The
+// checkpoint must flush every window page, not just the tail, so recovery reads back the
+// latest in-place value for every key across the window.
+func TestInPlaceWideWindowCrashAfterCheckpoint(t *testing.T) {
+	const budget = 24
+	s, tn := durableEvictingWindow(t, DurabilityNone, budget, budget)
+
+	const band = 1500
+	for i := 0; i < band; i++ {
+		if err := s.Set(tkey(i), tval(i)); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+	for i := 0; i < band; i++ {
+		if err := s.Set(tkey(i), tval(1_000_000+i)); err != nil { // same width, marked value
+			t.Fatalf("overwrite: %v", err)
+		}
+	}
+	if s.InPlaceUpdates() == 0 {
+		t.Fatalf("expected in-place overwrites across the window")
+	}
+	if err := s.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+	_ = s.df.f.Close() // crash with the checkpoint on disk
+
+	r, err := New(tn)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer r.Close()
+	for i := 0; i < band; i++ {
+		v, ok, err := r.GetCopy(tkey(i))
+		if err != nil || !ok {
+			t.Fatalf("GetCopy %d = (%q, %v, %v)", i, v, ok, err)
+		}
+		if want := tval(1_000_000 + i); !bytes.Equal(v, want) {
+			t.Fatalf("key %d recovered %q, want %q", i, v, want)
+		}
+	}
+}
+
+// TestInPlaceWideWindowCrashNoCheckpoint overwrites a multi-page band in place across the
+// window with no checkpoint after, then crashes and reopens. The unsynced window pages
+// were never written to disk, so recovery must land every key on a value the test actually
+// wrote, never a torn record.
+func TestInPlaceWideWindowCrashNoCheckpoint(t *testing.T) {
+	const budget = 24
+	s, tn := durableEvictingWindow(t, DurabilityNone, budget, budget)
+
+	const band = 800
+	written := make([]map[string]bool, band)
+	for i := 0; i < band; i++ {
+		written[i] = map[string]bool{}
+		v := tval(i)
+		if err := s.Set(tkey(i), v); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		written[i][string(v)] = true
+	}
+	if err := s.Checkpoint(); err != nil { // a committed version to fall back to
+		t.Fatalf("Checkpoint: %v", err)
+	}
+	for round := 0; round < 5; round++ {
+		for i := 0; i < band; i++ {
+			v := tval(1_000_000 + round*band + i)
+			if err := s.Set(tkey(i), v); err != nil {
+				t.Fatalf("overwrite: %v", err)
+			}
+			written[i][string(v)] = true
+		}
+	}
+	_ = s.df.f.Close() // crash with no checkpoint after the in-place overwrites
+
+	r, err := New(tn)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer r.Close()
+	for i := 0; i < band; i++ {
+		v, ok, err := r.GetCopy(tkey(i))
+		if err != nil {
+			t.Fatalf("GetCopy %d: %v", i, err)
+		}
+		if ok && !written[i][string(v)] {
+			t.Fatalf("key %d recovered %q, which was never written (torn record)", i, v)
+		}
+	}
+}
+
+// TestInPlaceWideWindowConcurrentReaders runs an in-place writer against many readers with
+// a wide window, so the rewrites land on pages behind the tail while readers probe the
+// whole band. Every observed value must be a complete member of the fixed value set; the
+// shard read lock the budgeted profile takes is what makes this race-free regardless of
+// which window page the rewrite hits. Run under -race.
+func TestInPlaceWideWindowConcurrentReaders(t *testing.T) {
+	const budget = 24
+	s, _ := durableEvictingWindow(t, DurabilityNone, budget, budget)
+	defer s.Close()
+
+	const band = 1200 // several pages per shard, so rewrites hit non-tail window pages
+	vals := [][]byte{
+		[]byte("val-AAAAAAAA-payload"), []byte("val-BBBBBBBB-payload"),
+		[]byte("val-CCCCCCCC-payload"), []byte("val-DDDDDDDD-payload"),
+	} // each 20 bytes, the same width tval produces
+	valid := map[string]bool{}
+	for _, v := range vals {
+		valid[string(v)] = true
+	}
+	for i := 0; i < band; i++ {
+		if err := s.Set(tkey(i), vals[0]); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+
+	var stop atomic.Bool
+	var writerWG, readerWG sync.WaitGroup
+	writerWG.Add(1)
+	go func() {
+		defer writerWG.Done()
+		i := 0
+		for !stop.Load() {
+			if err := s.Set(tkey(i%band), vals[i%len(vals)]); err != nil {
+				t.Errorf("writer Set: %v", err)
+				return
+			}
+			i++
+		}
+	}()
+
+	var torn atomic.Int64
+	for r := 0; r < 8; r++ {
+		readerWG.Add(1)
+		go func() {
+			defer readerWG.Done()
+			for j := 0; j < 40000; j++ {
+				v, ok, err := s.GetCopy(tkey(j % band))
+				if err != nil {
+					t.Errorf("reader Get: %v", err)
+					return
+				}
+				if ok && !valid[string(v)] {
+					torn.Add(1)
+				}
+			}
+		}()
+	}
+
+	readerWG.Wait()
+	stop.Store(true)
+	writerWG.Wait()
+	if got := torn.Load(); got != 0 {
+		t.Fatalf("observed %d torn values, want 0", got)
 	}
 }
