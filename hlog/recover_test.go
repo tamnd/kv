@@ -144,6 +144,90 @@ func TestTieredRecover(t *testing.T) {
 	}
 }
 
+// TestDeleteSurvivesRecovery confirms a delete is durable: a deleted key stays gone after a
+// reopen, because the tombstone is on disk and replay indexes it last so it wins over the older
+// value. It checks both the cold DB and the tiered store.
+func TestDeleteSurvivesRecovery(t *testing.T) {
+	t.Run("DB", func(t *testing.T) {
+		const ringBytes = 1 << 20
+		path := filepath.Join(t.TempDir(), "db.log")
+		d, err := OpenDB(path, ringBytes, 1000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range 200 {
+			d.Set([]byte(fmt.Sprintf("k%03d", i)), fmt.Appendf(nil, "v%03d", i))
+		}
+		for i := 0; i < 200; i += 2 {
+			d.Delete([]byte(fmt.Sprintf("k%03d", i))) // delete the even keys
+		}
+		if err := d.Close(); err != nil {
+			t.Fatal(err)
+		}
+		d2, err := OpenDB(path, ringBytes, 1000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer d2.Close()
+		var scratch []byte
+		for i := range 200 {
+			v, ok, err := d2.Get([]byte(fmt.Sprintf("k%03d", i)), scratch)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if i%2 == 0 {
+				if ok {
+					t.Fatalf("k%03d present after delete+reopen, want gone", i)
+				}
+				continue
+			}
+			if want := fmt.Sprintf("v%03d", i); !ok || string(v) != want {
+				t.Fatalf("k%03d = (%q,%v), want (%q,true)", i, v, ok, want)
+			}
+		}
+	})
+
+	t.Run("Tiered", func(t *testing.T) {
+		const segBytes = 1 << 16
+		const keys = 6000
+		path := filepath.Join(t.TempDir(), "tier.log")
+		d, err := OpenTiered(path, segBytes, 4096, 1<<20, keys, 2048)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range keys {
+			d.Set([]byte(fmt.Sprintf("t%05d", i)), fmt.Appendf(nil, "v%05d", i))
+		}
+		for i := 0; i < keys; i += 3 {
+			d.Delete([]byte(fmt.Sprintf("t%05d", i))) // delete every third key
+		}
+		if err := d.Close(); err != nil {
+			t.Fatal(err)
+		}
+		d2, err := OpenTiered(path, segBytes, 4096, 1<<20, keys, 2048)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer d2.Close()
+		var scratch []byte
+		for i := range keys {
+			v, ok, err := d2.Get([]byte(fmt.Sprintf("t%05d", i)), scratch)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if i%3 == 0 {
+				if ok {
+					t.Fatalf("t%05d present after delete+reopen, want gone", i)
+				}
+				continue
+			}
+			if want := fmt.Sprintf("v%05d", i); !ok || string(v) != want {
+				t.Fatalf("t%05d = (%q,%v), want (%q,true)", i, v, ok, want)
+			}
+		}
+	})
+}
+
 // TestTieredSyncThenRecover confirms TieredDB.Sync drains the hot tier to cold and fsyncs, so
 // the data is recoverable from the file without a Close.
 func TestTieredSyncThenRecover(t *testing.T) {

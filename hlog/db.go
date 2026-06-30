@@ -2,9 +2,7 @@ package hlog
 
 import (
 	"bytes"
-	"encoding/binary"
 	"hash/maphash"
-	"sync"
 )
 
 // DB is the larger-than-memory point store: the hybrid log holds the records with its hot
@@ -19,10 +17,9 @@ import (
 // copied into the caller's scratch buffer because a ring slot can be reused under a reader
 // and a disk record is not in memory at all.
 type DB struct {
-	log     *HybridLog
-	ix      *Index
-	seed    maphash.Seed
-	bufPool sync.Pool
+	log  *HybridLog
+	ix   *Index
+	seed maphash.Seed
 }
 
 // OpenDB creates a store at path whose log keeps ringBytes of the recent tail resident and
@@ -38,9 +35,6 @@ func OpenDB(path string, ringBytes int64, capKeys int) (*DB, error) {
 		log:  log,
 		ix:   NewIndex(capKeys),
 		seed: maphash.MakeSeed(),
-		bufPool: sync.Pool{
-			New: func() any { return make([]byte, 0, 256) },
-		},
 	}
 	if err := d.replay(); err != nil {
 		log.Close()
@@ -59,60 +53,64 @@ func (d *DB) replay() error {
 		return nil
 	}
 	return d.log.Range(func(addr int64, rec []byte) bool {
-		if len(rec) < keyLenSize {
+		_, key, _, ok := parseRecord(rec)
+		if !ok {
 			return true
 		}
-		klen := int(binary.LittleEndian.Uint16(rec))
-		if keyLenSize+klen > len(rec) {
-			return true
-		}
-		key := rec[keyLenSize : keyLenSize+klen]
+		// Index every record, tombstone included, so a delete that came after a value wins by
+		// being indexed last, the same latest-wins order the live write path produces.
 		d.ix.Put(maphash.Bytes(d.seed, key), addr)
 		return true
 	})
 }
 
-// Set stores value under key. It frames the record, a key-length prefix then the key then
-// the value, into a pooled buffer, appends it to the log, and points the index at the new
-// address. The pooled buffer keeps the write path allocation-free across calls.
-func (d *DB) Set(key, value []byte) {
+// Set stores value under key. It frames the record into a pooled buffer, appends it to the
+// log, and points the index at the new address. The pooled buffer keeps the write path
+// allocation-free across calls.
+func (d *DB) Set(key, value []byte) { d.write(opSet, key, value) }
+
+// Delete writes a tombstone for key. The key reads as absent afterward, and the tombstone
+// shadows any older value for the key, including one already on disk, because it is indexed
+// last and Get stops at it. The old record's space is reclaimed by a later compaction.
+func (d *DB) Delete(key []byte) { d.write(opDel, key, nil) }
+
+// write frames a record with the given op straight into the log and repoints the index. It is
+// the shared body of Set and Delete. Framing into the log rather than into a staging buffer it
+// then copies saves a copy of the value per write, which the profiler showed was a third of the
+// write path on a 1 KiB value (note 182).
+func (d *DB) write(op byte, key, value []byte) {
 	fp := maphash.Bytes(d.seed, key)
-	need := keyLenSize + len(key) + len(value)
-	b := d.bufPool.Get().([]byte)
-	if cap(b) < need {
-		b = make([]byte, need)
-	} else {
-		b = b[:need]
-	}
-	binary.LittleEndian.PutUint16(b, uint16(len(key)))
-	copy(b[keyLenSize:], key)
-	copy(b[keyLenSize+len(key):], value)
-	addr := d.log.Append(b)
+	addr := d.log.AppendFrame(op, key, value)
 	d.ix.Put(fp, addr)
-	d.bufPool.Put(b[:0])
 }
 
 // Get returns the value stored under key. scratch is a caller-owned buffer the value is
 // read into and may be reused across calls for allocation-free reads; the returned slice
 // aliases it. It hashes the key, asks the index for the address, reads the record from the
-// ring or the file, and verifies the stored key so a fingerprint collision is a clean miss.
+// ring or the file, and verifies the stored key so a fingerprint collision is a clean miss. A
+// tombstone reads as not found.
 func (d *DB) Get(key, scratch []byte) ([]byte, bool, error) {
+	v, ok, _, err := d.get(key, scratch)
+	return v, ok, err
+}
+
+// get is Get plus whether the value came from disk rather than the resident ring. The tiered
+// store uses the flag to cache only disk-sourced reads, so a read already served from memory does
+// not pay a cache write. The public Get drops the flag.
+func (d *DB) get(key, scratch []byte) (val []byte, ok, fromDisk bool, err error) {
 	addr, ok := d.ix.Get(maphash.Bytes(d.seed, key))
 	if !ok {
-		return nil, false, nil
+		return nil, false, false, nil
 	}
-	rec, err := d.log.At(addr, scratch)
+	rec, fromDisk, err := d.log.AtSource(addr, scratch)
 	if err != nil {
-		return nil, false, err
+		return nil, false, false, err
 	}
-	klen := int(binary.LittleEndian.Uint16(rec))
-	if keyLenSize+klen > len(rec) {
-		return nil, false, nil
+	op, recKey, value, ok := parseRecord(rec)
+	if !ok || op == opDel || !bytes.Equal(recKey, key) {
+		return nil, false, false, nil
 	}
-	if !bytes.Equal(rec[keyLenSize:keyLenSize+klen], key) {
-		return nil, false, nil
-	}
-	return rec[keyLenSize+klen:], true, nil
+	return value, true, fromDisk, nil
 }
 
 // Sync forces every set so far durable before returning. Callers that need a crash-safe
