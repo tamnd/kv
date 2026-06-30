@@ -1,8 +1,8 @@
 ---
 title: "kv"
-description: "kv is an embeddable key/value database for Go: one file on disk, zero external dependencies, full ACID transactions, and a storage core built for fast point lookups."
+description: "kv is an embeddable key/value database for Go: one file on disk, zero external dependencies, full ACID transactions, and a sharded hash-log storage core that keeps point lookups flat as the database grows and runs over datasets larger than memory."
 heroTitle: "A key/value store in one Go import"
-heroLead: "kv gives a Go program a durable, transactional key/value database that lives in a single file and pulls in nothing but the standard library. Snapshot-isolated transactions, a sharded hash index over a self-durable log, crash-safe writes through a write-ahead log, and a CLI and HTTP server built on the same API. It is what SQLite is for relations, for keys and values."
+heroLead: "kv gives a Go program a durable, transactional key/value database that lives in a single file and pulls in nothing but the standard library. Snapshot-isolated transactions, a sharded hash index over a self-durable log that keeps point reads flat and runs larger than memory, crash-safe writes through a write-ahead log, and a CLI and HTTP server built on the same API. It is what SQLite is for relations, for keys and values."
 heroPrimaryURL: "/getting-started/quick-start/"
 heroPrimaryText: "Get started"
 ---
@@ -27,7 +27,8 @@ db.Update(func(txn *kv.Txn) error {
 
 - **One file, zero dependencies.** A database is a single `.kv` file plus a write-ahead log alongside it. The module imports only the standard library, so `go get github.com/tamnd/kv` adds nothing else to your build.
 - **Real transactions.** `View` and `Update` run closures inside ACID transactions. Snapshot isolation is the default; ask for [serializable](/guides/transactions/) and write skew is closed too. Conflicts retry automatically.
-- **Built for point lookups.** Keys live in a sharded, mostly lock-free hash index over a hybrid log. A get hashes the key and reads one record, so read latency stays flat as the database grows. Set, get, exists, delete, and merge are the core operations.
+- **Fast point lookups that stay flat.** Keys live in a sharded, mostly lock-free hash index over a hybrid log. A get hashes the key and reads one record, with no tree to descend, so read latency does not grow with the database. In memory a random read across a million keys is about 60 ns and allocates nothing, and reads take no lock on the common path, so they scale across cores. Set, get, exists, delete, and merge are the core operations.
+- **[Larger than memory](/guides/engines/#larger-than-memory).** The hybrid log keeps the working set in RAM and the cold tail in the file, so a database can be many times the size of the cache. A read that misses the resident set faults its page in from disk, and the index stays compact at around 10 to 13 bytes per key, so a billion keys cost roughly 15 GiB of index.
 - **Crash-safe by construction.** Every commit goes through a write-ahead log with checksummed frames. After a crash, the next open replays the log and brings the file back to its last committed state. Durability is [tunable](/guides/durability/) from one fsync per commit down to none.
 - **More than a library.** The same surface ships as a [command-line tool](/reference/cli/) for scripting and operations, and an [HTTP and binary server](/guides/server/) with auth, TLS, and a change feed when you need the database over a socket.
 

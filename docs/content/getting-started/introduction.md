@@ -1,6 +1,6 @@
 ---
 title: "Introduction"
-description: "The model behind kv: one file, ACID transactions, and a hash-indexed storage core built for fast point lookups."
+description: "The model behind kv: one file, ACID transactions, and a hash-indexed storage core built for fast point lookups over datasets larger than memory."
 weight: 10
 ---
 
@@ -44,7 +44,9 @@ The default isolation level is snapshot isolation, which is fast and correct for
 
 kv is a point-lookup store. The operations are `Get`, `Set`, `Delete`, `Exists`, and `Merge`, each addressing one key at a time. There is no range scan or ordered iteration: keys are not kept in sorted order, so kv does not promise to walk them in order, and if you need that you keep an index in your own keys or reach for an ordered store instead.
 
-What you get in exchange is a read path that does not slow down as the database grows. Keys live in a sharded hash index over a hybrid log: a get hashes the key, looks it up in the index, and reads one record. The index is split into many shards so concurrent readers and writers rarely contend, and the hot working set stays in memory while the cold tail lives on the log on disk.
+What you get in exchange is a read path that does not slow down as the database grows. Keys live in a sharded hash index over a hybrid log: a get hashes the key, looks it up in the index, and reads one record. There is no tree to descend, so a lookup costs about the same at a thousand keys or a billion. In memory on an Apple M4, a random read across a million keys takes about 60 nanoseconds and allocates nothing; the previous B-tree core took several microseconds for the same read. The index is split into many shards so concurrent readers and writers rarely contend, and most reads take no lock at all, so they scale across cores.
+
+The hybrid log is also what lets a database outgrow RAM. The working set you touch most stays resident, bounded by the cache size you set, and the cold tail lives in the file; a read that misses the resident set faults its page in from disk, so you pay for a disk read only on the cold keys you actually reach. The index stays small while this happens, around 10 to 13 bytes per key whatever the key length, because a slot holds a fingerprint and a log offset rather than the key itself, so a billion keys cost roughly 15 GiB of index. The [storage engine guide](/guides/engines/) covers both in depth.
 
 ```go
 v, err := db.Get([]byte("user:1"))
