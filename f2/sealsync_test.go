@@ -25,8 +25,8 @@ func TestSealSyncDecouplesBarriersFromSeals(t *testing.T) {
 		Path:                  filepath.Join(t.TempDir(), "f2.db"),
 		Durability:            DurabilityNormal,
 		SyncBytes:             syncEvery,
-		SyncInterval:          -1,        // no time flusher: the cadence under test is byte-only
-		CheckpointBytes:       1 << 40,   // never auto-checkpoint, so seals are the only barriers
+		SyncInterval:          -1,      // no time flusher: the cadence under test is byte-only
+		CheckpointBytes:       1 << 40, // never auto-checkpoint, so seals are the only barriers
 	})
 	// Count barriers without paying a real device flush, so the test is fast and the
 	// count reflects the cadence rather than the host disk.

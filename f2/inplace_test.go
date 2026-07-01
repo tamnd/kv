@@ -220,9 +220,9 @@ func TestInPlaceConcurrentReaders(t *testing.T) {
 		}(r)
 	}
 
-	readerWG.Wait()    // readers finish their fixed loops
-	stop.Store(true)   // then stop the writer
-	writerWG.Wait()    // and wait for it to exit
+	readerWG.Wait()  // readers finish their fixed loops
+	stop.Store(true) // then stop the writer
+	writerWG.Wait()  // and wait for it to exit
 	if got := torn.Load(); got != 0 {
 		t.Fatalf("observed %d torn values, want 0", got)
 	}
