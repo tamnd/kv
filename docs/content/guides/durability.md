@@ -15,8 +15,12 @@ The difference is when the acknowledgement waits on the disk.
 
 | `SyncWrites` | Contract | Loses on a crash |
 | --- | --- | --- |
-| `false` (default) | Background group commit. A write lands in the in-memory hot tier and returns; a background flusher fsyncs it a moment later. | At most the un-flushed hot records, bounded to two segments. |
-| `true` | Per-commit fsync. A `Set` does not return until its record is fsynced. | Nothing acknowledged. |
+| `false` (default) | Background group commit. A write lands in the in-memory hot tier and returns; a background flusher fsyncs it a moment later. The same contract Redis gives with `appendfsync everysec`. | At most the un-flushed hot records, bounded to two segments. |
+| `true` | Synchronous group commit. A `Set` does not return until the group-commit fsync has persisted its record. The same contract Redis gives with `appendfsync always`. | Nothing acknowledged. |
+
+Both modes commit through the same group-commit flusher.
+The difference is only whether the acknowledgement waits for the fsync or the flusher catches up behind it.
+The `kv` server exposes the same two modes as `--appendfsync everysec` and `--appendfsync always`, so the wire face and the library make the identical promise.
 
 ### The default: background group commit
 
@@ -32,18 +36,19 @@ This is the fast default, and it is where the throughput lead lives, because the
 db, _ := kv.Open("app.kv", kv.Options{})
 ```
 
-### Zero loss: per-commit fsync
+### Zero loss: synchronous group commit
 
-Set `SyncWrites` to true and a `Set` does not return until its record is fsynced, so an acked write survives a crash with zero loss.
-This is the same guarantee bbolt, pebble, and per-commit sqlite give.
+Set `SyncWrites` to true and a `Set` does not return until the group-commit fsync has persisted its record, so an acked write survives a crash with zero loss.
+This is the same guarantee bbolt, badger, and sqlite in `synchronous=FULL` give: many commits share one fsync, and each one waits for it before it returns.
 
 ```go
-// every commit fsynced before it returns
+// a write waits for the group-commit fsync before it returns
 db, _ := kv.Open("app.kv", kv.Options{SyncWrites: true})
 ```
 
 Concurrent writers coalesce onto one shared fsync, so a burst pays one flush between them rather than hitting the disk's per-flush ceiling on every write.
 That is what keeps write throughput reasonable under concurrency even at the strict setting.
+A lone sequential writer, with nothing to coalesce with, pays one fsync per commit, the honest floor of durable-on-return.
 
 ## Choosing a mode
 

@@ -76,10 +76,10 @@ The image is a minimal base plus the static binary:
 
 ```bash
 docker run -p 6379:6379 -v "$PWD/data:/data" ghcr.io/tamnd/kv \
-  --addr :6379 --dir /data
+  --port 6379 --dir /data
 ```
 
-The store lives at `/data/kv.db` on the mounted volume, so it survives across container restarts.
+The store lives at `/data/dump.kv` on the mounted volume, so it survives across container restarts.
 
 ## Verify the install
 
@@ -88,10 +88,7 @@ kv --version
 ```
 
 ```
-kv 0.3.0
-  commit   1a2b3c4
-  built    2026-06-25T09:00:00Z
-  go       go1.23.0 linux/amd64
+kv 0.4.0 (1a2b3c4, built 2026-06-25T09:00:00Z)
 ```
 
 ## Verify a download

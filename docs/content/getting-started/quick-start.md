@@ -88,8 +88,8 @@ To enumerate a set of keys, keep your own list of them under a known key, or tra
 The `kv` binary serves one store over the Redis wire protocol, so any Redis client or `redis-cli` can drive the same engine:
 
 ```bash
-# start the server on a TCP port, store under ./data/kv.db
-kv --addr :6379 --dir ./data &
+# start the server on a TCP port, store under ./data/dump.kv
+kv --port 6379 --dir ./data &
 
 # talk to it with redis-cli
 redis-cli -p 6379 set user:1 alice
@@ -100,8 +100,8 @@ redis-cli -p 6379 get user:1
 alice
 ```
 
-One of `--addr` or `--unixsocket` is required.
-A unix socket is the faster local path, and it wins if you set both.
+The flags follow `redis-server`, so bare `kv` already listens on `127.0.0.1:6379`.
+Add `--unixsocket /path` for the faster local path, which binds alongside the TCP port.
 The [server guide](/guides/server/) covers the flags, the supported commands, and driving it from Redis client libraries.
 
 ## Where to go next

@@ -107,7 +107,7 @@ func main() {
 The `kv` binary serves one store over the Redis protocol, so `redis-cli` and every Redis client library work unchanged:
 
 ```bash
-kv --addr :6379 --dir ./data &
+kv --port 6379 --dir ./data &
 redis-cli -p 6379 set user:1 alice
 redis-cli -p 6379 get user:1
 ```
@@ -116,7 +116,7 @@ redis-cli -p 6379 get user:1
 alice
 ```
 
-It speaks the point-operation subset of RESP: `GET`, `SET`, `DEL`, `EXISTS`, `PING`, the `HELLO` handshake, and the handful of introspection commands a client issues at connect. A unix socket (`--unixsocket /path`) is the fast local path.
+It speaks the point-operation subset of RESP: `GET`, `SET`, `DEL`, `EXISTS`, `PING`, the `HELLO` handshake, and the handful of introspection commands a client issues at connect. The flags follow `redis-server`, so `--port`, `--bind`, `--unixsocket`, `--dir`, `--dbfilename`, `--appendonly`, `--appendfsync`, and `--maxmemory` carry their redis meaning. A unix socket (`--unixsocket /path`) is the fast local path, and it can bind alongside the TCP port.
 
 ## Durability
 
@@ -125,7 +125,7 @@ It speaks the point-operation subset of RESP: `GET`, `SET`, `DEL`, `EXISTS`, `PI
 | `SyncWrites` | Guarantee |
 | --- | --- |
 | `false` (default) | Background group commit. A write returns once it is in the hot tier and the flusher fsyncs it a moment later. A crash loses at most the un-flushed hot records, bounded to two segments, the same contract as Redis `appendfsync everysec`. This is where the throughput lead lives. |
-| `true` | Per-commit fsync. A `Set` does not return until its record is on the disk, so an acked write survives a crash with zero loss. Concurrent writers coalesce onto one shared fsync, so a burst pays one flush between them. |
+| `true` | Synchronous group commit. A `Set` does not return until the group-commit fsync has persisted its record, so an acked write survives a crash with zero loss. Concurrent writers coalesce onto one shared fsync, so a burst pays one flush between them; a lone writer pays one fsync per commit. This is the same guarantee Redis gives with `appendfsync always`. |
 
 `Sync` forces a durability barrier on demand under either setting, and `Close` syncs before it returns, so a clean shutdown leaves nothing unflushed.
 See the [durability guide](https://kv.tamnd.com/guides/durability/).
@@ -134,7 +134,7 @@ See the [durability guide](https://kv.tamnd.com/guides/durability/).
 
 kv is built for read-heavy and update-heavy workloads whose working set fits in memory.
 On an Apple M4, a random read across a million cache-resident keys runs in the millions of ops per second and allocates nothing on the hot path, several times faster than the LSM and B-tree engines in the same harness, and a read-update mix (YCSB-A) leads the field because a hot key takes its update straight into memory.
-Its per-commit durable write throughput is mid-pack, because it fsyncs per commit rather than batching many commits into one flush the way a group-committing LSM does.
+Its single-threaded durable write throughput is mid-pack: under one sequential writer each durable commit pays its own fsync, so a store that delays and coalesces commits over a wider window can beat it there, though under write concurrency kv's commits coalesce onto one fsync.
 
 The numbers, the methodology, and the honest places kv loses are all published at **[kvbench](https://github.com/tamnd/kvbench)**, which measures kv against badger, pebble, bbolt, buntdb, pogreb, goleveldb, and sqlite through one adapter with no home-field advantage.
 Run it on your own hardware; the whole point is that you do not have to take ours.

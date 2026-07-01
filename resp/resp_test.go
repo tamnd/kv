@@ -5,6 +5,7 @@ import (
 	"net"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/tamnd/kv"
@@ -75,6 +76,50 @@ func (c *client) cmd(t *testing.T, args ...string) (line string, bulk string, is
 	}
 }
 
+// arr writes one command and decodes a flat array-of-bulk-strings reply, the shape
+// CONFIG GET returns. It fails the test on any other reply type.
+func (c *client) arr(t *testing.T, args ...string) []string {
+	t.Helper()
+	var b []byte
+	b = append(b, '*')
+	b = strconv.AppendInt(b, int64(len(args)), 10)
+	b = append(b, '\r', '\n')
+	for _, a := range args {
+		b = append(b, '$')
+		b = strconv.AppendInt(b, int64(len(a)), 10)
+		b = append(b, '\r', '\n')
+		b = append(b, a...)
+		b = append(b, '\r', '\n')
+	}
+	if _, err := c.conn.Write(b); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	first, err := c.r.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	first = trimLine(first)
+	if len(first) == 0 || first[0] != '*' {
+		t.Fatalf("reply = %q, want an array", first)
+	}
+	n, _ := strconv.Atoi(first[1:])
+	out := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		hdr, err := c.r.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read elem hdr: %v", err)
+		}
+		hdr = trimLine(hdr)
+		blen, _ := strconv.Atoi(hdr[1:])
+		payload := make([]byte, blen+2) // value plus trailing CRLF
+		if _, err := readFull(c.r, payload); err != nil {
+			t.Fatalf("read elem: %v", err)
+		}
+		out = append(out, string(payload[:blen]))
+	}
+	return out
+}
+
 func (c *client) close() { _ = c.conn.Close() }
 
 func trimLine(s string) string {
@@ -97,11 +142,12 @@ func readFull(r *bufio.Reader, p []byte) (int, error) {
 }
 
 // startServer opens a temp store, serves it on a unix socket, and returns the
-// socket path plus a cleanup that tears both down.
-func startServer(t *testing.T, forceSync bool) (string, func()) {
+// socket path plus a cleanup that tears both down. syncWrites opens the store in
+// the appendfsync always mode, where a write waits for the group-commit fsync.
+func startServer(t *testing.T, syncWrites bool) (string, func()) {
 	t.Helper()
 	dir := t.TempDir()
-	db, err := kv.Open(filepath.Join(dir, "kv.db"), kv.Options{KeyCapacity: 1000})
+	db, err := kv.Open(filepath.Join(dir, "kv.db"), kv.Options{KeyCapacity: 1000, SyncWrites: syncWrites})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -110,7 +156,11 @@ func startServer(t *testing.T, forceSync bool) (string, func()) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	srv := New(db, forceSync)
+	fsync := "everysec"
+	if syncWrites {
+		fsync = "always"
+	}
+	srv := New(db, Config{AppendOnly: "yes", AppendFsync: fsync, Dir: dir, DBFilename: "kv.db"})
 	go func() { _ = srv.Serve(ln) }()
 	cleanup := func() {
 		_ = srv.Close()
@@ -211,5 +261,40 @@ func TestBgRewriteAOFSyncs(t *testing.T) {
 	}
 	if _, bulk, _ := c.cmd(t, "GET", "durable"); bulk != "yes" {
 		t.Fatalf("get after sync = %q, want yes", bulk)
+	}
+}
+
+func TestConfigGetReportsRunningValues(t *testing.T) {
+	// A synced server opened in the appendfsync always mode reports that value back
+	// through CONFIG GET, the way a redis client reads the running config.
+	sock, cleanup := startServer(t, true)
+	defer cleanup()
+	c := dial(t, sock)
+	defer c.close()
+
+	got := c.arr(t, "CONFIG", "GET", "appendfsync")
+	if len(got) != 2 || got[0] != "appendfsync" || got[1] != "always" {
+		t.Fatalf("config get appendfsync = %v, want [appendfsync always]", got)
+	}
+	if got := c.arr(t, "CONFIG", "GET", "appendonly"); len(got) != 2 || got[1] != "yes" {
+		t.Fatalf("config get appendonly = %v, want [appendonly yes]", got)
+	}
+	// An unknown parameter is an empty array, not an error.
+	if got := c.arr(t, "CONFIG", "GET", "nosuchparam"); len(got) != 0 {
+		t.Fatalf("config get nosuchparam = %v, want empty", got)
+	}
+}
+
+func TestInfoReportsFsyncPolicy(t *testing.T) {
+	sock, cleanup := startServer(t, false)
+	defer cleanup()
+	c := dial(t, sock)
+	defer c.close()
+
+	_, info, _ := c.cmd(t, "INFO")
+	for _, want := range []string{"redis_version:7.4.0", "aof_enabled:1", "aof_fsync:everysec"} {
+		if !strings.Contains(info, want) {
+			t.Fatalf("info missing %q; got %q", want, info)
+		}
 	}
 }

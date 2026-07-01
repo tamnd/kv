@@ -36,7 +36,8 @@ Update-heavy mixes lead the field too.
 A read-update mix (YCSB-A) and a read-modify-write mix (YCSB-F) both win, because a hot key takes its update straight into memory and the resident index is repointed rather than a tree page being rewritten.
 
 The honest limits are worth stating.
-Per-commit durable write throughput, with `SyncWrites` true so every commit is fsynced, is mid-pack: kv fsyncs per commit and does not batch many commits into one flush the way a group-committing LSM (badger) or sqlite does, so a group-committer beats it on that one workload.
+Single-threaded durable write throughput, with `SyncWrites` true, is mid-pack.
+kv group-commits, so concurrent writers coalesce onto one fsync, but under one sequential writer there is nothing to coalesce and each durable commit pays its own fsync, the honest floor of durable-on-return; a store that delays and batches commits over a wider window can beat kv on that single-threaded workload.
 And kv is a store for working sets that fit in memory: on out-of-cache uniform random reads where nothing is resident, it does not win, and an LSM with a block cache can do better there.
 Frame kv for read-heavy and update-heavy workloads whose working set fits in memory.
 

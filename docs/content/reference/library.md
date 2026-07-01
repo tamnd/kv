@@ -48,7 +48,7 @@ type Options struct {
 | `HotKeys` | heuristic from `HotBytes` | Records one hot segment's index is sized for; set it when the value size is known. Too small only causes an earlier seal, never a lost write. Zero uses a heuristic. |
 | `ResidentBytes` | 64 MiB | Cold log's resident tail window: how much recently-migrated cold data stays in RAM for fast reads. |
 | `ReadCacheCells` | `1 << 16` | Cells in the read cache over cold reads, rounded up to a power of two. |
-| `SyncWrites` | `false` | Durability contract. `false` is background group commit; `true` fsyncs every commit before it returns. See [Durability](/guides/durability/). |
+| `SyncWrites` | `false` | Durability contract. `false` is background group commit; `true` is synchronous group commit, where a write waits for the group-commit fsync before it returns. See [Durability](/guides/durability/). |
 
 The [sizing guide](/guides/sizing/) walks these in the order they matter.
 
@@ -72,7 +72,7 @@ func (d *DB) Set(key, value []byte)
 
 `Set` writes `value` under `key`, overwriting any existing value.
 It does not return an error.
-The write lands in the in-memory hot tier and returns; under the default durability a background flusher fsyncs it a moment later, and with `SyncWrites` true it does not return until the record is fsynced.
+The write lands in the in-memory hot tier and returns; under the default durability a background flusher fsyncs it a moment later, and with `SyncWrites` true it does not return until the group-commit fsync has persisted the record.
 
 ### Delete
 
@@ -137,8 +137,8 @@ Always close the store on the way out, typically with `defer db.Close()`.
 With `SyncWrites` false, the default, a write returns as soon as it lands in the hot tier and a background flusher fsyncs it a moment later.
 A crash between the ack and the next flush loses at most the un-flushed hot records, bounded to two segments, the same bounded sub-second window Redis gives with `appendfsync everysec`.
 
-With `SyncWrites` true, a `Set` does not return until its record is fsynced, so an acked write survives a crash with zero loss.
-Concurrent writers coalesce onto one shared fsync, so a burst pays one flush rather than one per write.
+With `SyncWrites` true, a `Set` does not return until the group-commit fsync has persisted its record, so an acked write survives a crash with zero loss, the same contract Redis gives with `appendfsync always`.
+Concurrent writers coalesce onto one shared fsync, so a burst pays one flush rather than one per write; a lone sequential writer pays one fsync per commit.
 
 `Sync()` forces a barrier on demand under either mode, and `Close()` syncs before returning.
 The [durability guide](/guides/durability/) covers when to pick which.

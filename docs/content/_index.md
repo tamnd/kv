@@ -38,7 +38,7 @@ db.Set([]byte("greeting"), []byte("hello"))
 The `kv` binary is the network face of the same engine, spoken over RESP:
 
 ```bash
-kv --addr :6379 --dir ./data &
+kv --port 6379 --dir ./data &
 redis-cli -p 6379 set user:1 alice
 redis-cli -p 6379 get user:1
 ```
