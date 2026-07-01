@@ -50,11 +50,11 @@ const tick = 2 * time.Millisecond
 // signal, runs one flush, and advances the flushed watermark. wakes counts how many flushes ran,
 // the storm metric the board reports.
 type flusher struct {
-	wake   chan struct{}
-	done   chan struct{}
-	wg     sync.WaitGroup
+	wake    chan struct{}
+	done    chan struct{}
+	wg      sync.WaitGroup
 	flushes atomic.Int64 // how many flushes ran, the wakeup-storm count
-	sink   atomic.Uint32
+	sink    atomic.Uint32
 }
 
 func newFlusher() *flusher {
@@ -112,11 +112,11 @@ func (w *WakeEach) Close() { w.f.stop() }
 // ticker backstop for the tail: the engine's policy. A burst of commits collapses to one wake per
 // triggerBytes, so the flusher runs far fewer flushes for the same bounded loss window.
 type WakeThreshold struct {
-	f        *flusher
+	f         *flusher
 	unflushed int64
-	ticker   *time.Ticker
-	stop     chan struct{}
-	wg       sync.WaitGroup
+	ticker    *time.Ticker
+	stop      chan struct{}
+	wg        sync.WaitGroup
 }
 
 func NewWakeThreshold() *WakeThreshold {
