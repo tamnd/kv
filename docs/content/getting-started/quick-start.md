@@ -1,10 +1,11 @@
 ---
 title: "Quick start"
-description: "From an empty editor to a transactional key/value database: open it, write in a transaction, and read it back, in both Go and the CLI."
+description: "From an empty editor to a key/value database: open it, set a key, get it back with a scratch buffer, delete it, and close. Then serve the same engine over the Redis protocol."
 weight: 30
 ---
 
-This walks the core loop twice, once from Go and once from the shell, so you can see that the CLI is the same database the library is. By the end you will have written keys in a transaction and read them back.
+This walks the core loop in Go: open a database, set a key, read it back, delete it, and close.
+Then a short section shows the same engine over the wire with the `kv` server and `redis-cli`.
 
 ## In Go
 
@@ -14,7 +15,6 @@ This walks the core loop twice, once from Go and once from the shell, so you can
 package main
 
 import (
-	"errors"
 	"fmt"
 	"log"
 
@@ -22,7 +22,7 @@ import (
 )
 
 func main() {
-	db, err := kv.Open("app.kv")
+	db, err := kv.Open("app.kv", kv.Options{})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -30,95 +30,81 @@ func main() {
 }
 ```
 
-`Open` creates the file if it does not exist and runs crash recovery if it does, so the same call works the first time and every time after. An empty path opens a memory-only database that is discarded on close, which is handy for tests.
+`Open` takes a path and an `Options` value.
+The zero value `kv.Options{}` is valid: every field falls back to a default, so `kv.Open(path, kv.Options{})` just works.
+`Open` creates the file if it does not exist and runs recovery if it does, so the same call works the first time and every time after.
+`Close` syncs before it returns.
 
-### 2. Write in a transaction
+### 2. Set some keys
 
 ```go
-err = db.Update(func(txn *kv.Txn) error {
-	if err := txn.Set([]byte("user:1"), []byte("alice")); err != nil {
-		return err
-	}
-	return txn.Set([]byte("user:2"), []byte("bob"))
-})
-if err != nil {
-	log.Fatal(err)
-}
+db.Set([]byte("user:1"), []byte("alice"))
+db.Set([]byte("user:2"), []byte("bob"))
 ```
 
-`Update` runs the closure inside a read-write transaction and commits it atomically when the closure returns nil. Both `Set`s land together or, if anything returns an error, neither does. If a concurrent writer causes a conflict, kv retries the closure automatically.
+`Set` does not return an error.
+The write lands in the in-memory hot tier and, under the default durability, a background flusher fsyncs it a moment later.
 
 ### 3. Read it back
 
-For a single key, `Get` is the shortest path:
+`Get` takes the key and a scratch buffer and returns three values: the value, whether the key was found, and an error.
 
 ```go
-v, err := db.Get([]byte("user:1"))
+scratch := make([]byte, 0, 256)
+v, ok, err := db.Get([]byte("user:1"), scratch)
 if err != nil {
 	log.Fatal(err)
+}
+if !ok {
+	fmt.Println("user:1 is not present")
+	return
 }
 fmt.Printf("user:1 = %s\n", v)
 ```
 
-A missing key returns `kv.ErrNotFound`, which you match with `errors.Is`:
+`Get` decodes the value into `scratch` and returns a slice aliased to it, so a hot loop can reuse one buffer and allocate nothing.
+Pass `nil` if you would rather the engine allocate a fresh slice each call.
+A missing key is `ok == false`, not an error, so you check `ok` rather than matching a sentinel.
+
+### 4. Delete a key
 
 ```go
-v, err := db.Get([]byte("absent"))
-if errors.Is(err, kv.ErrNotFound) {
-	// not there
-}
+db.Delete([]byte("user:2"))
 ```
 
-When several reads have to agree on one state, do them inside a `View` instead, which runs a read-only transaction at a consistent snapshot. Nothing another writer commits while the closure runs changes what it reads:
+`Delete` does not return an error either.
+A later `Get` on that key comes back with `ok == false`.
 
-```go
-err = db.View(func(txn *kv.Txn) error {
-	a, err := txn.Get([]byte("user:1"))
-	if err != nil {
-		return err
-	}
-	b, err := txn.Get([]byte("user:2"))
-	if err != nil {
-		return err
-	}
-	fmt.Printf("%s and %s\n", a, b)
-	return nil
-})
-```
+### 5. Close
 
-kv addresses one key at a time: there is no range scan or ordered iteration. To enumerate a set of keys, keep your own list of them under a known key, or track them in your application.
+`defer db.Close()` from step 1 runs a final sync and releases the file when `main` returns.
+Call `db.Sync()` any time you want to force a durability barrier before then.
 
-## At the shell
+kv addresses one key at a time: there is no range scan or ordered iteration.
+To enumerate a set of keys, keep your own list of them under a known key, or track them in your application.
 
-The same steps, with no code:
+## Over the wire
+
+The `kv` binary serves one store over the Redis wire protocol, so any Redis client or `redis-cli` can drive the same engine:
 
 ```bash
-# 1. Create the database
-kv create app.kv
+# start the server on a TCP port, store under ./data/kv.db
+kv --addr :6379 --dir ./data &
 
-# 2. Write two keys (each set is its own committed transaction)
-kv set app.kv user:1 alice
-kv set app.kv user:2 bob
-
-# 3. Read one back
-kv get app.kv user:1
+# talk to it with redis-cli
+redis-cli -p 6379 set user:1 alice
+redis-cli -p 6379 get user:1
 ```
 
 ```
 alice
 ```
 
-Run `kv app.kv` with no subcommand and you drop into an interactive shell on the open file, the way `sqlite3 app.db` does:
-
-```
-$ kv app.kv
-kv 0.3.0  engine=f2  app.kv
-kv> get user:1
-alice
-kv> .exit
-```
+One of `--addr` or `--unixsocket` is required.
+A unix socket is the faster local path, and it wins if you set both.
+The [server guide](/guides/server/) covers the flags, the supported commands, and driving it from Redis client libraries.
 
 ## Where to go next
 
-- The [guides](/guides/) cover transactions, durability, encryption, backup and replication, and running the server.
-- The [library API reference](/reference/library/) lists every type and method; the [CLI reference](/reference/cli/) lists every command and flag.
+- The [guides](/guides/) cover the storage engine, durability, sizing a store, and running the server.
+- The [library API reference](/reference/library/) lists every type and method; the [server reference](/reference/server/) lists every flag and supported command.

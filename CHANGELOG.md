@@ -5,6 +5,57 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.4.0] - 2026-07-01
+
+The biggest break in the project's life, and the point of it.
+
+kv shipped as a multi-engine transactional store: a write-ahead log, an MVCC layer, a
+pager and a VFS, three swappable engines behind an SPI, encryption at rest, backup and
+replication, and an HTTP and binary server with auth. Underneath all of it was one
+engine, the sharded hash index over a hybrid log, that beat the rest on every read and
+bulk-write benchmark in [kvbench](https://github.com/tamnd/kvbench). So it is now the
+whole product, and everything it does not need is gone.
+
+This is a breaking change to both the API and the on-disk format. A database from 0.3.x
+or earlier does not open in 0.4.0. The pre-rewrite tree, the full multi-engine product,
+is archived read-only at [tamnd/kv-v2](https://github.com/tamnd/kv-v2) if you need to
+build against it or move data across.
+
+### Changed
+
+- The public API is now the whole engine and nothing around it. `kv.Open(path,
+  kv.Options{})` returns a `*kv.DB` whose entire surface is `Set`, `Get`, `Delete`,
+  `Sync`, and `Close`. `Get(key, scratch)` decodes into a caller buffer and returns
+  `(value, found, error)`, so a hot loop allocates nothing. `Set` and `Delete` do not
+  return an error. There is no transaction type and no closure form.
+- Durability is one field, `Options.SyncWrites`, and both settings are durable. The
+  default (false) is background group commit: a write returns once it is in the hot tier
+  and the flusher fsyncs it a moment later, a bounded sub-second loss window, the same
+  contract as Redis `appendfsync everysec`. Setting it true fsyncs every commit before it
+  returns, so an acked write survives a crash with zero loss. This replaces the old
+  five-level `SyncOff` to `SyncExtra` ladder and `WithSynchronous`.
+- The `kv` binary is now only a Redis-protocol server over the hash-log store. It speaks
+  the point subset of RESP (`GET`, `SET`, `DEL`, `EXISTS`, `PING`, the `HELLO` handshake,
+  and the introspection commands a client issues at connect) over `--addr` or
+  `--unixsocket`.
+
+### Removed
+
+- Transactions, snapshot and serializable isolation, MVCC, and the `Txn`, `View`, and
+  `Update` surface.
+- The write-ahead log, the pager, the VFS, and the checksummed recovery layer built on
+  them. The hash-log store carries its own durability and recovers on open.
+- The engine selector and the B-tree and LSM cores. There is one engine and it is not
+  swappable.
+- Ordered iteration: range scan, cursors, and prefix walks. kv is an unordered point
+  store, the trade the hash index makes for a flat point lookup.
+- Encryption at rest, backup and replication, and point-in-time recovery.
+- The HTTP and binary servers, token and JWT/OIDC auth, TLS and mTLS, and the change feed.
+- The data CLI (`kv create`, `set`, `get`, the interactive shell, import and export,
+  vacuum, and the rest). The binary serves; it no longer manages a file from the shell.
+
+---
+
 ## [0.3.1] — 2026-06-30
 
 ### Changed

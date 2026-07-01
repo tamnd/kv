@@ -2,9 +2,8 @@
 # build context rather than compiling, so the image build is fast and uses the
 # same static binary every other artifact ships.
 #
-# kv is a single static pure-Go binary with no runtime dependencies, so the image
-# is a minimal base plus the binary and the certificate bundle the server needs
-# to validate JWKS endpoints over TLS.
+# kv is a single static pure-Go binary with no runtime dependencies. The image is
+# a minimal base plus the binary.
 #
 # GoReleaser builds one multi-platform image with buildx and stages each
 # platform's binary under a $TARGETPLATFORM directory (e.g. linux/amd64/) in the
@@ -14,7 +13,7 @@ FROM alpine:3.21
 
 ARG TARGETPLATFORM
 
-# ca-certificates for outbound HTTPS (OIDC/JWKS); tzdata for sane timestamps.
+# tzdata for sane timestamps; ca-certificates to keep the base well formed.
 RUN apk add --no-cache ca-certificates tzdata \
  && mkdir -p /data
 
@@ -22,13 +21,15 @@ COPY $TARGETPLATFORM/kv /usr/bin/kv
 
 WORKDIR /data
 
-# Databases live under the mounted /data volume by default:
+# kv serves one store over the Redis wire protocol. Point it at a data directory
+# on the mounted volume and expose the RESP port, then talk to it with any Redis
+# client:
 #
-#   docker run -v "$PWD/data:/data" ghcr.io/tamnd/kv create /data/app.kv
-#   docker run -p 8480:8480 -v "$PWD/data:/data" ghcr.io/tamnd/kv serve /data/app.kv --addr :8480 --insecure
+#   docker run -p 6379:6379 -v "$PWD/data:/data" ghcr.io/tamnd/kv --addr :6379 --dir /data
+#   redis-cli -p 6379 set greeting hello
 #
 VOLUME ["/data"]
 
-EXPOSE 8480
+EXPOSE 6379
 
 ENTRYPOINT ["/usr/bin/kv"]

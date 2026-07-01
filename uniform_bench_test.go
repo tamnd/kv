@@ -19,7 +19,7 @@ const uniValBytes = 1024
 // never leaves memory. Keeping the bench and the adapter in lockstep is what makes the profile
 // representative of the board.
 func openUniform(b *testing.B) *DB {
-	path := filepath.Join(b.TempDir(), "uni.hlog")
+	path := filepath.Join(b.TempDir(), "uni.kv")
 	// Mirror the kvbench hlog adapter in the cache-resident regime: the resident window covers
 	// the whole dataset (the harness budgets working-set x1.25) and the read cache stays small
 	// because the ring already serves a cold read from memory.
