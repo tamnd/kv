@@ -26,6 +26,7 @@ Run `kv --version` to print the build and version.
 | `--cardinality` | engine default | Expected distinct key count, mirroring `Options.KeyCapacity`. |
 | `--value-bytes` | engine default | Typical value size hint, used to size hot segments. |
 | `--cache-bytes` | engine default | Resident read window size, mirroring the cold-log resident window. |
+| `--version` | | Print the build version and exit. |
 
 One of `--addr` or `--unixsocket` must be set.
 If both are set, the unix socket is used.
