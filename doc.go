@@ -40,10 +40,12 @@
 // appendfsync everysec. This is the fast default, and it is where the engine's
 // throughput lead lives, because the ack does not wait on the disk.
 //
-// SyncWrites true is the per-commit contract: a Set does not return until its record
-// is fsynced, so an acked write survives a crash with zero loss. Concurrent writers
+// SyncWrites true is synchronous group commit: a Set does not return until the
+// group-commit fsync has persisted its record, so an acked write survives a crash with
+// zero loss, the same contract Redis gives with appendfsync always. Concurrent writers
 // coalesce onto one shared fsync, so a burst pays one flush between them rather than
-// hitting the disk's per-flush ceiling on every write.
+// hitting the disk's per-flush ceiling on every write; a lone sequential writer pays
+// one fsync per commit, the honest floor of durable-on-return.
 //
 // Sync forces a durability barrier on demand under either setting, and Close syncs
 // before it returns, so a clean shutdown leaves nothing unflushed.

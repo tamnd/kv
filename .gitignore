@@ -4,6 +4,9 @@
 *.test
 *.out
 
+# Rendered docs site (tago build output)
+/docs/public/
+
 # Database artifacts from tests and local runs
 *.kv
 *.kv-wal

@@ -12,25 +12,28 @@ For a task-oriented walkthrough, see [running the server](/guides/server/).
 kv [flags]
 ```
 
-One of `--addr` or `--unixsocket` is required.
+The flags follow `redis-server`, so the binary is close to a drop-in.
+Bare `kv` starts on `127.0.0.1:6379` with the store at `./dump.kv`, the way `redis-server` with no config does.
 Run `kv --version` to print the build and version.
 
 ## Flags
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--addr` | none | TCP listen address, for example `:6379`. Empty disables the TCP listener. |
-| `--unixsocket` | none | Unix socket path, the faster local path. Wins if both this and `--addr` are set. |
-| `--dir` | `.` | Data directory. The store lives at `<dir>/kv.db`. |
-| `--synchronous` | `default` | Durability: `off`, `normal`, `full`, or `default`. Any value but `off` keeps the synced contract. |
-| `--cardinality` | engine default | Expected distinct key count, mirroring `Options.KeyCapacity`. |
-| `--value-bytes` | engine default | Typical value size hint, used to size hot segments. |
-| `--cache-bytes` | engine default | Resident read window size, mirroring the cold-log resident window. |
+| `--port` | `6379` | TCP port to serve RESP on. `0` disables the TCP listener. |
+| `--bind` | `127.0.0.1` | Address the TCP listener binds to. |
+| `--unixsocket` | none | Unix socket path, the faster local path. Binds alongside the TCP port, not instead of it. |
+| `--dir` | `.` | Data directory. The store lives at `<dir>/<dbfilename>`. |
+| `--dbfilename` | `dump.kv` | Store file name within `--dir`. |
+| `--appendonly` | `yes` | Keep the append log: `yes` or `no`. kv is always log-backed, so this is accepted for compatibility and does not turn persistence off. |
+| `--appendfsync` | `everysec` | Durability: `no`, `everysec`, or `always`. `always` waits for the group-commit fsync before acknowledging a write; `everysec` and `no` ack from memory and fsync in the background. |
+| `--maxmemory` | engine default | Resident memory budget, a redis-style size like `512mb` or `1gb`, mirroring `Options.ResidentBytes`. `0` uses the engine default. |
+| `--cardinality` | engine default | kv-specific: expected distinct key count, mirroring `Options.KeyCapacity`. |
+| `--value-bytes` | engine default | kv-specific: typical value size hint, used to size the hot tier. |
 | `--version` | | Print the build version and exit. |
 
-One of `--addr` or `--unixsocket` must be set.
-If both are set, the unix socket is used.
-`--synchronous off` selects background group commit, the fast bounded-loss default; any other value fsyncs every commit before acknowledging it.
+At least one of `--port` (non-zero) or `--unixsocket` must be set; a TCP port and a unix socket can bind at once, as they can in `redis-server`.
+`--appendfsync` picks the [durability contract](/guides/durability/): `always` is synchronous group commit, where a write waits for the group-commit fsync before it returns for zero acked-write loss, and `everysec` (the default) is background group commit, a bounded sub-second loss window. `no` behaves like `everysec` here, since kv's background flusher runs either way. `--cardinality` and `--value-bytes` have no redis equivalent; they let a benchmark shape the tiers the way the in-process adapter does.
 
 ## Supported commands
 
@@ -43,7 +46,7 @@ The server implements the string commands a client and a benchmark use, plus the
 | `PING` | Liveness check. |
 | `HELLO` | The RESP2/RESP3 handshake. |
 | `CONFIG`, `COMMAND`, `INFO`, `DBSIZE`, `CLIENT`, `SELECT`, `FLUSHALL` | Introspection and session commands issued at connect. |
-| `BGREWRITEAOF` | Forces a `Sync` in a synced mode: the "make it durable now" hook. |
+| `BGREWRITEAOF` | Forces a durability barrier now: the "make it durable now" hook. Waits for the flusher to fsync everything acked so far. |
 
 It is the string keyspace only.
 kv is an unordered point store, so there are no lists, hashes, sorted sets, expiry, or sorted iteration.
@@ -54,8 +57,8 @@ The store lives under `--dir`:
 
 | File | Role |
 | --- | --- |
-| `<dir>/kv.db` | The main store file, where the hash-indexed log lives. |
-| commit-watermark sibling | A small file next to `kv.db` recording how far the durable commit point has advanced. |
+| `<dir>/dump.kv` | The main store file, where the hash-indexed log lives. The name comes from `--dbfilename`. |
+| commit-watermark sibling | A small file next to the store recording how far the durable commit point has advanced. |
 
 On the next start, an existing store is opened and its log is replayed forward, dropping any record left torn by a crash, so recovery is automatic and there is no repair step to run.
 

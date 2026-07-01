@@ -1,25 +1,25 @@
 // Package resp puts a Redis-compatible front end on the kv engine. It speaks
-// RESP2/RESP3 over a TCP or unix listener so any Redis client or benchmark can
-// drive the store with GET/SET/DEL/EXISTS, PING, the HELLO handshake, and the
-// handful of introspection commands a client issues at connect (CONFIG, COMMAND,
-// INFO, DBSIZE, CLIENT, SELECT, FLUSHALL). This is the store's own network face:
-// a SET is one append to the hybrid log and a GET is a point lookup, the same
-// surface Open returns in process.
+// RESP2/RESP3 over TCP and unix listeners so any Redis client, redis-cli, or
+// benchmark can drive the store with GET/SET/DEL/EXISTS, PING, the HELLO
+// handshake, and the handful of introspection commands a client issues at connect
+// (CONFIG, COMMAND, INFO, DBSIZE, CLIENT, SELECT, FLUSHALL). This is the store's
+// own network face: a SET is one append to the hybrid log and a GET is a point
+// lookup, the same surface Open returns in process.
 //
 // The wire loop is a raw-buffer, parse-in-place, one-write-per-burst design over
-// the *kv.DB surface. The hot path
-// reads one chunk off the socket, parses every complete command sitting in the
-// buffer in place, runs each one appending its reply to a single output buffer,
-// and writes that buffer back in one syscall, so steady-state parsing copies
-// nothing: a key points straight into the read buffer and the engine copies the
-// value once when it frames the record into the log.
+// the *kv.DB surface. The hot path reads one chunk off the socket, parses every
+// complete command sitting in the buffer in place, runs each one appending its
+// reply to a single output buffer, and writes that buffer back in one syscall, so
+// steady-state parsing copies nothing: a key points straight into the read buffer
+// and the engine copies the value once when it frames the record into the log.
 //
-// Durability follows the engine: the store is group-commit by construction, so a
-// SET returns as soon as it is in the hot tier and the background flusher makes it
-// durable. When the server is started in a synced mode the BGREWRITEAOF command
-// (the harness "make it durable now" hook) forces a Sync barrier; in the unsynced
-// mode it is a no-op that returns OK, so a benchmark's OFF durability pays no
-// fsync the engine would not otherwise do.
+// Durability follows the store the server was opened over, which is the redis
+// appendfsync contract. With appendfsync everysec the store acks a SET from the
+// in-memory hot tier and the background flusher fsyncs it a moment later, a bounded
+// sub-second loss window. With appendfsync always the store waits for the
+// group-commit fsync before the SET returns, so an acked write survives a crash
+// with zero loss; concurrent writers coalesce onto one shared fsync. BGREWRITEAOF
+// forces a durability barrier on demand under either mode.
 package resp
 
 import (
@@ -32,31 +32,45 @@ import (
 	"github.com/tamnd/kv"
 )
 
-// Server serves a kv store over RESP on a listener. sync decides whether the
-// durability hook forces a Sync: it is set from the mode the binary was started
-// in, so the wire face honours the same durability contract the in-process engine
-// does.
+// Config carries the redis-style settings the server reports back through CONFIG
+// GET and INFO. It does not change how the store is opened; the durability mode is
+// fixed when the caller opens the *kv.DB (appendfsync always opens it with
+// SyncWrites true). These fields let a redis client read the running config and
+// see values it recognizes.
+type Config struct {
+	AppendOnly  string // "yes" or "no"; kv is always log-backed, so it reports "yes"
+	AppendFsync string // "no", "everysec", or "always"
+	MaxMemory   int64  // resident memory budget in bytes; 0 means unset
+	Dir         string // data directory
+	DBFilename  string // store file name within Dir
+}
+
+// Server serves a kv store over RESP on one or more listeners. cfg is the
+// redis-style config it echoes back to clients; it does not affect the store,
+// which is already open in the durability mode the caller chose.
 type Server struct {
-	db   *kv.DB
-	sync bool
+	db  *kv.DB
+	cfg Config
 
 	wg     sync.WaitGroup
 	mu     sync.Mutex
-	ln     net.Listener
+	lns    map[net.Listener]struct{}
 	conns  map[net.Conn]struct{}
 	closed bool
 }
 
-// New builds a Server over an open store. forceSync makes the BGREWRITEAOF
-// durability hook issue a real Sync; pass false for the unsynced mode where the
-// background flusher is the only durability and the hook is a no-op. Call Serve
-// with a bound listener.
-func New(db *kv.DB, forceSync bool) *Server {
-	return &Server{db: db, sync: forceSync, conns: make(map[net.Conn]struct{})}
+// New builds a Server over an open store. cfg is the redis-style config the server
+// reports through CONFIG GET and INFO; the durability contract itself is set when
+// the caller opens the *kv.DB. Call Serve once per bound listener; a TCP and a unix
+// listener can both drive the same server.
+func New(db *kv.DB, cfg Config) *Server {
+	return &Server{db: db, cfg: cfg, lns: make(map[net.Listener]struct{}), conns: make(map[net.Conn]struct{})}
 }
 
 // Serve accepts connections on ln until Close, serving each one in its own
-// goroutine. It returns nil after a Close, and the accept error otherwise.
+// goroutine. It returns nil after a Close, and the accept error otherwise. It may
+// be called once per listener, so a TCP and a unix listener can both feed the same
+// server the way redis-server binds both at once.
 func (s *Server) Serve(ln net.Listener) error {
 	// Record the listener so Close can shut it down: dropping the open connections
 	// is not enough, the accept loop is parked in Accept and only closing the
@@ -67,7 +81,7 @@ func (s *Server) Serve(ln net.Listener) error {
 		_ = ln.Close()
 		return nil
 	}
-	s.ln = ln
+	s.lns[ln] = struct{}{}
 	s.mu.Unlock()
 	for {
 		c, err := ln.Accept()
@@ -105,8 +119,8 @@ func (s *Server) Close() error {
 		return nil
 	}
 	s.closed = true
-	if s.ln != nil {
-		_ = s.ln.Close()
+	for ln := range s.lns {
+		_ = ln.Close()
 	}
 	for c := range s.conns {
 		_ = c.Close()
@@ -308,7 +322,6 @@ var (
 	respNil      = []byte("$-1\r\n")
 	respZero     = []byte(":0\r\n")
 	respEmptyArr = []byte("*0\r\n")
-	respInfo     = []byte("# Server\r\nredis_version:7.4.0\r\nkv_redis_layer:1\r\n")
 )
 
 // dispatch runs one command, appends its reply to out, and returns the grown
@@ -332,7 +345,7 @@ func (s *Server) dispatch(conn *connState, out []byte, args [][]byte) ([]byte, b
 			return append(out, respPong...), false
 		}
 		if eqFold(cmd, "info") {
-			return appendBulk(out, respInfo), false
+			return appendBulk(out, s.infoBytes()), false
 		}
 	case 5:
 		if eqFold(cmd, "hello") {
@@ -343,7 +356,7 @@ func (s *Server) dispatch(conn *connState, out []byte, args [][]byte) ([]byte, b
 			return s.cmdExists(conn, out, args), false
 		}
 		if eqFold(cmd, "config") {
-			return append(out, respEmptyArr...), false
+			return s.cmdConfig(out, args), false
 		}
 		if eqFold(cmd, "dbsize") {
 			// The hash-log engine keeps no live-key counter, so the introspection
@@ -371,12 +384,12 @@ func (s *Server) dispatch(conn *connState, out []byte, args [][]byte) ([]byte, b
 		}
 	case 12:
 		if eqFold(cmd, "bgrewriteaof") {
-			// The harness "make it durable now" hook. In a synced mode it forces a
-			// group-commit barrier; in the unsynced mode the background flusher is
-			// the only durability and this is a no-op that still answers OK.
-			if s.sync {
-				_ = s.db.Sync()
-			}
+			// The "make it durable now" hook, redis BGREWRITEAOF. It forces a
+			// group-commit barrier: Sync waits for the flusher to fsync everything
+			// acked so far. Under appendfsync always the acked writes are already
+			// durable, so it is a cheap confirmation; under everysec it flushes the
+			// sub-second tail the background timer had not reached yet.
+			_ = s.db.Sync()
 			return append(out, respOK...), false
 		}
 	}
@@ -480,6 +493,113 @@ func (s *Server) cmdHello(out []byte, args [][]byte) []byte {
 	out = appendBulkStr(out, "master")
 	out = appendBulkStr(out, "modules")
 	out = append(out, respEmptyArr...)
+	return out
+}
+
+// cmdConfig answers CONFIG GET and CONFIG SET the way a redis client expects at
+// connect. GET returns the running value of a known parameter as the flat
+// [name, value, ...] array redis uses, so a client that reads maxmemory or
+// appendfsync sees a real answer; an unknown parameter returns an empty array. SET
+// is accepted and answered OK without changing anything: the durability mode and
+// the memory budget are fixed when the store is opened, so there is nothing to
+// retune at runtime.
+func (s *Server) cmdConfig(out []byte, args [][]byte) []byte {
+	if len(args) >= 2 && eqFold(args[1], "set") {
+		return append(out, respOK...)
+	}
+	if len(args) < 3 || !eqFold(args[1], "get") {
+		return append(out, respEmptyArr...)
+	}
+	pat := args[2]
+	pairs := s.configPairs()
+	matched := 0
+	for i := range pairs {
+		if configMatch(pat, pairs[i][0]) {
+			matched++
+		}
+	}
+	out = append(out, '*')
+	out = strconv.AppendInt(out, int64(matched*2), 10)
+	out = append(out, '\r', '\n')
+	for i := range pairs {
+		if configMatch(pat, pairs[i][0]) {
+			out = appendBulkStr(out, pairs[i][0])
+			out = appendBulkStr(out, pairs[i][1])
+		}
+	}
+	return out
+}
+
+// configPairs is the redis-style running config the server reports through CONFIG
+// GET. maxmemory-policy is fixed at noeviction (kv never evicts a key) and save is
+// empty (there is no periodic RDB dump, only the append log).
+func (s *Server) configPairs() [][2]string {
+	maxmem := "0"
+	if s.cfg.MaxMemory > 0 {
+		maxmem = strconv.FormatInt(s.cfg.MaxMemory, 10)
+	}
+	return [][2]string{
+		{"maxmemory", maxmem},
+		{"maxmemory-policy", "noeviction"},
+		{"appendonly", s.cfg.AppendOnly},
+		{"appendfsync", s.cfg.AppendFsync},
+		{"save", ""},
+		{"dir", s.cfg.Dir},
+		{"dbfilename", s.cfg.DBFilename},
+	}
+}
+
+// configMatch reports whether a CONFIG GET pattern selects a parameter name. It
+// covers the forms a client actually sends: an exact name, "*" for all, and a
+// trailing-star prefix like "maxmemory*". The name is matched case-insensitively.
+func configMatch(pat []byte, name string) bool {
+	if len(pat) == 1 && pat[0] == '*' {
+		return true
+	}
+	if n := len(pat); n > 0 && pat[n-1] == '*' {
+		prefix := pat[:n-1]
+		if len(prefix) > len(name) {
+			return false
+		}
+		return eqFoldPrefix(prefix, name)
+	}
+	return eqFold(pat, name)
+}
+
+// eqFoldPrefix reports whether name begins with the ASCII-lowercase-folded prefix.
+func eqFoldPrefix(prefix []byte, name string) bool {
+	for i := 0; i < len(prefix); i++ {
+		c := prefix[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		d := name[i]
+		if d >= 'A' && d <= 'Z' {
+			d += 'a' - 'A'
+		}
+		if c != d {
+			return false
+		}
+	}
+	return true
+}
+
+// infoBytes builds the INFO reply a client reads at connect. It reports the redis
+// version the wire layer emulates and a Persistence section carrying the append
+// log state and the fsync policy, so a client sees the durability mode the store
+// was opened in.
+func (s *Server) infoBytes() []byte {
+	aof := "1"
+	if s.cfg.AppendOnly == "no" {
+		aof = "0"
+	}
+	out := make([]byte, 0, 160)
+	out = append(out, "# Server\r\nredis_version:7.4.0\r\nkv_redis_layer:1\r\n"...)
+	out = append(out, "# Persistence\r\naof_enabled:"...)
+	out = append(out, aof...)
+	out = append(out, "\r\naof_fsync:"...)
+	out = append(out, s.cfg.AppendFsync...)
+	out = append(out, "\r\n"...)
 	return out
 }
 
