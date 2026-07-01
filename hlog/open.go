@@ -12,7 +12,12 @@ package hlog
 // it has been group-committed to the file, and Sync forces that barrier on demand.
 func Open(path string, opts Options) (*TieredDB, error) {
 	o := opts.withDefaults()
-	return OpenTiered(path, o.HotBytes, o.hotKeys(), o.ResidentBytes, o.KeyCapacity, o.ReadCacheCells)
+	t, err := OpenTiered(path, o.HotBytes, o.hotKeys(), o.ResidentBytes, o.KeyCapacity, o.ReadCacheCells)
+	if err != nil {
+		return nil, err
+	}
+	t.syncWrites = o.SyncWrites
+	return t, nil
 }
 
 // Options sizes a store opened by Open. The zero value is valid: every field falls back to a
@@ -49,6 +54,30 @@ type Options struct {
 	// ReadCacheCells is the number of cells in the read cache over cold reads. More cells catch
 	// more repeated cold keys at a cost of memory. Rounded up to a power of two. Default 1<<16.
 	ReadCacheCells int
+
+	// SyncWrites picks the durability contract. Both settings are durable; the knob only moves when
+	// the fsync happens relative to the returned Set, so it is a granularity choice, not durable
+	// versus not.
+	//
+	// The default, SyncWrites false, is background group commit: a write lands in the in-memory hot
+	// tier and returns, and the flusher fsyncs it a moment later. This is durable-on-a-short-delay,
+	// not durable-on-return: a crash in the window between the ack and the next flush loses the
+	// un-flushed hot records, bounded to at most two segments, the same bounded-loss-window a Redis
+	// appendfsync-everysec or an OS-buffered write gives. It is the right default for a cache, a read
+	// model, or any store that can replay a sub-second tail, and it is where the engine's throughput
+	// lead lives, because the ack does not wait on the disk.
+	//
+	// SyncWrites true is the honest per-commit contract: a Set does not return until its record is
+	// fsynced to the file, so an acked write survives a crash with zero loss, the guarantee bbolt,
+	// pebble, and a per-commit sqlite give. It is not a per-write fsync in disguise: writes route
+	// straight to the cold log's group-commit flusher, so many concurrent writers coalesce onto one
+	// shared fsync, the batching trick that lets a group-committing store stay fast under
+	// concurrency instead of hitting the disk's per-flush ceiling on every write. Reach for it for a
+	// ledger, a queue, anything where the write you acked must not vanish. Durability uses the file's
+	// Sync, which is fsync on Linux, a full-file flush on Windows, and the platform's file sync on
+	// macOS, the same primitive every embedded Go engine here flushes with, so the comparison stays
+	// on one footing across all three.
+	SyncWrites bool
 }
 
 const (

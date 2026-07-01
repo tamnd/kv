@@ -44,6 +44,12 @@ type TieredDB struct {
 	migrate chan *segment
 	closed  chan struct{}
 	wg      sync.WaitGroup
+
+	// syncWrites selects the per-commit-durable path when set: a write appends straight to the
+	// cold log's group-commit flusher and waits for the shared fsync before it returns, instead of
+	// acking from the hot tier and letting the background flush catch up. It is fixed at Open and
+	// never changes for a live store, so the write path reads it without synchronization.
+	syncWrites bool
 }
 
 // maxSealed bounds how many sealed segments may be outstanding at once, the pipeline depth
@@ -204,6 +210,10 @@ func (t *TieredDB) Delete(key []byte) { t.write(opDel, key, nil) }
 // delete could be shadowed in the hot tier yet still served stale from the cache after the hot
 // record drained away.
 func (t *TieredDB) write(op byte, key, value []byte) {
+	if t.syncWrites {
+		t.writeDurable(op, key, value)
+		return
+	}
 	fp := forceFP(maphash.Bytes(t.seed, key))
 	for {
 		a := t.active.Load()
@@ -224,6 +234,27 @@ func (t *TieredDB) write(op byte, key, value []byte) {
 		}
 		t.seal(a)
 	}
+}
+
+// writeDurable is the per-commit-durable write path, taken when the store was opened with
+// SyncWrites. It bypasses the hot tier and appends straight to the cold log, then blocks on the
+// cold log's Sync until the record is fsynced, so the write is on the platter before it returns.
+// The speed comes from where it waits: the cold flusher group-commits, streaming the whole
+// committed-but-unflushed prefix to the file under one fsync, so when many writers append and then
+// wait here at once, a single fsync makes all of them durable and every waiter wakes together.
+// That is the batching that lets a per-commit-durable store stay fast under concurrency instead of
+// paying one disk flush per write. Under low concurrency each write gets its own fsync, the honest
+// floor of durable-on-return. The read path already falls through to cold, and the cache cell is
+// dropped so a prior cold value for the key is not served stale, exactly as the hot path does.
+func (t *TieredDB) writeDurable(op byte, key, value []byte) {
+	fp := forceFP(maphash.Bytes(t.seed, key))
+	if op == opDel {
+		t.cold.Delete(key)
+	} else {
+		t.cold.Set(key, value)
+	}
+	t.cache.invalidate(fp)
+	t.cold.Sync()
 }
 
 // seal swaps the full segment out for a fresh one and queues it for migration. It re-checks
