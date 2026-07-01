@@ -51,13 +51,13 @@ func drainSegment(buf []byte) uint32 {
 // the engine uses. The outstanding count is released only after a drain completes, so depth here
 // means what maxSealed means in the engine: segments not yet drained, in flight included.
 type Pipeline struct {
-	work  chan []byte // sealed segment buffers handed to the migrator
+	work  chan []byte   // sealed segment buffers handed to the migrator
 	slots chan struct{} // one token per allowed outstanding segment; the depth bound
 	wg    sync.WaitGroup
 	sink  uint32 // accumulates drain checksums so the work is not optimized out
 
-	seg  []byte // the current hot segment buffer being filled
-	off  int    // fill offset into seg
+	seg  []byte      // the current hot segment buffer being filled
+	off  int         // fill offset into seg
 	free chan []byte // recycled segment buffers, so steady state does not allocate
 }
 

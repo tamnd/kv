@@ -13,8 +13,8 @@ import (
 // is the honest test of the architecture, and the skew here is deterministic, no rand, which
 // the harness forbids.
 
-const tierBenchKeys = 1 << 20    // ~1M distinct keys, far past one hot segment
-const tierHotKeys = 1 << 12      // 4K hot keys take most of the traffic
+const tierBenchKeys = 1 << 20 // ~1M distinct keys, far past one hot segment
+const tierHotKeys = 1 << 12   // 4K hot keys take most of the traffic
 const tierBenchVal = "a-record-value-around-a-hundred-bytes-so-the-write-path-moves-realistic-payload-sizes-xx"
 
 // skewIndex maps a loop counter to a key id with a fixed skew: most iterations hit the hot
