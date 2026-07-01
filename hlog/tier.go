@@ -83,6 +83,15 @@ type segment struct {
 	cap  int64
 	tail atomic.Int64
 	ix   *Index
+
+	// sealed and inflight fence the migrator against writers still filling this segment. A put
+	// claims its offset with tail.Add and then writes its bytes, so a segment sealed and handed
+	// to the drainer can still have a slow writer mid-record; the drainer walks the raw buffer
+	// by tail, so it would read a length header a PutUint32 is still writing. inflight counts the
+	// puts that have passed the sealed check and may still be writing bytes, and sealed stops new
+	// puts, so seal can wait for the buffer to go quiescent before the drainer sees it.
+	sealed   atomic.Bool
+	inflight atomic.Int64
 }
 
 func newSegment(capBytes int64, capKeys int) *segment {
@@ -198,7 +207,18 @@ func (t *TieredDB) write(op byte, key, value []byte) {
 	fp := forceFP(maphash.Bytes(t.seed, key))
 	for {
 		a := t.active.Load()
-		if a.put(fp, op, key, value) {
+		// Register as in-flight before the sealed check, so seal cannot both observe inflight
+		// zero and race a put still writing bytes: either seal sees this increment and waits, or
+		// this put sees the sealed flag and backs out. It is the store-load pair the barrier
+		// rests on, correct under Go's sequentially consistent atomics.
+		a.inflight.Add(1)
+		if a.sealed.Load() {
+			a.inflight.Add(-1)
+			continue // sealed after we loaded it; reload the fresh active
+		}
+		ok := a.put(fp, op, key, value)
+		a.inflight.Add(-1)
+		if ok {
 			t.cache.invalidate(fp)
 			return
 		}
@@ -227,8 +247,18 @@ func (t *TieredDB) seal(full *segment) {
 			return
 		}
 	}
+	// Stop new puts into full, then publish it on the sealed list so a reader still finds its
+	// records, then swap in a fresh active so writers move on to it. Only after that wait for any
+	// put that already claimed an offset in full to finish writing its bytes; until inflight
+	// reaches zero the buffer is still being written and the drainer must not walk it. Publishing
+	// before the swap keeps full reachable to readers the whole time, so no committed key blinks
+	// out between active and the sealed list.
+	full.sealed.Store(true)
 	t.sealed.Store(&sealedNode{seg: full, next: t.sealed.Load()})
 	t.active.Store(newSegment(t.segBytes, t.segKeys))
+	for full.inflight.Load() > 0 {
+		runtime.Gosched()
+	}
 	t.migrate <- full
 }
 
