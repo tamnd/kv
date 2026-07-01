@@ -36,8 +36,14 @@ build against it or move data across.
   five-level `SyncOff` to `SyncExtra` ladder and `WithSynchronous`.
 - The `kv` binary is now only a Redis-protocol server over the hash-log store. It speaks
   the point subset of RESP (`GET`, `SET`, `DEL`, `EXISTS`, `PING`, the `HELLO` handshake,
-  and the introspection commands a client issues at connect) over `--addr` or
-  `--unixsocket`.
+  and the introspection commands a client issues at connect).
+- The binary takes redis-server flags, so a Redis deployment drives it with the spelling it
+  already knows: `--port` (0 disables the TCP listener), `--bind`, `--unixsocket`, `--dir`,
+  `--dbfilename`, `--appendonly`, `--appendfsync` (`no` | `everysec` | `always`), and
+  `--maxmemory` as a redis-style size. Two sizing hints have no redis equivalent:
+  `--cardinality` sizes the resident key index and `--value-bytes` sizes the hot segment.
+  `--appendfsync always` is the per-commit path (`Options.SyncWrites`); `everysec`, the
+  default, is background group commit. `--version` prints the build and exits.
 
 ### Removed
 
