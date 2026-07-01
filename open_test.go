@@ -9,7 +9,7 @@ import (
 // TestOpenDefaults checks the friendly constructor works with a zero Options: set, get, delete,
 // and reopen all behave, so Open(path, Options{}) is a usable embedded store with no tuning.
 func TestOpenDefaults(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "store.hlog")
+	path := filepath.Join(t.TempDir(), "store.kv")
 	d, err := Open(path, Options{})
 	if err != nil {
 		t.Fatal(err)

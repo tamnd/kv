@@ -12,7 +12,7 @@ import (
 // before the store is ever closed. This is the difference from the default path, where a write is
 // acked from the hot tier and made durable a moment later by the background flush.
 func TestSyncWritesDurableOnReturn(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "store.hlog")
+	path := filepath.Join(t.TempDir(), "store.kv")
 	d, err := Open(path, Options{SyncWrites: true})
 	if err != nil {
 		t.Fatal(err)
@@ -53,7 +53,7 @@ func TestSyncWritesDurableOnReturn(t *testing.T) {
 // must still read back its own value. Run under -race, it also guards the durable path's shared
 // state the way TestTieredConcurrent guards the hot path.
 func TestSyncWritesConcurrent(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "store.hlog")
+	path := filepath.Join(t.TempDir(), "store.kv")
 	const writers, each = 8, 500
 	d, err := Open(path, Options{SyncWrites: true, KeyCapacity: writers * each})
 	if err != nil {

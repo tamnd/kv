@@ -101,7 +101,7 @@ func readFull(r *bufio.Reader, p []byte) (int, error) {
 func startServer(t *testing.T, forceSync bool) (string, func()) {
 	t.Helper()
 	dir := t.TempDir()
-	db, err := kv.Open(filepath.Join(dir, "hlog.db"), kv.Options{KeyCapacity: 1000})
+	db, err := kv.Open(filepath.Join(dir, "kv.db"), kv.Options{KeyCapacity: 1000})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}

@@ -228,7 +228,7 @@ func TestDeleteSurvivesRecovery(t *testing.T) {
 	})
 }
 
-// TestTieredSyncThenRecover confirms TieredDB.Sync drains the hot tier to cold and fsyncs, so
+// TestTieredSyncThenRecover confirms DB.Sync drains the hot tier to cold and fsyncs, so
 // the data is recoverable from the file without a Close.
 func TestTieredSyncThenRecover(t *testing.T) {
 	const segBytes = 1 << 16

@@ -8,7 +8,20 @@ The authoritative, full changelog lives in [CHANGELOG.md](https://github.com/tam
 
 ## Versioning
 
-kv follows semantic versioning. While the project is in its 0.x series, the API and on-disk format are still settling toward a 1.0 commitment, and any breaking change is called out in the release notes. 0.3.0 consolidated the storage engine and is a clean break: a database created by 0.1.0 or 0.2.0 does not open in 0.3.0 or later. From 0.3.0 on, the f2 on-disk format is the one the project carries forward.
+kv follows semantic versioning. While the project is in its 0.x series, the API and on-disk format are still settling toward a 1.0 commitment, and any breaking change is called out in the release notes. 0.4.0 is the largest break so far: kv dropped everything except its hash-log engine, so the API and the on-disk format both changed, and a database from 0.3.x or earlier does not open in 0.4.0. The pre-0.4.0 multi-engine product is archived read-only at [tamnd/kv-v2](https://github.com/tamnd/kv-v2).
+
+## 0.4.0
+
+kv shipped as a multi-engine transactional store: a write-ahead log, an MVCC layer, a pager and a VFS, three swappable engines, encryption, backup and replication, and an HTTP and binary server with auth. Underneath all of it was one engine, the sharded hash index over a hybrid log, that won every read and bulk-write benchmark in [kvbench](https://github.com/tamnd/kvbench). So it is now the whole product.
+
+This is a breaking change to both the API and the on-disk format. A database from 0.3.x or earlier does not open in 0.4.0.
+
+- **The API is the engine.** `kv.Open(path, kv.Options{})` returns a `*kv.DB` whose entire surface is `Set`, `Get`, `Delete`, `Sync`, and `Close`. `Get(key, scratch)` decodes into a buffer you pass and returns `(value, found, error)`, so a hot loop allocates nothing. `Set` and `Delete` do not return an error. There is no transaction type. See the [library reference](/reference/library/).
+- **Durability is one field.** `Options.SyncWrites` picks the contract, and both settings are durable. The default is background group commit, a bounded sub-second loss window, the same contract Redis gives with `appendfsync everysec`. Setting it true fsyncs every commit before it returns, for zero acked-commit loss. This replaces the old `SyncOff` to `SyncExtra` ladder. See the [durability guide](/guides/durability/).
+- **The server is Redis-only.** The `kv` binary serves one store over the Redis wire protocol, over `--addr` or `--unixsocket`. The HTTP and binary servers, the auth, the TLS, and the change feed are gone. See the [server guide](/guides/server/).
+- **A point store.** kv is unordered. Range scan, cursors, and prefix walks are gone, along with the multi-engine selector, encryption, backup and replication, and the data CLI. The [storage engine guide](/guides/storage-engine/) covers what stayed and why.
+
+If you relied on any of the removed features, 0.3.x remains available, and the pre-rewrite code is preserved in the [tamnd/kv-v2](https://github.com/tamnd/kv-v2) repository.
 
 ## 0.3.1
 
@@ -20,8 +33,8 @@ A consolidation release, and a deliberate breaking change. kv had shipped two st
 
 - **One engine.** The B-tree and LSM cores are gone, and so is the engine selector. Every database uses f2. `WithEngine`, `kv.BTree`, and `kv.LSM` are removed, along with the per-core tuning options (`WithMemtableSize`, `WithLevelRatio`, `WithFilter`, `WithRangeIndex`, `WithValueSeparation`, `WithCompression`, `WithColdCompression`, `WithFillFactor`, `WithMaxInlineValue`, `WithBtreeBuffers`).
 - **Point lookups only.** f2 does not keep keys in order, so range scan and ordered iteration are gone: `Txn.NewIterator`, `IterOptions`, the `Iterator` type, and `Txn.DeleteRange` are removed, and the CLI loses `scan`, `count`, `dump`, and `export`. The operations are the point ones: get, set, exists, delete, and merge. A get is a hash and a read, and read latency stays flat as the database grows.
-- **Larger than memory.** The hybrid log keeps a bounded resident working set, set with `WithCacheSize`, and leaves the cold tail in the file, so a database can be many times the cache you give it. A read that misses the resident set faults one page in from disk by offset; hot reads never touch it. The index stays compact at roughly 10 to 13 bytes per key, so a billion keys cost about 15 GiB and stay resident while the data does not. The [storage engine guide](/guides/engines/#larger-than-memory) covers it.
-- **A Redis face.** `kv serve` can now speak the Redis wire protocol, so a redis client, library, or benchmark drives the same database as the HTTP and binary faces. Bind it with `-resp-addr` or `-resp-unixsocket`; it serves the string keyspace (`GET`, `SET`, `DEL`, `EXISTS`, `PING`, the `HELLO` handshake, `DBSIZE`) over one writer shared with the other faces. The [server guide](/guides/server/#the-redis-face) has the details.
+- **Larger than memory.** The hybrid log keeps a bounded resident working set, set with `WithCacheSize`, and leaves the cold tail in the file, so a database can be many times the cache you give it. A read that misses the resident set faults one page in from disk by offset; hot reads never touch it. The index stays compact at roughly 10 to 13 bytes per key, so a billion keys cost about 15 GiB and stay resident while the data does not. The [storage engine guide](/guides/storage-engine/) covers it.
+- **A Redis face.** `kv serve` can now speak the Redis wire protocol, so a redis client, library, or benchmark drives the same database as the HTTP and binary faces. Bind it with `-resp-addr` or `-resp-unixsocket`; it serves the string keyspace (`GET`, `SET`, `DEL`, `EXISTS`, `PING`, the `HELLO` handshake, `DBSIZE`) over one writer shared with the other faces. The [server guide](/guides/server/) has the details.
 - **An in-memory mode.** `kv.OpenMem` and `kv serve :memory:` run the whole stack in RAM with nothing written to disk, for a throwaway cache or a benchmark that wants the engine without the file.
 - **Same everything else.** Transactions with snapshot and serializable isolation, the tunable write-ahead log and crash recovery, encryption at rest, backup and replication, the server, and the observability surface all carry forward unchanged.
 - **A new on-disk file.** f2 keeps its durable state in an `app.kv-f2` sidecar next to the main file and the WAL. A database created before 0.3.0 cannot be opened; move data across with the source you loaded from.
@@ -33,7 +46,7 @@ If you were running the default B-tree and using only point operations, the upgr
 A performance and ergonomics release. It is a drop-in upgrade: the on-disk format is unchanged, so an existing database opens as-is, and the API is purely additive, so existing code keeps compiling.
 
 - **A faster hot path.** Reads, scans, and writes were tightened across the board, with most of the work in the engine's point-read and iteration paths and in the per-operation overhead the transaction layer adds. Cold-start and out-of-cache behavior also improved as the buffer pool spends fewer cycles per page touched.
-- **Single-key reads.** `db.Get(key)` reads one key at the latest committed state without opening a transaction, returning a copy you own. It is the lightest way to read a lone key, for when a read does not need to agree with other reads. Use a `View` or `Snapshot` when several reads must see one consistent version. See [single-key reads](/reference/library/#single-key-reads).
+- **Single-key reads.** `db.Get(key)` reads one key at the latest committed state without opening a transaction, returning a copy you own. It is the lightest way to read a lone key, for when a read does not need to agree with other reads. Use a `View` or `Snapshot` when several reads must see one consistent version. See single-key reads.
 - **Correctness fix.** The B-tree interior-node decoder now verifies its checksum trailer on the path it previously skipped, closing a gap where a corrupt interior page could go unnoticed instead of returning `ErrCorrupt`.
 
 Everything from 0.1.0 carries forward unchanged.
@@ -57,4 +70,4 @@ kv is pure Go with zero external dependencies and builds against Go 1.23.
 ## Next
 
 - The [library reference](/reference/library/) lists the API this release exposes.
-- The [CLI reference](/reference/cli/) lists every command.
+- The [server reference](/reference/server/) lists every flag and command.

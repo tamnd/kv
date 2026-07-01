@@ -69,7 +69,7 @@ nfpms:
     vendor: tamnd
     homepage: https://github.com/tamnd/kv
     maintainer: Duc-Tam Nguyen <tamnd87@gmail.com>
-    description: Embeddable ordered key/value database for Go, in a single file with zero dependencies.
+    description: Embeddable key/value database for Go, in a single file with zero dependencies.
     license: Apache-2.0
     formats:
       - deb
@@ -96,7 +96,7 @@ dockers_v2:
       - linux/arm64
     labels:
       org.opencontainers.image.title: "{{ .ProjectName }}"
-      org.opencontainers.image.description: "Embeddable ordered key/value database for Go, in a single file with zero dependencies"
+      org.opencontainers.image.description: "Embeddable key/value database for Go, in a single file with zero dependencies"
       org.opencontainers.image.url: "https://github.com/tamnd/kv"
       org.opencontainers.image.source: "https://github.com/tamnd/kv"
       org.opencontainers.image.version: "{{ .Version }}"
@@ -116,7 +116,7 @@ homebrew_casks:
       token: '{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}'
     directory: Casks
     homepage: https://github.com/tamnd/kv
-    description: Embeddable ordered key/value database for Go, in a single file with zero dependencies
+    description: Embeddable key/value database for Go, in a single file with zero dependencies
     skip_upload: '{{ if index .Env "HOMEBREW_TAP_GITHUB_TOKEN" }}false{{ else }}true{{ end }}'
     commit_author:
       name: Duc-Tam Nguyen
@@ -132,7 +132,7 @@ scoops:
       token: '{{ .Env.SCOOP_BUCKET_GITHUB_TOKEN }}'
     directory: bucket
     homepage: https://github.com/tamnd/kv
-    description: Embeddable ordered key/value database for Go, in a single file with zero dependencies
+    description: Embeddable key/value database for Go, in a single file with zero dependencies
     license: Apache-2.0
     skip_upload: '{{ if index .Env "SCOOP_BUCKET_GITHUB_TOKEN" }}false{{ else }}true{{ end }}'
     commit_author:

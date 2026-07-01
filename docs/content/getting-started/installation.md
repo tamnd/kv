@@ -1,10 +1,10 @@
 ---
 title: "Installation"
-description: "Add kv to a Go program with go get, or install the kv command-line tool from Go, Homebrew, Scoop, a release archive, a Linux package, or the container image."
+description: "Add kv to a Go program with go get, or install the kv server binary from Go, Homebrew, Scoop, a release archive, a Linux package, or the container image."
 weight: 20
 ---
 
-kv is both a library you import and a single-binary command-line tool. The library is one `go get`; the CLI ships through every channel below.
+kv is both a library you import and a single-binary server. The library is one `go get`; the server ships through every channel below.
 
 ## As a library
 
@@ -18,9 +18,9 @@ import "github.com/tamnd/kv"
 
 That is the whole dependency. The module pulls in nothing outside the Go standard library, so it adds no transitive packages to your build. kv requires Go 1.23 or newer.
 
-## The command-line tool
+## The server binary
 
-Pick whichever channel suits you. Every channel installs the same static binary.
+The `kv` binary serves one store over the Redis wire protocol. Pick whichever channel suits you. Every channel installs the same static binary.
 
 ### Go
 
@@ -75,28 +75,24 @@ sudo rpm -i kv-*.x86_64.rpm
 The image is a minimal base plus the static binary:
 
 ```bash
-docker run -v "$PWD/data:/data" ghcr.io/tamnd/kv create /data/app.kv
-docker run -p 8480:8480 -v "$PWD/data:/data" ghcr.io/tamnd/kv \
-  serve /data/app.kv --addr :8480 --insecure
+docker run -p 6379:6379 -v "$PWD/data:/data" ghcr.io/tamnd/kv \
+  --addr :6379 --dir /data
 ```
 
-Databases land under the mounted `/data` volume on your host.
+The store lives at `/data/kv.db` on the mounted volume, so it survives across container restarts.
 
 ## Verify the install
 
 ```bash
-kv version
+kv --version
 ```
 
 ```
-kv 0.2.0
-  library  0.2.0
+kv 0.3.0
   commit   1a2b3c4
   built    2026-06-25T09:00:00Z
   go       go1.23.0 linux/amd64
 ```
-
-The `library` line is the one that matters for data: two binaries reporting the same library version read and write the same on-disk format.
 
 ## Verify a download
 

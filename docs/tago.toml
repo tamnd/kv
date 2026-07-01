@@ -1,6 +1,6 @@
 title       = "kv"
 baseURL     = "https://kv.tamnd.com/"
-description = "kv is an embeddable key/value database for Go. One file on disk, zero external dependencies, full ACID transactions, and a sharded hash-log storage core that keeps point lookups flat as the database grows and runs over datasets larger than memory. It feels like SQLite, for keys and values."
+description = "kv is an embeddable key/value database for Go. One file on disk, zero dependencies outside the standard library, and a sharded hash-log storage core that keeps point lookups flat as the database grows past memory. Two durability modes and a Redis-protocol server, with the SQLite feel of a database you import rather than run."
 contentDir  = "content"
 outputDir   = "public"
 theme       = "tago-doks"
