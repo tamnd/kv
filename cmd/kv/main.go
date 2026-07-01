@@ -26,12 +26,22 @@ import (
 	"github.com/tamnd/kv/resp"
 )
 
+// Build metadata, stamped by the linker at release time via -X. The zero
+// values are what a plain `go build` produces, so a from-source binary reports
+// "dev" rather than a bare empty string.
+var (
+	Version = "dev"
+	Commit  = "none"
+	Date    = "unknown"
+)
+
 func main() {
 	os.Exit(run(os.Args[1:]))
 }
 
 func run(args []string) int {
 	fs := flag.NewFlagSet("kv", flag.ContinueOnError)
+	showVersion := fs.Bool("version", false, "print version and exit")
 	unixsocket := fs.String("unixsocket", "", "unix socket path to serve RESP on (preferred for a local benchmark)")
 	addr := fs.String("addr", "", "TCP listen address for RESP, for example 127.0.0.1:6380 (empty disables TCP)")
 	dir := fs.String("dir", ".", "data directory; the store lives at <dir>/kv.db")
@@ -44,6 +54,10 @@ func run(args []string) int {
 	cacheBytes := fs.Int64("cache-bytes", 0, "resident cold window in bytes (0 uses the engine default)")
 	if err := fs.Parse(args); err != nil {
 		return 2
+	}
+	if *showVersion {
+		fmt.Printf("kv %s (%s, built %s)\n", Version, Commit, Date)
+		return 0
 	}
 	if *unixsocket == "" && *addr == "" {
 		fmt.Fprintln(os.Stderr, "kv: one of --unixsocket or --addr is required")
