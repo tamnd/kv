@@ -9,7 +9,7 @@ import (
 	"sync/atomic"
 )
 
-// TieredDB is the F2 flaw fix: it splits a small mutable hot tier from the compact cold tier
+// DB is the F2 flaw fix: it splits a small mutable hot tier from the compact cold tier
 // so the index the write path touches stays bounded to the working set, which note 179
 // measured is a 4x to 11x write win over an index sized to the whole keyspace. The cold tier
 // is the step-three hybrid log, larger than memory in one file; the hot tier lives in RAM.
@@ -31,11 +31,11 @@ import (
 // is a clean miss that falls through to the right tier. Because a segment is only ever sealed
 // after the previous sealed segment has fully drained, version order is preserved: the older
 // value reaches cold before the newer one can, so the newest write always wins.
-type TieredDB struct {
+type DB struct {
 	mu       sync.Mutex // guards the seal-and-swap only; the read and write fast paths are lock-free
 	active   atomic.Pointer[segment]
 	sealed   atomic.Pointer[sealedNode] // newest-first list of sealed segments not yet drained
-	cold     *DB
+	cold     *coldDB
 	cache    *readCache
 	segBytes int64
 	segKeys  int
@@ -88,7 +88,7 @@ type segment struct {
 	buf  []byte
 	cap  int64
 	tail atomic.Int64
-	ix   *Index
+	ix   *hashIndex
 
 	// sealed and inflight fence the migrator against writers still filling this segment. A put
 	// claims its offset with tail.Add and then writes its bytes, so a segment sealed and handed
@@ -101,7 +101,7 @@ type segment struct {
 }
 
 func newSegment(capBytes int64, capKeys int) *segment {
-	return &segment{buf: make([]byte, capBytes), cap: capBytes, ix: NewIndex(capKeys)}
+	return &segment{buf: make([]byte, capBytes), cap: capBytes, ix: newHashIndex(capKeys)}
 }
 
 // put writes the record for key and value under op and indexes it at its address. It returns
@@ -166,16 +166,16 @@ func (s *segment) rangeRecords(fn func(addr int64, op byte, key, value []byte)) 
 	}
 }
 
-// OpenTiered creates a tiered store at path. segBytes sizes one hot segment and segKeys its
+// openTiered creates a tiered store at path. segBytes sizes one hot segment and segKeys its
 // index, so the hot index is bounded to one segment's worth of keys, the small resident table
 // note 179 wants. ringBytes and coldKeys size the cold hybrid log and its index; cacheBytes
 // sizes the read cache.
-func OpenTiered(path string, segBytes int64, segKeys int, ringBytes int64, coldKeys int, cacheCells int) (*TieredDB, error) {
-	cold, err := OpenDB(path, ringBytes, coldKeys)
+func openTiered(path string, segBytes int64, segKeys int, ringBytes int64, coldKeys int, cacheCells int) (*DB, error) {
+	cold, err := openColdDB(path, ringBytes, coldKeys)
 	if err != nil {
 		return nil, err
 	}
-	t := &TieredDB{
+	t := &DB{
 		cold:     cold,
 		cache:    newReadCache(cacheCells),
 		segBytes: segBytes,
@@ -194,13 +194,13 @@ func OpenTiered(path string, segBytes int64, segKeys int, ringBytes int64, coldK
 // active segment. When the active segment fills, Set seals it, hands it to the background
 // migrator, and installs a fresh active segment, then retries; this is the only path that
 // takes the lock, and it runs once per segment, not once per write.
-func (t *TieredDB) Set(key, value []byte) { t.write(opSet, key, value) }
+func (t *DB) Set(key, value []byte) { t.write(opSet, key, value) }
 
 // Delete writes a tombstone for key in the hot tier. The key reads as absent afterward across
 // every tier: the hot tombstone shadows an older value in a sealed segment or in cold, and it
 // migrates to cold as a tombstone so the delete survives a reopen. It is one append, the same
 // fast path as Set.
-func (t *TieredDB) Delete(key []byte) { t.write(opDel, key, nil) }
+func (t *DB) Delete(key []byte) { t.write(opDel, key, nil) }
 
 // write appends a record under op into the active segment, sealing and retrying on a full
 // segment, then invalidates the read-cache cell for the key. The invalidation is what keeps a
@@ -209,7 +209,7 @@ func (t *TieredDB) Delete(key []byte) { t.write(opDel, key, nil) }
 // and the next cold read repopulates it from the migrated record. Without it an overwrite or a
 // delete could be shadowed in the hot tier yet still served stale from the cache after the hot
 // record drained away.
-func (t *TieredDB) write(op byte, key, value []byte) {
+func (t *DB) write(op byte, key, value []byte) {
 	if t.syncWrites {
 		t.writeDurable(op, key, value)
 		return
@@ -246,7 +246,7 @@ func (t *TieredDB) write(op byte, key, value []byte) {
 // paying one disk flush per write. Under low concurrency each write gets its own fsync, the honest
 // floor of durable-on-return. The read path already falls through to cold, and the cache cell is
 // dropped so a prior cold value for the key is not served stale, exactly as the hot path does.
-func (t *TieredDB) writeDurable(op byte, key, value []byte) {
+func (t *DB) writeDurable(op byte, key, value []byte) {
 	fp := forceFP(maphash.Bytes(t.seed, key))
 	if op == opDel {
 		t.cold.Delete(key)
@@ -264,7 +264,7 @@ func (t *TieredDB) writeDurable(op byte, key, value []byte) {
 // holds maxSealed segments it waits for the migrator to drain one, which is the backpressure that
 // bounds hot memory; version order is preserved because the list is newest-first for reads and
 // the migrator drains in seal order, so an older value always reaches cold before a newer one.
-func (t *TieredDB) seal(full *segment) {
+func (t *DB) seal(full *segment) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.active.Load() != full {
@@ -297,7 +297,7 @@ func (t *TieredDB) seal(full *segment) {
 // finished draining seg into cold. It rebuilds the chain rather than mutating it in place so a
 // reader walking the old chain keeps a consistent snapshot; the new chain reuses the surviving
 // segments and only the drained one falls out, to become garbage once no reader holds it.
-func (t *TieredDB) removeSealed(seg *segment) {
+func (t *DB) removeSealed(seg *segment) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	var keep []*segment
@@ -316,7 +316,7 @@ func (t *TieredDB) removeSealed(seg *segment) {
 // Get returns the value for key. It checks the hot tiers first, active then sealed, then the
 // read cache, then cold, populating the cache on a cold hit. scratch is a caller buffer the
 // value is copied into and may be reused across calls.
-func (t *TieredDB) Get(key, scratch []byte) ([]byte, bool, error) {
+func (t *DB) Get(key, scratch []byte) ([]byte, bool, error) {
 	fp := forceFP(maphash.Bytes(t.seed, key))
 	if v, found, tomb := t.active.Load().get(fp, key, scratch); found {
 		return v, true, nil
@@ -350,7 +350,7 @@ func (t *TieredDB) Get(key, scratch []byte) ([]byte, bool, error) {
 // at the record, dropping superseded records as compaction. When a segment is fully drained
 // it clears sealed, which releases any writer waiting in seal, and the segment and its index
 // become garbage.
-func (t *TieredDB) migrateLoop() {
+func (t *DB) migrateLoop() {
 	defer t.wg.Done()
 	for {
 		select {
@@ -375,7 +375,7 @@ func (t *TieredDB) migrateLoop() {
 // drain migrates the live records of one sealed segment into cold. A record is live when the
 // segment's index still maps its key to this record's address; a record superseded by a later
 // write in the same segment points elsewhere and is dropped.
-func (t *TieredDB) drain(seg *segment) {
+func (t *DB) drain(seg *segment) {
 	seg.rangeRecords(func(addr int64, op byte, key, value []byte) {
 		fp := forceFP(maphash.Bytes(t.seed, key))
 		cur, ok := seg.ix.Get(fp)
@@ -396,7 +396,7 @@ func (t *TieredDB) drain(seg *segment) {
 // syncs a crash loses the un-migrated hot records, bounded to at most two segments, which is
 // the cost of keeping the hot write path lock-free and allocation-light. Callers that need a
 // tighter window call Sync more often.
-func (t *TieredDB) Sync() error {
+func (t *DB) Sync() error {
 	a := t.active.Load()
 	if a.tail.Load() > 0 {
 		t.seal(a)
@@ -407,7 +407,7 @@ func (t *TieredDB) Sync() error {
 
 // drainPending blocks until the migrator has emptied the seal queue and cleared the sealed
 // slot, so every sealed record has reached cold. It is the wait a durability barrier needs.
-func (t *TieredDB) drainPending() {
+func (t *DB) drainPending() {
 	for {
 		if len(t.migrate) == 0 && t.sealed.Load() == nil {
 			return
@@ -418,7 +418,7 @@ func (t *TieredDB) drainPending() {
 
 // Close stops the migrator after draining queued segments, then closes the cold tier so every
 // set is on disk. A segment still in active at Close is migrated first so its records are not lost.
-func (t *TieredDB) Close() error {
+func (t *DB) Close() error {
 	// Seal whatever is in active so its records are queued for the final drain.
 	a := t.active.Load()
 	if a.tail.Load() > 0 {

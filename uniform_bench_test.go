@@ -18,7 +18,7 @@ const uniValBytes = 1024
 // cold index to the key count, the resident window to the whole dataset so a cache-resident read
 // never leaves memory. Keeping the bench and the adapter in lockstep is what makes the profile
 // representative of the board.
-func openUniform(b *testing.B) *TieredDB {
+func openUniform(b *testing.B) *DB {
 	path := filepath.Join(b.TempDir(), "uni.hlog")
 	// Mirror the kvbench hlog adapter in the cache-resident regime: the resident window covers
 	// the whole dataset (the harness budgets working-set x1.25) and the read cache stays small
@@ -36,7 +36,7 @@ func openUniform(b *testing.B) *TieredDB {
 		ResidentBytes:  budget,
 		ReadCacheCells: 4096,
 	}.withDefaults()
-	d, err := OpenTiered(path, o.HotBytes, o.hotKeys(), o.ResidentBytes, o.KeyCapacity, o.ReadCacheCells)
+	d, err := openTiered(path, o.HotBytes, o.hotKeys(), o.ResidentBytes, o.KeyCapacity, o.ReadCacheCells)
 	if err != nil {
 		b.Fatal(err)
 	}

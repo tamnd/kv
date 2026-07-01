@@ -9,7 +9,7 @@ import (
 // TestAppendReadBack checks the core round-trip: every Append returns an address that
 // reads back the exact bytes written, single-threaded.
 func TestAppendReadBack(t *testing.T) {
-	l := New(1 << 20)
+	l := newRingLog(1 << 20)
 	addrs := make([]int64, 1000)
 	for i := range addrs {
 		rec := fmt.Appendf(nil, "record-%04d-payload", i)
@@ -28,7 +28,7 @@ func TestAppendReadBack(t *testing.T) {
 // no torn or overlapping write. It records each appended address with its expected
 // payload, then verifies all of them after the writers join.
 func TestAppendConcurrentDisjoint(t *testing.T) {
-	l := New(1 << 24)
+	l := newRingLog(1 << 24)
 	const writers = 8
 	const each = 4000
 

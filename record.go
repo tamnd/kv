@@ -2,7 +2,7 @@ package kv
 
 import "encoding/binary"
 
-// A stored record in the durable engine (DB, TieredDB) carries a one-byte op ahead of the key
+// A stored record in the durable engine carries a one-byte op ahead of the key
 // so a delete is a real record, a tombstone, not the absence of one. A tombstone shadows any
 // older value for its key across every tier, which is what makes a delete durable and correct in
 // a log-structured store: you cannot erase the old record in place, so you write a newer record

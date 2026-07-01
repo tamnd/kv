@@ -23,22 +23,22 @@ import (
 // far above any key the engine stores.
 const keyLenSize = 2
 
-// Store is the hot-tier point store: a log and its fingerprint index, plus the per-store
+// hotStore is the hot-tier point store: a log and its fingerprint index, plus the per-store
 // hash seed mixed into every key. The seed is fixed for the store's life so a fingerprint
 // is stable across the run.
-type Store struct {
-	log  *Log
-	ix   *Index
+type hotStore struct {
+	log  *ringLog
+	ix   *hashIndex
 	seed maphash.Seed
 }
 
-// NewStore returns a hot-tier store backed by capBytes of log memory and an index sized
+// newHotStore returns a hot-tier store backed by capBytes of log memory and an index sized
 // for capKeys keys. The caller sizes both to the working set, the same staging the log
 // and index use on their own until the disk spill and resize steps land.
-func NewStore(capBytes int64, capKeys int) *Store {
-	return &Store{
-		log:  New(capBytes),
-		ix:   NewIndex(capKeys),
+func newHotStore(capBytes int64, capKeys int) *hotStore {
+	return &hotStore{
+		log:  newRingLog(capBytes),
+		ix:   newHashIndex(capKeys),
 		seed: maphash.MakeSeed(),
 	}
 }
@@ -48,7 +48,7 @@ func NewStore(capBytes int64, capKeys int) *Store {
 // the index at the new address. An overwrite of an existing key updates the index in
 // place to the new record and leaves the old record as garbage for a later compaction
 // step to reclaim.
-func (s *Store) Set(key, value []byte) {
+func (s *hotStore) Set(key, value []byte) {
 	addr, dst := s.log.Reserve(keyLenSize + len(key) + len(value))
 	binary.LittleEndian.PutUint16(dst, uint16(len(key)))
 	copy(dst[keyLenSize:], key)
@@ -62,7 +62,7 @@ func (s *Store) Set(key, value []byte) {
 // fingerprint collision safe: a different key that hashed to the same fingerprint fails
 // the compare and reports a miss instead of returning a stranger's value. No lock is
 // taken on this path. The returned value aliases the log buffer and must not be mutated.
-func (s *Store) Get(key []byte) ([]byte, bool) {
+func (s *hotStore) Get(key []byte) ([]byte, bool) {
 	addr, ok := s.ix.Get(maphash.Bytes(s.seed, key))
 	if !ok {
 		return nil, false

@@ -1,14 +1,13 @@
-// Package resp puts a Redis-compatible front end on the hlog engine. It speaks
+// Package resp puts a Redis-compatible front end on the kv engine. It speaks
 // RESP2/RESP3 over a TCP or unix listener so any Redis client or benchmark can
-// drive the bare hash-log store with GET/SET/DEL/EXISTS, PING, the HELLO
-// handshake, and the handful of introspection commands a client issues at
-// connect (CONFIG, COMMAND, INFO, DBSIZE, CLIENT, SELECT, FLUSHALL). This is the
-// engine's own network face, not the transactional kv database's: there is no
-// MVCC and no transaction, a SET is one append to the hybrid log and a GET is a
-// point lookup, the same surface Open returns in process.
+// drive the store with GET/SET/DEL/EXISTS, PING, the HELLO handshake, and the
+// handful of introspection commands a client issues at connect (CONFIG, COMMAND,
+// INFO, DBSIZE, CLIENT, SELECT, FLUSHALL). This is the store's own network face:
+// a SET is one append to the hybrid log and a GET is a point lookup, the same
+// surface Open returns in process.
 //
-// The wire loop is the raw-buffer, parse-in-place, one-write-per-burst design the
-// kv RESP front end uses, kept here over the *kv.TieredDB surface. The hot path
+// The wire loop is a raw-buffer, parse-in-place, one-write-per-burst design over
+// the *kv.DB surface. The hot path
 // reads one chunk off the socket, parses every complete command sitting in the
 // buffer in place, runs each one appending its reply to a single output buffer,
 // and writes that buffer back in one syscall, so steady-state parsing copies
@@ -33,12 +32,12 @@ import (
 	"github.com/tamnd/kv"
 )
 
-// Server serves an hlog store over RESP on a listener. sync decides whether the
+// Server serves a kv store over RESP on a listener. sync decides whether the
 // durability hook forces a Sync: it is set from the mode the binary was started
 // in, so the wire face honours the same durability contract the in-process engine
 // does.
 type Server struct {
-	db   *kv.TieredDB
+	db   *kv.DB
 	sync bool
 
 	wg     sync.WaitGroup
@@ -52,7 +51,7 @@ type Server struct {
 // durability hook issue a real Sync; pass false for the unsynced mode where the
 // background flusher is the only durability and the hook is a no-op. Call Serve
 // with a bound listener.
-func New(db *kv.TieredDB, forceSync bool) *Server {
+func New(db *kv.DB, forceSync bool) *Server {
 	return &Server{db: db, sync: forceSync, conns: make(map[net.Conn]struct{})}
 }
 
@@ -309,7 +308,7 @@ var (
 	respNil      = []byte("$-1\r\n")
 	respZero     = []byte(":0\r\n")
 	respEmptyArr = []byte("*0\r\n")
-	respInfo     = []byte("# Server\r\nredis_version:7.4.0\r\nhlog_redis_layer:1\r\n")
+	respInfo     = []byte("# Server\r\nredis_version:7.4.0\r\nkv_redis_layer:1\r\n")
 )
 
 // dispatch runs one command, appends its reply to out, and returns the grown
@@ -468,7 +467,7 @@ func (s *Server) cmdHello(out []byte, args [][]byte) []byte {
 	}
 	out = append(out, "*14\r\n"...)
 	out = appendBulkStr(out, "server")
-	out = appendBulkStr(out, "hlog")
+	out = appendBulkStr(out, "kv")
 	out = appendBulkStr(out, "version")
 	out = appendBulkStr(out, "7.4.0")
 	out = appendBulkStr(out, "proto")

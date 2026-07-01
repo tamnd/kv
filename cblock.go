@@ -11,7 +11,7 @@ import (
 	"sync"
 )
 
-// CompressedLog is the space-optimized cold backend: an append-only log that batches records
+// compressedLog is the space-optimized cold backend: an append-only log that batches records
 // into blocks, compresses each block with DEFLATE, and writes the compressed blocks to one
 // file, with a small in-memory index from each block's logical start to its place in the file.
 // It mirrors the HybridLog interface, Append returns a logical address and At reads it back, so
@@ -35,7 +35,7 @@ import (
 // infrequent by construction, most reads are served by the hot tier and the read cache above
 // this one, and a one-block decode cache serves a run of reads from the same block without
 // re-inflating it.
-type CompressedLog struct {
+type compressedLog struct {
 	f          *os.File
 	cf         *os.File // commit side file: durable block count and tails
 	blockBytes int
@@ -75,11 +75,11 @@ type decodeCache struct {
 // 1 for a raw (uncompressed) block.
 const cblockHdr = 9
 
-// OpenCompressedLog opens or creates a compressed cold log at path whose blocks target
+// openCompressedLog opens or creates a compressed cold log at path whose blocks target
 // blockBytes of raw records each. A larger block compresses better and amortizes the per-block
 // header but costs more to decode on a read; 64 KiB is the measured sweet spot for key-value
 // data. An existing file is recovered from its commit side file.
-func OpenCompressedLog(path string, blockBytes int) (*CompressedLog, error) {
+func openCompressedLog(path string, blockBytes int) (*compressedLog, error) {
 	if blockBytes < maxRecord {
 		blockBytes = maxRecord
 	}
@@ -93,7 +93,7 @@ func OpenCompressedLog(path string, blockBytes int) (*CompressedLog, error) {
 		return nil, err
 	}
 	zw, _ := flate.NewWriter(nil, flate.BestSpeed)
-	l := &CompressedLog{
+	l := &compressedLog{
 		f:          f,
 		cf:         cf,
 		blockBytes: blockBytes,
@@ -112,7 +112,7 @@ func OpenCompressedLog(path string, blockBytes int) (*CompressedLog, error) {
 // Append frames rec into the pending block and returns its logical address. When the pending
 // block fills it is sealed to disk. The record is readable immediately, from the pending buffer
 // before the seal and from its block after, so a reader never sees a gap.
-func (l *CompressedLog) Append(rec []byte) int64 {
+func (l *compressedLog) Append(rec []byte) int64 {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	addr := l.logTail
@@ -129,7 +129,7 @@ func (l *CompressedLog) Append(rec []byte) int64 {
 
 // sealLocked compresses the pending block, stores it raw if compression did not shrink it,
 // writes it to the file, and records its index entry. The caller holds the write lock.
-func (l *CompressedLog) sealLocked() {
+func (l *compressedLog) sealLocked() {
 	if len(l.pending) == 0 {
 		return
 	}
@@ -163,13 +163,13 @@ func (l *CompressedLog) sealLocked() {
 	l.pending = l.pending[:0]
 }
 
-var errBadAddr = errors.New("hlog: address not found in compressed log")
+var errBadAddr = errors.New("kv: address not found in compressed log")
 
 // At returns the record at logical address addr, copied into dst. A record still in the pending
 // block is sliced from the in-memory buffer; otherwise the containing block is located by the
 // index, decoded (served from the one-block cache when it is the same block as the last read),
 // and the record sliced out.
-func (l *CompressedLog) At(addr int64, dst []byte) ([]byte, error) {
+func (l *compressedLog) At(addr int64, dst []byte) ([]byte, error) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	if addr >= l.pendStart {
@@ -188,7 +188,7 @@ func (l *CompressedLog) At(addr int64, dst []byte) ([]byte, error) {
 }
 
 // readPendingLocked slices a record out of the not-yet-sealed pending buffer.
-func (l *CompressedLog) readPendingLocked(addr int64, dst []byte) ([]byte, error) {
+func (l *compressedLog) readPendingLocked(addr int64, dst []byte) ([]byte, error) {
 	return sliceRecord(l.pending, addr-l.pendStart, dst)
 }
 
@@ -209,7 +209,7 @@ func sliceRecord(block []byte, off int64, dst []byte) ([]byte, error) {
 
 // findBlock returns the index of the block containing addr, or -1. The index is sorted by
 // logStart, so a binary search finds the last block starting at or before addr.
-func (l *CompressedLog) findBlock(addr int64) int {
+func (l *compressedLog) findBlock(addr int64) int {
 	i := sort.Search(len(l.index), func(i int) bool { return l.index[i].logStart > addr })
 	if i == 0 {
 		return -1
@@ -223,7 +223,7 @@ func (l *CompressedLog) findBlock(addr int64) int {
 
 // decodeLocked returns the raw bytes of block bi, from the one-block cache if it is the same
 // block as the last read, otherwise by reading and inflating it and caching the result.
-func (l *CompressedLog) decodeLocked(bi int) ([]byte, error) {
+func (l *compressedLog) decodeLocked(bi int) ([]byte, error) {
 	if l.cache.id == bi {
 		return l.cache.buf, nil
 	}
@@ -251,7 +251,7 @@ func (l *CompressedLog) decodeLocked(bi int) ([]byte, error) {
 }
 
 // Tail returns the next logical address, the total logical bytes appended.
-func (l *CompressedLog) Tail() int64 {
+func (l *compressedLog) Tail() int64 {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	return l.logTail
@@ -259,7 +259,7 @@ func (l *CompressedLog) Tail() int64 {
 
 // Sync seals the pending block and fsyncs the file and the commit side file, so every appended
 // record is durable and the block index can be recovered.
-func (l *CompressedLog) Sync() error {
+func (l *compressedLog) Sync() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.sealLocked()
@@ -269,7 +269,7 @@ func (l *CompressedLog) Sync() error {
 // persistLocked fsyncs the data, then writes and fsyncs the durable watermark: the number of
 // blocks and the logical and file tails, enough to rebuild the index by re-reading the block
 // headers on open. The caller holds the write lock.
-func (l *CompressedLog) persistLocked() error {
+func (l *compressedLog) persistLocked() error {
 	if err := l.f.Sync(); err != nil {
 		return err
 	}
@@ -288,7 +288,7 @@ func (l *CompressedLog) persistLocked() error {
 // entry's logical start from the running raw-length total. The pending block is empty after
 // recovery: a Sync or Close always seals before recording the tail, so no record is left
 // unsealed in a durable image.
-func (l *CompressedLog) recover() error {
+func (l *compressedLog) recover() error {
 	var tb [24]byte
 	if n, _ := l.cf.ReadAt(tb[:], 0); n != 24 {
 		return nil
@@ -329,7 +329,7 @@ func (l *CompressedLog) recover() error {
 
 // Close seals the pending block, fsyncs, and closes the files. After Close every record is on
 // disk and recoverable.
-func (l *CompressedLog) Close() error {
+func (l *compressedLog) Close() error {
 	l.mu.Lock()
 	l.sealLocked()
 	err := l.persistLocked()

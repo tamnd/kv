@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-// HybridLog is the larger-than-memory log: one growing file whose recent tail is held in
+// hybridLog is the larger-than-memory log: one growing file whose recent tail is held in
 // a fixed in-memory ring, so the working set lives in RAM and the cold prefix lives on
 // disk, in one file, with the look and feel of a single-file store.
 //
@@ -38,7 +38,7 @@ import (
 // previous occupant is not yet flushed, so it waits until flushed catches up. In steady
 // state the flusher keeps ahead and the wait never triggers, so the common append path is
 // the fetch-add and a copy.
-type HybridLog struct {
+type hybridLog struct {
 	buf       []byte
 	ringBytes int64
 	mask      int64
@@ -67,12 +67,12 @@ const flushTick = 2 * time.Millisecond
 // flush chunk. A record larger than this is a misuse the engine does not store.
 const maxRecord = 1 << 20
 
-// OpenHybridLog opens or creates the backing file at path and returns a log whose ring holds
+// openHybridLog opens or creates the backing file at path and returns a log whose ring holds
 // ringBytes of the recent tail. ringBytes is rounded up to a power of two so the
 // address-to-slot map is a mask. It must exceed maxRecord so a record always fits the ring.
 // An existing file is not truncated: the log recovers its durable tail from the commit side
 // file and refills the ring from disk, so a reopen sees every fsynced record.
-func OpenHybridLog(path string, ringBytes int64) (*HybridLog, error) {
+func openHybridLog(path string, ringBytes int64) (*hybridLog, error) {
 	n := int64(1)
 	for n < ringBytes {
 		n <<= 1
@@ -89,7 +89,7 @@ func OpenHybridLog(path string, ringBytes int64) (*HybridLog, error) {
 		f.Close()
 		return nil, err
 	}
-	l := &HybridLog{
+	l := &hybridLog{
 		buf:          make([]byte, n),
 		ringBytes:    n,
 		mask:         n - 1,
@@ -115,7 +115,7 @@ func OpenHybridLog(path string, ringBytes int64) (*HybridLog, error) {
 // in case the side file is ahead of a short write, then refills the ring with the last
 // ringBytes of durable data so a hot read right after open serves from memory. Below that
 // window reads go to the file, which is intact.
-func (l *HybridLog) recover() error {
+func (l *hybridLog) recover() error {
 	var tb [8]byte
 	if n, _ := l.cf.ReadAt(tb[:], 0); n == 8 {
 		durable := int64(binary.LittleEndian.Uint64(tb[:]))
@@ -141,7 +141,7 @@ func (l *HybridLog) recover() error {
 // fillRing copies the last ringBytes of durable data from the file back into the in-memory
 // ring at the logical offsets, so the recovered tail is resident exactly as it would be had it
 // just been appended. It undoes the wrap split the same way flushRange does.
-func (l *HybridLog) fillRing(durable int64) {
+func (l *hybridLog) fillRing(durable int64) {
 	start := max(durable-l.ringBytes, 0)
 	for off := start; off < durable; {
 		pos := off & l.mask
@@ -157,7 +157,7 @@ func (l *HybridLog) fillRing(durable int64) {
 // ringWrite copies src into the ring at logical offset off, splitting at the ring end so a
 // record that wraps the buffer is written as two contiguous halves. The file never wraps,
 // so this split is only about the in-memory mirror.
-func (l *HybridLog) ringWrite(off int64, src []byte) {
+func (l *hybridLog) ringWrite(off int64, src []byte) {
 	pos := off & l.mask
 	end := pos + int64(len(src))
 	if end <= l.ringBytes {
@@ -171,7 +171,7 @@ func (l *HybridLog) ringWrite(off int64, src []byte) {
 
 // ringRead copies len(dst) bytes starting at logical offset off out of the ring, undoing
 // the same wrap split. The caller validates the read against the tail afterward.
-func (l *HybridLog) ringRead(off int64, dst []byte) {
+func (l *hybridLog) ringRead(off int64, dst []byte) {
 	pos := off & l.mask
 	end := pos + int64(len(dst))
 	if end <= l.ringBytes {
@@ -189,7 +189,7 @@ func (l *HybridLog) ringRead(off int64, dst []byte) {
 // advances the commit watermark. A wrapping ring cannot hand back one contiguous in-place
 // slice, so the store frames its record into a pooled buffer and calls Append; the single
 // ring copy here is the cost of the wrap, measured in note 178.
-func (l *HybridLog) Append(rec []byte) int64 {
+func (l *hybridLog) Append(rec []byte) int64 {
 	total := int64(hdrLen + len(rec))
 	off := l.tail.Add(total) - total
 	for off+total > l.flushed.Load()+l.ringBytes {
@@ -213,7 +213,7 @@ func (l *HybridLog) Append(rec []byte) int64 {
 // header parts, the op, the key length, and the key, are tiny next to the value. The length
 // header is still written last so its nonzero value marks the record complete, the same publish
 // order Append uses, and the same backpressure wait guards a not-yet-flushed ring slot.
-func (l *HybridLog) AppendFrame(op byte, key, value []byte) int64 {
+func (l *hybridLog) AppendFrame(op byte, key, value []byte) int64 {
 	payload := int64(recordLen(key, value))
 	total := hdrLen + payload
 	off := l.tail.Add(total) - total
@@ -240,7 +240,7 @@ func (l *HybridLog) AppendFrame(op byte, key, value []byte) int64 {
 // finished first waits its turn, so committed only ever exposes a contiguous fully-written
 // prefix. The wait is the cost of an ordered durable prefix and is short, bounded by the
 // number of concurrent appenders, and absent under low concurrency.
-func (l *HybridLog) commit(off, total int64) {
+func (l *hybridLog) commit(off, total int64) {
 	for l.committed.Load() != off {
 		runtime.Gosched()
 	}
@@ -256,7 +256,7 @@ func (l *HybridLog) commit(off, total int64) {
 	}
 }
 
-func (l *HybridLog) wakeFlusher() {
+func (l *hybridLog) wakeFlusher() {
 	select {
 	case l.flushWake <- struct{}{}:
 	default:
@@ -266,7 +266,7 @@ func (l *HybridLog) wakeFlusher() {
 // flushLoop streams the committed-but-unflushed prefix to the file and advances flushed,
 // which both makes the tail durable and frees ring slots for reuse. It writes at the
 // record's logical offset, so the file mirrors the address space exactly.
-func (l *HybridLog) flushLoop() {
+func (l *hybridLog) flushLoop() {
 	defer l.wg.Done()
 	ticker := time.NewTicker(flushTick)
 	defer ticker.Stop()
@@ -300,7 +300,7 @@ func (l *HybridLog) flushLoop() {
 // group commit the lab measured (note 181): one fsync covers the whole batch the flusher just
 // wrote, so under load the per-record fsync cost falls by the batch size, and when idle each
 // record gets its own fsync, which is the right shape.
-func (l *HybridLog) persist(upTo int64) {
+func (l *hybridLog) persist(upTo int64) {
 	if upTo <= l.synced.Load() {
 		return
 	}
@@ -314,7 +314,7 @@ func (l *HybridLog) persist(upTo int64) {
 
 // flushRange writes logical bytes [from, to) to the file at offset from, splitting the
 // read out of the ring at the wrap and writing the file in one or two contiguous pwrites.
-func (l *HybridLog) flushRange(from, to int64) {
+func (l *hybridLog) flushRange(from, to int64) {
 	for from < to {
 		pos := from & l.mask
 		span := to - from
@@ -326,7 +326,7 @@ func (l *HybridLog) flushRange(from, to int64) {
 	}
 }
 
-var errShortRecord = errors.New("hlog: record past tail")
+var errShortRecord = errors.New("kv: record past tail")
 
 // At returns the record bytes at logical address addr, copied into dst (grown as needed)
 // since the bytes may live in the ring or on disk and a ring slot can be reused under a
@@ -335,7 +335,7 @@ var errShortRecord = errors.New("hlog: record past tail")
 // copy, the record is now on disk (the backpressure invariant guarantees it was flushed
 // before being overwritten), so it falls back to a file read. A record comfortably inside
 // the window takes the lock-free ring path.
-func (l *HybridLog) At(addr int64, dst []byte) ([]byte, error) {
+func (l *hybridLog) At(addr int64, dst []byte) ([]byte, error) {
 	dst, _, err := l.AtSource(addr, dst)
 	return dst, err
 }
@@ -344,7 +344,7 @@ func (l *HybridLog) At(addr int64, dst []byte) ([]byte, error) {
 // The tier uses the flag to cache only disk-sourced reads: a record already resident in the ring
 // is served from memory at full speed, so a second copy of it in the read cache would only spend
 // RAM to save nothing, while a disk-sourced read is exactly the one worth caching.
-func (l *HybridLog) AtSource(addr int64, dst []byte) ([]byte, bool, error) {
+func (l *hybridLog) AtSource(addr int64, dst []byte) ([]byte, bool, error) {
 	t := l.tail.Load()
 	if addr < 0 || addr+hdrLen > t {
 		return nil, false, errShortRecord
@@ -369,7 +369,7 @@ func (l *HybridLog) AtSource(addr int64, dst []byte) ([]byte, bool, error) {
 
 // readDisk reads a record straight from the file at offset addr. The file mirrors the
 // address space, so the record is contiguous on disk even if it wrapped in the ring.
-func (l *HybridLog) readDisk(addr int64, dst []byte) ([]byte, error) {
+func (l *hybridLog) readDisk(addr int64, dst []byte) ([]byte, error) {
 	var hb [hdrLen]byte
 	if _, err := l.f.ReadAt(hb[:], addr); err != nil {
 		return nil, err
@@ -395,16 +395,16 @@ func grow(dst []byte, n int) []byte {
 }
 
 // Tail returns the current tail, the total logical bytes appended.
-func (l *HybridLog) Tail() int64 { return l.tail.Load() }
+func (l *hybridLog) Tail() int64 { return l.tail.Load() }
 
 // Synced returns the durable tail, the address below which every record is fsynced.
-func (l *HybridLog) Synced() int64 { return l.synced.Load() }
+func (l *hybridLog) Synced() int64 { return l.synced.Load() }
 
 // Sync forces every committed record durable before it returns, by waking the flusher and
 // waiting for the synced watermark to reach the current commit point. A caller that needs a
 // write on the platter, a checkpoint barrier or an explicit flush, calls this; the normal path
 // leaves durability to the background group commit.
-func (l *HybridLog) Sync() error {
+func (l *hybridLog) Sync() error {
 	target := l.committed.Load()
 	for l.synced.Load() < target {
 		l.wakeFlusher()
@@ -416,7 +416,7 @@ func (l *HybridLog) Sync() error {
 // Range calls fn for every committed record in address order, passing the record's address and
 // its bytes copied into a reused buffer. It is the log replay the store uses on open to rebuild
 // the index from the file. Returning false from fn stops the walk early.
-func (l *HybridLog) Range(fn func(addr int64, rec []byte) bool) error {
+func (l *hybridLog) Range(fn func(addr int64, rec []byte) bool) error {
 	end := l.committed.Load()
 	buf := make([]byte, 0, 256)
 	for off := int64(0); off+hdrLen <= end; {
@@ -435,7 +435,7 @@ func (l *HybridLog) Range(fn func(addr int64, rec []byte) bool) error {
 
 // Close stops the flusher after a final drain and closes the file. After Close every
 // committed record is on disk.
-func (l *HybridLog) Close() error {
+func (l *hybridLog) Close() error {
 	close(l.closed)
 	l.wakeFlusher()
 	l.wg.Wait()

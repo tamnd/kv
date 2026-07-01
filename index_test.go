@@ -8,7 +8,7 @@ import (
 // TestIndexPutGet covers the single-threaded contract: a put is found, an update
 // replaces the address in place, and an absent fingerprint misses.
 func TestIndexPutGet(t *testing.T) {
-	ix := NewIndex(1000)
+	ix := newHashIndex(1000)
 	for i := range 1000 {
 		if !ix.Put(uint64(i+1), int64(i*100)) {
 			t.Fatalf("put %d failed, table reported full", i)
@@ -39,7 +39,7 @@ func TestIndexPutGet(t *testing.T) {
 func TestIndexConcurrentPut(t *testing.T) {
 	const writers = 8
 	const each = 4000
-	ix := NewIndex(writers * each)
+	ix := newHashIndex(writers * each)
 
 	var wg sync.WaitGroup
 	for w := range writers {

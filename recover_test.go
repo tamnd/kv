@@ -11,7 +11,7 @@ import (
 func TestDBRecoverOverwrites(t *testing.T) {
 	const ringBytes = 1 << 20
 	path := filepath.Join(t.TempDir(), "db.log")
-	d, err := OpenDB(path, ringBytes, 1000)
+	d, err := openColdDB(path, ringBytes, 1000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -24,7 +24,7 @@ func TestDBRecoverOverwrites(t *testing.T) {
 	if err := d.Close(); err != nil {
 		t.Fatal(err)
 	}
-	d2, err := OpenDB(path, ringBytes, 1000)
+	d2, err := openColdDB(path, ringBytes, 1000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,7 +47,7 @@ func TestDBRecoverLargerThanMemory(t *testing.T) {
 	const ringBytes = 1 << 20 // 1 MiB resident
 	const keys = 20000        // far more than fits the ring
 	path := filepath.Join(t.TempDir(), "db.log")
-	d, err := OpenDB(path, ringBytes, keys)
+	d, err := openColdDB(path, ringBytes, keys)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +57,7 @@ func TestDBRecoverLargerThanMemory(t *testing.T) {
 	if err := d.Close(); err != nil {
 		t.Fatal(err)
 	}
-	d2, err := OpenDB(path, ringBytes, keys)
+	d2, err := openColdDB(path, ringBytes, keys)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +80,7 @@ func TestDBRecoverLargerThanMemory(t *testing.T) {
 func TestDBSyncThenRecover(t *testing.T) {
 	const ringBytes = 1 << 20
 	path := filepath.Join(t.TempDir(), "db.log")
-	d, err := OpenDB(path, ringBytes, 1000)
+	d, err := openColdDB(path, ringBytes, 1000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +91,7 @@ func TestDBSyncThenRecover(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Do not Close: reopen the file as if the process had crashed after the Sync barrier.
-	d2, err := OpenDB(path, ringBytes, 1000)
+	d2, err := openColdDB(path, ringBytes, 1000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,7 +114,7 @@ func TestTieredRecover(t *testing.T) {
 	const segBytes = 1 << 16
 	const keys = 8000
 	path := filepath.Join(t.TempDir(), "tier.log")
-	d, err := OpenTiered(path, segBytes, 4096, 1<<20, keys, 2048)
+	d, err := openTiered(path, segBytes, 4096, 1<<20, keys, 2048)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,7 +127,7 @@ func TestTieredRecover(t *testing.T) {
 	if err := d.Close(); err != nil {
 		t.Fatal(err)
 	}
-	d2, err := OpenTiered(path, segBytes, 4096, 1<<20, keys, 2048)
+	d2, err := openTiered(path, segBytes, 4096, 1<<20, keys, 2048)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +151,7 @@ func TestDeleteSurvivesRecovery(t *testing.T) {
 	t.Run("DB", func(t *testing.T) {
 		const ringBytes = 1 << 20
 		path := filepath.Join(t.TempDir(), "db.log")
-		d, err := OpenDB(path, ringBytes, 1000)
+		d, err := openColdDB(path, ringBytes, 1000)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -164,7 +164,7 @@ func TestDeleteSurvivesRecovery(t *testing.T) {
 		if err := d.Close(); err != nil {
 			t.Fatal(err)
 		}
-		d2, err := OpenDB(path, ringBytes, 1000)
+		d2, err := openColdDB(path, ringBytes, 1000)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -191,7 +191,7 @@ func TestDeleteSurvivesRecovery(t *testing.T) {
 		const segBytes = 1 << 16
 		const keys = 6000
 		path := filepath.Join(t.TempDir(), "tier.log")
-		d, err := OpenTiered(path, segBytes, 4096, 1<<20, keys, 2048)
+		d, err := openTiered(path, segBytes, 4096, 1<<20, keys, 2048)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -204,7 +204,7 @@ func TestDeleteSurvivesRecovery(t *testing.T) {
 		if err := d.Close(); err != nil {
 			t.Fatal(err)
 		}
-		d2, err := OpenTiered(path, segBytes, 4096, 1<<20, keys, 2048)
+		d2, err := openTiered(path, segBytes, 4096, 1<<20, keys, 2048)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -234,7 +234,7 @@ func TestTieredSyncThenRecover(t *testing.T) {
 	const segBytes = 1 << 16
 	const keys = 5000
 	path := filepath.Join(t.TempDir(), "tier.log")
-	d, err := OpenTiered(path, segBytes, 4096, 1<<20, keys, 2048)
+	d, err := openTiered(path, segBytes, 4096, 1<<20, keys, 2048)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -244,7 +244,7 @@ func TestTieredSyncThenRecover(t *testing.T) {
 	if err := d.Sync(); err != nil {
 		t.Fatal(err)
 	}
-	d2, err := OpenTiered(path, segBytes, 4096, 1<<20, keys, 2048)
+	d2, err := openTiered(path, segBytes, 4096, 1<<20, keys, 2048)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -15,7 +15,7 @@ func TestDBLargerThanMemory(t *testing.T) {
 	const ringBytes = 1 << 21 // 2 MiB ring
 	const keys = 200000       // ~ tens of MiB of records, an order of magnitude past the ring
 	path := filepath.Join(t.TempDir(), "db.log")
-	d, err := OpenDB(path, ringBytes, keys)
+	d, err := openColdDB(path, ringBytes, keys)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,7 +50,7 @@ func TestDBConcurrent(t *testing.T) {
 	const writers = 4
 	const each = 20000
 	path := filepath.Join(t.TempDir(), "db.log")
-	d, err := OpenDB(path, ringBytes, writers*each)
+	d, err := openColdDB(path, ringBytes, writers*each)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,7 +98,7 @@ func TestDBConcurrent(t *testing.T) {
 func TestDBPersistsToDisk(t *testing.T) {
 	const ringBytes = 1 << 20
 	path := filepath.Join(t.TempDir(), "db.log")
-	d, err := OpenDB(path, ringBytes, 1000)
+	d, err := openColdDB(path, ringBytes, 1000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +110,7 @@ func TestDBPersistsToDisk(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Reopen the same file and confirm every record comes back, the latest value for its key.
-	d2, err := OpenDB(path, ringBytes, 1000)
+	d2, err := openColdDB(path, ringBytes, 1000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +140,7 @@ func BenchmarkDBGetOutOfCache(b *testing.B) {
 	const ringBytes = 1 << 22 // 4 MiB resident
 	const keys = 1 << 19      // ~64 MiB of records, 16x the ring
 	path := filepath.Join(b.TempDir(), "db.log")
-	d, err := OpenDB(path, ringBytes, keys)
+	d, err := openColdDB(path, ringBytes, keys)
 	if err != nil {
 		b.Fatal(err)
 	}

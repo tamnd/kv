@@ -27,11 +27,11 @@ func skewIndex(i uint64) uint64 {
 	return (i * 40503) & (tierHotKeys - 1) // the rest stay in the hot set
 }
 
-func openTierBench(b *testing.B) *TieredDB {
+func openTierBench(b *testing.B) *DB {
 	path := filepath.Join(b.TempDir(), "tier.log")
 	// One hot segment holds the hot set comfortably; the cold tier and its index are sized to
 	// the whole keyspace, but they sit off the write hot path, which is the point.
-	d, err := OpenTiered(path, 1<<20, tierHotKeys*4, 1<<22, tierBenchKeys, 1<<16)
+	d, err := openTiered(path, 1<<20, tierHotKeys*4, 1<<22, tierBenchKeys, 1<<16)
 	if err != nil {
 		b.Fatal(err)
 	}
