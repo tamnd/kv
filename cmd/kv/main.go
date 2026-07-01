@@ -1,119 +1,132 @@
-// Command kv is the operator's and scripter's interface to a kv database file, the
-// SQLite-shell analog (spec 16). It is a thin layer over the public library (spec 15):
-// every command opens a *kv.DB and calls public API, so the CLI is the forcing function
-// that keeps the library surface complete.
+// Command hlog-server serves a single hlog store over the Redis wire protocol.
+// It is the network face of the bare hash-log engine: open one file, size the
+// tiers from the workload hints, and answer GET/SET/DEL on a unix socket or a TCP
+// port until a signal arrives, then sync and close so the file shuts down
+// coherently. It is the over-the-wire counterpart to the in-process engine, so a
+// benchmark can measure the same store across a socket the way it measures redis
+// or valkey, with the network round-trip in the number.
 //
-// The tool is a single static pure-Go binary with no runtime dependencies (spec 20):
-// the command surface is built on the standard library's flag package and a small
-// dispatcher rather than an external CLI framework, so the build stays dependency-free.
-//
-// Output is line-oriented and pipe-friendly; -f json|jsonl|table|raw selects the
-// format, auto-picking table on a TTY and jsonl in a pipe, so the tool composes with
-// jq, grep, and shell loops. Exit codes are meaningful and mirror the typed library
-// errors (spec 16 §7).
+// The sizing flags mirror the in-process adapter: the engine keeps a resident key
+// index sized to the cardinality, a hot tier sized to the value, and a resident
+// cold window sized to the cache budget, so the served store is the same shape as
+// the embedded one rather than a differently tuned second instance.
 package main
 
 import (
+	"flag"
 	"fmt"
+	"net"
 	"os"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"syscall"
+
+	"github.com/tamnd/kv"
+	"github.com/tamnd/kv/resp"
 )
-
-// exit codes, mirroring the typed library errors so a script gets the same signal from
-// the CLI as from the API (spec 16 §7).
-const (
-	exitOK       = 0
-	exitNotFound = 1 // not found / false (get/exists on a missing key)
-	exitUsage    = 2 // bad flags or arguments
-	exitOpen     = 3 // file not found / cannot open
-	exitCorrupt  = 4 // corruption detected
-	exitLock     = 5 // needs recovery / lock held by another writer
-	exitConflict = 6 // write could not commit after retries
-	exitCrypto   = 7 // encryption error
-	exitIO       = 8 // I/O / durability error
-)
-
-// command is one subcommand: a name, a one-line summary, and a run function that
-// returns an exit code. Keeping run returning the code (not calling os.Exit) keeps the
-// commands testable.
-type command struct {
-	name    string
-	summary string
-	run     func(args []string) int
-}
-
-func commands() []command {
-	return []command{
-		{"create", "create a new database file with create-time options", cmdCreate},
-		{"get", "print the value for a key", cmdGet},
-		{"set", "upsert a key to a value", cmdSet},
-		{"del", "delete one key", cmdDel},
-		{"exists", "exit 0 if a key is present, 1 if absent", cmdExists},
-		{"merge", "apply the registered merge operator to a key", cmdMerge},
-		{"load", "bulk-load key/value pairs from stdin or a file", cmdLoad},
-		{"import", "import key/value pairs from CSV, TSV, or JSONL", cmdImport},
-		{"checkpoint", "fold the WAL into the main file", cmdCheckpoint},
-		{"backup", "stream a consistent physical image to a file or stdout", cmdBackup},
-		{"restore", "rebuild a database from a backup stream", cmdRestore},
-		{"ship", "stream the current WAL generation as a replication delta", cmdShip},
-		{"replay", "apply a shipped WAL delta onto a read-only follower", cmdReplay},
-		{"vacuum", "return trailing free pages to the OS; shrink the file", cmdVacuum},
-		{"pragma", "read or set a configuration knob (engine, application_id, ...)", cmdPragma},
-		{"check", "verify structural integrity; exit 4 on any violation", cmdCheck},
-		{"info", "print a human summary of the database", cmdInfo},
-		{"stats", "print space and durability accounting as JSON", cmdStats},
-		{"metrics", "print observability metrics in Prometheus text format", cmdMetrics},
-		{"watch", "stream committed changes as JSONL (change feed)", cmdWatch},
-		{"serve", "serve the database over HTTP/JSON", cmdServe},
-		{"version", "print the build and library version", cmdVersion},
-	}
-}
 
 func main() {
 	os.Exit(run(os.Args[1:]))
 }
 
-// run dispatches to a subcommand and returns its exit code.
 func run(args []string) int {
-	if len(args) == 0 {
-		usage(os.Stderr)
-		return exitUsage
+	fs := flag.NewFlagSet("hlog-server", flag.ContinueOnError)
+	unixsocket := fs.String("unixsocket", "", "unix socket path to serve RESP on (preferred for a local benchmark)")
+	addr := fs.String("addr", "", "TCP listen address for RESP, for example 127.0.0.1:6380 (empty disables TCP)")
+	dir := fs.String("dir", ".", "data directory; the store lives at <dir>/hlog.db")
+	synchronous := fs.String("synchronous", "default", "durability: off | normal | full | default")
+	// Workload sizing hints. The harness knows the cell's cardinality and value
+	// size, so it passes them and the server sizes the tiers the same way the
+	// in-process adapter does, rather than guessing from defaults.
+	cardinality := fs.Int("cardinality", 0, "expected distinct key count, sizes the resident cold index (0 uses the engine default)")
+	valueBytes := fs.Int("value-bytes", 0, "value size hint, sizes the hot segment index (0 assumes a 1 KiB record)")
+	cacheBytes := fs.Int64("cache-bytes", 0, "resident cold window in bytes (0 uses the engine default)")
+	if err := fs.Parse(args); err != nil {
+		return 2
 	}
-	switch args[0] {
-	case "-h", "--help", "help":
-		usage(os.Stdout)
-		return exitOK
-	case "-v", "--version":
-		return cmdVersion(args[1:])
+	if *unixsocket == "" && *addr == "" {
+		fmt.Fprintln(os.Stderr, "hlog-server: one of --unixsocket or --addr is required")
+		return 2
 	}
-	for _, c := range commands() {
-		if c.name == args[0] {
-			return c.run(args[1:])
-		}
+
+	opts, forceSync := buildOptions(*cardinality, *valueBytes, *cacheBytes, *synchronous)
+	dbPath := filepath.Join(*dir, "hlog.db")
+	db, err := kv.Open(dbPath, opts)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "hlog-server: open:", err)
+		return 1
 	}
-	// `kv <file>` with no subcommand opens the interactive shell on that file, the
-	// sqlite3-shell convention (spec 16 §1, §5). The single argument must be an existing
-	// file, so a genuine mistyped command still gets the unknown-command error.
-	if len(args) == 1 {
-		if _, err := os.Stat(args[0]); err == nil {
-			return runShell(args[0])
-		}
+
+	ln, err := listen(*unixsocket, *addr)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "hlog-server: listen:", err)
+		_ = db.Close()
+		return 1
 	}
-	fmt.Fprintf(os.Stderr, "kv: unknown command %q\n\n", args[0])
-	usage(os.Stderr)
-	return exitUsage
+
+	srv := resp.New(db, forceSync)
+	// A signal closes the listener and drops the connections, so Serve returns and
+	// the deferred sync and close run on the way out.
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sig
+		_ = srv.Close()
+	}()
+
+	serveErr := srv.Serve(ln)
+	if *unixsocket != "" {
+		_ = os.Remove(*unixsocket)
+	}
+	// Force a final durability barrier before the file closes so a clean shutdown
+	// leaves nothing in the hot tier unflushed, then close the store.
+	_ = db.Sync()
+	if cerr := db.Close(); cerr != nil && serveErr == nil {
+		serveErr = cerr
+	}
+	if serveErr != nil {
+		fmt.Fprintln(os.Stderr, "hlog-server:", serveErr)
+		return 1
+	}
+	return 0
 }
 
-// usage prints the top-level help.
-func usage(w *os.File) {
-	fmt.Fprintln(w, "kv - embeddable ordered key/value database")
-	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  kv <command> <db> [args] [flags]")
-	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Commands:")
-	for _, c := range commands() {
-		fmt.Fprintf(w, "  %-12s %s\n", c.name, c.summary)
+// listen binds the RESP listener. A unix socket wins when both are set; it is the
+// fast local path the benchmark uses. A stale socket file from a crashed run is
+// removed first so the bind does not fail on an address already in use.
+func listen(unixsocket, addr string) (net.Listener, error) {
+	if unixsocket != "" {
+		_ = os.Remove(unixsocket)
+		return net.Listen("unix", unixsocket)
 	}
-	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Run 'kv <command> -h' for command flags.")
+	return net.Listen("tcp", addr)
+}
+
+// buildOptions sizes the store from the workload hints, mirroring the in-process
+// kvbench adapter so the served store is the same shape as the embedded one. It
+// returns the options and whether a durability hook should force a Sync: every
+// mode but off keeps the synced contract, off leaves the background flusher as the
+// only durability.
+func buildOptions(cardinality, valueBytes int, cacheBytes int64, synchronous string) (kv.Options, bool) {
+	const (
+		hotRecords  = 32768
+		maxHotBytes = int64(64 << 20)
+		recordOver  = 32
+		fallbackRec = 1056 // a 1 KiB value plus framing when the value size is unknown
+	)
+	recordBytes := int64(fallbackRec)
+	if valueBytes > 0 {
+		recordBytes = int64(valueBytes + recordOver)
+	}
+	hotBytes := min(int64(hotRecords)*recordBytes, maxHotBytes)
+	opts := kv.Options{
+		KeyCapacity:    cardinality,
+		HotBytes:       hotBytes,
+		HotKeys:        hotRecords + hotRecords/4,
+		ResidentBytes:  cacheBytes,
+		ReadCacheCells: 4096,
+	}
+	forceSync := strings.ToLower(synchronous) != "off"
+	return opts, forceSync
 }
