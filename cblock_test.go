@@ -15,7 +15,7 @@ func cblockRec(i int) []byte {
 
 func TestCompressedLogRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "cold.cblk")
-	l, err := OpenCompressedLog(path, 1<<16)
+	l, err := openCompressedLog(path, 1<<16)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,7 +42,7 @@ func TestCompressedLogRoundTrip(t *testing.T) {
 	}
 
 	// Reopen and confirm recovery rebuilt the block index and every record reads back.
-	l2, err := OpenCompressedLog(path, 1<<16)
+	l2, err := openCompressedLog(path, 1<<16)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +62,7 @@ func TestCompressedLogRoundTrip(t *testing.T) {
 // bytes, the whole point of the cold backend, and reports the ratio.
 func TestCompressedLogActuallyCompresses(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "cold.cblk")
-	l, err := OpenCompressedLog(path, 1<<16)
+	l, err := openCompressedLog(path, 1<<16)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +89,7 @@ func TestCompressedLogActuallyCompresses(t *testing.T) {
 // file past the logical bytes by more than the per-block headers.
 func TestCompressedLogIncompressible(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "cold.cblk")
-	l, err := OpenCompressedLog(path, 1<<16)
+	l, err := openCompressedLog(path, 1<<16)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +121,7 @@ func TestCompressedLogIncompressible(t *testing.T) {
 		t.Fatalf("incompressible data inflated: file %d vs logical %d", fi.Size(), logical)
 	}
 	// And it still reads back.
-	l2, err := OpenCompressedLog(path, 1<<16)
+	l2, err := openCompressedLog(path, 1<<16)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,7 +136,7 @@ func TestCompressedLogIncompressible(t *testing.T) {
 // side of the cold backend. It is the background migration rate, not the hot write path.
 func BenchmarkCompressedLogAppend(b *testing.B) {
 	path := filepath.Join(b.TempDir(), "cold.cblk")
-	l, err := OpenCompressedLog(path, 1<<16)
+	l, err := openCompressedLog(path, 1<<16)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -154,7 +154,7 @@ func BenchmarkCompressedLogAppend(b *testing.B) {
 // a block other than the cached one, the honest cold-read cost including decompression.
 func BenchmarkCompressedLogReadCold(b *testing.B) {
 	path := filepath.Join(b.TempDir(), "cold.cblk")
-	l, err := OpenCompressedLog(path, 1<<16)
+	l, err := openCompressedLog(path, 1<<16)
 	if err != nil {
 		b.Fatal(err)
 	}

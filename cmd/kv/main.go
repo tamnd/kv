@@ -1,4 +1,4 @@
-// Command hlog-server serves a single hlog store over the Redis wire protocol.
+// Command kv serves a single kv store over the Redis wire protocol.
 // It is the network face of the bare hash-log engine: open one file, size the
 // tiers from the workload hints, and answer GET/SET/DEL on a unix socket or a TCP
 // port until a signal arrives, then sync and close so the file shuts down
@@ -31,10 +31,10 @@ func main() {
 }
 
 func run(args []string) int {
-	fs := flag.NewFlagSet("hlog-server", flag.ContinueOnError)
+	fs := flag.NewFlagSet("kv", flag.ContinueOnError)
 	unixsocket := fs.String("unixsocket", "", "unix socket path to serve RESP on (preferred for a local benchmark)")
 	addr := fs.String("addr", "", "TCP listen address for RESP, for example 127.0.0.1:6380 (empty disables TCP)")
-	dir := fs.String("dir", ".", "data directory; the store lives at <dir>/hlog.db")
+	dir := fs.String("dir", ".", "data directory; the store lives at <dir>/kv.db")
 	synchronous := fs.String("synchronous", "default", "durability: off | normal | full | default")
 	// Workload sizing hints. The harness knows the cell's cardinality and value
 	// size, so it passes them and the server sizes the tiers the same way the
@@ -46,21 +46,21 @@ func run(args []string) int {
 		return 2
 	}
 	if *unixsocket == "" && *addr == "" {
-		fmt.Fprintln(os.Stderr, "hlog-server: one of --unixsocket or --addr is required")
+		fmt.Fprintln(os.Stderr, "kv: one of --unixsocket or --addr is required")
 		return 2
 	}
 
 	opts, forceSync := buildOptions(*cardinality, *valueBytes, *cacheBytes, *synchronous)
-	dbPath := filepath.Join(*dir, "hlog.db")
+	dbPath := filepath.Join(*dir, "kv.db")
 	db, err := kv.Open(dbPath, opts)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "hlog-server: open:", err)
+		fmt.Fprintln(os.Stderr, "kv: open:", err)
 		return 1
 	}
 
 	ln, err := listen(*unixsocket, *addr)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "hlog-server: listen:", err)
+		fmt.Fprintln(os.Stderr, "kv: listen:", err)
 		_ = db.Close()
 		return 1
 	}
@@ -86,7 +86,7 @@ func run(args []string) int {
 		serveErr = cerr
 	}
 	if serveErr != nil {
-		fmt.Fprintln(os.Stderr, "hlog-server:", serveErr)
+		fmt.Fprintln(os.Stderr, "kv:", serveErr)
 		return 1
 	}
 	return 0

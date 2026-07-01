@@ -2,17 +2,17 @@ package kv
 
 // Open is the friendly in-process constructor: it opens a tiered store at path with one option
 // struct and sane defaults, so a caller does not have to size five separate knobs to get a
-// correct store. It is the front door for using hlog as an embedded key-value engine, the
-// SQLite-feel single-file store the design set out to be. The returned *TieredDB is the engine
+// correct store. It is the front door for using kv as an embedded key-value engine, the
+// SQLite-feel single-file store the design set out to be. The returned *DB is the engine
 // itself; its Set, Get, Delete, Sync, and Close are the whole surface.
 //
 // The store is one file at path (plus a sibling commit watermark file). Values larger than
 // memory live on disk in the cold tier; the working set is served from the in-memory hot tier
 // and a read cache. There is no separate WAL and no transaction manager: a write is durable once
 // it has been group-committed to the file, and Sync forces that barrier on demand.
-func Open(path string, opts Options) (*TieredDB, error) {
+func Open(path string, opts Options) (*DB, error) {
 	o := opts.withDefaults()
-	t, err := OpenTiered(path, o.HotBytes, o.hotKeys(), o.ResidentBytes, o.KeyCapacity, o.ReadCacheCells)
+	t, err := openTiered(path, o.HotBytes, o.hotKeys(), o.ResidentBytes, o.KeyCapacity, o.ReadCacheCells)
 	if err != nil {
 		return nil, err
 	}

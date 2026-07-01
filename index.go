@@ -37,22 +37,22 @@ type slot struct {
 	addr atomic.Int64
 }
 
-// Index is the flat slot table. mask is len(slots)-1 with len a power of two, so the
+// hashIndex is the flat slot table. mask is len(slots)-1 with len a power of two, so the
 // home slot is fp&mask and probing wraps with a mask, no modulo on the hot path.
-type Index struct {
+type hashIndex struct {
 	slots []slot
 	mask  uint64
 }
 
-// NewIndex returns an index with at least capacity slots, rounded up to a power of two
+// newHashIndex returns an index with at least capacity slots, rounded up to a power of two
 // and then doubled so the table stays below the load factor where linear probing's
 // probe chains grow. The caller sizes capacity to the expected key count.
-func NewIndex(capacity int) *Index {
+func newHashIndex(capacity int) *hashIndex {
 	n := 1
 	for n < capacity*2 {
 		n <<= 1
 	}
-	return &Index{slots: make([]slot, n), mask: uint64(n - 1)}
+	return &hashIndex{slots: make([]slot, n), mask: uint64(n - 1)}
 }
 
 // forceFP maps a fingerprint onto the nonzero range so emptyFP stays an unambiguous free
@@ -72,7 +72,7 @@ func forceFP(fp uint64) uint64 {
 // slot in the probe chain with a compare-and-swap. It returns true on success and false
 // only if the table is full, which the power-of-two oversizing in NewIndex is meant to
 // prevent for the sized working set.
-func (ix *Index) Put(fp uint64, addr int64) bool {
+func (ix *hashIndex) Put(fp uint64, addr int64) bool {
 	fp = forceFP(fp)
 	i := fp & ix.mask
 	for probe := uint64(0); probe <= ix.mask; probe++ {
@@ -103,7 +103,7 @@ func (ix *Index) Put(fp uint64, addr int64) bool {
 // fingerprint (hit) or the first free slot (miss, since an insert never leaves a gap
 // before its slot). The address it returns is the most recent one Put stored for the
 // fingerprint; the engine reads the record there and verifies the key.
-func (ix *Index) Get(fp uint64) (int64, bool) {
+func (ix *hashIndex) Get(fp uint64) (int64, bool) {
 	fp = forceFP(fp)
 	i := fp & ix.mask
 	for probe := uint64(0); probe <= ix.mask; probe++ {

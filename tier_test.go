@@ -14,7 +14,7 @@ func TestTieredSetGet(t *testing.T) {
 	const segBytes = 1 << 16 // small segments so many seals happen
 	const keys = 50000
 	path := filepath.Join(t.TempDir(), "tier.log")
-	d, err := OpenTiered(path, segBytes, keys, 1<<20, keys, 1024)
+	d, err := openTiered(path, segBytes, keys, 1<<20, keys, 1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,7 +46,7 @@ func TestTieredUpdateWins(t *testing.T) {
 	const segBytes = 1 << 16
 	const keys = 20000
 	path := filepath.Join(t.TempDir(), "tier.log")
-	d, err := OpenTiered(path, segBytes, keys, 1<<20, keys, 1024)
+	d, err := openTiered(path, segBytes, keys, 1<<20, keys, 1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +78,7 @@ func TestTieredConcurrent(t *testing.T) {
 	const writers = 4
 	const each = 10000
 	path := filepath.Join(t.TempDir(), "tier.log")
-	d, err := OpenTiered(path, segBytes, writers*each, 1<<20, writers*each, 2048)
+	d, err := openTiered(path, segBytes, writers*each, 1<<20, writers*each, 2048)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,7 +124,7 @@ func TestTieredConcurrent(t *testing.T) {
 func TestTieredDelete(t *testing.T) {
 	const segBytes = 1 << 16
 	path := filepath.Join(t.TempDir(), "tier.log")
-	d, err := OpenTiered(path, segBytes, 4096, 1<<20, 4096, 1024)
+	d, err := openTiered(path, segBytes, 4096, 1<<20, 4096, 1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,7 +155,7 @@ func TestTieredDelete(t *testing.T) {
 func TestTieredDeleteThenReinsert(t *testing.T) {
 	const segBytes = 1 << 16
 	path := filepath.Join(t.TempDir(), "tier.log")
-	d, err := OpenTiered(path, segBytes, 4096, 1<<20, 4096, 1024)
+	d, err := openTiered(path, segBytes, 4096, 1<<20, 4096, 1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -181,7 +181,7 @@ func TestTieredDeleteThenReinsert(t *testing.T) {
 func TestTieredOverwriteAfterCacheFill(t *testing.T) {
 	const segBytes = 1 << 16
 	path := filepath.Join(t.TempDir(), "tier.log")
-	d, err := OpenTiered(path, segBytes, 4096, 1<<20, 4096, 1024)
+	d, err := openTiered(path, segBytes, 4096, 1<<20, 4096, 1024)
 	if err != nil {
 		t.Fatal(err)
 	}

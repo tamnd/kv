@@ -9,7 +9,7 @@ import (
 // TestStoreSetGet is the end-to-end point contract: a value set under a key reads back,
 // an overwrite is observed, and an absent key misses.
 func TestStoreSetGet(t *testing.T) {
-	s := NewStore(1<<24, 10000)
+	s := newHotStore(1<<24, 10000)
 	for i := range 5000 {
 		key := fmt.Appendf(nil, "key-%05d", i)
 		val := fmt.Appendf(nil, "value-for-%05d", i)
@@ -38,7 +38,7 @@ func TestStoreSetGet(t *testing.T) {
 // stored returns a miss even when other keys are present, which is the same compare that
 // makes a true collision safe.
 func TestStoreKeyVerification(t *testing.T) {
-	s := NewStore(1<<20, 1000)
+	s := newHotStore(1<<20, 1000)
 	s.Set([]byte("alpha"), []byte("one"))
 	s.Set([]byte("beta"), []byte("two"))
 	if _, ok := s.Get([]byte("gamma")); ok {
@@ -61,7 +61,7 @@ var pointVal = []byte("a-hundred-byte-value-padded-out-to-look-like-a-realistic-
 // key verify. It should be allocation-free, since the value aliases the log.
 func BenchmarkStoreGet(b *testing.B) {
 	const n = 1 << 16
-	s := NewStore(int64(n)*256+1<<20, n)
+	s := newHotStore(int64(n)*256+1<<20, n)
 	key := make([]byte, 8)
 	for i := range uint64(n) {
 		fixedKey(key, i)
@@ -85,7 +85,7 @@ func BenchmarkStoreGet(b *testing.B) {
 // grows the log, so the buffer is sized for the whole run.
 func BenchmarkStoreSet(b *testing.B) {
 	recSize := int64(hdrLen + keyLenSize + 8 + len(pointVal))
-	s := NewStore(int64(b.N)*recSize+1<<20, b.N+16)
+	s := newHotStore(int64(b.N)*recSize+1<<20, b.N+16)
 	key := make([]byte, 8)
 	b.ReportAllocs()
 	b.ResetTimer()
